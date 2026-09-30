@@ -8,6 +8,10 @@ _build/
 !.github
 !.mailmap
 !.weblate.json
+# factory: keep .factory/skills/ tracked, ignore everything else in .factory/
+!.factory/
+.factory/*
+!.factory/skills/
 # compiled python files
 *.py[co]
 __pycache__/
@@ -56,3 +60,6 @@ package.json
 # local dev environment (scripts/dev)
 /logs/
 /var/
+
+# generated wiki video (stays on disk, never committed)
+*.mp4
