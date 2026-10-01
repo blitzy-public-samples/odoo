@@ -1,8 +1,13 @@
+import { effect, onMounted, onPatched, onWillDestroy } from "@odoo/owl";
 import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
 import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
 import { registry } from "@web/core/registry";
 import { getScheduleORMExtras } from "@web/model/relational_model/utils";
 import { formView } from "@web/views/form/form_view";
+
+// B8/B11 (offline_inventory.md): the AI-probability switch exists twice in
+// the lead form arch (desktop and touch layouts), both as a plain `<a>`.
+const AI_SWITCH_SELECTOR = "a[name='action_set_automated_probability']";
 
 class CrmFormRecord extends formView.Model.Record {
      /**
@@ -75,6 +80,35 @@ class CrmFormController extends formView.Controller {
     setup() {
         super.setup();
         this.crmOffline = useCrmOffline();
+
+        // B8/B11/C7 (architecture.md §3.7, offline_inventory.md rows
+        // B8/B11/C7, VAL-DIS-002): the AI-probability switch is a plain
+        // `<a>`, so `OfflinePlugin.SELECTORS_TO_DISABLE` (which only
+        // matches `<button>`) never disables it. `beforeExecuteActionButton`
+        // below already blocks the method call; this effect only gives the
+        // control its visual offline-disabled state. `effect()` re-runs
+        // whenever `isOffline()` changes, independently of whether anything
+        // else causes this controller to re-render; `onPatched` additionally
+        // reapplies the class after every render of this form (e.g. after a
+        // save replaces the `<a>` node while already offline), since a
+        // patch caused by an unrelated reactive read would not otherwise
+        // retrigger the effect.
+        const syncAiSwitchOfflineState = () => {
+            const rootEl = this.rootRef();
+            if (!rootEl) {
+                return;
+            }
+            const offline = this.crmOffline.isOffline();
+            for (const el of rootEl.querySelectorAll(AI_SWITCH_SELECTOR)) {
+                el.classList.toggle("o_disabled_offline", offline);
+            }
+        };
+        let disposeAiSwitchEffect = () => {};
+        onMounted(() => {
+            disposeAiSwitchEffect = effect(syncAiSwitchOfflineState);
+        });
+        onPatched(syncAiSwitchOfflineState);
+        onWillDestroy(() => disposeAiSwitchEffect());
     }
 
     /**
@@ -88,17 +122,31 @@ class CrmFormController extends formView.Controller {
      * `action_unarchive`, a bare `[[id]]` write like `action_restore` has
      * no framework producer, so crm must queue it itself.
      *
+     * B8/B11/C7 (offline_inventory.md rows B8/B11/C7, VAL-DIS-002): the
+     * AI-probability switch, reclassified to DISABLE by the milestone-2
+     * user review -- predictive scoring is out of scope and the
+     * probability only recomputes on the server, so unlike Restore/Won
+     * there is no optimistic UI to apply, just a plain block. The check
+     * must run (and return `false`) *before* `super()`: the base
+     * `beforeExecuteActionButton` unconditionally calls `record.save()`
+     * first for any non-"cancel" button, so returning late would still
+     * save (and offline, queue) the record as an unwanted side effect of
+     * a button that itself does nothing offline.
+     *
      * @override
      */
     async beforeExecuteActionButton(clickParams) {
-        if (
-            this.crmOffline.isOffline() &&
-            this.model.root.resModel === "crm.lead" &&
-            clickParams.type === "object" &&
-            clickParams.name === "action_restore"
-        ) {
-            this._queueRestoreOffline();
-            return false; // skip the real action_restore RPC
+        if (this.crmOffline.isOffline() && this.model.root.resModel === "crm.lead") {
+            if (clickParams.type === "object" && clickParams.name === "action_restore") {
+                this._queueRestoreOffline();
+                return false; // skip the real action_restore RPC
+            }
+            if (
+                clickParams.type === "object" &&
+                clickParams.name === "action_set_automated_probability"
+            ) {
+                return false; // no optimistic UI possible; just block, no save
+            }
         }
         return super.beforeExecuteActionButton(clickParams);
     }
