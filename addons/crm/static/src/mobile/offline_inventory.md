@@ -91,7 +91,11 @@ rg -n "webSearchRead|searchRead|readGroup|formattedReadGroup|webSave|read_group|
 Every matched line was opened in context and either turned into a row or excluded with a
 documented reason (below). Every `*.js`/`*.xml` file under `addons/crm/static/src/` was also
 listed (`find addons/crm/static/src -type f \( -name "*.js" -o -name "*.xml" \)`, 47 files)
-and cross-checked file by file so files with zero hits are confirmed empty, not skipped.
+and cross-checked file by file so files with zero hits are confirmed empty, not skipped. A
+bare `useService("orm")`/`useService("action")` assignment that only acquires a service
+handle, with no call on that line, is excluded here and gets no row of its own
+(user-testing fix): acquiring a handle issues no server call by itself, only the calls
+later made *through* it do, and each of those already has its own row below.
 
 **Excluded from Section A** (matched a broad grep, but not a network call, or not an Odoo
 server call):
@@ -373,12 +377,10 @@ about control rows, not about reproducing the throwaway script's own internal ta
 |---|---|---|---|---|---|
 | A1 | `static/src/activity_menu_patch.js` | 39 | `this.action.loadAction("crm.crm_lead_action_my_activities")` | DISABLE | Activity-menu CRM entry (contract: DISABLE); disk-cached action, but its search state (activity filters, `active in [true,false]`) is unlikely to be visited, and the promise has no `.catch`. |
 | A2 | `static/src/activity_menu_patch.js` | 45 | `this.action.doAction(action, {...})` | DISABLE | Same activity-menu CRM entry path as A1. |
-| A3 | `static/src/components/team_switcher/team_switcher.js` | 18 | `this.actionService = useService("action")` | SKIP | Service-handle acquisition only; no network I/O at this line (the call it enables is A5). |
 | A4 | `static/src/components/team_switcher/team_switcher.js` | 21 | `await user.hasGroup("sales_team.group_sale_manager")` | SKIP | Team-switcher sales-manager probe (contract: SKIP); only toggles "Manage Teams" visibility. |
 | A5 | `static/src/components/team_switcher/team_switcher.js` | 46 | `this.actionService.doAction("sales_team.crm_team_action_config")` | DISABLE | "Manage Teams" navigation (contract: DISABLE); manager-only admin area, its `DropdownItem` is not auto-disabled. |
 | A6 | `static/src/views/crm_search_model.js` | 130-142 | `this.orm.cache({type:"disk",update:"always",callback}).call("crm.team","get_team_switcher_data")` | SKIP | Feeds the switcher list/domain; SKIP is the *target* disposition (a probe that only decorates/filters an already-loaded view), but **correction (this revision)**: today it does not degrade gracefully on a cache miss. `_initSwitcher()` (`crm_search_model.js:125-145`) `await`s this call with no `.catch`, and `load()` (`:42-47`) `await`s `_initSwitcher()` with no `.catch` either; `RPCCache.read()` (`addons/web/static/src/core/network/rpc_cache.js`) rejects its returned promise when there is no ram/disk value to fall back on, so an offline cache miss rejects `_initSwitcher()`, which rejects the whole `CrmSearchModel.load()` — aborting the view's load, not silently falling back to "All Teams". The file's "Offline Mode" section (`:210-250`) only re-exports/restores the team **facet** on an already-loaded search state (`applySearch`/`getCurrentSearch`); it has no bearing on this cache-miss path. Making this call actually skip silently on a miss (the behavior this row's SKIP classification assumes) is milestone-2 (`offline-fixes`) work, not yet done — see Notes #2. |
 | A7 | `static/src/views/crm_kanban/crm_column_progress.js` | 14 | `await user.hasGroup("crm.group_use_recurring_revenues")` | SKIP | Recurring-revenue (MRR) group probe (contract: SKIP); only toggles the MRR aggregate line. |
-| A8 | `static/src/views/crm_form/crm_pls_tooltip_button.js` | 30 | `this.orm = useService("orm")` | SKIP | Service-handle acquisition only; no network I/O at this line. |
 | A9 | `static/src/views/crm_form/crm_pls_tooltip_button.js` | 45 | `await this.props.record.save()` | QUEUE | Framework's `web_save` producer (`record.js` `_offlineSave`); queues any pending changes before the tooltip computation, same generic mechanism as any form save. |
 | A10 | `static/src/views/crm_form/crm_pls_tooltip_button.js` | 51 | `await this.orm.call("crm.lead","prepare_pls_tooltip_data",[this.props.record.resId])` | DISABLE | PLS tooltip lookup (contract: DISABLE). |
 | A11 | `static/src/views/crm_form/crm_pls_tooltip_button.js` | 57 | `await this.props.record.load()` | DISABLE | Refresh tied to the same disabled PLS-tooltip flow (reloads the server-recomputed probability); not merely decorative, so it does not qualify for SKIP, and it is unreachable once the control is disabled per A10/B9/B10. |
@@ -387,8 +389,6 @@ about control rows, not about reproducing the throwaway script's own internal ta
 | A14 | `static/src/views/crm_form/crm_form.js` | 51 | `await checkRainbowmanMessage(this.model.orm, this.model.effect, this.resId)` | SKIP | Rainbowman lookup call site (defect 1) after a stage-changing form save. |
 | A15 | `static/src/views/crm_kanban/crm_kanban_model.js` | 25 | `await super.moveRecords(...arguments)` | QUEUE | Framework's per-record `web_save({stage_id})` producer for a kanban drag; also the only kanban "mark-won" path (dropping into an `is_won` stage). |
 | A16 | `static/src/views/crm_kanban/crm_kanban_model.js` | 29 | `await checkRainbowmanMessage(this.model.orm, this.model.effect, movedLeads[0].resId)` | SKIP | Rainbowman lookup call site (defect 1) after a kanban stage drop. |
-| A17 | `static/src/components/lead_generation_dropdown/lead_generation_dropdown.js` | 26 | `this.orm = useService("orm")` | SKIP | Service-handle acquisition only. |
-| A18 | `static/src/components/lead_generation_dropdown/lead_generation_dropdown.js` | 28 | `this.action = useService("action")` | SKIP | Service-handle acquisition only. |
 | A19 | `static/src/components/lead_generation_dropdown/lead_generation_dropdown.js` | 137-143 | `await this.orm.cache().searchRead("ir.module.module",[["name","in",moduleNames]],["id","name","shortdesc"])` | DISABLE | Lead generation (contract: DISABLE); module-install lookup, and the Generate button already lacks `data-available-offline`. |
 | A20 | `static/src/components/lead_generation_dropdown/lead_generation_dropdown.js` | 165 | `await user.checkAccessRight(model,"create")` | DISABLE | Lead generation (contract: DISABLE); access probe gating install/access-request UI (dead code today: no `dropdownContentElements` entry sets `model`). |
 | A21 | `static/src/components/lead_generation_dropdown/lead_generation_dropdown.js` | 206 | `await this.orm.silent.call("ir.module.module","button_immediate_install",[id])` | DISABLE | Lead generation, module install (contract: DISABLE). |
@@ -474,8 +474,8 @@ about control rows, not about reproducing the throwaway script's own internal ta
 | B69 | `views/crm_lead_views.xml`; `views/crm_team_views.xml` | 7, 320, 364, 503, 707; 123, 134 | Selected-record Action-menu "Archive"/"Unarchive" on `crm.lead`/`crm.team` roots | QUEUE | **New row (round-4 fix).** Same `getStaticActionMenuItems()` wiring as B66-B68, to `record.archive()`/`record.unarchive()`/the list equivalents → the framework's `action_archive`/`action_unarchive` producers (AGENTS.md section 2's "Producers" list), already auto-queued with no new crm-side wiring needed — the missing piece was the Action-menu entry point, same as B67. See also C22 (`action_unarchive`, no longer excluded). |
 | B70 | `views/crm_lead_views.xml` | 320, 364, 503, 707 | List/kanban "select all N matching records" (domain selection, `isDomainSelected`/`selectDomain` in `dynamic_list.js`) feeding any of B66-B69's Action-menu operations | DISABLE | **New row (round-4 fix).** Selecting *all records matching the current search domain* (not just the loaded page) resolves ids with a server-side `search()` the UI never shows the caller, and the resulting Duplicate/Delete/Archive/Unarchive call then operates on an id set that was never individually bare-id-verified by the user offline — the selection step itself needs a live server round-trip before any of B66-B69 can even be attempted, so this path is DISABLE regardless of which of those rows' dispositions would otherwise apply to the subset the user actually intended. |
 | B71 | `views/crm_lead_views.xml` | 503, 653-660, 974-983 | Pipeline/Leads kanban column, or a grouped-list header, grouped by `team_id` (via the Leads/Opportunities search filters at `:653-660`/`:974-983`) — column/header "Delete" + sequence-handle drag resequence | QUEUE | **New row (round-4 fix).** `GroupConfigMenu`'s "Delete" (`group_config_menu.js:102-113`, `deleteGroup()`) calls `orm.unlink("crm.team", [groupId])` and column/header drag-resequence calls the shared `web_resequence` util — both on a `crm.team` id the user already selected to group by, bare-id resolvable, same reasoning as B58/B59's stage resequence and C16's team `unlink`. QUEUE closes the "non-stage group-by" gap in the pipeline/Leads kanban's and the grouped list's group-level controls. |
-| B72 | `views/crm_lead_views.xml` | 503, 653-660, 657, 974-983, 980 | Pipeline/Leads kanban column, or a grouped-list header, grouped by any relation other than `stage_id` (`team_id`, `user_id`, `country_id`, `company_id`, `utm.campaign`/`medium`/`source`, `lost_reason_id`) — column/header "Edit" | DISABLE | **New row (round-4 fix).** Same `GroupConfigMenu` "Edit" mechanism B62 already classifies DISABLE for a stage column, generalized: `editGroup()` opens a `FormViewDialog` on the clicked group's own id for whichever relation the view is currently grouped by, on a model whose record was never individually visited offline for that view/action — DISABLE per the same navigation-unavailable-offline reasoning as B62, now covering every other group-by relation and both the kanban-column and the grouped-list-header renderings of the same `GroupConfigMenu` component. **Correction (round-5 fix):** the Leads search's and the Opportunities search's `<filter string="Company" name="company" context="{'group_by':'company_id'}" groups="base.group_multi_company"/>` (`:657`, `:980`, both already inside this row's cited `653-660`/`974-983` ranges but not named individually) is a `company_id` (`res.company`) group-by, gated by `base.group_multi_company` rather than any CRM access right; it reaches the identical `editGroup()` mechanism as every other relation this row already covers, so it is folded into this row's relation list rather than given its own. |
-| B73 | `views/crm_lead_views.xml` | 653-660, 657, 974-983, 980 | Grouped kanban column / grouped-list header "Delete" + resequence, grouped by `user_id`, `country_id`, `company_id`, `utm.campaign`/`medium`/`source`, or `lost_reason_id` | DISABLE | **New row (round-4 fix).** Same `deleteGroup()`/resequence mechanism as B71, but on models outside rule 1's scope (`res.users`, `res.country`, `res.company`, `utm.campaign`, `utm.medium`, `utm.source`, `crm.lost.reason`) — DISABLE regardless of mechanism, same reasoning as B68. **Correction (round-5 fix):** `company_id` (`res.company`, the same `:657`/`:980` multi-company group-by B72 now names) was missing from this relation list even though it is already outside rule 1's model scope exactly like the others here; added for the same reasoning, no mechanism change. |
+| B72 | `views/crm_lead_views.xml`; `report/crm_activity_report_views.xml` | 503, 653-660, 657, 974-983, 980; 30-33, 70-78 | Pipeline/Leads kanban column, or a grouped-list header, grouped by any relation other than `stage_id` (`team_id`, `user_id`, `country_id`, `company_id`, `utm.campaign`/`medium`/`source`, `lost_reason_id`) — column/header "Edit"; the `crm.activity.report` grouped list's own header "Edit" for any of its seven relational group-bys (`mail_activity_type_id`, `subtype_id`, `author_id`, `user_id`, `team_id`, `stage_id`, `company_id`) | DISABLE | **New row (round-4 fix).** Same `GroupConfigMenu` "Edit" mechanism B62 already classifies DISABLE for a stage column, generalized: `editGroup()` opens a `FormViewDialog` on the clicked group's own id for whichever relation the view is currently grouped by, on a model whose record was never individually visited offline for that view/action — DISABLE per the same navigation-unavailable-offline reasoning as B62, now covering every other group-by relation and both the kanban-column and the grouped-list-header renderings of the same `GroupConfigMenu` component. **Correction (round-5 fix):** the Leads search's and the Opportunities search's `<filter string="Company" name="company" context="{'group_by':'company_id'}" groups="base.group_multi_company"/>` (`:657`, `:980`, both already inside this row's cited `653-660`/`974-983` ranges but not named individually) is a `company_id` (`res.company`) group-by, gated by `base.group_multi_company` rather than any CRM access right; it reaches the identical `editGroup()` mechanism as every other relation this row already covers, so it is folded into this row's relation list rather than given its own. **Extension (user-testing fix):** the identical mechanism also covers `report/crm_activity_report_views.xml`'s own grouped list (`:30-33`, `action="action_open_lead" type="object"`), whose search view exposes seven relational group-by filters (`:70-78`); unlike `crm_lead_views.xml`, this report has no separate stage-only Edit row (no B62 equivalent for this file), so this row's DISABLE disposition covers all seven of the report's relations, including `team_id`/`stage_id` — their Delete/resequence counterpart is a different control with a model-dependent disposition; see B73 (the other five relations) and B89 (QUEUE, `team_id`/`stage_id`). Resolves VAL-INV-005. |
+| B73 | `views/crm_lead_views.xml`; `report/crm_activity_report_views.xml` | 653-660, 657, 974-983, 980; 30-33, 70-72, 75, 78 | Grouped kanban column / grouped-list header "Delete" + resequence, grouped by `user_id`, `country_id`, `company_id`, `utm.campaign`/`medium`/`source`, or `lost_reason_id`; the `crm.activity.report` grouped list's own header "Delete" + resequence, grouped by `mail_activity_type_id`, `subtype_id`, `author_id`, `user_id`, or `company_id` | DISABLE | **New row (round-4 fix).** Same `deleteGroup()`/resequence mechanism as B71, but on models outside rule 1's scope (`res.users`, `res.country`, `res.company`, `utm.campaign`, `utm.medium`, `utm.source`, `crm.lost.reason`) — DISABLE regardless of mechanism, same reasoning as B68. **Correction (round-5 fix):** `company_id` (`res.company`, the same `:657`/`:980` multi-company group-by B72 now names) was missing from this relation list even though it is already outside rule 1's model scope exactly like the others here; added for the same reasoning, no mechanism change. **Extension (user-testing fix):** the identical `deleteGroup()`/resequence mechanism also covers `report/crm_activity_report_views.xml`'s own grouped list (`:30-33`) for its five relational group-bys outside rule 1's scope — `mail_activity_type_id` (→ `mail.activity.type`), `subtype_id` (→ `mail.message.subtype`), `author_id` (→ `res.partner`), `user_id` (→ `res.users`), `company_id` (→ `res.company`), confirmed in `report/crm_activity_report.py`'s own field definitions — DISABLE regardless of mechanism, same reasoning as above. The report's other two relations, `team_id`/`stage_id`, are in rule 1's model scope and get their own QUEUE row, B89. Resolves VAL-INV-005. |
 | B74 | `views/crm_team_views.xml` | 123 | Inherited CRM team list (`sales_team.crm_team_view_tree`, `addons/sales_team/views/crm_team_views.xml:95-109`, retained unchanged by this file's additive `<xpath>` at `:123`): `multi_edit="1"` cell edits (`:99`) + `widget="handle"` sequence-drag resequence (`:100`) | QUEUE | **New row (round-4 fix).** Ordinary cell edits on this inherited list auto-queue through the same `web_save` multi-edit producer as B40/B60/B61 (here, on `crm.team` instead); the handle-drag resequence goes through the same `web_resequence` util as B58/B59. Both are bare-id resolvable on `crm.team`, QUEUE — the inherited list was previously only covered by C15's prose ("inherited, unchanged"), with no Section B row of its own. |
 | B75 | `views/crm_team_views.xml` | 134 | Inherited CRM team form (`sales_team.crm_team_view_form`, `addons/sales_team/views/crm_team_views.xml:21-94`, retained with crm's own additive fields by `sales_team_form_view_in_crm` at `:134`) Save | QUEUE | **New row (round-4 fix).** The form's own Save is the generic form producer already covered in substance by C15's "`crm.team` write, inherited unchanged"; this row gives it its own Section B entry so the control (not just the model method) is listed, consistent with how every other in-scope form (B1, B40, etc.) has its own row. |
 | B76 | `views/crm_team_views.xml` | 256 | Inherited Sales Team dashboard color picker (`kanban_color_picker` on `crm.team`, `addons/sales_team/views/crm_team_views.xml:157`, retained unchanged by this file's `crm_team_view_kanban_dashboard` record, which inherits `sales_team.crm_team_view_kanban_dashboard` at `:259`) | QUEUE | **New row (round-4 fix).** Same `switchTagColor`-style direct `tagRecord.update({color}); tagRecord.save();` write pattern as B55, here on `crm.team` itself (not a related `crm.tag`) — bare-id resolvable, QUEUE, matching C16's `crm.team` write classification. |
@@ -491,6 +491,7 @@ about control rows, not about reproducing the throwaway script's own internal ta
 | B86 | `views/crm_lead_views.xml` | 374, 547, 735 | Mail activity popover (`widget="kanban_activity"`/`widget="list_activity"` on `activity_ids`) "Edit" sub-control (opens the existing activity's own edit form) | DISABLE | **New row (round-4 fix).** Distinct from the popover's "Schedule" and "Mark Done" sub-controls B17/B23/BR7 already classify; "Edit" re-opens a specific, already-created `mail.activity` record's form, a navigation to a record not tracked by `isAvailableOffline` for this widget — DISABLE, same uncached-navigation family as B18/B62/B77/B82. |
 | B87 | `views/crm_lead_views.xml` | 374, 547, 735 | Mail activity popover "Done & Schedule Next" sub-control (`action_feedback_schedule_next`, `activity_model_patch.js`) | DISABLE | **New row (round-4 fix).** Returns a transient `mail.activity.schedule` wizard action (same family as the popover's own "Schedule" sub-control, B17/B23/BR7) rather than a bare resolvable write — DISABLE. |
 | B88 | `views/crm_lead_views.xml` | 320, 707 | Ordinary (non-tag, non-priority) multi-edit cell Save on the Leads list (`:320`) / Opportunities list (`:707`) | QUEUE | **New row (round-4 fix).** The framework's per-record `web_save` multi-edit producer (same mechanism as B40/B60/B61/B74), here on `crm.lead`'s own ordinary fields (`contact_name`, `email_from`, `team_id`, `stage_id`, etc.) directly, not through a specialized widget — bare-id resolvable, QUEUE. The inherited reporting/forecast-list variants (`report/crm_opportunity_report_views.xml`'s `crm_lead_view_tree_opportunity_reporting`, `crm_lead_views.xml:766-781`'s `crm_lead_view_tree_forecast`) inherit this same `multi_edit="1"` list unchanged and need no separate row; see "Round-4 findings not added" above. |
+| B89 | `report/crm_activity_report_views.xml` | 30-33, 76-77 | `crm.activity.report` grouped list header "Delete" + resequence, grouped by `team_id` ("Sales Team" filter, `:76`) or `stage_id` ("Stage" filter, `:77`) | QUEUE | **New row (user-testing fix).** Resolves VAL-INV-005. Same `GroupConfigMenu`/`deleteGroup()` mechanism as B71: `dynamic_group_list.js`'s `_unlinkGroups()` calls `orm.unlink(groupByField.relation, groupResIds)`; `showGroupConfigMenu()` (`list_renderer.js:2290-2291`) gates the menu on `["many2one","many2many"].includes(groupByField.type)`, true for both relations here — reached through this report's own list arch (`:30-33`) grouped via the search view's "Sales Team" (`:76`) or "Stage" (`:77`) filter. Bare-id resolvable on `crm.team`/`crm.stage` (confirmed `Many2one` fields in `report/crm_activity_report.py`), QUEUE by rule 1, same reasoning as B57/B59/B71. |
 
 ## Section B-REL — relational-field create/edit controls
 
@@ -642,25 +643,28 @@ all, or are unreachable through a different gate):
 
 | Classification | Count |
 |---|---|
-| QUEUE | 38 |
-| SKIP | 13 |
+| QUEUE | 39 |
+| SKIP | 9 |
 | DISABLE | 99 |
-| **Total** | **150** |
+| **Total** | **147** |
 
 ### Per section
 
 | Section | Rows | QUEUE | SKIP | DISABLE |
 |---|---|---|---|---|
-| A — JS/XML calls | 27 | 3 (A9, A13, A15) | 10 (A3, A4, A6, A7, A8, A12, A14, A16, A17, A18) | 14 (A1, A2, A5, A10, A11, A19, A20, A21, A22, A23, A24, A25, A26, A27) |
-| B — view/wizard/report buttons and controls | 88 | 25 (B1, B3, B5, B8, B11, B19, B20, B21, B22, B24, B40, B53, B54, B57, B58, B59, B64, B65, B67, B69, B71, B74, B75, B76, B88) | 1 (B80) | 62 (B2, B4, B6, B7, B9, B10, B12-B18, B23, B25-B39, B41-B52, B55, B56, B60, B61, B62, B63, B66, B68, B70, B72, B73, B77, B78, B79, B81, B82, B83, B84, B85, B86, B87) |
+| A — JS/XML calls | 23 | 3 (A9, A13, A15) | 6 (A4, A6, A7, A12, A14, A16) | 14 (A1, A2, A5, A10, A11, A19, A20, A21, A22, A23, A24, A25, A26, A27) |
+| B — view/wizard/report buttons and controls | 89 | 26 (B1, B3, B5, B8, B11, B19, B20, B21, B22, B24, B40, B53, B54, B57, B58, B59, B64, B65, B67, B69, B71, B74, B75, B76, B88, B89) | 1 (B80) | 62 (B2, B4, B6, B7, B9, B10, B12-B18, B23, B25-B39, B41-B52, B55, B56, B60, B61, B62, B63, B66, B68, B70, B72, B73, B77, B78, B79, B81, B82, B83, B84, B85, B86, B87) |
 | B-REL — relational-field create/edit controls | 12 | 0 | 0 | 12 (BR1-BR12) |
 | C — public model methods reachable from a button | 23 | 10 (C1, C2, C3, C4, C6, C7, C14, C15, C16, C22) | 2 (C9, C20) | 11 (C5, C8, C10, C11, C12, C13, C17, C18, C19, C21, C23) |
-| **Total** | **150** | **38** | **13** | **99** |
+| **Total** | **147** | **39** | **9** | **99** |
 
 (9 rows added in the round-1 fix: A26; B55-B61; C21. 2 more rows added in the round-2 fix:
 B62, B63. 8 more rows added in the round-3 fix: BR1-BR8, the new B-REL subsection. 32 more
-rows added in this round-4 fix: A27; B64-B88; BR9-BR12; C22-C23 — see Notes #7. Counts above
-are the recomputed totals, not a delta.)
+rows added in this round-4 fix: A27; B64-B88; BR9-BR12; C22-C23 — see Notes #7. This
+user-testing fix (VAL-INV-005, VAL-INV-007 — see Notes #8) removes 4 rows (A3, A8, A17,
+A18, bare service-handle acquisitions with no server call) and adds 1 row (B89), extending
+B72 and B73 to also cover `report/crm_activity_report_views.xml`'s grouped-list Edit/Delete.
+Counts above are the recomputed totals, not a delta.)
 
 ## Notes for review
 
@@ -1038,3 +1042,35 @@ archive, the two blanket-covered relational families, and the inherited team con
   does render the link exactly as the lead form's own avatar occurrence does. It is moved
   into **BR10** (DISABLE) and removed from this exclusion list; see BR10's row for the full
   reasoning.
+
+### 8. User-testing fix (VAL-INV-005, VAL-INV-007)
+
+A round of document/source-only user-testing validation against `4bdd42c3` (the commit the
+round-5 fix above landed as; no crm source changed since, so this fix's re-verification is
+against the same HEAD) found 2 blocking gaps, closed above.
+
+**VAL-INV-005**: `report/crm_activity_report_views.xml`'s own grouped list (`:30-33`) had no
+row for its `GroupConfigMenu` "Edit"/"Delete" controls across the seven relational
+group-bys its search view exposes (`:70-78`) — the same `GroupConfigMenu` mechanism B71/B72/
+B73 already classify for `crm_lead_views.xml`'s kanban/list, just unswept for this second
+file. Closed by extending **B72** (Edit, all seven relations, DISABLE — this report has no
+separate stage-only Edit row, unlike B62's `crm_lead_views.xml` case, so B72 alone covers
+all seven here, including `team_id`/`stage_id`), extending **B73** (Delete/resequence on the
+five relations outside rule 1's model scope, DISABLE), and adding **B89** (Delete/resequence
+on `team_id`/`stage_id`, QUEUE, same reasoning as B71 — a bare `orm.unlink` on a client-known
+`crm.team`/`crm.stage` id).
+
+**VAL-INV-007**: four Section A rows (A3, A8, A17, A18) classified a bare
+`useService("orm"/"action")` handle acquisition SKIP. Rule 2 reserves SKIP for a
+decorative/advisory *read*; acquiring a handle issues no server call at all, so it is not an
+entry point of any kind and was never eligible for a classification token in the first
+place. Removed (not renumbered, per this document's existing no-reassignment convention —
+see the top-of-document preamble). Every call actually made through each removed handle
+already had, and keeps, its own row: A3's `this.actionService` handle → A5's
+`doAction("sales_team.crm_team_action_config")`; A8's `this.orm` handle → A10's
+`orm.call("crm.lead", "prepare_pls_tooltip_data", ...)` (A9/A11 use `this.props.record`, not
+the removed handle); A17's `this.orm` handle → A19's `orm.cache().searchRead(...)` and A21's
+`orm.silent.call("ir.module.module", "button_immediate_install", ...)`; A18's `this.action`
+handle → A22's and A23's `this.action.doAction(...)`. The Section A sweep-method header now
+states this exclusion once, matching how it already explains the `user.isAdmin`/
+`fillTemporalService` exclusions.
