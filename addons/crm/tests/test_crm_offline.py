@@ -97,3 +97,38 @@ class TestCrmOffline(TestCrmCommon):
                           'Partner email should have moved away from its stale value')
         self.assertEqual(online_lead.partner_id.phone, online_lead.phone,
                           'Partner phone should have moved away from its stale value')
+
+    def test_action_restore_replay_restores_lead_like_online(self):
+        """ B3/C4 (architecture.md §3.7, offline_inventory.md rows B3/C4,
+        VAL-QUEUE-006): the offline "Restore" button
+        (crm_form.js's `CrmFormController._queueRestoreOffline`) queues a
+        bare `crm.lead.action_restore([[id]])` -- no onchange, no id
+        remapping, nothing else. Replaying that queued call verbatim, with
+        no sudo (as the salesman who owns the lead, same access rights an
+        offline user would have), must leave the lead exactly as restoring
+        it online would: active again, and its probability reset to its
+        (freshly recomputed) automated probability -- not merely
+        unarchived, which `action_unarchive` alone would already do.
+        """
+        lead = self.env['crm.lead'].create({
+            'name': 'Lost Lead For Restore',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        })
+        lead.action_set_lost()
+        self.assertFalse(lead.active)
+        self.assertEqual(lead.probability, 0)
+
+        # Replay exactly as `_syncORM` replays the queued `[[id]]` call:
+        # same model, method, args -- no sudo.
+        self.env['crm.lead'].with_user(self.user_sales_salesman).browse(lead.ids).action_restore()
+        lead.invalidate_recordset()
+
+        self.assertTrue(lead.active)
+        self.assertEqual(
+            lead.probability, lead.automated_probability,
+            'Restoring a lead must reset its probability to the (recomputed) '
+            'automated probability, the same result an online Restore gives'
+        )

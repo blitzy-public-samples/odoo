@@ -1,5 +1,7 @@
 import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
+import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
 import { registry } from "@web/core/registry";
+import { getScheduleORMExtras } from "@web/model/relational_model/utils";
 import { formView } from "@web/views/form/form_view";
 
 class CrmFormRecord extends formView.Model.Record {
@@ -69,7 +71,73 @@ class CrmFormModel extends formView.Model {
     }
 }
 
+class CrmFormController extends formView.Controller {
+    setup() {
+        super.setup();
+        this.crmOffline = useCrmOffline();
+    }
+
+    /**
+     * B3/C4 (architecture.md §3.7, offline_inventory.md rows B3/C4,
+     * VAL-QUEUE-005): the "Restore" button is `type="object"`, so without
+     * this guard the base `FormController.beforeExecuteActionButton`
+     * would still save (a no-op here) and then let `useViewButtons` call
+     * `action.doActionButton(...)`, issuing a real `action_restore` RPC
+     * that rejects offline with `ConnectionLostError` and is never queued
+     * -- unlike `web_save`/`web_unlink`/`action_archive`/
+     * `action_unarchive`, a bare `[[id]]` write like `action_restore` has
+     * no framework producer, so crm must queue it itself.
+     *
+     * @override
+     */
+    async beforeExecuteActionButton(clickParams) {
+        if (
+            this.crmOffline.isOffline() &&
+            this.model.root.resModel === "crm.lead" &&
+            clickParams.type === "object" &&
+            clickParams.name === "action_restore"
+        ) {
+            this._queueRestoreOffline();
+            return false; // skip the real action_restore RPC
+        }
+        return super.beforeExecuteActionButton(clickParams);
+    }
+
+    _queueRestoreOffline() {
+        const record = this.model.root;
+        this.crmOffline.queueCall(
+            "crm.lead",
+            "action_restore",
+            [[record.resId]],
+            { context: record.context },
+            getScheduleORMExtras(this.model, [record])
+        );
+        // Optimistic UI: mirror the server-side effect of `action_restore`
+        // (action_unarchive + probability reset, see models/crm_lead.py)
+        // directly on `record.data` so the Restore/Lost buttons' own
+        // `invisible="won_status != ...` conditions flip immediately.
+        // Deliberately not `record.update()`/`record._applyChanges()`:
+        // both would also record these two fields in `record._changes`,
+        // so they would be re-sent -- `won_status` is a compute+store
+        // field with no inverse, so the server would reject a later
+        // `web_save` that includes it. Mutating `record.data` directly
+        // and refreshing `record.evalContext` by hand (`_setEvalContext`,
+        // the same call `_applyChanges` itself makes) gets the same
+        // visible effect with nothing queued for these two fields and no
+        // onchange attempted (architecture.md §2: onchange is skipped
+        // offline, never queued). `won_status` defaults to "pending", the
+        // outcome in every case except the rare one where the automated
+        // probability alone would already mark the lead won; that
+        // discrepancy self-corrects once the queued call replays and the
+        // view is reloaded.
+        record.data.active = true;
+        record.data.won_status = "pending";
+        record._setEvalContext();
+    }
+}
+
 registry.category("views").add("crm_form", {
     ...formView,
     Model: CrmFormModel,
+    Controller: CrmFormController,
 });

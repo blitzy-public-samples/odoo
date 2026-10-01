@@ -12,6 +12,7 @@
                         <button name="action_convert_to_opportunity" string="Convert to Opportunity" type="object"
                             class="oe_highlight" invisible="type == 'opportunity' or not active" data-hotkey="v"/>
                         <button name="action_restore" string="Restore" type="object" data-hotkey="x"
+                            data-available-offline=""
                             invisible="won_status != 'lost'"/>
                         <button name="%(crm.crm_lead_lost_action)d" string="Lost" type="action" data-hotkey="l"
                             invisible="won_status != 'pending' or not active"/>
