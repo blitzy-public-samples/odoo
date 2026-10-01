@@ -6,6 +6,7 @@ import {
     defineModels,
     fields,
     getService,
+    MockServer,
     models,
     mockOffline,
     mountView,
@@ -24,18 +25,26 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
  *   inherited Sales Team lists' `widget="handle"` drag calls the shared
  *   `resequence()` util -> `orm.webResequence`, never one of the
  *   framework's four auto-queued producers (architecture.md §3.7).
- * - B40/B74: VAL-DIS-017 says these two lists' ordinary cell edits "still
- *   queue"; this bucket's test-first work found that assumption wrong (see
- *   this feature's handoff KNOWN-LIMIT) and reclassifies them DISABLE: both
+ * - B40/B74: cell edits on these two lists are DISABLE offline (reclassified
+ *   from "still queue" by the m2-list-celledit-disable feature, which also
+ *   reclassified B88's multi-edit part the same way for the crm.lead lists
+ *   -- see `offline_inventory.md` and that feature's KNOWN-LIMIT). Both
  *   lists are `multi_edit="1"` with no `editable` attribute, so the only
- *   way to edit a cell at all, online or offline, is to check a row first
- *   (`Record._update` -> `this.model.root._multiSave` when `this.selected
- *   && this.model.multiEdit`, `model/relational_model/record.js`); unlike
- *   every other save producer, `DynamicList._multiSave`
- *   (`model/relational_model/dynamic_list.js`) has no `ConnectionLostError`
- *   branch and re-throws, discarding the edit. No row can be checked
- *   offline on these two models (`canSelectRecord`), so multi-edit, their
- *   only edit entry point, never triggers.
+ *   way to open a cell editor at all, online or offline, is to check a row
+ *   first and let `onCellClicked`'s `multiEdit && record.selected` branch
+ *   (`list_renderer.js`) call `enterEditMode`, which an eventual save would
+ *   route through `DynamicList._multiSave`
+ *   (`model/relational_model/dynamic_list.js`): unlike every other save
+ *   producer, it has no `ConnectionLostError` branch and re-throws,
+ *   discarding the edit. Row selection itself stays available offline on
+ *   both lists (`canSelectRecord` is untouched -- B67/B69-style
+ *   action-menu operations on a selected row must keep working), so the
+ *   guard instead sits on the cell-edit entry points themselves
+ *   (`onCellClicked`/`onCellKeydownReadOnlyMode`, scoped by resModel in
+ *   `list_renderer_offline_patch.js`), covering a row checked before going
+ *   offline and a row already mid-edit when the connection drops too. The
+ *   crm.lead lists get the identical guard; their tests live in
+ *   `crm_offline_list_celledit_disable.test.js`.
  * - B60/B61 (`crm_recurring_plan_views.xml:9`, `crm_lost_reason_views.xml:49`):
  *   `crm.recurring.plan` and `crm.lost.reason` are editable lists outside
  *   rule 1's model scope (not a lead, stage, team or lead activity), so a
@@ -175,39 +184,84 @@ defineMailModels();
 // ---------------------------------------------------------------------------
 
 test.tags("desktop");
-test("offline, the Stages list's row checkbox is disabled and no cell edit is reachable; online both work again", async () => {
+test("offline, the Stages list's row checkbox stays enabled but no cell editor opens, including a row checked before going offline; online cell editing still works", async () => {
     onRpc("crm.stage", "web_save", () => expect.step("web_save"));
     await mountView({ resModel: "crm.stage", type: "list", arch: Stage._views.list });
+
+    // Checked online, before going offline (VAL-DIS-030's "including rows
+    // checked before going offline" case).
+    await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+    expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
 
     const setOffline = mockOffline();
     await setOffline(true);
 
-    // No row can be checked (`canSelectRecord` is false), so multi-edit --
-    // the only edit entry point this `multi_edit="1"`-with-no-`editable`
-    // list has -- never triggers.
-    expect(".o_data_row:eq(0) .o_list_record_selector input").toHaveProperty("disabled", true);
-    await contains(".o_data_row:eq(0) .o_list_record_selector input").click({
-        interactive: false,
-    });
-    expect(".o_data_row:eq(0)").not.toHaveClass("o_selected_row");
+    // Row selection itself stays available offline (architecture.md §3.7:
+    // action-menu Archive/Unarchive/Delete, B67/B69, still queue through
+    // it) -- the already-checked row stays checked, and a second row can
+    // still be checked too.
+    expect(".o_data_row:eq(0) .o_list_record_selector input").toHaveProperty("disabled", false);
+    expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
+    await contains(".o_data_row:eq(1) .o_list_record_selector input").click();
+    expect(".o_data_row:eq(1)").toHaveClass("o_data_row_selected");
 
-    // A plain cell click does nothing either (no `editable` attribute: the
-    // framework's own `isInlineEditable` default is already false without
-    // a selected row).
+    // But the only edit entry point this `multi_edit="1"`-with-no-
+    // `editable` list has -- a cell click or Enter on a checked row,
+    // which online enters multi-edit regardless of `isInlineEditable`
+    // (`list_renderer.js`'s `onCellClicked`, never gated by
+    // `canSelectRecord`) -- opens no editor on either checked row.
     await contains(".o_data_row:eq(0) [name='rotting_threshold_days']").click();
     expect(".o_field_widget[name='rotting_threshold_days'] input").toHaveCount(0);
+    await contains(".o_data_row:eq(1) [name='rotting_threshold_days']").focus();
+    await press("Enter");
+    expect(".o_field_widget[name='rotting_threshold_days'] input").toHaveCount(0);
+
     expect.verifySteps([]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_notification").toHaveCount(0);
 
+    // Uncheck the second row again before going back online, so the
+    // single-record save below doesn't trip the framework's own
+    // multi-record `ListConfirmationDialog` (shown whenever more than one
+    // record is selected) -- that dialog is itself unrelated to this fix.
+    await contains(".o_data_row:eq(1) .o_list_record_selector input").click();
     await setOffline(false);
 
     // Back online, checking a row and editing it still multi-edit-saves.
-    expect(".o_data_row:eq(0) .o_list_record_selector input").toHaveProperty("disabled", false);
-    await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
     await contains(".o_data_row:eq(0) [name='rotting_threshold_days']").click();
     await contains(".o_field_widget[name='rotting_threshold_days'] input").edit("45");
     await contains(".o_list_renderer").click();
     expect.verifySteps(["web_save"]);
+});
+
+test.tags("desktop");
+test("offline, a Stages list row already mid cell-edit when the connection drops leaves edit mode instead of risking a silent save", async () => {
+    onRpc("crm.stage", "web_save", () => expect.step("web_save"));
+    await mountView({ resModel: "crm.stage", type: "list", arch: Stage._views.list });
+
+    // Online: check the row and open its cell editor (allowed online).
+    await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+    await contains(".o_data_row:eq(0) [name='rotting_threshold_days']").click();
+    await contains(".o_field_widget[name='rotting_threshold_days'] input").edit("999", {
+        confirm: false, // keep the draft unsubmitted, like a user mid-keystroke
+    });
+    expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
+    expect(".o_field_widget[name='rotting_threshold_days'] input").toHaveCount(1);
+
+    // The connection drops mid-edit: the row is forced out of edition
+    // (discarding the in-progress "999", never saving it) instead of
+    // leaving an edit that could look saved without being sent or queued.
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect(".o_field_widget[name='rotting_threshold_days'] input").toHaveCount(0);
+    expect.verifySteps([]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(
+        MockServer.env["crm.stage"].find((r) => r.id === 1).rotting_threshold_days
+    ).toBe(30); // unchanged: the discarded "999" was never sent or queued
+
+    await setOffline(false);
 });
 
 test.tags("desktop");
@@ -249,32 +303,69 @@ test("offline, dragging the Stages list's handle does not resequence it; online 
 // ---------------------------------------------------------------------------
 
 test.tags("desktop");
-test("offline, the inherited Sales Team list's row checkbox is disabled and no cell edit is reachable; online both work again", async () => {
+test("offline, the inherited Sales Team list's row checkbox stays enabled but no cell editor opens, including a row checked before going offline; online cell editing still works", async () => {
     onRpc("crm.team", "web_save", () => expect.step("web_save"));
     await mountView({ resModel: "crm.team", type: "list", arch: Team._views.list });
+
+    // Checked online, before going offline (VAL-DIS-030's "including rows
+    // checked before going offline" case).
+    await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+    expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
 
     const setOffline = mockOffline();
     await setOffline(true);
 
-    expect(".o_data_row:eq(0) .o_list_record_selector input").toHaveProperty("disabled", true);
-    await contains(".o_data_row:eq(0) .o_list_record_selector input").click({
-        interactive: false,
-    });
-    expect(".o_data_row:eq(0)").not.toHaveClass("o_selected_row");
+    // Row selection itself stays available offline, and a second row can
+    // still be checked too (two or more checked rows).
+    expect(".o_data_row:eq(0) .o_list_record_selector input").toHaveProperty("disabled", false);
+    expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
+    await contains(".o_data_row:eq(1) .o_list_record_selector input").click();
+    expect(".o_data_row:eq(1)").toHaveClass("o_data_row_selected");
 
+    // But no cell editor opens on either checked row.
     await contains(".o_data_row:eq(0) [name='alias_full_name']").click();
     expect(".o_field_widget[name='alias_full_name'] input").toHaveCount(0);
+    await contains(".o_data_row:eq(1) [name='alias_full_name']").focus();
+    await press("Enter");
+    expect(".o_field_widget[name='alias_full_name'] input").toHaveCount(0);
+
     expect.verifySteps([]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_notification").toHaveCount(0);
 
+    // Uncheck the second row again before going back online (same reason
+    // as the Stages list test above: avoid the unrelated multi-record
+    // `ListConfirmationDialog`).
+    await contains(".o_data_row:eq(1) .o_list_record_selector input").click();
     await setOffline(false);
 
-    expect(".o_data_row:eq(0) .o_list_record_selector input").toHaveProperty("disabled", false);
-    await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
     await contains(".o_data_row:eq(0) [name='alias_full_name']").click();
     await contains(".o_field_widget[name='alias_full_name'] input").edit("renamed");
     await contains(".o_list_renderer").click();
     expect.verifySteps(["web_save"]);
+});
+
+test.tags("desktop");
+test("offline, an inherited Sales Team list row already mid cell-edit when the connection drops leaves edit mode instead of risking a silent save", async () => {
+    onRpc("crm.team", "web_save", () => expect.step("web_save"));
+    await mountView({ resModel: "crm.team", type: "list", arch: Team._views.list });
+
+    await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+    await contains(".o_data_row:eq(0) [name='alias_full_name']").click();
+    await contains(".o_field_widget[name='alias_full_name'] input").edit("mid-edit draft", {
+        confirm: false,
+    });
+    expect(".o_field_widget[name='alias_full_name'] input").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect(".o_field_widget[name='alias_full_name'] input").toHaveCount(0);
+    expect.verifySteps([]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(MockServer.env["crm.team"].find((r) => r.id === 1).alias_full_name).toBe("sales");
+
+    await setOffline(false);
 });
 
 test.tags("desktop");
@@ -366,14 +457,14 @@ for (const { resModel, label, arch } of READONLY_LIST_CASES) {
 
         // Click: no editor opens.
         await contains(".o_data_row:eq(0) [name='name']").click();
-        expect(".o_data_row.o_selected_row").toHaveCount(0);
+        expect(".o_data_row.o_selected_row").toHaveCount(0); // not in edition
         expect(".o_field_widget[name='name'] input").toHaveCount(0);
 
         // Keyboard: Enter on the focused (but not entered) cell does the
         // same nothing.
         await contains(".o_data_row:eq(0) [name='name']").focus();
         await press("Enter");
-        expect(".o_data_row.o_selected_row").toHaveCount(0);
+        expect(".o_data_row.o_selected_row").toHaveCount(0); // not in edition
         expect(".o_field_widget[name='name'] input").toHaveCount(0);
 
         expect.verifySteps([]); // no web_save queued or sent
@@ -385,7 +476,7 @@ for (const { resModel, label, arch } of READONLY_LIST_CASES) {
         // Back online, the same cell click enters edition and saves as
         // before.
         await contains(".o_data_row:eq(0) [name='name']").click();
-        expect(".o_data_row:eq(0)").toHaveClass("o_selected_row");
+        expect(".o_data_row:eq(0)").toHaveClass("o_selected_row"); // in edition (editable list, not checkbox-selected)
         await contains(".o_field_widget[name='name'] input").edit("Renamed");
         await contains(".o_list_renderer").click();
         expect.verifySteps(["web_save"]);

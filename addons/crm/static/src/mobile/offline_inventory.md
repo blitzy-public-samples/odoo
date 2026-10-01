@@ -442,7 +442,7 @@ about control rows, not about reproducing the throwaway script's own internal ta
 | B37 | `views/crm_team_views.xml` | 318 | `<a name="%(action_report_crm_lead_salesteam)d" type="action">` (Leads report) | DISABLE | Server-computed report/analysis view (contract: forecast/graph/pivot views DISABLE family). |
 | B38 | `views/crm_team_views.xml` | 323 | `<a name="%(action_report_crm_opportunity_salesteam)d" type="action">` (Opportunities report) | DISABLE | Same reasoning as B37. |
 | B39 | `views/crm_team_views.xml` | 331 | `<a name="%(crm.crm_activity_report_action_team)d" type="action">` (Activities report) | DISABLE | Same reasoning as B37. |
-| B40 | `views/crm_stage_views.xml` | 22, 37 | `crm_stage_tree` (multi_edit list) / `crm_stage_form` field edits | QUEUE | Framework `web_save` producer for `crm.stage` edits; write access is manager-only, so a salesman's queued edit is parked with an `AccessError` by the framework (no rule change). |
+| B40 | `views/crm_stage_views.xml` | 22 | `crm_stage_tree` multi-edit list cell edits (`multi_edit="1"`, no `editable`) | DISABLE | **Reclassified (milestone-2 list-cell-edit-disable fix, user decision).** List cell edits on this `multi_edit="1"` list go through `addons/web`'s `DynamicList._multiSave`, which the offline framework does not queue (user decision during milestone 2); offline, the record is edited from its form instead, whose save queues `web_save` (see **B92**, split out of this row for the form's own field edits). **This row no longer covers `crm_stage_form` field edits** (`:37`): that control reaches `write` through the generic form `web_save` producer, unaffected by `_multiSave`'s gap, so it keeps its own classification in the new row **B92** rather than sharing this one — a row needs exactly one class. |
 | B41 | `views/crm_lost_reason_views.xml` | 22-28 | Stat button `action_lost_leads` | DISABLE | Navigation; returns a read-only action. |
 | B42 | `views/res_partner_views.xml` | 12-19 | Partner form stat button `action_view_opportunity` | DISABLE | Navigation; returns a read-only action (also on `res.partner`, not `crm.lead`). |
 | B43 | `views/utm_campaign_views.xml` | 17-24 | Campaign kanban `<a type="object" name="action_redirect_to_leads_opportunities">` | DISABLE | Navigation; returns a read-only action. |
@@ -464,7 +464,7 @@ about control rows, not about reproducing the throwaway script's own internal ta
 | B59 | `views/crm_stage_views.xml` | 23 | `<field name="sequence" widget="handle"/>` (Stages list drag-to-reorder) | DISABLE | **Reclassified to DISABLE (milestone-2 user review).** Dragging a row by its handle calls the same `resequence()` util as B58 → the same `orm.webResequence` call on `crm.stage`. Same user-review decision and framework fact as B57/B58: `webResequence` has no framework queue producer, so crm adds no new hook and disables the handle drag offline instead; the gap is a PR known limit. |
 | B60 | `views/crm_recurring_plan_views.xml` | 8-9 | `<list editable="bottom">` + `<field name="sequence" widget="handle"/>` (crm.recurring.plan: inline create/edit/resequence) | DISABLE | **New row (this revision)**. An editable-list row's inline edit/create would auto-queue via the framework's `web_save` producer like any form, and the handle's resequence would go through the same `webResequence` path as B58/B59 — but the model is `crm.recurring.plan`, not `crm.lead`/`crm.stage`/`crm.team` or a lead's `mail.activity`, so rule 1 does not apply at all regardless of mechanism — DISABLE. |
 | B61 | `views/crm_lost_reason_views.xml` | 49 | `<list string="Channel" editable="bottom">` (crm.lost.reason: inline create/edit) | DISABLE | **New row (this revision)**. Same reasoning as B60: inline edits on an editable list would auto-queue via `web_save`, but `crm.lost.reason` is outside rule 1's model scope — DISABLE. |
-| B62 | `views/crm_lead_views.xml` | 503 | Pipeline kanban column config-menu "Edit" (stage-column edit; `group_edit` not set on this `<kanban>`, defaults to enabled per `kanban_arch_parser.js:20`) | DISABLE | **New row (round 2 fix)**. The same column config menu that renders Delete (B57) also renders an "Edit" item (`group_config_menu.js`'s `edit_group` entry, `:87-98`, gated by `canEditGroup()`, `:80-84`); choosing it calls `editGroup()` (`:61-72`), which opens a `FormViewDialog` on the clicked stage's own id (`resModel: groupByField.relation`, i.e. `crm.stage`) and, on save, calls `this.props.list.load()` to reload the kanban. The dialog loads that specific `crm.stage` record outside the view-level `actionId`/`viewType` tracking `OfflinePlugin.isAvailableOffline` keys offline availability on, so opening the dialog for a stage never visited offline throws `ConnectionLostError` — the same uncached-record-navigation reasoning as B18's kanban-card "Edit" menu item, plus a second round-trip on save. Not a bare resolvable write: DISABLE per the navigation-unavailable-offline rule, distinct from B40 (direct form/list field edits, QUEUE); B57 (Delete) was QUEUE at the time this row was written but is now also DISABLE, reclassified by the milestone-2 user review (see B57's current row and Notes #9) — both are DISABLE today, for independent reasons (B57: no framework queue producer for `unlink` on a group; B62: uncached-record navigation). |
+| B62 | `views/crm_lead_views.xml` | 503 | Pipeline kanban column config-menu "Edit" (stage-column edit; `group_edit` not set on this `<kanban>`, defaults to enabled per `kanban_arch_parser.js:20`) | DISABLE | **New row (round 2 fix)**. The same column config menu that renders Delete (B57) also renders an "Edit" item (`group_config_menu.js`'s `edit_group` entry, `:87-98`, gated by `canEditGroup()`, `:80-84`); choosing it calls `editGroup()` (`:61-72`), which opens a `FormViewDialog` on the clicked stage's own id (`resModel: groupByField.relation`, i.e. `crm.stage`) and, on save, calls `this.props.list.load()` to reload the kanban. The dialog loads that specific `crm.stage` record outside the view-level `actionId`/`viewType` tracking `OfflinePlugin.isAvailableOffline` keys offline availability on, so opening the dialog for a stage never visited offline throws `ConnectionLostError` — the same uncached-record-navigation reasoning as B18's kanban-card "Edit" menu item, plus a second round-trip on save. Not a bare resolvable write: DISABLE per the navigation-unavailable-offline rule, distinct from B92 (the stage form's own direct field edits, QUEUE); B57 (Delete) was QUEUE at the time this row was written but is now also DISABLE, reclassified by the milestone-2 user review (see B57's current row and Notes #9) — both are DISABLE today, for independent reasons (B57: no framework queue producer for `unlink` on a group; B62: uncached-record navigation). **Correction (milestone-2 list-cell-edit-disable fix):** this row's contrast target was originally B40 (then QUEUE, covering both the stage list and form); B40 is now DISABLE (list only) and the form half is split into B92 (QUEUE), so the contrast above is restated against B92. |
 | B63 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', 'no_create_edit': True}"/>` (lead form, tag quick-create) | DISABLE | **New row (round 2 fix)**. Only `no_create_edit` is set on this field, not `no_create` or `no_quick_create`; `many2many_tags_field.js`'s `extractProps` therefore computes `canQuickCreate = canCreate && !noQuickCreate` as true, so typing an unmatched tag name in the autocomplete offers a "Create" suggestion (`relational_utils.js:483-515`) whose handler calls `this.orm.call("crm.tag", "name_create", [name], ...)` and immediately links the **returned id** to the lead (`many2many_tags_field.js:127-132`) — an id produced by this very call, so DISABLE per the chained-id rule, same family as B25/B56. Distinct from B55, which classifies the color-edit popover on this same field (an existing tag's `write`, not a `name_create`). **Addendum (round-3 fix):** this "Create" suggestion is itself already hidden offline by the framework before a user could ever select it — `Many2XAutocomplete.suggest()` only adds the create/create-and-edit/search-more suggestions `if (!this.offlinePlugin.isOffline())` (`relational_utils.js:450-454`), and `many2many_tags_field.xml:23` wires this field's `quickCreate` into that same `Many2XAutocomplete`; see Section B-REL's header for the full blanket-coverage statement this row is one instance of. The row is kept (as it already was) for completeness and defense in depth, not because the control is reachable offline today. |
 | B64 | `views/crm_lead_views.xml` | 503, 565-575 | Forecast kanban (`crm_lead_view_kanban_forecast` inherits `crm_case_kanban_view_leads` at `:503`) card drag between `date_deadline` columns | QUEUE | **New row (round-4 fix).** `forecast_kanban_renderer.js`'s `isMovableField()` (`:32-34`) explicitly allows dragging a card on `date_deadline` in addition to the base `stage_id`; a successful drop still goes through `CrmKanbanModel.moveRecords` (A15) → the framework's per-record `web_save({date_deadline:...})` producer, the same already-auto-queued mechanism B21's stage-column drag uses, just a different field. Entering the forecast view itself stays DISABLE (A24/A27: its `fill_temporal` read-group is never cached), but a drag inside an already-rendered, previously-cached forecast board is a bare, client-resolvable write — QUEUE by rule 1, no new crm producer needed (framework-auto-queued like B21). |
 | B65 | `views/crm_lead_views.xml` | 503 | Forecast kanban record quick-create on a `date_deadline` column (`on_create="quick_create"` inherited from `:503`, enabled for the date groupby by `forecast_kanban_controller.js`'s `isQuickCreateField()`, `:4-6`) | QUEUE | **New row (round-4 fix).** Same quick-create producer as B24 (`web_save([], vals)`), reached through the forecast board instead of the pipeline; `ForecastKanbanController.isQuickCreateField` (`:4-6`) extends the base check so a date-grouped column also offers the quick-create row. QUEUE by the same reasoning as B24 (the quick-create form has no onchange dependency for its editable fields); distinct from `canCreateGroup`'s *group-level* "add next period" column (`forecast_kanban_renderer.js:21-23`, already DISABLE via A24/A27 — adding a new date **group**, not a new **lead**, needs the uncached `fill_temporal` read). **Note (milestone-2 user review):** the per-column "+" quick-add button that triggers this (`addons/web/static/src/views/kanban/kanban_header.xml:21`, `<button class="o_kanban_quick_add" ...>`, same control family as B24's) is itself a `<button>` with no `data-available-offline`, so the framework's `SELECTORS_TO_DISABLE` already disables it offline; crm does not add the attribute. This QUEUE row documents what *would* be queued if the button were enabled, but today it is framework-disabled offline — the control-panel New button is the offline entry point instead (accepted, no crm change). See B24 for the same note. |
@@ -476,8 +476,8 @@ about control rows, not about reproducing the throwaway script's own internal ta
 | B71 | `views/crm_lead_views.xml` | 503, 653-660, 974-983 | Pipeline/Leads kanban column, or a grouped-list header, grouped by `team_id` (via the Leads/Opportunities search filters at `:653-660`/`:974-983`) — column/header "Delete" + sequence-handle drag resequence | DISABLE | **Reclassified to DISABLE (milestone-2 user review).** `GroupConfigMenu`'s "Delete" (`group_config_menu.js:102-113`, `deleteGroup()`) calls `orm.unlink("crm.team", [groupId])` and column/header drag-resequence calls the shared `web_resequence` util — neither is one of the framework's four auto-queued producers. Same user-review decision and framework fact as B57-B59: the framework does not queue group-level `unlink`/`webResequence`, so crm adds no new queue hook and disables these column/header controls offline instead (architecture.md §3.7, mission AGENTS.md); the gap is a PR known limit, same family as the stage-column controls. |
 | B72 | `views/crm_lead_views.xml`; `report/crm_activity_report_views.xml` | 503, 653-660, 657, 974-983, 980; 30-33, 70-78 | Pipeline/Leads kanban column, or a grouped-list header, grouped by any relation other than `stage_id` (`team_id`, `user_id`, `country_id`, `company_id`, `utm.campaign`/`medium`/`source`, `lost_reason_id`) — column/header "Edit"; the `crm.activity.report` grouped list's own header "Edit" for any of its seven relational group-bys (`mail_activity_type_id`, `subtype_id`, `author_id`, `user_id`, `team_id`, `stage_id`, `company_id`) | DISABLE | **New row (round-4 fix).** Same `GroupConfigMenu` "Edit" mechanism B62 already classifies DISABLE for a stage column, generalized: `editGroup()` opens a `FormViewDialog` on the clicked group's own id for whichever relation the view is currently grouped by, on a model whose record was never individually visited offline for that view/action — DISABLE per the same navigation-unavailable-offline reasoning as B62, now covering every other group-by relation and both the kanban-column and the grouped-list-header renderings of the same `GroupConfigMenu` component. **Correction (round-5 fix):** the Leads search's and the Opportunities search's `<filter string="Company" name="company" context="{'group_by':'company_id'}" groups="base.group_multi_company"/>` (`:657`, `:980`, both already inside this row's cited `653-660`/`974-983` ranges but not named individually) is a `company_id` (`res.company`) group-by, gated by `base.group_multi_company` rather than any CRM access right; it reaches the identical `editGroup()` mechanism as every other relation this row already covers, so it is folded into this row's relation list rather than given its own. **Extension (user-testing fix):** the identical mechanism also covers `report/crm_activity_report_views.xml`'s own grouped list (`:30-33`, `action="action_open_lead" type="object"`), whose search view exposes seven relational group-by filters (`:70-78`); unlike `crm_lead_views.xml`, this report has no separate stage-only Edit row (no B62 equivalent for this file), so this row's DISABLE disposition covers all seven of the report's relations, including `team_id`/`stage_id` — their Delete/resequence counterpart is a different control with a model-dependent disposition; see B73 (the other five relations) and B89 (`team_id`/`stage_id` — QUEUE when this row was written, reclassified **DISABLE** by the milestone-2 user review, see B89's current row and Notes #9). Resolves VAL-INV-005. |
 | B73 | `views/crm_lead_views.xml`; `report/crm_activity_report_views.xml` | 653-660, 657, 974-983, 980; 30-33, 70-72, 75, 78 | Grouped kanban column / grouped-list header "Delete" + resequence, grouped by `user_id`, `country_id`, `company_id`, `utm.campaign`/`medium`/`source`, or `lost_reason_id`; the `crm.activity.report` grouped list's own header "Delete" + resequence, grouped by `mail_activity_type_id`, `subtype_id`, `author_id`, `user_id`, or `company_id` | DISABLE | **New row (round-4 fix).** Same `deleteGroup()`/resequence mechanism as B71, but on models outside rule 1's scope (`res.users`, `res.country`, `res.company`, `utm.campaign`, `utm.medium`, `utm.source`, `crm.lost.reason`) — DISABLE regardless of mechanism, same reasoning as B68. **Correction (round-5 fix):** `company_id` (`res.company`, the same `:657`/`:980` multi-company group-by B72 now names) was missing from this relation list even though it is already outside rule 1's model scope exactly like the others here; added for the same reasoning, no mechanism change. **Extension (user-testing fix):** the identical `deleteGroup()`/resequence mechanism also covers `report/crm_activity_report_views.xml`'s own grouped list (`:30-33`) for its five relational group-bys outside rule 1's scope — `mail_activity_type_id` (→ `mail.activity.type`), `subtype_id` (→ `mail.message.subtype`), `author_id` (→ `res.partner`), `user_id` (→ `res.users`), `company_id` (→ `res.company`), confirmed in `report/crm_activity_report.py`'s own field definitions — DISABLE regardless of mechanism, same reasoning as above. The report's other two relations, `team_id`/`stage_id`, are in rule 1's model scope and got their own row, B89 — QUEUE when this row was written, reclassified **DISABLE** by the milestone-2 user review (no framework queue producer for group-level `unlink`/`webResequence`; see B89's current row and Notes #9). Resolves VAL-INV-005. |
-| B74 | `views/crm_team_views.xml` | 123 | Inherited CRM team list (`sales_team.crm_team_view_tree`, `addons/sales_team/views/crm_team_views.xml:95-109`, retained unchanged by this file's additive `<xpath>` at `:123`): `multi_edit="1"` cell edits only (`:99`) | QUEUE | **Narrowed (milestone-2 user review).** Ordinary cell edits on this inherited list auto-queue through the same `web_save` multi-edit producer as B40/B60/B61/B88 (here, on `crm.team`'s own fields) — bare-id resolvable on `crm.team`, QUEUE; the inherited list was previously only covered by C15's prose ("inherited, unchanged"), with no Section B row of its own. **This row no longer covers the handle-drag sequence resequence** (`:100`) it previously described: that control is split out to its own row, **B90** (DISABLE), because the framework has no queue producer for `webResequence` (same user-review decision as B57-B59/B71) and this row must not read as if any part of it still needs a QUEUE producer. |
-| B75 | `views/crm_team_views.xml` | 134 | Inherited CRM team form (`sales_team.crm_team_view_form`, `addons/sales_team/views/crm_team_views.xml:21-94`, retained with crm's own additive fields by `sales_team_form_view_in_crm` at `:134`) Save | QUEUE | **New row (round-4 fix).** The form's own Save is the generic form producer already covered in substance by C15's "`crm.team` write, inherited unchanged"; this row gives it its own Section B entry so the control (not just the model method) is listed, consistent with how every other in-scope form (B1, B40, etc.) has its own row. |
+| B74 | `views/crm_team_views.xml` | 123 | Inherited CRM team list (`sales_team.crm_team_view_tree`, `addons/sales_team/views/crm_team_views.xml:95-109`, retained unchanged by this file's additive `<xpath>` at `:123`): `multi_edit="1"` cell edits only (`:99`) | DISABLE | **Narrowed (milestone-2 user review); reclassified (milestone-2 list-cell-edit-disable fix, user decision).** This row previously read QUEUE because ordinary cell edits on this inherited list auto-queue through the same multi-edit producer as B40/B60/B61/B88 — but that producer is `DynamicList._multiSave`, which the offline framework does not queue (user decision during milestone 2). Offline, the record is edited from the inherited team form instead, whose Save queues `web_save` (**B75**). **This row still does not cover the handle-drag sequence resequence** (`:100`): that control is split out to its own row, **B90** (DISABLE, for the unrelated `webResequence` framework gap), and this row covers only the list's ordinary multi-edit cell edits. |
+| B75 | `views/crm_team_views.xml` | 134 | Inherited CRM team form (`sales_team.crm_team_view_form`, `addons/sales_team/views/crm_team_views.xml:21-94`, retained with crm's own additive fields by `sales_team_form_view_in_crm` at `:134`) Save | QUEUE | **New row (round-4 fix).** The form's own Save is the generic form producer already covered in substance by C15's "`crm.team` write, inherited unchanged"; this row gives it its own Section B entry so the control (not just the model method) is listed, consistent with how every other in-scope form (B1, B92, etc.) has its own row. |
 | B76 | `views/crm_team_views.xml` | 256 | Inherited Sales Team dashboard color picker (`kanban_color_picker` on `crm.team`, `addons/sales_team/views/crm_team_views.xml:157`, retained unchanged by this file's `crm_team_view_kanban_dashboard` record, which inherits `sales_team.crm_team_view_kanban_dashboard` at `:259`) | DISABLE | **Reclassified to DISABLE (milestone-2 user review).** This control's only entry point is the same generic kanban card-menu toggler B19/B20 rely on (`addons/web/static/src/views/kanban/kanban_record.xml:26`, `<button class="btn btn-light o-no-caret px-2">`), a `<button>` with no `data-available-offline` that the framework already disables offline; crm does not add the attribute to it, so the menu — and this color picker inside it — cannot be opened at all offline. The framework's card-menu disable stays, matching B19/B20's reclassification and reinforcing B77's ("Configuration" link, same menu) already-DISABLE disposition. |
 | B77 | `views/crm_team_views.xml` | 256 | Inherited Sales Team dashboard "Configuration" link (`<a class="dropdown-item" type="open">`, `addons/sales_team/views/crm_team_views.xml:160`, same retained-unchanged `crm_team_view_kanban_dashboard` inherit as B76) | DISABLE | **New row (round-4 fix).** A plain record-open navigation to the team's own form; if that specific team was never visited in form view offline, `isAvailableOffline` returns false and opening throws — same uncached-record-navigation reasoning as B18/B62, DISABLE. |
 | B78 | `views/crm_team_views.xml` | 134 | Inherited CRM team form "Activate Multi-team" button (`name="crm_team_activate_multi_membership"`, `addons/sales_team/views/crm_team_views.xml:30`, retained unchanged by `sales_team_form_view_in_crm` at `:134`) | DISABLE | **New row (round-4 fix).** `crm_team_form.js`'s `beforeExecuteActionButton` override writes `ir.config_parameter` (a transient, non-rule-1 model) via `orm.call("ir.config_parameter","set_param",...)` and then reloads the current action — a config-level toggle with an immediate action reload, not a bare-id lead/stage/team write — DISABLE per the catch-all rule, same family as A20's access-probe/config-toggle controls. |
@@ -490,10 +490,11 @@ about control rows, not about reproducing the throwaway script's own internal ta
 | B85 | `wizard/crm_merge_opportunities_views.xml` | 19-32 | Merge wizard `opportunity_ids` X2Many list "Add a line" / inline "Create" / "Edit" (no `create="false"`/`add-label` suppression on this X2Many, unlike the mass-convert wizard's `duplicated_lead_ids`, which does set `create="false"`) | DISABLE | **New row (round-4 fix).** `x2many_field.js`'s `onAdd`/`onCreateEdit` open a `SelectCreateDialog`/record form scoped to `crm.lead` ids not already on the wizard, and the wizard itself is transient (`crm.merge.opportunity`, never queueable per AGENTS.md section 2's "transient-model wizard" exclusion) — DISABLE regardless of the X2Many's own target model being otherwise in-scope. |
 | B86 | `views/crm_lead_views.xml` | 374, 547, 735 | Mail activity popover (`widget="kanban_activity"`/`widget="list_activity"` on `activity_ids`) "Edit" sub-control (opens the existing activity's own edit form) | DISABLE | **New row (round-4 fix).** Distinct from the popover's "Schedule" and "Mark Done" sub-controls B17/B23/BR7 already classify; "Edit" re-opens a specific, already-created `mail.activity` record's form, a navigation to a record not tracked by `isAvailableOffline` for this widget — DISABLE, same uncached-navigation family as B18/B62/B77/B82. |
 | B87 | `views/crm_lead_views.xml` | 374, 547, 735 | Mail activity popover "Done & Schedule Next" sub-control (`action_feedback_schedule_next`, `activity_model_patch.js`) | DISABLE | **New row (round-4 fix).** Returns a transient `mail.activity.schedule` wizard action (same family as the popover's own "Schedule" sub-control, B17/B23/BR7) rather than a bare resolvable write — DISABLE. |
-| B88 | `views/crm_lead_views.xml` | 320, 707 | Ordinary (non-tag, non-priority) multi-edit cell Save on the Leads list (`:320`) / Opportunities list (`:707`) | QUEUE | **New row (round-4 fix).** The framework's per-record `web_save` multi-edit producer (same mechanism as B40/B60/B61/B74), here on `crm.lead`'s own ordinary fields (`contact_name`, `email_from`, `team_id`, `stage_id`, etc.) directly, not through a specialized widget — bare-id resolvable, QUEUE. The inherited reporting/forecast-list variants (`report/crm_opportunity_report_views.xml`'s `crm_lead_view_tree_opportunity_reporting`, `crm_lead_views.xml:766-781`'s `crm_lead_view_tree_forecast`) inherit this same `multi_edit="1"` list unchanged and need no separate row; see "Round-4 findings not added" above. |
+| B88 | `views/crm_lead_views.xml` | 320, 707 | Ordinary (non-tag, non-priority) multi-edit cell Save on the Leads list (`:320`) / Opportunities list (`:707`) | DISABLE | **Reclassified whole (milestone-2 list-cell-edit-disable fix, user decision); not split.** This row already covered only the list's multi-edit cell edits (nothing else is bundled into it), so the reclassification applies to the whole row rather than peeling off a sub-part. List cell edits go through `DynamicList._multiSave`, which the offline framework does not queue (user decision during milestone 2); offline, the record is edited from its form instead, whose save queues `web_save`. The inherited reporting/forecast-list variants (`report/crm_opportunity_report_views.xml`'s `crm_lead_view_tree_opportunity_reporting`, `crm_lead_views.xml:766-781`'s `crm_lead_view_tree_forecast`) inherit this same `multi_edit="1"` list unchanged and need no separate row; see "Round-4 findings not added" above (also updated to DISABLE). |
 | B89 | `report/crm_activity_report_views.xml` | 30-33, 76-77 | `crm.activity.report` grouped list header "Delete" + resequence, grouped by `team_id` ("Sales Team" filter, `:76`) or `stage_id` ("Stage" filter, `:77`) | DISABLE | **Reclassified to DISABLE (milestone-2 user review).** Resolves VAL-INV-005. Same `GroupConfigMenu`/`deleteGroup()` mechanism as B71: `dynamic_group_list.js`'s `_unlinkGroups()` calls `orm.unlink(groupByField.relation, groupResIds)` and the resequence counterpart calls `webResequence` — neither is one of the framework's four auto-queued producers. Same user-review decision and framework fact as B57-B59/B71: the framework does not queue group-level `unlink`/`webResequence`, so crm adds no new queue hook and disables this report's grouped-list header controls offline instead for both relations here (architecture.md §3.7, mission AGENTS.md); the gap is a PR known limit, same family as B71. |
-| B90 | `views/crm_team_views.xml` | 123 | Inherited CRM team list (`sales_team.crm_team_view_tree`, `addons/sales_team/views/crm_team_views.xml:95-109`, retained unchanged by `:123`'s additive `<xpath>`): `widget="handle"` sequence-drag resequence (`:100`) | DISABLE | **New row (milestone-2 user review).** Split out of B74 (which stays QUEUE for the list's ordinary multi-edit cell edits only). Dragging the handle calls the same `resequence()` util as B58/B59/B71/B89 → `orm.webResequence` on `crm.team` — not one of the framework's four auto-queued producers (`web_save`/`web_unlink`/`action_archive`/`action_unarchive`). The user approved this as DISABLE: per the mission's principle (architecture.md §3.7, mission AGENTS.md), crm adds no new queue hook for anything the framework does not already queue, so this control is disabled offline instead and the gap is listed in the PR's known limits, same family as B57-B59/B71/B89. |
+| B90 | `views/crm_team_views.xml` | 123 | Inherited CRM team list (`sales_team.crm_team_view_tree`, `addons/sales_team/views/crm_team_views.xml:95-109`, retained unchanged by `:123`'s additive `<xpath>`): `widget="handle"` sequence-drag resequence (`:100`) | DISABLE | **New row (milestone-2 user review).** Split out of B74 for an independent reason: dragging the handle calls the same `resequence()` util as B58/B59/B71/B89 → `orm.webResequence` on `crm.team` — not one of the framework's four auto-queued producers (`web_save`/`web_unlink`/`action_archive`/`action_unarchive`). The user approved this as DISABLE: per the mission's principle (architecture.md §3.7, mission AGENTS.md), crm adds no new queue hook for anything the framework does not already queue, so this control is disabled offline instead and the gap is listed in the PR's known limits, same family as B57-B59/B71/B89. **Note (milestone-2 list-cell-edit-disable fix):** B74 itself (the list's remaining ordinary multi-edit cell edits) is now *also* DISABLE, but for the unrelated `_multiSave` framework gap — the two rows share no classification reasoning even though both ended up DISABLE. |
 | B91 | `addons/mail/static/src/js/rotting_mixin/rotting_column_progress.xml` | 6 | Mail's rotting badge on pipeline kanban column headers: `<div t-if="rottingAggregate.value > 0" t-on-click="this.onRottingIconClick" ...>`, inherited unchanged into the pipeline kanban's column headers via `crm.ColumnProgress` (`views/crm_kanban/crm_column_progress.xml:3`, `t-inherit="mail.RottingColumnProgress"`), rendered by `CrmColumnProgress extends RottingColumnProgress` (`views/crm_kanban/crm_column_progress.js`), which `crm_kanban_renderer.js` wires in as the kanban's `ColumnProgress` component | DISABLE | **New row (milestone-2 user review), approved by the user as DISABLE.** `onRottingIconClick()` calls `this.props.onRotIconClicked(this.props.group)`, which toggles a rotting-state filter and reloads the column from the server (a `web_read_group`/`web_search_read` with a different domain) — not a bare resolvable write, and not queueable. The clickable element is a `<div>`, not a `<button>`, so the framework's `SELECTORS_TO_DISABLE` does not auto-disable it; crm has not added `data-available-offline`/a guard to it, so it must be disabled from crm (scoped to the crm pipeline kanban) — same reasoning as B79's progressbar-segment filter, which this row joins in VAL-DIS-029. |
+| B92 | `views/crm_stage_views.xml` | 37 | `crm_stage_form` field edits (Save) | QUEUE | **New row (milestone-2 list-cell-edit-disable fix), split out of B40.** The form's own Save is the generic `web_save` form producer (`record.js`), bare-id resolvable on `crm.stage`, unaffected by `_multiSave`'s offline gap because a form save never goes through `DynamicList`. Write access is manager-only, so a salesman's queued edit is parked with an `AccessError` by the framework (no rule change) — the same reasoning the combined B40 row previously stated. |
 
 ## Section B-REL — relational-field create/edit controls
 
@@ -616,7 +617,7 @@ all, or are unreachable through a different gate):
 | # | File | Line | Method | Class | Justification |
 |---|---|---|---|---|---|
 | C1 | `models/crm_lead.py` | 729 | `create(vals_list)` | QUEUE | Reachable via any Save on a new record or the pipeline quick create (B24); framework `web_save`/create producer, bare vals resolvable client-side. |
-| C2 | `models/crm_lead.py` | 760 | `write(vals)` | QUEUE | Reachable via any Save/edit/stage-move/priority control (B5, B21, B22, B88); framework `web_save` producer; stage-change side effects (`date_last_stage_update`, won-stage forcing) run fully server-side on replay. **Correction (milestone-2 user review):** no longer reachable via the kanban card-menu color picker (B20, reclassified DISABLE — its only entry point, the card-menu toggler, is framework-disabled offline); the list above drops that reference. |
+| C2 | `models/crm_lead.py` | 760 | `write(vals)` | QUEUE | Reachable via any Save/edit/stage-move/priority control (B5, B21, B22); framework `web_save` producer; stage-change side effects (`date_last_stage_update`, won-stage forcing) run fully server-side on replay. **Correction (milestone-2 user review):** no longer reachable via the kanban card-menu color picker (B20, reclassified DISABLE — its only entry point, the card-menu toggler, is framework-disabled offline); the list above drops that reference. **Correction (milestone-2 list-cell-edit-disable fix):** no longer reachable via the Leads/Opportunities list's multi-edit cell Save either (B88, reclassified DISABLE — `_multiSave` is not a framework queue producer); the list above drops that reference too, since the only remaining list-level path to this method offline is B21's per-record drag save. |
 | C3 | `models/crm_lead.py` | 971 | `unlink()` | QUEUE | Reachable via the selected-record Action-menu "Delete" (**B67**); framework `web_unlink` producer (bare ids); a salesman's queued delete is parked with an `AccessError` since salesmen have no unlink rights (no rule change). **Correction (milestone-2 user review):** no longer reachable via the kanban card-menu "Delete" (B19, reclassified DISABLE — its only entry point, the card-menu toggler, is framework-disabled offline and crm does not enable it); lead delete stays available offline through B67/B69's QUEUE path instead. |
 | C4 | `models/crm_lead.py` | 1042 | `action_restore()` | QUEUE | Reachable via the "Restore" button (B3); bare `[[id]]` write; needs a CRM-side `scheduleORM` producer — see Notes #1. |
 | C5 | `models/crm_lead.py` | 1051 | `action_set_lost(**additional_values)` | DISABLE | Reachable today only indirectly, through the transient `crm.lead.lost` wizard's `action_lost_reason_apply` (B49), itself DISABLE; no crm view calls this method directly. A hypothetical direct `action_set_lost([[id]],{lost_reason_id})` call would be bare-args QUEUE-able, but no button reaches it that way today — see Notes #2. |
@@ -628,7 +629,7 @@ all, or are unreachable through a different gate):
 | C11 | `models/crm_lead.py` | 1307 | `action_show_potential_duplicates()` | DISABLE | Reachable via the stat button (B7); navigation, read-only server action. |
 | C12 | `models/crm_lead.py` | 1320 | `action_convert_to_opportunity()` | DISABLE | Reachable via the "Convert to Opportunity" button (B2); creates/matches a `res.partner` server-side. |
 | C13 | `models/crm_lead.py` | 2794 | `prepare_pls_tooltip_data()` | DISABLE | Reachable via the PLS tooltip widget (A10, B9, B10); PLS tooltip lookup (contract: DISABLE). |
-| C14 | `models/crm_stage.py` | 70 | `write(vals)` | QUEUE | Reachable via any stage edit (B40); framework `web_save` producer; write access is manager-only (no rule change; a salesman's queued edit is parked with an `AccessError`, matching current online behavior). |
+| C14 | `models/crm_stage.py` | 70 | `write(vals)` | QUEUE | Reachable via the stage form's Save (**B92**); framework `web_save` producer; write access is manager-only (no rule change; a salesman's queued edit is parked with an `AccessError`, matching current online behavior). **Correction (milestone-2 list-cell-edit-disable fix):** no longer reachable via the stage list's multi-edit cell edits (B40, reclassified DISABLE and split into B92 for the form — `_multiSave` is not a framework queue producer); B40 is dropped from this row's reachability list. |
 | C15 | `models/crm_team.py` | 120 | `write(vals)` | QUEUE | Reachable via any team form Save (inherited `sales_team` form, edited in-scope by `sales_team_form_view_in_crm`); framework `web_save` producer (updates the alias when `use_leads`/`use_opportunities` change). |
 | C16 | `models/crm_team.py` | 131 | `unlink()` | QUEUE | Reachable via the team list/kanban Delete action (inherited from `sales_team`, the override itself lives in this crm file); framework `web_unlink` producer. |
 | C17 | `models/crm_team.py` | 211 | `action_assign_leads()` | DISABLE | Reachable via the "Assign Leads" button (B30); mass assignment across many leads, posts a note, returns a notification action. |
@@ -645,20 +646,20 @@ all, or are unreachable through a different gate):
 
 | Classification | Count |
 |---|---|
-| QUEUE | 28 |
+| QUEUE | 26 |
 | SKIP | 9 |
-| DISABLE | 112 |
-| **Total** | **149** |
+| DISABLE | 115 |
+| **Total** | **150** |
 
 ### Per section
 
 | Section | Rows | QUEUE | SKIP | DISABLE |
 |---|---|---|---|---|
 | A — JS/XML calls | 23 | 3 (A9, A13, A15) | 6 (A4, A6, A7, A12, A14, A16) | 14 (A1, A2, A5, A10, A11, A19, A20, A21, A22, A23, A24, A25, A26, A27) |
-| B — view/wizard/report buttons and controls | 91 | 16 (B1, B3, B5, B21, B22, B24, B40, B53, B54, B64, B65, B67, B69, B74, B75, B88) | 1 (B80) | 74 (B2, B4, B6, B7, B8-B20, B23, B25-B39, B41-B52, B55-B63, B66, B68, B70-B73, B76-B79, B81-B87, B89-B91) |
+| B — view/wizard/report buttons and controls | 92 | 14 (B1, B3, B5, B21, B22, B24, B53, B54, B64, B65, B67, B69, B75, B92) | 1 (B80) | 77 (B2, B4, B6, B7, B8-B20, B23, B25-B52, B55-B63, B66, B68, B70-B74, B76-B79, B81-B91) |
 | B-REL — relational-field create/edit controls | 12 | 0 | 0 | 12 (BR1-BR12) |
 | C — public model methods reachable from a button | 23 | 9 (C1, C2, C3, C4, C6, C14, C15, C16, C22) | 2 (C9, C20) | 12 (C5, C7, C8, C10, C11, C12, C13, C17, C18, C19, C21, C23) |
-| **Total** | **149** | **28** | **9** | **112** |
+| **Total** | **150** | **26** | **9** | **115** |
 
 (9 rows added in the round-1 fix: A26; B55-B61; C21. 2 more rows added in the round-2 fix:
 B62, B63. 8 more rows added in the round-3 fix: BR1-BR8, the new B-REL subsection. 32 more
@@ -666,12 +667,20 @@ rows added in this round-4 fix: A27; B64-B88; BR9-BR12; C22-C23 — see Notes #7
 user-testing fix (VAL-INV-005, VAL-INV-007 — see Notes #8) removed 4 rows (A3, A8, A17,
 A18, bare service-handle acquisitions with no server call) and added 1 row (B89), extending
 B72 and B73 to also cover `report/crm_activity_report_views.xml`'s grouped-list Edit/Delete,
-landing as `01ccefaa` with the previous Total 147 (QUEUE 39 / SKIP 9 / DISABLE 99). This
+landing as `01ccefaa` with the previous Total 147 (QUEUE 39 / SKIP 9 / DISABLE 99). The
 milestone-2 user-review fix (see Notes #9) reclassifies 10 Section B rows and 1 Section C
 row from QUEUE to DISABLE (B8, B11, B19, B20, B57, B58, B59, B71, B76, B89, and C7), adds 2
 new DISABLE rows (B90, B91) and narrows B74's scope (no row-count or classification change
-for B74 itself) — a net of QUEUE −11, DISABLE +13, for a recomputed Total 149 (QUEUE 28 /
-SKIP 9 / DISABLE 112). Counts above are the recomputed totals, not a delta.)
+for B74 itself at that point) — a net of QUEUE −11, DISABLE +13, for a recomputed Total 149
+(QUEUE 28 / SKIP 9 / DISABLE 112). The milestone-2 list-cell-edit-disable fix (see Notes #10)
+reclassifies B40, B74 and B88 (the Stages list, the inherited Sales Team list and the
+Leads/Opportunities lists' ordinary multi-edit cell edits) from QUEUE to DISABLE — list cell
+edits go through `DynamicList._multiSave`, which the offline framework does not queue (user
+decision during milestone 2) — and splits B40's bundled form-field-edits half into a new
+row, **B92** (QUEUE, the stage form's own Save, unaffected by the `_multiSave` gap); B88 is
+reclassified whole, not split (see B88's row). Net for this fix: QUEUE −3 +1 = −2, DISABLE
++3, Total +1 (B92), for a recomputed Total **150** (QUEUE **26** / SKIP **9** / DISABLE
+**115**). Counts above are the recomputed totals, not a delta.)
 
 ## Notes for review
 
@@ -692,12 +701,16 @@ round-3 and round-4 scrutiny; fixed here, no row/classification changes:
 - **B3/C4 — Restore**: `action_restore` with `[[record.resId]]`.
 - **B21 — kanban drag**, **B22/B53/B54 — priority stars** (pipeline kanban, Leads kanban,
   Opportunities list), **B24/C1 — quick create** (and **B65**, the forecast kanban's own
-  quick create), **B40/C14 — stage edits**, **B67/C3 — Action-menu Delete**, **B69/C22 —
-  Action-menu Archive/Unarchive**, **B74/C15 — the inherited team list's multi-edit cell
-  edits** and **B75 — the inherited team form's Save** are all *already* covered by the
-  framework's own `web_save`/`web_unlink`/`action_archive`/`action_unarchive` producers
-  (`record.js`, `dynamic_list.js`), so no new crm producer is needed for any of them —
-  listed here only to make clear which QUEUE rows do and do not need new crm code.
+  quick create), **B92/C14 — the stage form's own field edits (Save)**, **B67/C3 —
+  Action-menu Delete**, **B69/C22 — Action-menu Archive/Unarchive**, **B75/C15 — the
+  inherited team form's Save** are all *already* covered by the framework's own
+  `web_save`/`web_unlink`/`action_archive`/`action_unarchive` producers (`record.js`,
+  `dynamic_list.js`), so no new crm producer is needed for any of them — listed here only
+  to make clear which QUEUE rows do and do not need new crm code. **(milestone-2
+  list-cell-edit-disable fix)**: B40/C14 and B74/C15 previously appeared in this bullet for
+  the *list's* multi-edit cell edits; that path is now DISABLE (see the next bullet and
+  Notes #10) — B40 is split into the list part (DISABLE, no producer needed) and B92 (QUEUE,
+  the form's Save, listed above); B74 covers only the list and is now wholly DISABLE.
 - Outside this milestone's Section C scope (mail.activity is not `crm.lead`/`stage`/`team`),
   architecture §3.3 also calls for new producers for `mail.activity` `create` (schedule),
   `action_done` (done), and a new `crm.lead.action_log_call` (log a call) — flagged here
@@ -718,6 +731,19 @@ round-3 and round-4 scrutiny; fixed here, no row/classification changes:
   rotting badge on pipeline column headers) are new rows added by the same review, both
   DISABLE for the same framework-gap reasoning. None of these nine rows needs, or will ever
   need, a crm-side `scheduleORM` producer; see Notes #2 and #9.
+- **B40, B74, B88's multi-edit part (milestone-2 list-cell-edit-disable fix).** The Stages
+  list's (B40), the inherited Sales Team list's (B74) and the Leads/Opportunities lists'
+  (B88, including their inherited report/forecast variants) ordinary multi-edit cell edits
+  were reclassified to **DISABLE** by this fix, per the user's decision during milestone 2
+  (architecture.md §3.7/§3.8). The reason is distinct from the B8/B11/C7/B57-B59/B71/B89
+  family above: those lack a framework queue producer for `unlink`/`webResequence` on a
+  *group*; these three instead go through `addons/web`'s `DynamicList._multiSave`, the
+  per-record multi-edit list-save path, which likewise has no `ConnectionLostError`/offline
+  branch and is explicitly *not* to be patched to add one (crm must not build a second save
+  path for the same records a form already saves correctly). None of these three rows
+  needs, or will ever need, a crm-side `scheduleORM` producer either — the record is edited
+  from its form instead, whose Save already queues `web_save` (B92, B75, and the lead
+  form's own Save respectively). See Notes #10.
 - B56 (stage-column create via `name_create`) stays DISABLE regardless of a producer: the
   chained id defeats rule 1 outright, so no amount of crm-side `scheduleORM` wiring would
   make it QUEUE-eligible; it is listed in the DISABLE counts, not here.
@@ -944,9 +970,13 @@ archive, the two blanket-covered relational families, and the inherited team con
    "Excluded from Section A" bullet is corrected below.
 2. **Ordinary multi-edit saves on the Leads/Opportunities lists** — selecting a row and
    editing an ordinary (non-tag, non-priority) cell was never given its own row; closed by
-   **B88** (QUEUE), which also cross-references the inherited reporting/forecast-list
-   variants (`report/crm_opportunity_report_views.xml`, `crm_lead_views.xml:766-781`) that
-   inherit the same `multi_edit="1"` list unchanged, needing no separate row.
+   **B88** (QUEUE at the time), which also cross-references the inherited
+   reporting/forecast-list variants (`report/crm_opportunity_report_views.xml`,
+   `crm_lead_views.xml:766-781`) that inherit the same `multi_edit="1"` list unchanged,
+   needing no separate row. **Correction (milestone-2 list-cell-edit-disable fix):** B88 is
+   reclassified **DISABLE** (whole row, not split — see B88's current row and Notes #10):
+   `DynamicList._multiSave` is not a framework queue producer, by the user's milestone-2
+   decision.
 3. **Selected-record Action-menu Duplicate/Delete/Archive/Unarchive, and the matching
    Section C exclusions** — the framework's default-enabled action-menu items on every
    in-scope editable root (lead form/lists/kanbans, stage list/form, inherited team
@@ -975,7 +1005,11 @@ archive, the two blanket-covered relational families, and the inherited team con
    QUEUE at the time), **B77** (dashboard "Configuration" link, DISABLE), **B78**
    ("Activate Multi-team" button, DISABLE). **Correction (milestone-2 user review):** B74's
    handle-drag resequence is split out to its own row, **B90** (DISABLE); B74 itself is
-   narrowed to the list's multi-edit cell edits only and stays QUEUE. B76 is reclassified
+   narrowed to the list's multi-edit cell edits only. **Correction (milestone-2
+   list-cell-edit-disable fix):** B74's remaining multi-edit cell edits are now also
+   reclassified **DISABLE** (`_multiSave` is not a framework queue producer, by the user's
+   milestone-2 decision; see B74's current row and Notes #10) — B74 no longer stays QUEUE at
+   all; it is DISABLE for a reason independent of B90's. B76 is reclassified
    **DISABLE** (its only entry point, the kanban card-menu toggler, is framework-disabled
    offline and crm does not enable it, same as B19/B20; see B76's current row and
    Notes #9).
@@ -1038,8 +1072,9 @@ archive, the two blanket-covered relational families, and the inherited team con
   (`report/crm_opportunity_report_views.xml:5-11`'s `crm_lead_view_tree_opportunity_reporting`
   and `crm_lead_views.xml:766-781`'s `crm_lead_view_tree_forecast`) are not given separate
   rows: both inherit `crm_case_tree_view_oppor`'s `multi_edit="1"` list (B88) unchanged —
-  neither `<xpath>` touches that attribute or any editable field — so B88's QUEUE
-  disposition already covers them; see B88's justification.
+  neither `<xpath>` touches that attribute or any editable field — so B88's disposition
+  already covers them (**DISABLE** since the milestone-2 list-cell-edit-disable fix); see
+  B88's justification.
 - The mail activity popover's "optional assign/upload controls" the round-4 relational
   review mentioned in passing (alongside Edit and Done & Schedule Next) are not given their
   own row: the review gave no file:line for them beyond the parent widget's own three
@@ -1105,8 +1140,9 @@ several rows:
   QUEUE).
 - **B90 (new row): the inherited Sales Team list's `widget="handle"` sequence drag →
   `webResequence`, no framework producer → DISABLE.** The user approved this as DISABLE,
-  split out of B74 (which stays QUEUE for the list's ordinary multi-edit cell edits only, so
-  no reclassified row still needs a QUEUE producer through B74's combined text).
+  split out of B74 for an independent reason (B74 at the time stayed QUEUE for the list's
+  ordinary multi-edit cell edits; B74 is itself also reclassified DISABLE by the later
+  milestone-2 list-cell-edit-disable fix, for the unrelated `_multiSave` gap — see Notes #10).
 - **B91 (new row): mail's rotting badge on pipeline kanban column headers
   (`addons/mail/static/src/js/rotting_mixin/rotting_column_progress.xml:6`) → DISABLE.** The
   user approved this: the badge reloads the column from the server and is not disabled by
@@ -1135,3 +1171,60 @@ the removed handle); A17's `this.orm` handle → A19's `orm.cache().searchRead(.
 handle → A22's and A23's `this.action.doAction(...)`. The Section A sweep-method header now
 states this exclusion once, matching how it already explains the `user.isAdmin`/
 `fillTemporalService` exclusions.
+
+### 10. Milestone-2 list-cell-edit-disable fix (this fix)
+
+A further user decision during milestone 2 (architecture.md §3.7/§3.8, mission.md section
+11): list cell editing is disabled offline, wholesale, in the `crm.lead` lists (Leads,
+Opportunities, and the inherited report/forecast lists), the `crm.stage` list and the
+inherited `crm.team` list. These lists are `multi_edit="1"` with no `editable` attribute, so
+every cell edit on a selected row goes through `addons/web`'s `DynamicList._multiSave`
+(`model/relational_model/dynamic_list.js`), which has no `ConnectionLostError`/offline
+branch at all: it discards every selected record's in-progress edit and re-throws on any
+save error, online or offline alike. Per the mission's AGENTS.md section 4 ("never build a
+second offline engine" / "don't change the queue's conflict semantics"), `_multiSave` is
+**not** patched to queue — doing so would mean maintaining a second, `addons/crm`-owned
+save/queue path for the exact same records a form save already queues correctly through the
+framework's existing `web_save` producer, duplicating logic the framework already owns.
+Offline, the record is edited from its form instead; the form's Save is unaffected (it never
+goes through `DynamicList`) and keeps queuing exactly one `web_save` per record, replayed on
+reconnect like any other queued form save (**VAL-DIS-031**).
+
+- **B40 (Stages list) → DISABLE, split.** The original row bundled the list's multi-edit
+  cell edits (`crm_stage_tree`, `:22`) together with the form's own field edits
+  (`crm_stage_form`, `:37`) under one classification. Since the list half and the form half
+  now classify differently, the row is split: **B40** keeps the list half (DISABLE) and a
+  new row, **B92**, takes the form half (QUEUE, unaffected by the `_multiSave` gap). This
+  split was necessary for internal consistency (every row has exactly one class), not
+  optional — see B40's and B92's current rows.
+- **B74 (inherited Sales Team list) → DISABLE, not split further.** Already narrowed by the
+  milestone-2 user review to cover only the list's ordinary multi-edit cell edits (the
+  handle-drag resequence was already split out to B90 by that earlier fix); no further split
+  is needed, the whole row's remaining scope reclassifies to DISABLE.
+- **B88 (Leads/Opportunities lists) → DISABLE, reclassified whole, not split.** This row
+  already covered only the lists' ordinary multi-edit cell edits (and the inherited
+  reporting/forecast-list variants, which need no row of their own since they inherit the
+  same `multi_edit="1"` list unchanged); there is no non-multi-edit part bundled into it to
+  split off, so the whole row reclassifies.
+- **Totals.** This fix's net change is QUEUE −3 (B40, B74, B88) +1 (B92, the new row split
+  from B40) = −2, DISABLE +3 (B40, B74, B88), for one net new row (B92) — recomputed Total
+  **150** (QUEUE **26** / SKIP **9** / DISABLE **115**), up from the prior Total 149 (QUEUE
+  28 / SKIP 9 / DISABLE 112). See the Counts section above for the full per-section
+  breakdown; the "150/26/9/115" numbers here are the recomputed totals, not a delta, and
+  differ from the "149 if B88 is reclassified whole" estimate only because of B40's row
+  split (not because of B88, which is whole) — see VAL-INV-010's note that the check is
+  internal consistency, not these specific numbers.
+- **Row selection and the action menu are unaffected.** Only the cell-editor entry points
+  (`onCellClicked`'s multi-edit branch, `onCellKeydownReadOnlyMode`'s Enter handling in
+  `addons/web`'s `list_renderer.js`) are blocked offline for these three models; row
+  selection itself (`canSelectRecord`, `toggleRecordSelection`) is deliberately left alone,
+  so the selected-record Action-menu Archive/Unarchive/Delete (B67/B69, `crm.lead`; the
+  Section C/B rows for `crm.team`/`crm.stage` where applicable) keep queuing exactly as
+  before (**VAL-QUEUE-007/-008**). This is why the fix replaces (not extends) the prior
+  `m2-config-list-guards` feature's blunt `canSelectRecord=false` guard on `crm.stage`/
+  `crm.team` with a cell-edit-scoped guard instead: disabling selection outright offline
+  would have also disabled the action menu, which is explicitly required to keep working.
+- **No crm producer is added or will be needed** for B40, B74 or B88's multi-edit part (see
+  Notes #1's updated bullet); the gap belongs in the PR's known limits with the exact wording
+  "List cell editing is disabled offline; edit records from their form." (architecture.md
+  §3.8).

@@ -1,3 +1,4 @@
+import { effect, onMounted, onWillDestroy } from "@odoo/owl";
 import { ListRenderer } from "@web/views/list/list_renderer";
 import { patch } from "@web/core/utils/patch";
 import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
@@ -29,34 +30,86 @@ const HANDLE_DRAG_DISABLED_MODELS = ["crm.stage", "crm.recurring.plan", "crm.tea
 const READONLY_OFFLINE_MODELS = ["crm.recurring.plan", "crm.lost.reason"];
 
 /**
- * B40/B74 (VAL-DIS-017 says these "still queue"; reclassified here to
- * DISABLE -- see the KNOWN-LIMIT in this feature's handoff): the Stages
- * list (`crm_stage_views.xml:22`) and the inherited Sales Team list
- * (`sales_team/views/crm_team_views.xml:100`) carry `multi_edit="1"` with
- * no `editable` attribute, so `ListRenderer.isInlineEditable`'s default
- * (`!!this.props.editable`) is false and the *only* way to edit a cell,
- * online or offline, is to check a row and let `Record._update` route
- * through `this.model.root._multiSave` (`model/relational_model/record.js`,
- * `this.selected && this.model.multiEdit`). Unlike every other save
- * producer -- `Record._save`'s own path (`_offlineSave`), `DynamicList
- * ._saveRecords`, `._deleteRecords`, `._toggleArchive` (all in
- * `model/relational_model/dynamic_list.js`) -- `DynamicList._multiSave`
- * has no `ConnectionLostError` branch: it discards the edit and re-throws
- * on any save error, offline or not. Queuing it would mean adding a new
- * catch there, i.e. patching a save path shared by every multi-edit list
- * in every installed app, not just these two crm models -- out of this
- * fix's addons/crm scope and against "never build a second offline
- * engine." Per architecture.md §3.7's own principle for an action the
- * framework doesn't queue, the control is disabled offline instead: no
- * row can be checked (`canSelectRecord`), so multi-edit, the only edit
- * entry point on these two lists, never triggers.
+ * B40/B74/B88 multi-edit part (VAL-DIS-030, architecture.md §3.7): the
+ * crm.lead lists (Leads/Opportunities and the inherited report/forecast
+ * lists), the Stages list (`crm_stage_views.xml:22`) and the inherited
+ * Sales Team list (`sales_team/views/crm_team_views.xml:100`) all carry
+ * `multi_edit="1"` with no `editable` attribute, so
+ * `ListRenderer.isInlineEditable`'s default (`!!this.props.editable`) is
+ * false and the *only* way to open a cell editor, online or offline, is to
+ * check a row first and let `onCellClicked`'s `multiEdit && record.selected`
+ * branch (`list_renderer.js`) call `list.enterEditMode()`, which routes the
+ * eventual save through `DynamicList._multiSave`
+ * (`model/relational_model/dynamic_list.js`). Unlike every other save
+ * producer -- `Record._save`'s own offline branch, `DynamicList
+ * ._saveRecords`, `._deleteRecords`, `._toggleArchive` -- `_multiSave` has
+ * no `ConnectionLostError` branch: on any save error, offline or not, it
+ * discards the edit on every selected record and re-throws. Queuing it
+ * would mean patching a save path shared by every multi-edit list in every
+ * installed app, not just these three crm models -- out of this fix's
+ * addons/crm scope and against "never build a second offline engine" (the
+ * repo AGENTS.md section 4 "Project rules" is explicit here, and wins over
+ * architecture.md §3.7's own "B40/B74 ... still QUEUE" text, which this
+ * feature's user decision supersedes). Per the framework-gap principle for
+ * an action the framework doesn't queue, the control is disabled offline
+ * instead -- but *unlike* a plain "no row can be checked" guard,
+ * `onCellClicked`'s multi-edit branch is reached through `record.selected`
+ * alone and never consults `canSelectRecord` (`list_renderer.js:1527`), so
+ * disabling selection would not even close this entry point for a row
+ * that was already checked before going offline. Row selection itself
+ * must stay available offline (action-menu Archive/Unarchive/Delete,
+ * B67/B69, still queue through it), so the guard instead sits on the
+ * cell-edit entry points themselves: a click (`onCellClicked`) or Enter
+ * (`onCellKeydownReadOnlyMode`) on a selected row's cell does nothing while
+ * offline, and a row already mid-edit when the connection drops is forced
+ * out of edition (discarding, never saving) by the `effect` below, so no
+ * edit can ever reach `_multiSave` while offline on these three models.
  */
-const MULTI_EDIT_SELECTION_DISABLED_MODELS = ["crm.stage", "crm.team"];
+const CELL_EDIT_DISABLED_MODELS = ["crm.lead", "crm.stage", "crm.team"];
+
+/**
+ * True when `record`'s only possible editor offline on this list would be
+ * the multi-edit one blocked above: offline, the model is in scope, the
+ * list is in multi-edit mode and the record is checked. Shared by the
+ * click guard, the keyboard guard and the mid-edit effect so the three
+ * can't drift from each other.
+ */
+function blocksMultiEditOffline(crmOffline, list, record) {
+    return (
+        crmOffline.isOffline() &&
+        CELL_EDIT_DISABLED_MODELS.includes(list.resModel) &&
+        list.model.multiEdit &&
+        record?.selected
+    );
+}
 
 patch(ListRenderer.prototype, {
     setup() {
         super.setup();
         this.crmOffline = useCrmOffline();
+
+        // A row can be mid cell-edit (checked, multi-edit, cell opened)
+        // when the connection drops. Nothing on the save path itself can
+        // be guarded (`_multiSave` has no offline branch and is not
+        // patched -- see the comment above), so the row is forced out of
+        // edition the moment offline is detected: `leaveEditMode({
+        // discard: true })` reverts the in-progress edit instead of
+        // leaving it to be committed later, so nothing can ever look
+        // saved without being sent or queued. `effect()` re-runs whenever
+        // `isOffline()` changes, independently of any unrelated render
+        // (same pattern as `crm_form.js`'s AI-switch guard).
+        const forceLeaveEditModeOffline = () => {
+            const list = this.props.list;
+            const edited = list.editedRecord;
+            if (blocksMultiEditOffline(this.crmOffline, list, edited)) {
+                list.leaveEditMode({ discard: true });
+            }
+        };
+        let disposeEffect = () => {};
+        onMounted(() => {
+            disposeEffect = effect(forceLeaveEditModeOffline);
+        });
+        onWillDestroy(() => disposeEffect());
     },
 
     /** @override */
@@ -79,13 +132,32 @@ patch(ListRenderer.prototype, {
     },
 
     /** @override */
-    get canSelectRecord() {
-        if (
-            this.crmOffline.isOffline() &&
-            MULTI_EDIT_SELECTION_DISABLED_MODELS.includes(this.props.list.resModel)
-        ) {
-            return false;
+    async onCellClicked(record, column, ev, newWindow) {
+        if (blocksMultiEditOffline(this.crmOffline, this.props.list, record)) {
+            // Online, this is the *only* way `onCellClicked` opens a cell
+            // editor on these three models (`multiEdit && record.selected`,
+            // `list_renderer.js`, never gated by `canSelectRecord`). Doing
+            // nothing here -- not even falling through to `super()` --
+            // keeps the row selected and leaves it in readonly mode: no
+            // RPC, nothing queued, no value shown as saved.
+            return;
         }
-        return super.canSelectRecord;
+        return super.onCellClicked(record, column, ev, newWindow);
+    },
+
+    /** @override */
+    onCellKeydownReadOnlyMode(hotkey, cell, group, record) {
+        if (
+            hotkey === "enter" &&
+            blocksMultiEditOffline(this.crmOffline, this.props.list, record)
+        ) {
+            // Same guard as `onCellClicked` for the keyboard path: Enter
+            // on a selected row's cell opens no editor offline either.
+            // Returning `true` (handled) only swallows the key
+            // (`onCellKeydown`'s `preventDefault`/`stopPropagation`); it
+            // does not call `enterEditMode`.
+            return true;
+        }
+        return super.onCellKeydownReadOnlyMode(hotkey, cell, group, record);
     },
 });
