@@ -12,6 +12,7 @@ from . import test_crm_lead_duplicates
 from . import test_crm_lead_merge
 from . import test_crm_lead_multicompany
 from . import test_crm_lead_smart_calendar
+from . import test_crm_offline
 from . import test_crm_ui
 from . import test_crm_pls
 from . import test_crm_rainbowman
