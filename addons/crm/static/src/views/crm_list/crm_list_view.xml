@@ -7,4 +7,18 @@
             </t>
         </xpath>
     </t>
+
+    <!-- Uncached lead opened offline (architecture.md §3.2 item 10): a
+         primary inheritance of "web.ListView" scoped to crm_list only, so
+         every other list view keeps the base template untouched. -->
+    <t t-name="crm.ListView" t-inherit="web.ListView" t-inherit-mode="primary">
+        <xpath expr="//t[@t-component='this.props.Renderer']" position="attributes">
+            <attribute name="t-if">this.model.isReady() and !(this.offlineUncachedClick() and this.crmOffline.isOffline())</attribute>
+        </xpath>
+        <xpath expr="//t[@t-component='this.props.Renderer']" position="before">
+            <t t-if="this.offlineUncachedClick() and this.crmOffline.isOffline()">
+                <OfflineActionHelper/>
+            </t>
+        </xpath>
+    </t>
 </templates>
