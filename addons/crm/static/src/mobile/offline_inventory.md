@@ -22,6 +22,21 @@ appended to the end of each section's table (same convention the original sweep 
 used for B53/B54), so every existing cross-reference in "Notes for review" still points at
 the same row.
 
+**This round-2 fix** closes 4 further scrutiny findings against `6e6de2b8` (the commit the
+round-1 fix above landed as): two Section B controls the round-1 completeness pass missed
+(the pipeline kanban's default-enabled column "Edit" menu, and the lead form's tag
+quick-create, both on `crm_lead_views.xml`), and two inaccuracies in how B58/B59 and their
+Notes #1 entries described the stage-resequence/-delete producers — those entries spelled
+out `scheduleORM`/`webResequence` argument lists, kwargs, and a `specification` payload
+that were each incomplete or wrong (a missing fifth `options`/`extras` argument on
+`scheduleORM`, a missing `specification` kwarg on `webResequence`). This inventory
+classifies entry points; it is not an implementation spec, so those recipes are removed in
+favor of a method-level statement of what a future producer must queue, with the exact
+argument list, kwargs, and options/extras left to milestone 2. The two new rows are B62 and
+B63, appended per this document's existing convention (no row renumbered). HEAD for this
+round's re-verification is `6e6de2b8` (no crm source changed by this fix either); every
+citation — old and new — was re-read again at this HEAD.
+
 ## Rules (applied in order, verbatim from the kickoff)
 
 1. **QUEUE** — a write on `crm.lead`, `crm.stage`, `crm.team`, or a lead's `mail.activity`,
@@ -122,9 +137,13 @@ only `if (this.props.record.isInEdition)`; list/kanban records default to
 `record.js`'s `isInEdition` getter), and none of these four views sets `editable=` on the
 list or a mechanism that puts the clicked row into edit mode, so the click is a no-op there
 today — checked individually, not assumed; only the form occurrence (always `isInEdition`
-for an existing record) gets a row. The pipeline kanban's `group_create`/`group_delete`
-(B56/B57) and resequence (B58) and the stage list's `widget="handle"` resequence (B59) are
-likewise control-level additions this round; see their own rows for the exact mechanism.
+for an existing record) gets a row. The pipeline kanban's `group_create`/`group_delete`/
+`group_edit` (B56/B57/B62) and resequence (B58) and the stage list's `widget="handle"`
+resequence (B59) are likewise control-level additions; see their own rows for the exact
+mechanism. The lead form's tag field (`:245`) also exposes a quick-create "Create" option
+distinct from the four options above: only `no_create_edit` is set there, not `no_create`
+or `no_quick_create`, so the field's autocomplete still offers to create a brand-new tag by
+name — see B63, which is distinct from B55's color-edit popover on the same field.
 
 **Section C** — public (no leading underscore) methods on `crm.lead`, `crm.stage`,
 `crm.team`:
@@ -201,6 +220,29 @@ not a many2one field; `kanban_renderer.js`'s `canCreateGroup()` requires
 `resequence` both throw synchronously for a non-many2one groupby — so this kanban never
 renders group-level create/delete/resequence controls at all, and no new row applies there
 (it keeps relying on A25's "add next period" `list.load()`, already DISABLE).
+
+**Sweep method, round 3 (gap-closing re-sweep, round 2 fix)** — a second scrutiny round
+found 4 blocking gaps in `6e6de2b8`: two missed Section B controls and two inaccurate
+producer-recipe excerpts. The round-2 sweep's own
+`group_create|group_delete|group_edit|archivable=` grep already matched `group_edit`
+alongside `group_create`/`group_delete`, but the round-1 fix only drew a conclusion for the
+latter two; re-reading the matched kanban tag's config menu
+(`addons/web/static/src/views/view_components/group_config_menu.js`) shows it also
+registers an `edit_group` item (`:87-98`) gated by `canEditGroup()` (`:80-84`), reachable
+whenever `group_edit` is not overridden on the `<kanban>` tag (true here, same as
+`group_delete`) — new row B62. Separately, re-reading `many2many_tags_field.js`'s
+`extractProps` (`:356-365`) against the lead form's `tag_ids` options
+(`crm_lead_views.xml:245`, only `no_create_edit: True`) shows
+`canQuickCreate = canCreate && !noQuickCreate` evaluates true (`no_create`/`no_quick_create`
+are both unset), so the field's autocomplete still offers a "Create" suggestion
+(`relational_utils.js:483-515`) that calls `name_create` on `crm.tag` and links the
+returned id (`many2many_tags_field.js:127-132`) — a distinct control from the color-edit
+popover already covered by B55, missed in the earlier sweeps because the Section B grep
+patterns match XML attributes/widgets, not a JS field's internally-computed prop — new row
+B63. The B57/B58/B59 producer notes were checked against the actual framework call sites
+again (`relational_model/utils.js:854-861`, `offline_plugin.js:271-279,447-449`,
+`addons/web/models/models.py:540`) and rewritten below and in Notes #1 to name the model and
+method a future producer must queue without restating the exact argument list.
 
 ## Section A — JS/XML ORM, rpc, action-service and group/access-probe calls (`static/src/**`)
 
@@ -294,10 +336,12 @@ renders group-level create/delete/resequence controls at all, and no new row app
 | B55 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', ...}"/>` (lead form) | DISABLE | **New row (this revision)**. The form record is always `isInEdition` (an existing record being viewed in a non-readonly form), so clicking a tag opens `Many2ManyTagsFieldColorListPopover`; picking a color calls `many2many_tags_field.js`'s `switchTagColor()` → `tagRecord.update({[colorField]: colorIndex}); tagRecord.save();` — a direct write to `crm.tag`, not `crm.lead`/`crm.stage`/`crm.team`, so DISABLE. The four other `on_tag_click="edit_color"` occurrences in this file (`:353`, `:370`, `:542`, `:753`) are in non-`editable` list/kanban views where the control is unreachable today (see "Excluded from Section B" above) and get no row. |
 | B56 | `views/crm_lead_views.xml` | 503 | Pipeline kanban "Add a column..." (stage-column create; `group_create` not set on this `<kanban>`, defaults to enabled per `kanban_arch_parser.js:18`) | DISABLE | **New row (this revision)**. Submitting the column-create input calls `dynamic_group_list.js`'s `createGroup(groupName)` → `_createGroup()`, which does `orm.call("crm.stage", "name_create", [groupName])` and then uses the **returned id** to set `default_<field>` context on the new group's config and to resequence the new column after the last one — an id produced by this very call, so DISABLE per the chained-id rule, never QUEUE, regardless of `crm.stage` being otherwise QUEUE-eligible. |
 | B57 | `views/crm_lead_views.xml` | 503 | Pipeline kanban column config-menu "Delete" (stage-column delete; `group_delete` not set, defaults to enabled per `kanban_arch_parser.js:19`) | QUEUE | **New row (this revision)**. Calls `dynamic_group_list.js`'s `deleteGroups([group])` → `_deleteGroups()` → `_unlinkGroups()`, which issues a plain `orm.unlink("crm.stage", [stageId])` — a bare write with a client-known id on `crm.stage` (a QUEUE-eligible model), so QUEUE by rule 1; this matches what the scrutiny review flagged as the correct target. It is **not** one of the framework's own auto-queued producers (`web_save`/`web_unlink`/`action_archive`/`action_unarchive`): `_unlinkGroups()` has no `ConnectionLostError` catch, so today the click throws uncaught offline instead of queueing — it needs a new crm-side `scheduleORM` producer like the other rows in Notes #1, which now also lists it. |
-| B58 | `views/crm_lead_views.xml` | 503 | Pipeline kanban stage-column drag (resequencing stage columns themselves, not cards; `groups_draggable` not overridden, defaults to enabled for a many2one groupby) | QUEUE | **New row (this revision)**. Dropping a dragged column calls `dynamic_group_list.js`'s `resequence(movedGroupId, targetGroupId)` → `_resequence()` → the shared `resequence()` util (`relational_model/utils.js:794-866`) → `orm.webResequence("crm.stage", resIds, {field_name:"sequence", offset, context})` — **not** `web_save`, unlike what B21's card-drag and B40's generic "any stage edit" wording might suggest. `webResequence` has no queue producer either (the util's only `catch` rolls the UI order back and rethrows); bare ids + offset are client-resolvable on `crm.stage`, so QUEUE by rule 1, needing a new producer — see Notes #1. Distinct from B21 (per-record `web_save({stage_id})` when a *card* is dropped into a different column, already auto-queued). |
-| B59 | `views/crm_stage_views.xml` | 23 | `<field name="sequence" widget="handle"/>` (Stages list drag-to-reorder) | QUEUE | **New row (this revision)**. Dragging a row by its handle calls the list's `_resequence()` → the same `resequence()` util → `orm.webResequence("crm.stage", resIds, {field_name:"sequence", offset, context})` as B58 — the exact call B40's "any stage edit → `web_save`" wording does not cover. QUEUE by rule 1 (bare ids + offset, `crm.stage`); needs its own crm-side producer, same gap as B57/B58 — see Notes #1. |
+| B58 | `views/crm_lead_views.xml` | 503 | Pipeline kanban stage-column drag (resequencing stage columns themselves, not cards; `groups_draggable` not overridden, defaults to enabled for a many2one groupby) | QUEUE | **New row (this revision)**. Dropping a dragged column calls `dynamic_group_list.js`'s `resequence(movedGroupId, targetGroupId)` → `_resequence()` → the shared `resequence()` util (`relational_model/utils.js:794-866`), which calls `orm.webResequence` on `crm.stage` — **not** `web_save`, unlike what B21's card-drag and B40's generic "any stage edit" wording might suggest. `webResequence` has no queue producer either (the util's only `catch` rolls the UI order back and rethrows). Every argument that call needs — the moved ids, the sequence field name, the offset, and the per-field `specification` the Python method requires (`addons/web/models/models.py:540`) — is resolvable purely from client-known state, so the full argument list stays client-resolvable and this is QUEUE by rule 1 regardless; it needs a new producer — see Notes #1 for the method-level statement (the exact call, including that `specification` kwarg and the `scheduleORM` options/extras, is implementation work for milestone 2). Distinct from B21 (per-record `web_save({stage_id})` when a *card* is dropped into a different column, already auto-queued). |
+| B59 | `views/crm_stage_views.xml` | 23 | `<field name="sequence" widget="handle"/>` (Stages list drag-to-reorder) | QUEUE | **New row (this revision)**. Dragging a row by its handle calls the list's `_resequence()` → the same `resequence()` util as B58 → the same `orm.webResequence` call on `crm.stage` — the exact call B40's "any stage edit → `web_save`" wording does not cover. Same client-resolvable-argument reasoning as B58 applies (bare ids, offset, and a client-known `specification`), so QUEUE by rule 1; needs its own crm-side producer, same gap as B57/B58 — see Notes #1. |
 | B60 | `views/crm_recurring_plan_views.xml` | 8-9 | `<list editable="bottom">` + `<field name="sequence" widget="handle"/>` (crm.recurring.plan: inline create/edit/resequence) | DISABLE | **New row (this revision)**. An editable-list row's inline edit/create would auto-queue via the framework's `web_save` producer like any form, and the handle's resequence would go through the same `webResequence` path as B58/B59 — but the model is `crm.recurring.plan`, not `crm.lead`/`crm.stage`/`crm.team` or a lead's `mail.activity`, so rule 1 does not apply at all regardless of mechanism — DISABLE. |
 | B61 | `views/crm_lost_reason_views.xml` | 49 | `<list string="Channel" editable="bottom">` (crm.lost.reason: inline create/edit) | DISABLE | **New row (this revision)**. Same reasoning as B60: inline edits on an editable list would auto-queue via `web_save`, but `crm.lost.reason` is outside rule 1's model scope — DISABLE. |
+| B62 | `views/crm_lead_views.xml` | 503 | Pipeline kanban column config-menu "Edit" (stage-column edit; `group_edit` not set on this `<kanban>`, defaults to enabled per `kanban_arch_parser.js:20`) | DISABLE | **New row (round 2 fix)**. The same column config menu that renders Delete (B57) also renders an "Edit" item (`group_config_menu.js`'s `edit_group` entry, `:87-98`, gated by `canEditGroup()`, `:80-84`); choosing it calls `editGroup()` (`:61-72`), which opens a `FormViewDialog` on the clicked stage's own id (`resModel: groupByField.relation`, i.e. `crm.stage`) and, on save, calls `this.props.list.load()` to reload the kanban. The dialog loads that specific `crm.stage` record outside the view-level `actionId`/`viewType` tracking `OfflinePlugin.isAvailableOffline` keys offline availability on, so opening the dialog for a stage never visited offline throws `ConnectionLostError` — the same uncached-record-navigation reasoning as B18's kanban-card "Edit" menu item, plus a second round-trip on save. Not a bare resolvable write: DISABLE per the navigation-unavailable-offline rule, distinct from B57 (Delete, QUEUE) and B40 (direct form/list field edits, QUEUE). |
+| B63 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', 'no_create_edit': True}"/>` (lead form, tag quick-create) | DISABLE | **New row (round 2 fix)**. Only `no_create_edit` is set on this field, not `no_create` or `no_quick_create`; `many2many_tags_field.js`'s `extractProps` therefore computes `canQuickCreate = canCreate && !noQuickCreate` as true, so typing an unmatched tag name in the autocomplete offers a "Create" suggestion (`relational_utils.js:483-515`) whose handler calls `this.orm.call("crm.tag", "name_create", [name], ...)` and immediately links the **returned id** to the lead (`many2many_tags_field.js:127-132`) — an id produced by this very call, so DISABLE per the chained-id rule, same family as B25/B56. Distinct from B55, which classifies the color-edit popover on this same field (an existing tag's `write`, not a `name_create`). |
 
 ## Section C — public `crm.lead` / `crm.stage` / `crm.team` methods reachable from a button
 
@@ -333,20 +377,20 @@ renders group-level create/delete/resequence controls at all, and no new row app
 |---|---|
 | QUEUE | 28 |
 | SKIP | 12 |
-| DISABLE | 68 |
-| **Total** | **108** |
+| DISABLE | 70 |
+| **Total** | **110** |
 
 ### Per section
 
 | Section | Rows | QUEUE | SKIP | DISABLE |
 |---|---|---|---|---|
 | A — JS/XML calls | 26 | 3 (A9, A13, A15) | 10 (A3, A4, A6, A7, A8, A12, A14, A16, A17, A18) | 13 (A1, A2, A5, A10, A11, A19, A20, A21, A22, A23, A24, A25, A26) |
-| B — view/wizard/report buttons and controls | 61 | 16 (B1, B3, B5, B8, B11, B19, B20, B21, B22, B24, B40, B53, B54, B57, B58, B59) | 0 | 45 (B2, B4, B6, B7, B9, B10, B12-B18, B23, B25-B39, B41-B52, B55, B56, B60, B61) |
+| B — view/wizard/report buttons and controls | 63 | 16 (B1, B3, B5, B8, B11, B19, B20, B21, B22, B24, B40, B53, B54, B57, B58, B59) | 0 | 47 (B2, B4, B6, B7, B9, B10, B12-B18, B23, B25-B39, B41-B52, B55, B56, B60, B61, B62, B63) |
 | C — public model methods reachable from a button | 21 | 9 (C1, C2, C3, C4, C6, C7, C14, C15, C16) | 2 (C9, C20) | 10 (C5, C8, C10, C11, C12, C13, C17, C18, C19, C21) |
-| **Total** | **108** | **28** | **12** | **68** |
+| **Total** | **110** | **28** | **12** | **70** |
 
-(9 rows added this revision: A26; B55-B61; C21. Counts above are the recomputed totals,
-not a delta.)
+(9 rows added in the round-1 fix: A26; B55-B61; C21. 2 more rows added in this round-2 fix:
+B62, B63. Counts above are the recomputed totals, not a delta.)
 
 ## Notes for review
 
@@ -377,16 +421,18 @@ these, gated on `isOffline()`, with optimistic UI:
   because they are the other half of "QUEUE rows needing a producer" even though the
   triggering controls (B17/B23, kanban_activity widget) are classified DISABLE in *this*
   inventory since no crm-owned offline UI exists for them yet (see Notes #3).
-- **New this revision — B57/C stage-column delete**: call `scheduleORM("crm.stage",
-  "unlink", [[group.value]], {context})` from the kanban header's delete handler
-  (`addons/web`'s `deleteGroup`), gated on `isOffline()`; the id is already known client-side
-  (it is the group's own value), so no onchange/wizard is involved.
-- **New this revision — B58/B59 stage resequencing**: both the pipeline's column drag and
-  the Stages list's handle widget need a producer around `webResequence("crm.stage", ids,
-  {field_name:"sequence", offset, context})`, e.g. `scheduleORM("crm.stage",
-  "web_resequence", [ids], {field_name, offset, context})`, gated on `isOffline()` and with
-  the same UI-rollback-on-reject behavior the online `resequence()` util already has when
-  offline the call doesn't actually fail. Two call sites, one producer.
+- **B57 — stage-column delete**: needs a CRM-side producer queuing `crm.stage` `unlink` via
+  `OfflinePlugin.scheduleORM`, called from the kanban header's delete handler (`addons/web`'s
+  `deleteGroup`), gated on `isOffline()`; the id is already known client-side (it is the
+  group's own value), so no onchange/wizard is involved. Exact args, kwargs, and
+  options/extras (including `timeStamp`) are defined at implementation in milestone 2.
+- **B58/B59 — stage resequencing**: both the pipeline's column drag and the Stages list's
+  handle widget need a CRM-side producer queuing `crm.stage` `web_resequence` via
+  `OfflinePlugin.scheduleORM`, gated on `isOffline()`, with the same UI-rollback-on-reject
+  behavior the online `resequence()` util already has when offline the call doesn't
+  actually fail. Exact args, kwargs (including the per-field `specification` the Python
+  method requires) and options/extras (including `timeStamp`) are defined at implementation
+  in milestone 2. Two call sites, one producer.
 - B56 (stage-column create via `name_create`) stays DISABLE regardless of a producer: the
   chained id defeats rule 1 outright, so no amount of crm-side `scheduleORM` wiring would
   make it QUEUE-eligible; it is listed in the DISABLE counts, not here.
@@ -433,12 +479,14 @@ these, gated on `isOffline()`, with optimistic UI:
   "Mark Done" case does, and because it targets `mail.activity` reschedule methods with no
   offline UI designed. The alternative (QUEUE for `action_reschedule_today`, which needs no
   extra argument) is plausible but not pursued here; flagged for the next milestone.
-- **B18 — kanban card `<a type="open">` ("Edit")**: chosen DISABLE because the framework
-  does not gate this click on `isAvailableOffline` today (`o_disabled_offline` styling is
-  applied but the card stays clickable per the web-framework research), so opening an
-  uncached lead throws an unhandled `ConnectionLostError`. This is consistent with — and
-  will be resolved by — architecture §3.2 item 10's planned uncached-lead helper; see
-  Notes #3.
+- **B18/B62 — kanban card/column "Edit"**: both chosen DISABLE because the framework does
+  not gate the click on `isAvailableOffline` today — B18's card-edit link stays clickable
+  offline (`o_disabled_offline` styling applied but no actual disabling) and B62's
+  column-edit menu item opens a `FormViewDialog` whose own load is outside the view-level
+  visited-tracking this framework keys offline availability on — so opening either an
+  uncached lead (B18) or an uncached stage (B62) throws an unhandled `ConnectionLostError`.
+  This is consistent with — and will be resolved by — architecture §3.2 item 10's planned
+  uncached-record helper; see Notes #3.
 - **B57/B58/B59 — stage delete/resequence**: chosen QUEUE on the same content-based reading
   as B8/B11/C7 above (bare ids, no onchange/wizard/chained id, on `crm.stage`), matching
   what the scrutiny review flagged as the correct target. The conservative alternative is
@@ -489,12 +537,14 @@ these, gated on `isOffline()`, with optimistic UI:
   `res.config.settings`, B42 on `res.partner`, B43/B44 on `utm.campaign`) is already
   DISABLE regardless of how simple the write would otherwise be.
 - **Chained id → DISABLE, never QUEUE**: matches B56 (stage-column create via `name_create`,
-  same family as B25's partner `name_create` and A25's share-target `name_create`), applying
-  the chained-id rule exactly as it already does elsewhere in this document.
+  same family as B25's partner `name_create` and A25's share-target `name_create`) and B63
+  (lead-form tag quick-create via `crm.tag.name_create`, same family), applying the
+  chained-id rule exactly as it already does elsewhere in this document.
 - **Navigation to data that may be unavailable offline → DISABLE**: A26 (team-switcher
   selection reload) joins A5 (Manage Teams) and the B30-B39/C17-C19 team-navigation family
   under this same reasoning; C21 (`action_primary_channel_button`) joins C18/C19 as a third
-  read-only `crm.team` navigation method.
+  read-only `crm.team` navigation method; B62 (column-menu "Edit") joins B18 as a second
+  uncached-record-navigation control, see Notes #2.
 
 ### 4. Scrutiny round and bounded completeness pass (this revision)
 
@@ -516,3 +566,25 @@ date-groupby never exposes group-level controls at all (same section); no other 
 `group_delete`/`group_edit`/`archivable` attribute (confirmed by the round-2 `rg` commands
 above matching only the rows already added); no other component under `static/src` has an
 `onSelect`/`_notify`-style reload handler (confirmed by the same sweep).
+**Correction (round 2 fix):** that last claim about `group_edit` was incomplete — the
+round-2 `rg` command for `group_create|group_delete|group_edit|archivable=` did match
+`group_edit`'s absence on the same `<kanban>` tag as `group_create`/`group_delete`, but no
+row was drawn from it at the time; see Notes #5 and B62 below.
+
+### 5. Scrutiny round 2 (round 2 fix)
+
+A second scrutiny round against `6e6de2b8` found 4 blocking gaps: two same-category
+Section B controls the round-1 completeness pass still missed, and two inaccuracies in how
+B58/B59 and their Notes #1 entries described producer work. Closed above: B62 (pipeline
+kanban column config-menu "Edit", the same `group_edit` default this document's own
+round-2 grep had already matched but not acted on) and B63 (the lead form's tag
+quick-create via `crm.tag.name_create`, distinct from B55's color-edit popover on the same
+field). B58/B59's call descriptions and their Notes #1 entries no longer spell out an exact
+`scheduleORM`/`webResequence` argument list, kwargs, or `specification` payload — this
+document classifies entry points, not implementation call recipes, so those rows and notes
+now name the producer at the method level only (what model/method a future
+`OfflinePlugin.scheduleORM` call must queue), while still stating, as the QUEUE
+classification requires, that the full argument list — including `web_resequence`'s
+`specification` kwarg — is resolvable purely from client-known state. No other row in this
+document stated an executable `scheduleORM` call with a full options/extras argument, so no
+further row needed the same correction.
