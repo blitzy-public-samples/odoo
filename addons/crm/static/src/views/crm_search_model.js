@@ -1,6 +1,7 @@
 import { browser } from "@web/core/browser/browser";
 import { Domain } from "@web/core/domain";
 import { _t } from "@web/core/l10n/translation";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { SearchModel } from "@web/search/search_model";
 
 import { computed, proxy } from "@odoo/owl";
@@ -127,19 +128,37 @@ export class CrmSearchModel extends SearchModel {
             return;
         }
         // Retrieve team switcher data
-        const { available, teams } = await this.orm
-            .cache({
-                type: "disk",
-                update: "always",
-                callback: (result, hasChanged) => {
-                    if (hasChanged) {
-                        this.state.switcherAvailable = result.available;
-                        this.state.switcherTeams = result.teams;
-                        this._initSwitcherSelection(true);
-                    }
-                },
-            })
-            .call("crm.team", "get_team_switcher_data");
+        let available = false;
+        let teams = [];
+        try {
+            ({ available, teams } = await this.orm
+                .cache({
+                    type: "disk",
+                    update: "always",
+                    callback: (result, hasChanged) => {
+                        if (hasChanged) {
+                            this.state.switcherAvailable = result.available;
+                            this.state.switcherTeams = result.teams;
+                            this._initSwitcherSelection(true);
+                        }
+                    },
+                })
+                .call("crm.team", "get_team_switcher_data"));
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
+            }
+            // Offline with no ram/disk value cached yet for this call:
+            // `RPCCache.read()` (addons/web/static/src/core/network/
+            // rpc_cache.js) rejects instead of resolving with a fallback,
+            // which would otherwise reject this whole `_initSwitcher()`
+            // and, through it, `load()` — aborting the view's load instead
+            // of degrading to "All Teams" (architecture.md §3.2 item 3,
+            // offline_inventory.md rows A6/C20). The selected-team facet is
+            // restored separately, from the search state
+            // (`_importState`/`applySearch` below), not from this call, so
+            // it is unaffected by this fallback.
+        }
         this.state.switcherAvailable = available;
         this.state.switcherTeams = teams;
         this._initSwitcherSelection();

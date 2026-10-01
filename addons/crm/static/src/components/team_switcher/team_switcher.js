@@ -3,6 +3,7 @@ import { DropdownItem } from "@web/core/dropdown/dropdown_item";
 import { _t } from "@web/core/l10n/translation";
 import { user } from "@web/core/user";
 import { useService } from "@web/core/utils/hooks";
+import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
 
 import { Component, onWillStart } from "@odoo/owl";
 
@@ -16,9 +17,22 @@ export class TeamSwitcher extends Component {
     setup() {
         super.setup();
         this.actionService = useService("action");
+        this.crmOffline = useCrmOffline();
 
         onWillStart(async () => {
-            this.isSaleManager = await user.hasGroup("sales_team.group_sale_manager");
+            // `user.hasGroup` is backed by a `Cache` (addons/web/static/src/
+            // core/utils/cache.js) that never evicts a rejected promise, so
+            // an uncached probe issued offline would stay rejected for the
+            // rest of the page's life, even after reconnecting
+            // (architecture.md §2). Check `isOffline()` first and treat the
+            // probe as `false` instead of issuing it (architecture.md §3.2
+            // item 3). "Manage Teams" is unreachable offline regardless:
+            // the toggler below is a plain `<button>` without
+            // `data-available-offline`, so the framework's
+            // `SELECTORS_TO_DISABLE` already disables it.
+            this.isSaleManager = this.crmOffline.isOffline()
+                ? false
+                : await user.hasGroup("sales_team.group_sale_manager");
         });
     }
 
