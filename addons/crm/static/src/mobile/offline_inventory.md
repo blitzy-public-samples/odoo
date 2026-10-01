@@ -2,11 +2,25 @@
 
 Milestone 1 (inventory only — **no code changes** in this commit). This document sweeps
 `addons/crm/` for every entry point that needs a live server, and classifies each one so a
-later milestone can enforce it. HEAD at the time of this sweep: `8916e416` (branch
-`eval/factory-crm-offline`). Every file:line citation below was re-read at this commit; none
-is copied uncritically from the starting research reports (`{missionDir}/research/
-crm_js_sweep.md`, `crm_python_views.md`, `design_options.md`) — those reports seeded the
-search, but every row here was independently re-verified against the files in this repo.
+later milestone can enforce it. HEAD at the time of the original sweep: `8916e416` (branch
+`eval/factory-crm-offline`), committed as `a6a1ceef`. Every file:line citation below was
+re-read at this commit; none is copied uncritically from the starting research reports
+(`{missionDir}/research/crm_js_sweep.md`, `crm_python_views.md`, `design_options.md`) —
+those reports seeded the search, but every row here was independently re-verified against
+the files in this repo.
+
+**This revision** closes 7 blocking gaps a scrutiny review found in `a6a1ceef` (missing
+stage-column create/delete/resequence rows, two missing non-lead/stage/team editable
+lists, a missing team-switcher selection row, a missing reachable `crm.team` method, a
+missing tag-color-editor row, and a false claim about the team-switcher cache-miss
+fallback), then runs a bounded completeness pass for the same categories of omission
+across the rest of the addon. HEAD for this revision's re-verification is still `a6a1ceef`
+(no crm source changed between the two sweeps). Every citation — old and new — was
+re-read again at this HEAD with the scripted check in "Self-verification" below; the new
+rows and corrected text are marked inline. No row number was reassigned: new rows are
+appended to the end of each section's table (same convention the original sweep already
+used for B53/B54), so every existing cross-reference in "Notes for review" still points at
+the same row.
 
 ## Rules (applied in order, verbatim from the kickoff)
 
@@ -98,7 +112,19 @@ in `views/crm_lead_templates.xml:32` are mail-template markup (external mailto/w
 not Odoo server calls). `report/crm_opportunity_report_views.xml:11` removes (`position="replace"`)
 the `mail_activity_mixin_list_reschedule_dropdown` widget from the report list — no server
 effect, deleting a control, not adding one. `special="cancel"` buttons in every wizard just
-close the dialog client-side, no row needed.
+close the dialog client-side, no row needed. The lead's `tag_ids` many2many_tags field has
+`options="{'on_tag_click': 'edit_color'}"` four more times besides the form occurrence (B55):
+`views/crm_lead_views.xml:353` (Leads list, no `editable` attribute), `:370` (Leads mobile
+kanban card), `:542` (pipeline kanban card) and `:753` (Opportunities list, no `editable`
+attribute). `many2many_tags_field.js`'s `onTagClick()` (`addons/web`) opens the color popover
+only `if (this.props.record.isInEdition)`; list/kanban records default to
+`mode: "readonly"` (`dynamic_list.js`/`dynamic_record_list.js`, confirmed by reading
+`record.js`'s `isInEdition` getter), and none of these four views sets `editable=` on the
+list or a mechanism that puts the clicked row into edit mode, so the click is a no-op there
+today — checked individually, not assumed; only the form occurrence (always `isInEdition`
+for an existing record) gets a row. The pipeline kanban's `group_create`/`group_delete`
+(B56/B57) and resequence (B58) and the stage list's `widget="handle"` resequence (B59) are
+likewise control-level additions this round; see their own rows for the exact mechanism.
 
 **Section C** — public (no leading underscore) methods on `crm.lead`, `crm.stage`,
 `crm.team`:
@@ -123,9 +149,58 @@ method's own file and, where applicable, the one caller noted):
   `convert_opportunity` (called internally by `action_convert_to_opportunity`, see C12),
   `message_new` (mail gateway entry point, not a button), `get_import_templates` (import
   wizard entry point, not a crm view button).
-- `crm.team`: `action_primary_channel_button` (defined in `crm_team.py:783`, not referenced
-  anywhere under `addons/crm/views`, `wizard`, `report`, or `static/src` — dead from crm's
-  own UI today; it is a `sales_team` dashboard control this addon does not customize).
+
+  **Correction (this revision):** `crm.team.action_primary_channel_button` (`crm_team.py:783`)
+  was previously listed here as excluded ("dead from crm's own UI today ... a `sales_team`
+  dashboard control this addon does not customize"). That is wrong: this addon's own
+  `crm_team_view_kanban_dashboard` (`views/crm_team_views.xml:259`,
+  `inherit_id="sales_team.crm_team_view_kanban_dashboard"`) inherits the exact view whose
+  kanban root carries `action="action_primary_channel_button" type="object"`
+  (`addons/sales_team/views/crm_team_views.xml:132`); the inherited view only adds fields
+  and a few `<xpath>` insertions, it never touches the kanban tag's `action`/`type`
+  attributes, so clicking a team card on the inherited Teams dashboard reaches this crm
+  override. It is reachable and gets its own row — C21.
+
+**Sweep method, round 2 (gap-closing re-sweep, this revision)** — a scrutiny review found
+7 blocking omissions in the sweep above; closing them exposed the same categories of
+omission are not special-cased by the original Section A/B grep patterns, so a second,
+targeted sweep was run across the same scope:
+```
+rg -n "editable=" addons/crm/views addons/crm/wizard addons/crm/report
+rg -n "widget=\"handle\"" addons/crm/views addons/crm/wizard addons/crm/report
+rg -n "group_create|group_delete|group_edit|archivable=" addons/crm/views addons/crm/wizard addons/crm/report
+rg -n "many2many_tags" addons/crm/views addons/crm/wizard addons/crm/report
+rg -n "on_tag_click" addons/crm/views
+rg -n "default_group_by|groups_draggable" addons/crm/views
+rg -n "kanban_color_picker" addons/crm/views
+rg -n "onSelect|_updateSwitcherSelection|_notify\(|switchView|searchModel\." addons/crm/static/src --include=*.js
+```
+Findings beyond the 7 confirmed gaps: the pipeline kanban (`crm_lead_views.xml:503`) has no
+`group_create`/`group_delete` attribute, so both default to enabled
+(`kanban_arch_parser.js:18-19` in `addons/web`) — the column-level create/delete rows (B56,
+B57) and the column-drag resequence (B58) all follow from that same `<kanban>` tag; the
+stage list's `widget="handle"` (`crm_stage_views.xml:23`) adds a fourth row (B59). The
+`editable="bottom"` sweep found exactly the two models named in the scrutiny findings
+(`crm.recurring.plan`, `crm.lost.reason` — B60/B61) and no third; `crm.stage`'s own list
+(B40) is `multi_edit="1"`, not `editable=`, and was already a row. The `many2many_tags`/
+`on_tag_click` sweep found the lead's five occurrences discussed above (one new row, B55,
+plus the four confirmed-unreachable siblings) and two more `many2many_tags` fields with no
+`on_tag_click` option at all (`wizard/crm_lead_pls_update_views.xml:12`'s `pls_fields` and
+`crm_stage_views.xml:26,48`'s `team_ids`, both display-only tag pickers, no color-edit
+control to classify) plus one more `on_tag_click="edit_color"` occurrence outside
+`crm.lead`'s own views (`report/crm_activity_report_views.xml:39`, `tag_ids` "Lead Tags" on
+a read-only report list row) — report-list rows are never `isInEdition` for the same reason
+as the non-editable Leads/Opportunities lists above, so no new row. The `onSelect`/`_notify`
+sweep found exactly
+one unmatched handler, `team_switcher.js:56-60` (A26); `crm_search_model.js`'s own
+`_notify()` calls (lines 163, 206, 228) are internal to the already-covered team-switcher
+family and are not themselves separate network entry points. The forecast kanban
+(`crm_lead_view_kanban_forecast`, `crm_lead_views.xml:565-600`) groups by `date_deadline`,
+not a many2one field; `kanban_renderer.js`'s `canCreateGroup()` requires
+`groupByField.type === "many2one"`, and `dynamic_group_list.js`'s `createGroup`/
+`resequence` both throw synchronously for a non-many2one groupby — so this kanban never
+renders group-level create/delete/resequence controls at all, and no new row applies there
+(it keeps relying on A25's "add next period" `list.load()`, already DISABLE).
 
 ## Section A — JS/XML ORM, rpc, action-service and group/access-probe calls (`static/src/**`)
 
@@ -136,7 +211,7 @@ method's own file and, where applicable, the one caller noted):
 | A3 | `static/src/components/team_switcher/team_switcher.js` | 18 | `this.actionService = useService("action")` | SKIP | Service-handle acquisition only; no network I/O at this line (the call it enables is A5). |
 | A4 | `static/src/components/team_switcher/team_switcher.js` | 21 | `await user.hasGroup("sales_team.group_sale_manager")` | SKIP | Team-switcher sales-manager probe (contract: SKIP); only toggles "Manage Teams" visibility. |
 | A5 | `static/src/components/team_switcher/team_switcher.js` | 46 | `this.actionService.doAction("sales_team.crm_team_action_config")` | DISABLE | "Manage Teams" navigation (contract: DISABLE); manager-only admin area, its `DropdownItem` is not auto-disabled. |
-| A6 | `static/src/views/crm_search_model.js` | 130-142 | `this.orm.cache({type:"disk",update:"always",callback}).call("crm.team","get_team_switcher_data")` | SKIP | Feeds the switcher list/domain; on a cache miss or offline the file's own "Offline Mode" section already falls back to "All Teams" with no crash and no queueing — same decision family as the team-switcher probe (see Notes #2 for the debated alternative). |
+| A6 | `static/src/views/crm_search_model.js` | 130-142 | `this.orm.cache({type:"disk",update:"always",callback}).call("crm.team","get_team_switcher_data")` | SKIP | Feeds the switcher list/domain; SKIP is the *target* disposition (a probe that only decorates/filters an already-loaded view), but **correction (this revision)**: today it does not degrade gracefully on a cache miss. `_initSwitcher()` (`crm_search_model.js:125-145`) `await`s this call with no `.catch`, and `load()` (`:42-47`) `await`s `_initSwitcher()` with no `.catch` either; `RPCCache.read()` (`addons/web/static/src/core/network/rpc_cache.js`) rejects its returned promise when there is no ram/disk value to fall back on, so an offline cache miss rejects `_initSwitcher()`, which rejects the whole `CrmSearchModel.load()` — aborting the view's load, not silently falling back to "All Teams". The file's "Offline Mode" section (`:210-250`) only re-exports/restores the team **facet** on an already-loaded search state (`applySearch`/`getCurrentSearch`); it has no bearing on this cache-miss path. Making this call actually skip silently on a miss (the behavior this row's SKIP classification assumes) is milestone-2 (`offline-fixes`) work, not yet done — see Notes #2. |
 | A7 | `static/src/views/crm_kanban/crm_column_progress.js` | 14 | `await user.hasGroup("crm.group_use_recurring_revenues")` | SKIP | Recurring-revenue (MRR) group probe (contract: SKIP); only toggles the MRR aggregate line. |
 | A8 | `static/src/views/crm_form/crm_pls_tooltip_button.js` | 30 | `this.orm = useService("orm")` | SKIP | Service-handle acquisition only; no network I/O at this line. |
 | A9 | `static/src/views/crm_form/crm_pls_tooltip_button.js` | 45 | `await this.props.record.save()` | QUEUE | Framework's `web_save` producer (`record.js` `_offlineSave`); queues any pending changes before the tooltip computation, same generic mechanism as any form save. |
@@ -156,6 +231,7 @@ method's own file and, where applicable, the one caller noted):
 | A23 | `static/src/components/lead_generation_dropdown/lead_generation_dropdown.js` | 257 | `this.action.doAction({type:"ir.actions.act_window",res_model:"base.module.install.request",...})` | DISABLE | Lead generation, transient access-request wizard (contract: DISABLE). |
 | A24 | `static/src/views/forecast_kanban/forecast_kanban_renderer.js` | 48 | `await this.props.list.load()` | DISABLE | Forecast kanban "add next period" column (contract: forecast views DISABLE); the new `fill_temporal` read-group context is never cached. |
 | A25 | `static/src/webclient/share_target/crm_share_target_item.js` | 18-22 | `this.state.teams = await this.orm.webSearchRead("crm.team", this.teamsDomain, {...}).then(...)` | DISABLE | PWA share-target team lookup; the whole share-to-lead flow needs a server-produced id from `name_create` on `res.partner` before an `ir.attachment` write — a chained id, DISABLE per the chained-id rule. |
+| A26 | `static/src/components/team_switcher/team_switcher.js` | 56-60 | `onSelect(teamId) { ... this.env.searchModel._updateSwitcherSelection(teamId); }` | DISABLE | **New row (this revision)**, missed by the original Section A grep (no `orm.`/`rpc(`/`doAction`/`hasGroup` token on these lines). Reached only through a `DropdownItem` inside the switcher's `Dropdown`, whose toggle is `<button class="o_cp_team_switcher">` (`team_switcher.xml:6`) with no `data-available-offline`; the framework's `SELECTORS_TO_DISABLE` (`button:not([data-available-offline]):not([disabled])`) disables that exact button offline — the same mechanism A5 relies on for "Manage Teams" — so the dropdown cannot be opened to reach this handler at all. Even if it were reached, `_updateSwitcherSelection` changes the search domain/context and calls `_notify()`, which drives the view controller to reload the kanban/list for the newly selected team; that reload may hit crm.lead/crm.stage data never visited offline for that team, so this is navigation to possibly-unavailable data, not a bare resolvable write — DISABLE per the catch-all rule, matching the scrutiny finding. |
 
 ## Section B — view, wizard and report buttons/controls with a server side effect
 
@@ -215,6 +291,13 @@ method's own file and, where applicable, the one caller noted):
 | B52 | `wizard/crm_merge_opportunities_views.xml` | 34 | Footer button `action_merge` ("Merge", transient `crm.merge.opportunity`) | DISABLE | Merge wizard (contract: DISABLE). |
 | B53 | `views/crm_lead_views.xml` | 373 | `<field name="priority" widget="priority"/>` (Leads mobile kanban card footer) | QUEUE | Framework `web_save({priority})` producer, same mechanism as B22, second kanban view (Leads instead of pipeline). |
 | B54 | `views/crm_lead_views.xml` | 734 | `<field name="priority" optional="hide" widget="priority"/>` (Opportunities list column) | QUEUE | Framework `web_save({priority})` producer; list-view click-to-save widget, same mechanism as B22/B53, third occurrence. |
+| B55 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', ...}"/>` (lead form) | DISABLE | **New row (this revision)**. The form record is always `isInEdition` (an existing record being viewed in a non-readonly form), so clicking a tag opens `Many2ManyTagsFieldColorListPopover`; picking a color calls `many2many_tags_field.js`'s `switchTagColor()` → `tagRecord.update({[colorField]: colorIndex}); tagRecord.save();` — a direct write to `crm.tag`, not `crm.lead`/`crm.stage`/`crm.team`, so DISABLE. The four other `on_tag_click="edit_color"` occurrences in this file (`:353`, `:370`, `:542`, `:753`) are in non-`editable` list/kanban views where the control is unreachable today (see "Excluded from Section B" above) and get no row. |
+| B56 | `views/crm_lead_views.xml` | 503 | Pipeline kanban "Add a column..." (stage-column create; `group_create` not set on this `<kanban>`, defaults to enabled per `kanban_arch_parser.js:18`) | DISABLE | **New row (this revision)**. Submitting the column-create input calls `dynamic_group_list.js`'s `createGroup(groupName)` → `_createGroup()`, which does `orm.call("crm.stage", "name_create", [groupName])` and then uses the **returned id** to set `default_<field>` context on the new group's config and to resequence the new column after the last one — an id produced by this very call, so DISABLE per the chained-id rule, never QUEUE, regardless of `crm.stage` being otherwise QUEUE-eligible. |
+| B57 | `views/crm_lead_views.xml` | 503 | Pipeline kanban column config-menu "Delete" (stage-column delete; `group_delete` not set, defaults to enabled per `kanban_arch_parser.js:19`) | QUEUE | **New row (this revision)**. Calls `dynamic_group_list.js`'s `deleteGroups([group])` → `_deleteGroups()` → `_unlinkGroups()`, which issues a plain `orm.unlink("crm.stage", [stageId])` — a bare write with a client-known id on `crm.stage` (a QUEUE-eligible model), so QUEUE by rule 1; this matches what the scrutiny review flagged as the correct target. It is **not** one of the framework's own auto-queued producers (`web_save`/`web_unlink`/`action_archive`/`action_unarchive`): `_unlinkGroups()` has no `ConnectionLostError` catch, so today the click throws uncaught offline instead of queueing — it needs a new crm-side `scheduleORM` producer like the other rows in Notes #1, which now also lists it. |
+| B58 | `views/crm_lead_views.xml` | 503 | Pipeline kanban stage-column drag (resequencing stage columns themselves, not cards; `groups_draggable` not overridden, defaults to enabled for a many2one groupby) | QUEUE | **New row (this revision)**. Dropping a dragged column calls `dynamic_group_list.js`'s `resequence(movedGroupId, targetGroupId)` → `_resequence()` → the shared `resequence()` util (`relational_model/utils.js:794-866`) → `orm.webResequence("crm.stage", resIds, {field_name:"sequence", offset, context})` — **not** `web_save`, unlike what B21's card-drag and B40's generic "any stage edit" wording might suggest. `webResequence` has no queue producer either (the util's only `catch` rolls the UI order back and rethrows); bare ids + offset are client-resolvable on `crm.stage`, so QUEUE by rule 1, needing a new producer — see Notes #1. Distinct from B21 (per-record `web_save({stage_id})` when a *card* is dropped into a different column, already auto-queued). |
+| B59 | `views/crm_stage_views.xml` | 23 | `<field name="sequence" widget="handle"/>` (Stages list drag-to-reorder) | QUEUE | **New row (this revision)**. Dragging a row by its handle calls the list's `_resequence()` → the same `resequence()` util → `orm.webResequence("crm.stage", resIds, {field_name:"sequence", offset, context})` as B58 — the exact call B40's "any stage edit → `web_save`" wording does not cover. QUEUE by rule 1 (bare ids + offset, `crm.stage`); needs its own crm-side producer, same gap as B57/B58 — see Notes #1. |
+| B60 | `views/crm_recurring_plan_views.xml` | 8-9 | `<list editable="bottom">` + `<field name="sequence" widget="handle"/>` (crm.recurring.plan: inline create/edit/resequence) | DISABLE | **New row (this revision)**. An editable-list row's inline edit/create would auto-queue via the framework's `web_save` producer like any form, and the handle's resequence would go through the same `webResequence` path as B58/B59 — but the model is `crm.recurring.plan`, not `crm.lead`/`crm.stage`/`crm.team` or a lead's `mail.activity`, so rule 1 does not apply at all regardless of mechanism — DISABLE. |
+| B61 | `views/crm_lost_reason_views.xml` | 49 | `<list string="Channel" editable="bottom">` (crm.lost.reason: inline create/edit) | DISABLE | **New row (this revision)**. Same reasoning as B60: inline edits on an editable list would auto-queue via `web_save`, but `crm.lost.reason` is outside rule 1's model scope — DISABLE. |
 
 ## Section C — public `crm.lead` / `crm.stage` / `crm.team` methods reachable from a button
 
@@ -239,7 +322,8 @@ method's own file and, where applicable, the one caller noted):
 | C17 | `models/crm_team.py` | 211 | `action_assign_leads()` | DISABLE | Reachable via the "Assign Leads" button (B30); mass assignment across many leads, posts a note, returns a notification action. |
 | C18 | `models/crm_team.py` | 762 | `action_open_opportunities()` | DISABLE | Reachable via the stat button (B31); navigation, read-only. |
 | C19 | `models/crm_team.py` | 770 | `action_open_unassigned_opportunities()` | DISABLE | Reachable via the dashboard `<a>` (B32); navigation, read-only. |
-| C20 | `models/crm_team.py` | 794 | `get_team_switcher_data()` | SKIP | Reachable via the JS call (A6); same decision as A6 (falls back to "All Teams", no queueing) — debatable, see Notes #2. |
+| C20 | `models/crm_team.py` | 794 | `get_team_switcher_data()` | SKIP | Reachable via the JS call (A6); SKIP is the target disposition, but **correction (this revision)**: today an offline cache miss rejects the whole search-model load rather than falling back to "All Teams" — see A6's corrected justification and Notes #2. |
+| C21 | `models/crm_team.py` | 783 | `action_primary_channel_button()` | DISABLE | **New row (this revision)**. Previously excluded as "dead from crm's own UI"; that was wrong — this addon's `crm_team_view_kanban_dashboard` (`views/crm_team_views.xml:259`) inherits `sales_team.crm_team_view_kanban_dashboard`, whose kanban root carries `action="action_primary_channel_button" type="object"` (`addons/sales_team/views/crm_team_views.xml:132`); the inherited view's `<xpath>` edits never touch that attribute, so clicking a team card on the Teams dashboard reaches this crm override. It returns `self.action_open_opportunities()` when `use_opportunities` (otherwise `super()`'s own navigation) — a read-only navigation action, same reasoning as C18/C19 — DISABLE. |
 
 ## Counts
 
@@ -247,19 +331,22 @@ method's own file and, where applicable, the one caller noted):
 
 | Classification | Count |
 |---|---|
-| QUEUE | 25 |
+| QUEUE | 28 |
 | SKIP | 12 |
-| DISABLE | 62 |
-| **Total** | **99** |
+| DISABLE | 68 |
+| **Total** | **108** |
 
 ### Per section
 
 | Section | Rows | QUEUE | SKIP | DISABLE |
 |---|---|---|---|---|
-| A — JS/XML calls | 25 | 3 (A9, A13, A15) | 10 (A3, A4, A6, A7, A8, A12, A14, A16, A17, A18) | 12 (A1, A2, A5, A10, A11, A19, A20, A21, A22, A23, A24, A25) |
-| B — view/wizard/report buttons and controls | 54 | 13 (B1, B3, B5, B8, B11, B19, B20, B21, B22, B24, B40, B53, B54) | 0 | 41 (B2, B4, B6, B7, B9, B10, B12-B18, B23, B25-B39, B41-B52) |
-| C — public model methods reachable from a button | 20 | 9 (C1, C2, C3, C4, C6, C7, C14, C15, C16) | 2 (C9, C20) | 9 (C5, C8, C10, C11, C12, C13, C17, C18, C19) |
-| **Total** | **99** | **25** | **12** | **62** |
+| A — JS/XML calls | 26 | 3 (A9, A13, A15) | 10 (A3, A4, A6, A7, A8, A12, A14, A16, A17, A18) | 13 (A1, A2, A5, A10, A11, A19, A20, A21, A22, A23, A24, A25, A26) |
+| B — view/wizard/report buttons and controls | 61 | 16 (B1, B3, B5, B8, B11, B19, B20, B21, B22, B24, B40, B53, B54, B57, B58, B59) | 0 | 45 (B2, B4, B6, B7, B9, B10, B12-B18, B23, B25-B39, B41-B52, B55, B56, B60, B61) |
+| C — public model methods reachable from a button | 21 | 9 (C1, C2, C3, C4, C6, C7, C14, C15, C16) | 2 (C9, C20) | 10 (C5, C8, C10, C11, C12, C13, C17, C18, C19, C21) |
+| **Total** | **108** | **28** | **12** | **68** |
+
+(9 rows added this revision: A26; B55-B61; C21. Counts above are the recomputed totals,
+not a delta.)
 
 ## Notes for review
 
@@ -290,18 +377,42 @@ these, gated on `isOffline()`, with optimistic UI:
   because they are the other half of "QUEUE rows needing a producer" even though the
   triggering controls (B17/B23, kanban_activity widget) are classified DISABLE in *this*
   inventory since no crm-owned offline UI exists for them yet (see Notes #3).
+- **New this revision — B57/C stage-column delete**: call `scheduleORM("crm.stage",
+  "unlink", [[group.value]], {context})` from the kanban header's delete handler
+  (`addons/web`'s `deleteGroup`), gated on `isOffline()`; the id is already known client-side
+  (it is the group's own value), so no onchange/wizard is involved.
+- **New this revision — B58/B59 stage resequencing**: both the pipeline's column drag and
+  the Stages list's handle widget need a producer around `webResequence("crm.stage", ids,
+  {field_name:"sequence", offset, context})`, e.g. `scheduleORM("crm.stage",
+  "web_resequence", [ids], {field_name, offset, context})`, gated on `isOffline()` and with
+  the same UI-rollback-on-reject behavior the online `resequence()` util already has when
+  offline the call doesn't actually fail. Two call sites, one producer.
+- B56 (stage-column create via `name_create`) stays DISABLE regardless of a producer: the
+  chained id defeats rule 1 outright, so no amount of crm-side `scheduleORM` wiring would
+  make it QUEUE-eligible; it is listed in the DISABLE counts, not here.
 
 ### 2. Debatable rows
 
-- **A6/C20 — `get_team_switcher_data`**: chosen SKIP because `crm_search_model.js`'s own
-  "Offline Mode" section already implements a graceful fallback (`switcherAvailable=false`,
-  `switcherTeams=[]`, "All Teams") with no crash. The alternative is DISABLE, because an
-  uncached miss with the background-refresh error unhandled could in principle abort the
-  whole view load (the disk-cache rethrows the network error from the background refresh).
-  SKIP wins because the code path that would need to catch that error already exists and is
-  designed to degrade gracefully, matching the "probe that only toggles display" spirit of
-  rule 2 (the switcher list only decorates/filters an already-loaded view; it does not gate
-  the view's own load).
+- **A6/C20 — `get_team_switcher_data`** — **corrected this revision**: the previous version
+  of this row claimed `crm_search_model.js`'s "Offline Mode" section already implements a
+  graceful fallback to "All Teams" with no crash on a cache miss. That claim was false:
+  rereading `_initSwitcher()` (`:125-145`) shows it `await`s
+  `this.orm.cache({type:"disk",...}).call("crm.team","get_team_switcher_data")` with **no
+  `.catch`**, and `load()` (`:42-47`) `await`s `_initSwitcher()` with **no `.catch`**
+  either; `RPCCache.read()` (`addons/web/static/src/core/network/rpc_cache.js`) rejects its
+  returned promise when there is no cached value to serve, so an uncached offline miss
+  rejects `_initSwitcher()` and therefore the whole `CrmSearchModel.load()` — aborting the
+  view's load entirely, not falling back to "All Teams". The "Offline Mode" section
+  (`:210-250`, `applySearch`/`getCurrentSearch`) only restores/exports the team **facet** on
+  an already-loaded search state; it never runs during `_initSwitcher()`. SKIP is kept as
+  the row's classification because the call's *nature* is still a decorative/advisory probe
+  (rule 2's "probe that only toggles display" — the switcher list filters an already-usable
+  view, it is not supposed to gate the view's own load); the fix is **milestone-2
+  (`offline-fixes`) work**: add an explicit `.catch` in `_initSwitcher()` so a miss degrades
+  to `{available:false, teams:[]}` instead of rejecting, which is what would make the
+  current SKIP classification actually true in practice. Until that fix lands, note that
+  today's behavior does not match the SKIP contract ("not issued offline, raises nothing");
+  this is a known, tracked gap, not a silent omission.
 - **B8/B11/C7 — `action_set_automated_probability`**: chosen QUEUE because the rule is
   content-based (bare `[[id]]`, fully resolvable, no onchange/wizard/chained id) and the
   method is a plain recompute-and-write. The alternative is DISABLE, because the `<a>`
@@ -328,6 +439,16 @@ these, gated on `isOffline()`, with optimistic UI:
   uncached lead throws an unhandled `ConnectionLostError`. This is consistent with — and
   will be resolved by — architecture §3.2 item 10's planned uncached-lead helper; see
   Notes #3.
+- **B57/B58/B59 — stage delete/resequence**: chosen QUEUE on the same content-based reading
+  as B8/B11/C7 above (bare ids, no onchange/wizard/chained id, on `crm.stage`), matching
+  what the scrutiny review flagged as the correct target. The conservative alternative is
+  DISABLE for the same reason B8/B11 could be downgraded: none of `orm.unlink`/
+  `orm.webResequence` is one of the framework's four auto-queued producers, so today the
+  click just throws uncaught offline instead of either queueing or being disabled — a
+  reviewer who wants QUEUE reserved for calls the framework *already* auto-queues could
+  downgrade all three to DISABLE with no ripple effect (same crm-side work either way: a
+  new producer for QUEUE, or three new `data-available-offline`-less disablings for
+  DISABLE).
 - **C5/C8 vs B1/B3/B4/B49**: `action_set_lost` (C5) and `action_set_won_rainbowman` (C8) are
   each DISABLE as *methods*, even though the *button* that is their nearest neighbour (B1
   for C8, and B4/B49 for the "Lost" family that C5 belongs to) is QUEUE (B1) or DISABLE
@@ -361,3 +482,37 @@ these, gated on `isOffline()`, with optimistic UI:
   (`get_team_switcher_data`) is an additional SKIP in the same team-switcher family, decided
   as debatable in Notes #2 above but consistent with the same "probe that only
   decorates/filters an already-usable view" reasoning.
+- **Writes on non-`crm.lead`/`crm.stage`/`crm.team` models → DISABLE**: matches the two
+  rows added this revision for editable lists on other models, B60 (`crm.recurring.plan`)
+  and B61 (`crm.lost.reason`), and B55 (writes `crm.tag`, not a lead/stage/team field) —
+  consistent with how every other out-of-scope-model row in this document (B45-B47 on
+  `res.config.settings`, B42 on `res.partner`, B43/B44 on `utm.campaign`) is already
+  DISABLE regardless of how simple the write would otherwise be.
+- **Chained id → DISABLE, never QUEUE**: matches B56 (stage-column create via `name_create`,
+  same family as B25's partner `name_create` and A25's share-target `name_create`), applying
+  the chained-id rule exactly as it already does elsewhere in this document.
+- **Navigation to data that may be unavailable offline → DISABLE**: A26 (team-switcher
+  selection reload) joins A5 (Manage Teams) and the B30-B39/C17-C19 team-navigation family
+  under this same reasoning; C21 (`action_primary_channel_button`) joins C18/C19 as a third
+  read-only `crm.team` navigation method.
+
+### 4. Scrutiny round and bounded completeness pass (this revision)
+
+A scrutiny review of the `a6a1ceef` commit found 7 blocking gaps, all confirmed against
+source and closed above: A26 (team-switcher selection), B55 (lead tag-color editor), B56/
+B57/B58 (pipeline stage-column create/delete/resequence), B59 (stage-list handle
+resequence), B60/B61 (recurring-plan/lost-reason editable lists), C21
+(`action_primary_channel_button`, with the "excluded" bullet in Section C's header removed),
+and the corrected A6/C20 justification (no code change; the false "graceful fallback" claim
+is replaced with the actual uncaught-rejection behavior, and the fix is flagged as
+milestone-2 work). The bounded completeness pass for the same categories (editable lists,
+handle/resequence widgets, kanban group-level controls, many2many_tags color/edit options,
+component-level reload/selection handlers) across the rest of `addons/crm` found no further
+rows beyond those 9: the four other `on_tag_click="edit_color"` occurrences and the two
+plain `many2many_tags` (no color-click) fields are confirmed unreachable or non-actionable
+(see "Excluded from Section B" and "Sweep method, round 2" above); the forecast kanban's
+date-groupby never exposes group-level controls at all (same section); no other view in
+`addons/crm` has an `editable=`, `widget="handle"`, or non-default `group_create`/
+`group_delete`/`group_edit`/`archivable` attribute (confirmed by the round-2 `rg` commands
+above matching only the rows already added); no other component under `static/src` has an
+`onSelect`/`_notify`-style reload handler (confirmed by the same sweep).
