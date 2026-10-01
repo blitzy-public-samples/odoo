@@ -37,6 +37,29 @@ B63, appended per this document's existing convention (no row renumbered). HEAD 
 round's re-verification is `6e6de2b8` (no crm source changed by this fix either); every
 citation — old and new — was re-read again at this HEAD.
 
+**This round-3 fix** closes 3 further scrutiny findings against `cf127d42` (the commit the
+round-2 fix above landed as), all in the same "relational-field create/edit" category: the
+Leads/Opportunities multi-edit lists' tag color-edit and quick-create
+(`crm_lead_views.xml:353,753`, both falsely excluded as unreachable), the Stages multi-edit
+list's `team_ids` quick-create (`crm_stage_views.xml:26`, falsely called "display-only"),
+and the PLS-update wizard's `pls_fields` quick-create (`wizard/crm_lead_pls_update_views.xml:12`,
+same false "display-only" framing). Rather than patch these three in place, this fix adds a
+new **Section B-REL** that exhaustively enumerates every many2one/many2many/many2many_tags/
+one2many field occurrence in an editable context that can create or edit a related record,
+generated with a throwaway script (`/tmp/rel_field_sweep.py`, not committed — its selection
+logic is restated below so the enumeration is reproducible without the script itself). That
+pass found 2 further occurrences beyond the three named findings (the Opportunities list's
+`list_activity` widget, and the lead form's `partner_id` with `widget="res_partner_many2one"`)
+and confirmed that one single framework mechanism — `Many2XAutocomplete.suggest()` adding its
+"Create"/"Create and edit" suggestions only `if (!this.offlinePlugin.isOffline())`
+(`addons/web/static/src/views/fields/relational_utils.js:450-454`) — already hides the
+*typed-name* quick-create path for every many2one and many2many_tags field in this addon's
+views offline, which the original "display-only" claims had not identified as the real
+reason those two specific fields' create paths are already effectively covered; the tag
+color-edit popover is a separate, uncovered mechanism (confirmed in Section B-REL's header).
+HEAD for this round's re-verification is `cf127d42` (no crm source changed by this fix
+either); every citation — old and new — was re-read again at this HEAD.
+
 ## Rules (applied in order, verbatim from the kickoff)
 
 1. **QUEUE** — a write on `crm.lead`, `crm.stage`, `crm.team`, or a lead's `mail.activity`,
@@ -129,15 +152,20 @@ the `mail_activity_mixin_list_reschedule_dropdown` widget from the report list �
 effect, deleting a control, not adding one. `special="cancel"` buttons in every wizard just
 close the dialog client-side, no row needed. The lead's `tag_ids` many2many_tags field has
 `options="{'on_tag_click': 'edit_color'}"` four more times besides the form occurrence (B55):
-`views/crm_lead_views.xml:353` (Leads list, no `editable` attribute), `:370` (Leads mobile
-kanban card), `:542` (pipeline kanban card) and `:753` (Opportunities list, no `editable`
-attribute). `many2many_tags_field.js`'s `onTagClick()` (`addons/web`) opens the color popover
-only `if (this.props.record.isInEdition)`; list/kanban records default to
-`mode: "readonly"` (`dynamic_list.js`/`dynamic_record_list.js`, confirmed by reading
-`record.js`'s `isInEdition` getter), and none of these four views sets `editable=` on the
-list or a mechanism that puts the clicked row into edit mode, so the click is a no-op there
-today — checked individually, not assumed; only the form occurrence (always `isInEdition`
-for an existing record) gets a row. The pipeline kanban's `group_create`/`group_delete`/
+`views/crm_lead_views.xml:353` (Leads list), `:370` (Leads mobile kanban card), `:542`
+(pipeline kanban card) and `:753` (Opportunities list). `many2many_tags_field.js`'s
+`onTagClick()` (`addons/web`) opens the color popover only
+`if (this.props.record.isInEdition)`; kanban records default to `mode: "readonly"`
+(`dynamic_record_list.js`), so `:370` and `:542` (both kanban cards) are correctly excluded
+regardless of anything else on the page. **Correction (round-3 fix):** `:353` and `:753`
+are **not** excluded — both lists (`crm_case_tree_view_leads`/`crm_case_tree_view_oppor`)
+are `multi_edit="1"` (`:320`, `:707`), and `list_renderer.js`'s `onCellClicked()` enters a
+*selected* row into edit mode on a cell click even with no `editable=` attribute (confirmed
+by reading `:1520-1557` at HEAD — the `multiEdit && record.selected` branch is checked
+before the `editable=`-only branch), making `record.isInEdition` true for that row exactly
+as it already is for the form; see Section B-REL's BR1-BR4 for the color-edit and
+quick-create rows this adds, replacing the earlier "no-op" claim for these two occurrences.
+The pipeline kanban's `group_create`/`group_delete`/
 `group_edit` (B56/B57/B62) and resequence (B58) and the stage list's `widget="handle"`
 resequence (B59) are likewise control-level additions; see their own rows for the exact
 mechanism. The lead form's tag field (`:245`) also exposes a quick-create "Create" option
@@ -203,10 +231,16 @@ stage list's `widget="handle"` (`crm_stage_views.xml:23`) adds a fourth row (B59
 (`crm.recurring.plan`, `crm.lost.reason` — B60/B61) and no third; `crm.stage`'s own list
 (B40) is `multi_edit="1"`, not `editable=`, and was already a row. The `many2many_tags`/
 `on_tag_click` sweep found the lead's five occurrences discussed above (one new row, B55,
-plus the four confirmed-unreachable siblings) and two more `many2many_tags` fields with no
-`on_tag_click` option at all (`wizard/crm_lead_pls_update_views.xml:12`'s `pls_fields` and
-`crm_stage_views.xml:26,48`'s `team_ids`, both display-only tag pickers, no color-edit
-control to classify) plus one more `on_tag_click="edit_color"` occurrence outside
+plus the four siblings, two of which — `:370`, `:542` — are confirmed-unreachable kanban
+cards; see the round-3 fix's correction for `:353`/`:753` above and BR1-BR4) and two more
+`many2many_tags` fields with no `on_tag_click` option at all: `crm_stage_views.xml:48`'s
+form `team_ids` (`no_open`+`no_create` both set — genuinely display-only, no create and no
+color-edit control) and, **(correction, round-3 fix)**, `crm_stage_views.xml:26`'s *list*
+`team_ids` and `wizard/crm_lead_pls_update_views.xml:12`'s `pls_fields` — neither of these
+two sets `no_create`/`no_quick_create`, so each still exposes a quick-create "Create"
+suggestion in its autocomplete (hidden offline by the framework, see Section B-REL's header);
+calling them "display-only" alongside `:48` was wrong — see BR5/BR6. One more
+`on_tag_click="edit_color"` occurrence outside
 `crm.lead`'s own views (`report/crm_activity_report_views.xml:39`, `tag_ids` "Lead Tags" on
 a read-only report list row) — report-list rows are never `isInEdition` for the same reason
 as the non-editable Leads/Opportunities lists above, so no new row. The `onSelect`/`_notify`
@@ -243,6 +277,54 @@ B63. The B57/B58/B59 producer notes were checked against the actual framework ca
 again (`relational_model/utils.js:854-861`, `offline_plugin.js:271-279,447-449`,
 `addons/web/models/models.py:540`) and rewritten below and in Notes #1 to name the model and
 method a future producer must queue without restating the exact argument list.
+
+**Sweep method, round 4 (relational-field create/edit sweep, this revision)** — a third
+scrutiny round found 3 blocking gaps in `cf127d42`, all in the same category: a many2one/
+many2many/many2many_tags/one2many field, in an editable context, that can create or edit a
+related record through a mechanism this document had not swept for. Rather than patch the
+3 named occurrences in place, a dedicated throwaway script,
+`/tmp/rel_field_sweep.py` (not committed), was written to re-derive the whole category from
+scratch; its selection logic, restated here so the result is reproducible without the
+script itself:
+1. Parse every `<record model="ir.ui.view">` in `addons/crm/views/*.xml`,
+   `addons/crm/wizard/*.xml`, `addons/crm/report/*.xml` with `lxml.etree` (keeps
+   `.sourceline`); read each record's `<field name="model">` (the arch's `res_model`) and
+   the root tag of its `<field name="arch" type="xml">`.
+2. Skip the whole record if that root tag is `kanban`/`search`/`graph`/`pivot`/`calendar`
+   (per the task's exclusion), or descend into a `<templates>` (kanban card QWeb) without
+   ever treating it as editable.
+3. Track, at every `<list>`/`<form>` boundary, whether the container is an **editable
+   context**: a `<form>` always is; a `<list>` is only if it has `editable="top"/"bottom"`
+   **or** `multi_edit="1"` — the latter because `list_renderer.js`'s `onCellClicked()`
+   (`:1520-1557`) puts a *selected* row into edit mode on a cell click with no `editable=`
+   attribute at all (the exact mechanism the round-3 findings turned on); a `<list>` with
+   neither is a display/open-only list and nothing inside it is independently editable.
+4. For every `<field>` inside an editable container, resolve its Odoo field type from a
+   `model, field → (ttype, relation)` map read once from `ir_model_fields` in the
+   `crm_offline` database (`psql -d crm_offline -Atc "select model, name, ttype, relation
+   from ir_model_fields where ttype in ('many2one','many2many','one2many') and model in
+   (...)"`, for every `res_model` this sweep's records target) — keep only
+   `many2one`/`many2many`/`one2many` (`many2many_tags` is a *widget*, not a type; the type
+   is `many2many`). One2many/many2many fields with their own inline `<list>`/`<form>`
+   sub-arch are recursed into with the model switched to the field's `relation`.
+5. Exclude a field occurrence with a static `readonly="1"`/`readonly="True"`, or a static
+   `invisible="1"`/`column_invisible="True"` (a field that is never rendered has no
+   interactive capability at all) — dynamic expressions are not evaluated and are kept,
+   same as the existing document's section-A/B readonly handling.
+6. The script prints every surviving occurrence (file, line, model, container kind, field,
+   ttype/relation, widget, options, create/domain attrs, inline-subarch flag) as a
+   candidate list; it does not itself decide create/edit capability per widget — that
+   requires reading each widget's own `extractProps`/component, done by hand below and
+   cross-checked against `addons/web`'s field-registry source files at HEAD.
+
+Run against this scope, the script found 52 candidate many2one/many2many/one2many
+occurrences in an editable context. Of those, 44 are plain many2one/many2many(_tags) fields
+with no non-default create/edit mechanism and fall under the blanket Many2XAutocomplete
+coverage stated in Section B-REL's header (listed there, not repeated here); the remaining
+8 are the three round-3 findings (6 rows, since the two list `tag_ids` occurrences each need
+a separate color-edit row and quick-create row) plus 2 more the completeness pass surfaced
+(the Opportunities list's `list_activity` widget, and the lead form's `partner_id` with
+`widget="res_partner_many2one"`) — Section B-REL's BR1-BR8.
 
 ## Section A — JS/XML ORM, rpc, action-service and group/access-probe calls (`static/src/**`)
 
@@ -333,7 +415,7 @@ method a future producer must queue without restating the exact argument list.
 | B52 | `wizard/crm_merge_opportunities_views.xml` | 34 | Footer button `action_merge` ("Merge", transient `crm.merge.opportunity`) | DISABLE | Merge wizard (contract: DISABLE). |
 | B53 | `views/crm_lead_views.xml` | 373 | `<field name="priority" widget="priority"/>` (Leads mobile kanban card footer) | QUEUE | Framework `web_save({priority})` producer, same mechanism as B22, second kanban view (Leads instead of pipeline). |
 | B54 | `views/crm_lead_views.xml` | 734 | `<field name="priority" optional="hide" widget="priority"/>` (Opportunities list column) | QUEUE | Framework `web_save({priority})` producer; list-view click-to-save widget, same mechanism as B22/B53, third occurrence. |
-| B55 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', ...}"/>` (lead form) | DISABLE | **New row (this revision)**. The form record is always `isInEdition` (an existing record being viewed in a non-readonly form), so clicking a tag opens `Many2ManyTagsFieldColorListPopover`; picking a color calls `many2many_tags_field.js`'s `switchTagColor()` → `tagRecord.update({[colorField]: colorIndex}); tagRecord.save();` — a direct write to `crm.tag`, not `crm.lead`/`crm.stage`/`crm.team`, so DISABLE. The four other `on_tag_click="edit_color"` occurrences in this file (`:353`, `:370`, `:542`, `:753`) are in non-`editable` list/kanban views where the control is unreachable today (see "Excluded from Section B" above) and get no row. |
+| B55 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', ...}"/>` (lead form) | DISABLE | **New row (this revision)**. The form record is always `isInEdition` (an existing record being viewed in a non-readonly form), so clicking a tag opens `Many2ManyTagsFieldColorListPopover`; picking a color calls `many2many_tags_field.js`'s `switchTagColor()` → `tagRecord.update({[colorField]: colorIndex}); tagRecord.save();` — a direct write to `crm.tag`, not `crm.lead`/`crm.stage`/`crm.team`, so DISABLE. Two of the four other `on_tag_click="edit_color"` occurrences in this file (`:370`, `:542`) are kanban cards, always `mode: "readonly"`, and stay unreachable (see "Excluded from Section B" above); the other two (`:353`, `:753`, both `multi_edit="1"` lists) are reachable through row selection and get their own rows — see Section B-REL's BR1/BR3 (**correction, round-3 fix**: the original document wrongly excluded these two as well). |
 | B56 | `views/crm_lead_views.xml` | 503 | Pipeline kanban "Add a column..." (stage-column create; `group_create` not set on this `<kanban>`, defaults to enabled per `kanban_arch_parser.js:18`) | DISABLE | **New row (this revision)**. Submitting the column-create input calls `dynamic_group_list.js`'s `createGroup(groupName)` → `_createGroup()`, which does `orm.call("crm.stage", "name_create", [groupName])` and then uses the **returned id** to set `default_<field>` context on the new group's config and to resequence the new column after the last one — an id produced by this very call, so DISABLE per the chained-id rule, never QUEUE, regardless of `crm.stage` being otherwise QUEUE-eligible. |
 | B57 | `views/crm_lead_views.xml` | 503 | Pipeline kanban column config-menu "Delete" (stage-column delete; `group_delete` not set, defaults to enabled per `kanban_arch_parser.js:19`) | QUEUE | **New row (this revision)**. Calls `dynamic_group_list.js`'s `deleteGroups([group])` → `_deleteGroups()` → `_unlinkGroups()`, which issues a plain `orm.unlink("crm.stage", [stageId])` — a bare write with a client-known id on `crm.stage` (a QUEUE-eligible model), so QUEUE by rule 1; this matches what the scrutiny review flagged as the correct target. It is **not** one of the framework's own auto-queued producers (`web_save`/`web_unlink`/`action_archive`/`action_unarchive`): `_unlinkGroups()` has no `ConnectionLostError` catch, so today the click throws uncaught offline instead of queueing — it needs a new crm-side `scheduleORM` producer like the other rows in Notes #1, which now also lists it. |
 | B58 | `views/crm_lead_views.xml` | 503 | Pipeline kanban stage-column drag (resequencing stage columns themselves, not cards; `groups_draggable` not overridden, defaults to enabled for a many2one groupby) | QUEUE | **New row (this revision)**. Dropping a dragged column calls `dynamic_group_list.js`'s `resequence(movedGroupId, targetGroupId)` → `_resequence()` → the shared `resequence()` util (`relational_model/utils.js:794-866`), which calls `orm.webResequence` on `crm.stage` — **not** `web_save`, unlike what B21's card-drag and B40's generic "any stage edit" wording might suggest. `webResequence` has no queue producer either (the util's only `catch` rolls the UI order back and rethrows). Every argument that call needs — the moved ids, the sequence field name, the offset, and the per-field `specification` the Python method requires (`addons/web/models/models.py:540`) — is resolvable purely from client-known state, so the full argument list stays client-resolvable and this is QUEUE by rule 1 regardless; it needs a new producer — see Notes #1 for the method-level statement (the exact call, including that `specification` kwarg and the `scheduleORM` options/extras, is implementation work for milestone 2). Distinct from B21 (per-record `web_save({stage_id})` when a *card* is dropped into a different column, already auto-queued). |
@@ -341,7 +423,105 @@ method a future producer must queue without restating the exact argument list.
 | B60 | `views/crm_recurring_plan_views.xml` | 8-9 | `<list editable="bottom">` + `<field name="sequence" widget="handle"/>` (crm.recurring.plan: inline create/edit/resequence) | DISABLE | **New row (this revision)**. An editable-list row's inline edit/create would auto-queue via the framework's `web_save` producer like any form, and the handle's resequence would go through the same `webResequence` path as B58/B59 — but the model is `crm.recurring.plan`, not `crm.lead`/`crm.stage`/`crm.team` or a lead's `mail.activity`, so rule 1 does not apply at all regardless of mechanism — DISABLE. |
 | B61 | `views/crm_lost_reason_views.xml` | 49 | `<list string="Channel" editable="bottom">` (crm.lost.reason: inline create/edit) | DISABLE | **New row (this revision)**. Same reasoning as B60: inline edits on an editable list would auto-queue via `web_save`, but `crm.lost.reason` is outside rule 1's model scope — DISABLE. |
 | B62 | `views/crm_lead_views.xml` | 503 | Pipeline kanban column config-menu "Edit" (stage-column edit; `group_edit` not set on this `<kanban>`, defaults to enabled per `kanban_arch_parser.js:20`) | DISABLE | **New row (round 2 fix)**. The same column config menu that renders Delete (B57) also renders an "Edit" item (`group_config_menu.js`'s `edit_group` entry, `:87-98`, gated by `canEditGroup()`, `:80-84`); choosing it calls `editGroup()` (`:61-72`), which opens a `FormViewDialog` on the clicked stage's own id (`resModel: groupByField.relation`, i.e. `crm.stage`) and, on save, calls `this.props.list.load()` to reload the kanban. The dialog loads that specific `crm.stage` record outside the view-level `actionId`/`viewType` tracking `OfflinePlugin.isAvailableOffline` keys offline availability on, so opening the dialog for a stage never visited offline throws `ConnectionLostError` — the same uncached-record-navigation reasoning as B18's kanban-card "Edit" menu item, plus a second round-trip on save. Not a bare resolvable write: DISABLE per the navigation-unavailable-offline rule, distinct from B57 (Delete, QUEUE) and B40 (direct form/list field edits, QUEUE). |
-| B63 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', 'no_create_edit': True}"/>` (lead form, tag quick-create) | DISABLE | **New row (round 2 fix)**. Only `no_create_edit` is set on this field, not `no_create` or `no_quick_create`; `many2many_tags_field.js`'s `extractProps` therefore computes `canQuickCreate = canCreate && !noQuickCreate` as true, so typing an unmatched tag name in the autocomplete offers a "Create" suggestion (`relational_utils.js:483-515`) whose handler calls `this.orm.call("crm.tag", "name_create", [name], ...)` and immediately links the **returned id** to the lead (`many2many_tags_field.js:127-132`) — an id produced by this very call, so DISABLE per the chained-id rule, same family as B25/B56. Distinct from B55, which classifies the color-edit popover on this same field (an existing tag's `write`, not a `name_create`). |
+| B63 | `views/crm_lead_views.xml` | 245 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color', 'no_create_edit': True}"/>` (lead form, tag quick-create) | DISABLE | **New row (round 2 fix)**. Only `no_create_edit` is set on this field, not `no_create` or `no_quick_create`; `many2many_tags_field.js`'s `extractProps` therefore computes `canQuickCreate = canCreate && !noQuickCreate` as true, so typing an unmatched tag name in the autocomplete offers a "Create" suggestion (`relational_utils.js:483-515`) whose handler calls `this.orm.call("crm.tag", "name_create", [name], ...)` and immediately links the **returned id** to the lead (`many2many_tags_field.js:127-132`) — an id produced by this very call, so DISABLE per the chained-id rule, same family as B25/B56. Distinct from B55, which classifies the color-edit popover on this same field (an existing tag's `write`, not a `name_create`). **Addendum (round-3 fix):** this "Create" suggestion is itself already hidden offline by the framework before a user could ever select it — `Many2XAutocomplete.suggest()` only adds the create/create-and-edit/search-more suggestions `if (!this.offlinePlugin.isOffline())` (`relational_utils.js:450-454`), and `many2many_tags_field.xml:23` wires this field's `quickCreate` into that same `Many2XAutocomplete`; see Section B-REL's header for the full blanket-coverage statement this row is one instance of. The row is kept (as it already was) for completeness and defense in depth, not because the control is reachable offline today. |
+
+## Section B-REL — relational-field create/edit controls
+
+Closes the "relational-field create/edit" omission category identified by round-3 scrutiny:
+every many2one/many2many/many2many_tags/one2many field occurrence (found by the sweep
+documented above) in an editable context that lets the user create or edit a record on a
+*different* model than the view's own `res_model`, through a mechanism distinct from the
+host record's own Save. **Selecting an existing related record (no create) is not listed
+here**: picking an existing record for the field only stages a value that is written when
+the host record itself is saved — that save is already a Section A/B/C row (the generic
+form/list-save producer, or the model's specific QUEUE/DISABLE row) and is not a separate
+entry point.
+
+**Blanket coverage — read before the rows below.** Every many2one field in this addon's
+views (plain `many2one`, and the `many2one_avatar_user`/`many2one_avatar_leader_user`/
+`rotting`/`badges_many2one`-style wrappers that extend it — confirmed by reading
+`many2one_avatar_user_field.js:15`, `many2one_avatar_leader_user.js:9`, `rotting_widget.js:44`,
+each `extends`/wraps `Many2One`) and every many2many_tags field's typed-name quick-create
+(`many2many_tags_field.xml:23` wires its `quickCreate` into the same `<Many2XAutocomplete>`)
+go through one single component, `Many2XAutocomplete` (`addons/web/static/src/views/fields/
+relational_utils.js`). Its `suggest()` method only pushes the create/create-and-edit/
+search-more suggestions onto the dropdown `if (!this.offlinePlugin.isOffline())`
+(`:450-454`); offline, the "Create ..."/"Create and edit..." entries never appear at all, so
+nobody can trigger `name_create`/`slowCreate` through this path while offline, for **any**
+many2one or many2many_tags field in this addon — regardless of whether the field sets
+`no_create`/`no_quick_create`/`no_create_edit`. This is a single framework mechanism, not a
+per-field one, so it is stated once here rather than repeated on every row; rows below are
+only for occurrences where creating or editing a related record happens through a
+**different** mechanism this blanket rule does **not** reach (confirmed per-widget by
+reading its source, not assumed): a many2many_tags color-edit popover (`onTagClick`'s
+`edit_color` branch, which never touches `Many2XAutocomplete`), a one2many widget with its
+own inline control (`list_activity`'s `ActivityButton`), or an `otherSources` entry injected
+alongside the base autocomplete (`res_partner_many2one`'s external partner lookup, added via
+`props.otherSources`, outside `suggest()`'s gate — see BR8). Quick-create rows below (BR2,
+BR4-BR6, and the already-existing B63) are kept anyway, for completeness and consistency
+with how this document already keeps framework-covered QUEUE rows (Notes #1's B19/B20/B21
+bullet) — not because the control is reachable offline today.
+
+| # | File | Line | Field + widget/options | Class | Justification |
+|---|---|---|---|---|---|
+| BR1 | `views/crm_lead_views.xml` | 353 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color'}"/>` (Leads list, color-edit) | DISABLE | **New row.** Resolves round-3 scrutiny finding #1 (part A). `crm_case_tree_view_leads` is `multi_edit="1"` (`:320`); `list_renderer.js`'s `onCellClicked()` (`:1520-1557`) checks `multiEdit && record.selected` before the `editable=`-only branch, and on a match calls `this.props.list.enterEditMode(record)` (`:1552`) — selecting the row, then clicking a cell, puts that record in `mode: "edit"`, so `record.isInEdition` (`record.js:148-154`) becomes true for the same reason B55's form occurrence always is. `many2many_tags_field.js`'s `onTagClick()` (`:169`) only early-returns `if (!this.props.record.isInEdition)`; once true, clicking an existing tag opens the color popover, and `switchTagColor()` (`:256-262`) writes `crm.tag` directly — same mechanism and DISABLE reasoning as B55, reached through row selection instead of a form. **Not** covered by the blanket Many2XAutocomplete rule above: the color popover never goes through that component. |
+| BR2 | `views/crm_lead_views.xml` | 353 | same field, quick-create | DISABLE | **New row.** Resolves round-3 scrutiny finding #1 (part B). Once the row is in edit mode (BR1), the field's own autocomplete is also live; this occurrence sets no `no_create`/`no_quick_create`/`no_create_edit`, so (same `extractProps` formula as B63) `canQuickCreate` is true and typing an unmatched name offers "Create" → `name_create` on `crm.tag`, consuming the returned id — chained-id DISABLE, same family as B63. **Is** covered by the blanket Many2XAutocomplete rule above: the "Create" suggestion itself never renders offline. Row kept for completeness, same as B63. |
+| BR3 | `views/crm_lead_views.xml` | 753 | `<field name="tag_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color'}"/>` (Opportunities list, color-edit) | DISABLE | **New row.** Same control and reasoning as BR1, second occurrence: `crm_case_tree_view_oppor` is also `multi_edit="1"` (`:707`). |
+| BR4 | `views/crm_lead_views.xml` | 753 | same field, quick-create | DISABLE | **New row.** Same control and reasoning as BR2, second occurrence; covered by the blanket rule. |
+| BR5 | `views/crm_stage_views.xml` | 26 | `<field name="team_ids" widget="many2many_tags"/>` (Stages multi-edit list, quick-create) | DISABLE | **New row.** Resolves round-3 scrutiny finding #2. `crm_stage_tree` is `multi_edit="1"` (`:22`); `team_ids` here carries no `no_create`/`no_quick_create`/`no_create_edit` option at all — unlike the stage *form*'s own `team_ids` (`:48`, `no_open`+`no_create` both set, genuinely has no create path; the earlier "both display-only" framing wrongly conflated the two). Once a row is selected and a cell clicked (same mechanism as BR1), typing an unmatched team name offers "Create" → `crm.team.name_create`, consuming the returned id — chained-id DISABLE, same family as B56/B63. No `on_tag_click` option is set here, so there is no paired color-edit control. Covered by the blanket Many2XAutocomplete rule; row kept for completeness, correcting the original "display-only" claim. |
+| BR6 | `wizard/crm_lead_pls_update_views.xml` | 12 | `<field name="pls_fields" widget="many2many_tags" options="{'color_field': 'color'}"/>` (PLS-update wizard, quick-create) | DISABLE | **New row.** Resolves round-3 scrutiny finding #3. `pls_fields` sets only `color_field`, no `no_create`/`no_quick_create`, no `on_tag_click`; the wizard's own form is always an editable context, so typing an unmatched value offers "Create" → `name_create` on `crm.lead.scoring.frequency.field`, consuming the returned id — chained-id DISABLE, same family as BR2/BR5/B63, regardless of whether a read-only ACL would reject the create server-side (an ACL rejection does not make the request disappear). Covered by the blanket Many2XAutocomplete rule, **and** doubly unreachable today because the wizard's own opening button (`res_config_settings_views.xml:47-49`, B46) and "Update" footer button (B50) are both already DISABLE with no `data-available-offline`. Row kept for completeness, correcting the original "display-only" claim. |
+| BR7 | `views/crm_lead_views.xml` | 735 | `<field name="activity_ids" optional="hide" widget="list_activity"/>` (Opportunities list) | DISABLE | **New row** (completeness pass, not a named round-3 finding). `list_activity.js` (`addons/mail`) renders the same `ActivityButton` component (`@mail/core/web/activity_button`) as the `kanban_activity` widget already classified DISABLE at B17/B23 — confirmed by reading both widget registrations (`kanban_activity.js:1,9`; `list_activity.js:1,9`). One2many (`activity_ids` → `mail.activity`) inline-create control (the popover's "Schedule" action); reachable here on a direct click, independent of the list's own edit mode (unlike BR1-BR5). Same DISABLE reasoning as B17/B23: "Schedule" opens the transient `mail.activity.schedule` wizard; "Mark Done" on an existing activity is bare-id resolvable but has no crm-owned offline handling yet (debatable, same family as B17/B23 — see Notes #2). |
+| BR8 | `views/crm_lead_views.xml` | 167, 187 | `<field name="partner_id" widget="res_partner_many2one" .../>` (lead form; `:167` for `type == 'lead'`, `:187` for `type == 'opportunity'`, one always rendered) | DISABLE | **New row** (completeness pass). `PartnerAutoCompleteMany2one` (`partner_autocomplete_many2one.js`) wraps the standard `Many2One`/`Many2XAutocomplete` — its base "Create"/"Create and edit" suggestion is covered by the blanket rule above — **and additionally** injects an `otherSources` entry (`:67-91`) that queries the external IAP partner-autocomplete service directly; selecting a suggestion calls `onSelectPartnerAutocompleteOption()` (`:97-114`), which opens a prefilled *new* `res.partner` form via `openRecord({context})` (not a bare `name_create`, but still DISABLE under the same reasoning as B2/B25 — creates/matches a partner, needs an explicit follow-up Save; architecture.md §3.3's "Contact lookup" bullet makes the same call for this exact field — "no create option offline (web already hides it — prove it)"). `otherSources` bypasses `suggest()` entirely (`relational_utils.js:307`: `[this.optionsSource, ...this.props.otherSources]`), so it is **not** covered by the blanket rule; whether the external lookup's own network call fails gracefully offline (silently empty, or an uncaught rejection) is **not verified here** — this is a document-only milestone with no browser QA — meaning this row is exactly the "prove it" architecture.md asks for, only partially proven: the base Many2XAutocomplete half is proven (confirmed covered by the blanket rule), the `otherSources` half is not. |
+
+**Excluded from B-REL** (occurrences the sweep script found in an editable context, with no
+individual row because they fall under the blanket rule above, have no create/edit path at
+all, or are unreachable through a different gate):
+- Covered by the blanket Many2XAutocomplete rule (plain many2one/many2many fields, no
+  distinct widget-level mechanism, no row needed beyond the header statement): lead-form
+  `lost_reason_id` (`:234`), `user_id`/`many2one_avatar_leader_user` (`:237-238`), `state_id`
+  (`:264`, `no_open` only), `campaign_id` (`:281`), `medium_id` (`:282`), `source_id`
+  (`:283`); Leads-list `company_id` (`:337`), `state_id` (`:339`), `user_id` (`:343-344`),
+  `team_id` (`:345`), `campaign_id` (`:347`), `medium_id` (`:349`), `source_id` (`:350`);
+  Opportunities-list `partner_id` (`:722`), `company_id` (`:726`), `state_id` (`:728`),
+  `user_id` (`:731-732`), `team_id` (`:733`), `activity_user_id` (`:736`), `campaign_id` (`:738`),
+  `medium_id` (`:739`), `source_id` (`:740`), `recurring_plan` (`:748`), `stage_id`/`rotting`
+  (`:749`, `no_open` only), `lost_reason_id` (`:752`); merge-wizard `user_id` (`:11`) and
+  `team_id` (`:15`) (both unreachable anyway — see below). Two of these fields are only
+  create-capable in a *list*, not the *form*, for the same field: `team_id` has
+  `no_create: True` on the lead form (`:293`) but no such option on either multi-edit list
+  (`:345`, `:733`); `recurring_plan` has `no_create`+`no_open` on the form (`:81`, `:119`,
+  `:445`) but neither on the Opportunities list (`:748`). This form/list asymmetry is a
+  genuine inconsistency worth a reviewer's attention for milestone 2 but does not change
+  either occurrence's classification (both still DISABLE, both still covered by the blanket
+  rule) — flagged in Notes #6, not given extra rows here.
+- No create path at all (option(s) fully suppress it; excluded without a row, not merely
+  folded into the blanket statement): lead-form `recurring_plan` (`:81`, `:119`, `:445`,
+  `no_create`+`no_open`), `country_id` (`:266`, `no_create`+`no_open`), `lang_id` (`:269`,
+  `no_quick_create`+`no_create_edit` both set — equivalent to no create path at all),
+  `company_id` (`:289`, `no_create`), `team_id` (`:293`, `no_create`); Leads/Opportunities
+  lists' `country_id` (`:340`, `:729`, `no_create`+`no_open`); stage form `team_ids` (`:48`,
+  `no_open`+`no_create`, genuinely display-only); `crm.lead.lost`'s `lost_reason_id`
+  (`:9`, `widget="badges_many2one"`, whose own component hard-codes
+  `activeActions: { create: false }` in `badges_many2one_field.js:53-59`, regardless of any
+  XML option); `crm_lead_to_opportunity_mass`'s `user_ids` (`:22`, `no_create`) and `team_id`
+  (`:23`, `no_create`); `crm_lead_to_opportunity_mass`'s `duplicated_lead_ids` (`:36`, its
+  inline `<list create="false">` disables creation outright). Form field `stage_id`
+  (`:18-21`, same occurrence as B5, `widget="rotting_statusbar_duration"`) is a pure
+  status-bar/selection widget (`rotting_statusbar.js:8`'s `RottingStatusBarDurationField`
+  extends `StatusBarDurationField` (`statusbar_duration_field.js:6`), which extends
+  `StatusBarField`, not `Many2OneField`) — it offers no autocomplete and no create path at
+  all, unlike the Opportunities list's `stage_id`
+  (`:749`, plain `widget="rotting"`, which does extend `Many2OneField` and is in the
+  blanket-coverage list above).
+- Unreachable because the field's own host wizard is already DISABLE at the entry point
+  (its opening button/menu item lacks `data-available-offline`, so the framework disables
+  it offline before the wizard can even open): `crm.merge.opportunity`'s `user_id`/`team_id`/
+  `opportunity_ids` (opened only via B52, DISABLE) and `crm.lead2opportunity.partner.mass`'s
+  `user_ids`/`team_id`/`duplicated_lead_ids`/`lead_tomerge_ids` (opened only via B15, DISABLE)
+  — each is additionally covered by one of the two bullets above regardless, so this is a
+  second, independent reason none of them gets a row.
+- `wizard/crm_lead_lost_views.xml`'s `lead_ids` (`:8`) is `invisible="1"` (context-only,
+  never rendered) — excluded by the script's invisible filter, no row needed.
 
 ## Section C — public `crm.lead` / `crm.stage` / `crm.team` methods reachable from a button
 
@@ -377,8 +557,8 @@ method a future producer must queue without restating the exact argument list.
 |---|---|
 | QUEUE | 28 |
 | SKIP | 12 |
-| DISABLE | 70 |
-| **Total** | **110** |
+| DISABLE | 78 |
+| **Total** | **118** |
 
 ### Per section
 
@@ -386,11 +566,13 @@ method a future producer must queue without restating the exact argument list.
 |---|---|---|---|---|
 | A — JS/XML calls | 26 | 3 (A9, A13, A15) | 10 (A3, A4, A6, A7, A8, A12, A14, A16, A17, A18) | 13 (A1, A2, A5, A10, A11, A19, A20, A21, A22, A23, A24, A25, A26) |
 | B — view/wizard/report buttons and controls | 63 | 16 (B1, B3, B5, B8, B11, B19, B20, B21, B22, B24, B40, B53, B54, B57, B58, B59) | 0 | 47 (B2, B4, B6, B7, B9, B10, B12-B18, B23, B25-B39, B41-B52, B55, B56, B60, B61, B62, B63) |
+| B-REL — relational-field create/edit controls | 8 | 0 | 0 | 8 (BR1-BR8) |
 | C — public model methods reachable from a button | 21 | 9 (C1, C2, C3, C4, C6, C7, C14, C15, C16) | 2 (C9, C20) | 10 (C5, C8, C10, C11, C12, C13, C17, C18, C19, C21) |
-| **Total** | **110** | **28** | **12** | **70** |
+| **Total** | **118** | **28** | **12** | **78** |
 
-(9 rows added in the round-1 fix: A26; B55-B61; C21. 2 more rows added in this round-2 fix:
-B62, B63. Counts above are the recomputed totals, not a delta.)
+(9 rows added in the round-1 fix: A26; B55-B61; C21. 2 more rows added in the round-2 fix:
+B62, B63. 8 more rows added in this round-3 fix: BR1-BR8, the new B-REL subsection. Counts
+above are the recomputed totals, not a delta.)
 
 ## Notes for review
 
@@ -588,3 +770,51 @@ classification requires, that the full argument list — including `web_resequen
 `specification` kwarg — is resolvable purely from client-known state. No other row in this
 document stated an executable `scheduleORM` call with a full options/extras argument, so no
 further row needed the same correction.
+
+### 6. Scrutiny round 3 and the relational-field create/edit sweep (this revision)
+
+A third scrutiny round against `cf127d42` found 3 blocking gaps, all in one previously
+unswept category — a many2one/many2many/many2many_tags/one2many field, in an editable
+context, whose create/edit mechanism is distinct from the host record's own form/list save:
+the Leads/Opportunities multi-edit lists' `tag_ids` color-edit + quick-create
+(`crm_lead_views.xml:353,753`), the Stages multi-edit list's `team_ids` quick-create
+(`crm_stage_views.xml:26`), and the PLS-update wizard's `pls_fields` quick-create
+(`wizard/crm_lead_pls_update_views.xml:12`) — all three previously dismissed as
+unreachable/display-only, corrected above (see the "Excluded from Section B" and round-2
+"Sweep method" corrections) and resolved as BR1, BR2+BR4 (BR3 is the second `tag_ids`
+occurrence), BR5, and BR6. Rather than patch those three in place, the whole category was
+re-derived from scratch with a dedicated throwaway script (`/tmp/rel_field_sweep.py`, not
+committed; its selection logic is restated in "Sweep method, round 4" above so the result
+is reproducible without the script) and organized as the new Section B-REL, rather than
+folded into Section B, because its rows share a selection method and a classification
+rule (chained-id DISABLE, or the Many2XAutocomplete blanket offline-hiding noted in the new
+section's header) distinct from Section B's button-click-driven rows.
+
+The script surfaced 2 further occurrences beyond the three named findings, both resolved as
+DISABLE and debatable only on how much weight to give a mechanism this document cannot
+exercise in a browser (document-only milestone, no QA performed here):
+- **BR7 — Opportunities list's `list_activity` widget**: DISABLE is consistent with the
+  already-settled B17/B23 (`kanban_activity`, same underlying `ActivityButton` component)
+  rather than a new judgment call; listed here only because it is a *new* occurrence of an
+  *already-debated* control (see Notes #2's B17/B23 entry), not a new debate.
+- **BR8 — lead form's `partner_id` with `widget="res_partner_many2one"`**: DISABLE because
+  creating/matching a partner through the external IAP lookup still ends at `openRecord` on
+  a new/matched `res.partner` (same reasoning as B2/B25, and the exact "no create option
+  offline" question architecture.md itself flags as needing proof, not an assumption). What
+  is **not** verified here, and is explicitly out of scope for a document-only inventory: whether
+  `partnerAutocomplete.autocomplete()`'s own network call (an IAP RPC, not an ORM call
+  through `orm.call`) fails silently or throws uncaught when offline — `otherSources` is not
+  reached through `Many2XAutocomplete.suggest()`'s offline gate (`relational_utils.js:450-454`,
+  stated in Section B-REL's header), so this control's offline behavior rests entirely on
+  how that one network call degrades, which milestone 2's browser QA should confirm one way
+  or the other.
+
+Two further asymmetries the sweep surfaced are flagged, not rowed, because they do not
+change any classification: `team_id`'s `no_create` is set on the lead form
+(`crm_lead_views.xml:293`) but not on either Leads/Opportunities multi-edit list
+(`:345`, `:733`), and `recurring_plan`'s `no_create`+`no_open` are set on the lead form
+(`:81`, `:119`, `:445`) but not on the Opportunities list (`:748`) — in both cases the list
+occurrence is still DISABLE today only because it is covered by the Many2XAutocomplete
+blanket rule, not because of a matching `no_create` option, so a future milestone that ever
+needs to re-enable list quick-create for either field first needs the matching option added
+for parity with the form (see "Excluded from Section B-REL" above).
