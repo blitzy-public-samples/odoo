@@ -370,6 +370,71 @@ test("offline, a card menu opened online can't Delete afterward (mobile)", async
 });
 
 // ---------------------------------------------------------------------------
+// Scrutiny round-3 (VAL-DIS-009, B19): the two tests above click "Delete"
+// *after* disconnecting, which the entry-point `triggerAction` guard
+// already stops. This covers the different, still-open-dialog case: the
+// confirmation itself opened *while online* and is still open -- its own
+// Confirm button carries `data-available-offline` (every
+// `web.ConfirmationDialog`) and stays clickable -- when the connection
+// drops. `useDeleteRecords`'s `confirm` closure is created at dialog-open
+// time, so the entry-point guard above never runs again for it; only a
+// guard inside `confirm` itself (`kanban_controller_offline_patch.js`) can
+// stop it.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, a card-menu Delete confirmation opened online can't be confirmed after disconnecting; online it still deletes (desktop)", async () => {
+    onRpc("crm.lead", "web_unlink", ({ parent }) => {
+        expect.step("web_unlink");
+        return parent();
+    });
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    await contains(".dropdown-item:contains('Delete')").click();
+    expect(".o_dialog:contains('Bye-bye, record!')").toHaveCount(1); // opened while online
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+    expect(".modal-footer button.btn-danger").not.toHaveAttribute("disabled"); // framework leaves it clickable
+
+    await contains(".modal-footer button.btn-danger").click();
+    expect.verifySteps([]); // no web_unlink issued or queued
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2); // neither record was deleted
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_dialog").toHaveCount(0); // the dialog closed itself
+
+    await setOffline(false);
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    await contains(".dropdown-item:contains('Delete')").click();
+    await contains(".modal-footer button.btn-danger").click();
+    expect.verifySteps(["web_unlink"]); // online, the confirmation still deletes
+});
+
+test.tags("mobile");
+test("offline, a card-menu Delete confirmation opened online can't be confirmed after disconnecting (mobile)", async () => {
+    onRpc("crm.lead", "web_unlink", () => expect.step("web_unlink"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    await contains(".dropdown-item:contains('Delete')").click();
+    expect(".o_dialog:contains('Bye-bye, record!')").toHaveCount(1);
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    await contains(".modal-footer button.btn-danger").click();
+    expect.verifySteps([]);
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_dialog").toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
 // Online guard: `isRecordAvailableOffline` short-circuits to `true` while
 // online, so a never-visited lead still opens normally -- the fix only
 // changes offline behavior.

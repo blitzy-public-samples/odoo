@@ -220,6 +220,20 @@ export class LeadGenerationDropdown extends Component {
             title: element.title,
             body: sprintf(this.newContentText["NOT_INSTALLED"], { module_name: name }),
             confirm: async () => {
+                // Scrutiny round-3 (VAL-DIS-012): this dialog can be opened
+                // online and still be open -- with its framework
+                // `data-available-offline` Confirm button fully clickable
+                // -- after the connection drops; `onClickAction`'s guard
+                // above only runs when the dialog is *opened*, never when
+                // this deferred callback itself finally executes. Re-check
+                // here too: returning (not `false`) lets
+                // `ConfirmationDialog.execButton` close the dialog as
+                // normal, with no `button_immediate_install` call, nothing
+                // queued (installing a module isn't one of the framework's
+                // four auto-queued producers anyway) and no error dialog.
+                if (this.crmOffline.isOffline()) {
+                    return;
+                }
                 this.setElementStatus(element, name, MODULE_STATUS.INSTALLING);
                 try {
                     await this.orm.silent.call("ir.module.module", "button_immediate_install", [

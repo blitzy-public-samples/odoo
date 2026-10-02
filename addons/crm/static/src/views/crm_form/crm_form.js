@@ -208,12 +208,35 @@ class CrmFormController extends formView.Controller {
 
     _queueRestoreOffline() {
         const record = this.model.root;
+        const extras = getScheduleORMExtras(this.model, [record]);
+        // Scrutiny finding (VAL-QUEUE-005): `record.save()` just above may
+        // have queued a `web_save` for this very lead, stamped with
+        // `Date.now()` at the moment it was queued
+        // (`record.js` `_offlineSave`'s `_offlineTimeStamp`). This call's
+        // own `getScheduleORMExtras` above stamps its own `Date.now()`
+        // independently, and `_syncORM` orders replay by `extras.timeStamp`
+        // alone (`offline_plugin.js`) after reloading entries from
+        // IndexedDB in hash-key order, not insertion order -- so an equal
+        // millisecond timestamp is a real tie, not just a same-array
+        // ordering coincidence, and could let Restore replay before the
+        // save it depends on. Read the pending save's actual queued
+        // timestamp back from the queue (`record.offlineId` is the public
+        // key `_offlineSave` scheduled it under) and force this timestamp
+        // strictly after it when they'd otherwise tie, without touching
+        // `_syncORM`'s own sort (framework replay semantics unchanged).
+        const pendingSaveKey = record.offlineId;
+        const pendingSave = pendingSaveKey
+            ? this.model.offlinePlugin._ormToSync()[pendingSaveKey]
+            : undefined;
+        if (pendingSave) {
+            extras.timeStamp = Math.max(extras.timeStamp, pendingSave.value.extras.timeStamp + 1);
+        }
         this.crmOffline.queueCall(
             "crm.lead",
             "action_restore",
             [[record.resId]],
             { context: record.context },
-            getScheduleORMExtras(this.model, [record])
+            extras
         );
         // Optimistic UI: mirror the server-side effect of `action_restore`
         // (action_unarchive + probability reset, see models/crm_lead.py)

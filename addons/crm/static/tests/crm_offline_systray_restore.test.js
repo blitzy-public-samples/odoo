@@ -1,5 +1,6 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import { animationFrame, expect, queryAllTexts, runAllTimers, test } from "@odoo/hoot";
+import { mockDate } from "@odoo/hoot-mock";
 import { press } from "@odoo/hoot-dom";
 import {
     contains,
@@ -318,7 +319,10 @@ test("offline, Restore on a dirty valid form queues web_save then action_restore
     expect(queued[0].value.args[1].name).toBe("Renamed before Restore");
     expect(queued[1].value.method).toBe("action_restore");
     expect(queued[1].value.args).toEqual([[1]]);
-    expect(queued[0].value.extras.timeStamp <= queued[1].value.extras.timeStamp).toBe(true);
+    // Strict, not <=: VAL-QUEUE-005 requires Restore to always replay after
+    // the save it depends on, including when both would otherwise tie on
+    // the same Date.now() millisecond (see the dedicated tie test below).
+    expect(queued[0].value.extras.timeStamp < queued[1].value.extras.timeStamp).toBe(true);
 
     // Optimistic UI still applies: the record is no longer dirty (it was
     // just saved) and shows as restored.
@@ -359,6 +363,90 @@ test("offline, Restore on a dirty valid form queues web_save then action_restore
 
     await setOffline(false);
     await runAllTimers(); // flush _syncORM's 1s pause between the two replays
+    expect.verifySteps(["web_save", "action_restore"]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny round-3 (VAL-QUEUE-005): the two tests above rely on whatever
+// millisecond actually elapses between the dirty save's `Date.now()`
+// (record.js's `_offlineSave`) and Restore's own `Date.now()`
+// (`getScheduleORMExtras`, in `_queueRestoreOffline`) during a real test
+// run -- usually distinct, but not guaranteed, and the reviewed code
+// before this fix only asserted `<=`. `mockDate` freezes the clock (it
+// does not advance on its own), forcing the exact tie the finding is
+// about, so a regression here only passes if `_queueRestoreOffline`
+// itself breaks the tie rather than happening to get lucky.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, Restore timestamp is strictly after the pending save's even with an identical Date.now() (desktop)", async () => {
+    onRpc("crm.lead", "action_restore", function ({ args }) {
+        expect.step("action_restore");
+        this.env["crm.lead"].write(args[0], { active: true, won_status: "pending" });
+        return true;
+    });
+    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    await runAllTimers(); // flush the plugin's harmless startup sync pass before the queue is populated
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+    mockDate("2024-05-15 00:00:00"); // frozen: every Date.now() call below returns the same value
+
+    await contains(".o_field_widget[name='name'] input").edit("Renamed before Restore (tie)");
+    await contains("button[name='action_restore']").click();
+    expect.verifySteps([]); // both calls queued, neither sent yet
+
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync()).sort(
+        (a, b) => a.value.extras.timeStamp - b.value.extras.timeStamp
+    );
+    expect(queued.length).toBe(2);
+    const [saveEntry, restoreEntry] = queued;
+    expect(saveEntry.value.method).toBe("web_save");
+    expect(restoreEntry.value.method).toBe("action_restore");
+    // Without the fix these two would be equal (both stamped from the same
+    // frozen Date.now()); the fix must force a strict break of the tie.
+    expect(restoreEntry.value.extras.timeStamp > saveEntry.value.extras.timeStamp).toBe(true);
+
+    await setOffline(false);
+    await runAllTimers(); // flush _syncORM's 1s pause between the two replays
+    expect.verifySteps(["web_save", "action_restore"]); // save replays before Restore despite the tie
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+});
+
+test.tags("mobile");
+test("offline, Restore timestamp is strictly after the pending save's even with an identical Date.now() (mobile)", async () => {
+    onRpc("crm.lead", "action_restore", function ({ args }) {
+        expect.step("action_restore");
+        this.env["crm.lead"].write(args[0], { active: true, won_status: "pending" });
+        return true;
+    });
+    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    await runAllTimers();
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+    mockDate("2024-05-15 00:00:00");
+
+    await contains(".o_field_widget[name='name'] input").edit("Renamed before Restore (tie)");
+    await contains("button[name='action_restore']").click();
+    expect.verifySteps([]);
+
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync()).sort(
+        (a, b) => a.value.extras.timeStamp - b.value.extras.timeStamp
+    );
+    expect(queued.length).toBe(2);
+    const [saveEntry, restoreEntry] = queued;
+    expect(saveEntry.value.method).toBe("web_save");
+    expect(restoreEntry.value.method).toBe("action_restore");
+    expect(restoreEntry.value.extras.timeStamp > saveEntry.value.extras.timeStamp).toBe(true);
+
+    await setOffline(false);
+    await runAllTimers();
     expect.verifySteps(["web_save", "action_restore"]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
 });

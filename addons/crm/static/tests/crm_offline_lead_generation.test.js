@@ -4,10 +4,14 @@ import {
     contains,
     defineModels,
     fields,
+    getService,
     models,
     mountWithCleanup,
     onRpc,
+    patchWithCleanup,
 } from "@web/../tests/web_test_helpers";
+import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
 import { LeadGenerationDropdown } from "@crm/components/lead_generation_dropdown/lead_generation_dropdown";
 import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
@@ -137,4 +141,75 @@ test("online, the lead generation toggler opens and issues the module search_rea
 
     expect.verifySteps(["search_read"]);
     expect(".o_lead_mining_menu_choices").toHaveCount(1);
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny round-3 (VAL-DIS-012): the two tests above only cover the entry
+// handlers (`toggleDropdown`/`onClickAction`); they don't exercise an
+// Install confirmation that was already open and offline-available
+// (`data-available-offline` on every `web.ConfirmationDialog` Confirm
+// button, `confirmation_dialog.xml`) before the connection drops. Its
+// `confirm` callback is a closure created at dialog-open time, so a guard
+// at the entry handlers alone cannot stop it once it is already open.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("an Install confirmation opened online cannot be confirmed after disconnecting; no button_immediate_install RPC, nothing queued, no error dialog", async () => {
+    patchWithCleanup(user, { isAdmin: true });
+    onRpc("ir.module.module", "search_read", ({ parent }) => {
+        expect.step("search_read");
+        return parent();
+    });
+    onRpc("ir.module.module", "button_immediate_install", () => {
+        expect.step("button_immediate_install");
+        return true;
+    });
+    const setOffline = mockCrmOffline();
+    await mountWithCleanup(WebClient);
+    await mountWithCleanup(LeadGenerationDropdown);
+
+    // Open the dropdown and the Install confirmation while still online.
+    await contains(".o-dropdown-caret.btn-secondary").click();
+    expect.verifySteps(["search_read"]);
+    await contains("[data-module-xml-id='base.module_crm_iap_mine']").click();
+    expect(".modal-footer button.btn-primary").toHaveCount(1); // the Install confirmation is open
+
+    // The connection drops with the dialog still open; its Confirm button
+    // is not disabled by the framework (it carries `data-available-offline`
+    // like every `web.ConfirmationDialog` button).
+    await setOffline(true);
+    expect(".modal-footer button.btn-primary").not.toHaveAttribute("disabled");
+
+    await contains(".modal-footer button.btn-primary").click();
+    expect.verifySteps([]); // no button_immediate_install call, queued or sent
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_dialog").toHaveCount(0); // dialog closed itself; no error dialog shown
+});
+
+test.tags("desktop");
+test("online, an Install confirmation's own Confirm still issues button_immediate_install (guard)", async () => {
+    patchWithCleanup(user, { isAdmin: true });
+    onRpc("ir.module.module", "search_read", ({ parent }) => {
+        expect.step("search_read");
+        return parent();
+    });
+    // A real success would resolve and call the component's own
+    // `location.reload()`, navigating the actual test page away; the real
+    // `window.location.reload` can't be patched out (non-configurable in a
+    // real browser), so the mock RPC is left pending instead -- enough to
+    // prove the real callback (not the offline early-return) reached the
+    // network, without ever letting it resolve into `location.reload()`.
+    onRpc("ir.module.module", "button_immediate_install", () => {
+        expect.step("button_immediate_install");
+        return new Promise(() => {});
+    });
+    await mountWithCleanup(LeadGenerationDropdown);
+
+    await contains(".o-dropdown-caret.btn-secondary").click();
+    expect.verifySteps(["search_read"]);
+    await contains("[data-module-xml-id='base.module_crm_iap_mine']").click();
+    expect(".modal-footer button.btn-primary").toHaveCount(1);
+
+    await contains(".modal-footer button.btn-primary").click();
+    expect.verifySteps(["button_immediate_install"]);
 });
