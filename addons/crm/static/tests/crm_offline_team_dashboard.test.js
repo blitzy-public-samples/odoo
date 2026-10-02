@@ -141,6 +141,41 @@ test("offline, every team dashboard link, the card click and the card menu are i
     expect.verifySteps(["C21"]);
 });
 
+// ---------------------------------------------------------------------------
+// B77 (scrutiny finding 24): "Configuration" is a `type="open"` link, not a
+// `ViewButton` -- it compiles to `KanbanRecord.triggerAction({type:'open'})`
+// directly, bypassing both the `beforeExecuteActionButton` gate above and
+// the card-root `onGlobalClick` guard. A menu opened online and left open
+// when the connection drops bypasses the toggler's own disable pass too
+// (`DropdownItem`s are never `<button>`s), so only a handler-level guard on
+// `triggerAction` itself (`kanban_record_offline_patch.js`) can stop it.
+// ---------------------------------------------------------------------------
+
+test("offline, a team card menu opened online can't open Configuration afterward; online it still can", async () => {
+    let selectRecordCalls = 0;
+    await mountView({
+        resModel: "crm.team",
+        type: "kanban",
+        arch: Team._views.kanban,
+        selectRecord: () => selectRecordCalls++,
+    });
+
+    await contains(".o_kanban_record .o_dropdown_kanban button").click();
+    expect(".dropdown-item:contains('Configuration')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Configuration')").click();
+    expect(selectRecordCalls).toBe(0); // unreachable: no navigation at all
+    expect(".o-dropdown--menu").toHaveCount(0); // the item click still closes the dropdown itself
+
+    await setOffline(false);
+    await contains(".o_kanban_record .o_dropdown_kanban button").click();
+    await contains(".dropdown-item:contains('Configuration')").click();
+    expect(selectRecordCalls).toBe(1);
+});
+
 test.tags("mobile");
 test("offline, every team dashboard link, the card click and the card menu are inert; online B32 and the card click still work (mobile)", async () => {
     onRpc("crm.team", "action_open_unassigned_opportunities", () => {

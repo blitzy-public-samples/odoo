@@ -46,6 +46,23 @@ export class CrmActivityController extends ActivityController {
         return super.openActivityFormView(resId, activityTypeId);
     }
 
+    /**
+     * @override
+     *
+     * B81 (VAL-DIS-007): the template dropdown's items are a
+     * `<div t-on-click>` (`activity_renderer.xml`'s `.o_send_mail_template`),
+     * not a `<button>`, so `SELECTORS_TO_DISABLE` never reaches them.
+     * `sendMailTemplate` issues `crm.lead`'s `activity_send_mail` directly
+     * -- same DISABLE family as `scheduleActivity`/`openActivityFormView`
+     * above.
+     */
+    sendMailTemplate(templateID, activityTypeID) {
+        if (this.crmOffline.isOffline()) {
+            return;
+        }
+        return super.sendMailTemplate(templateID, activityTypeID);
+    }
+
     async openRecord(record, options = {}) {
         if (!this.crmOffline.isRecordAvailableOffline(this.env.config.actionId, record.resId)) {
             return;

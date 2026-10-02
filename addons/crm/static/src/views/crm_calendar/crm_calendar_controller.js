@@ -2,11 +2,19 @@ import { CalendarController } from "@web/views/calendar/calendar_controller";
 import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
 
 /**
- * B82 (VAL-DIS-008): every click path that opens an event (single click via
- * the day/week/month popover, double-click, the side panel and the year
- * view) funnels through this one choke point, either a `FormViewDialog` or
- * a raw `doAction` -- neither checks whether the underlying `crm.lead` form
- * was ever visited offline before issuing its `web_read`.
+ * B82 (VAL-DIS-008): double-click, the side panel and the year view all
+ * open an event through `editRecord`, either a `FormViewDialog` or a raw
+ * `doAction` -- neither checks whether the underlying `crm.lead` form was
+ * ever visited offline before issuing its `web_read`, so this guards the
+ * one choke point they share.
+ *
+ * A single click is a *different* path: online, `CalendarCommonRenderer.
+ * onClick` calls `openPopover` directly, never `editRecord`, and that
+ * popover's own `Record` issues its own uncached `web_read`.
+ * `calendar_common_renderer_patch.js` patches `openPopover` to route a
+ * single click through this controller's own (guarded) `editRecord`
+ * while offline instead, rather than duplicate the uncached-lead check
+ * and the visited-lead fallback for a second, always-failing read.
  */
 export class CrmCalendarController extends CalendarController {
     setup() {

@@ -9,6 +9,7 @@ import {
     mockOffline,
     models,
     mountWithCleanup,
+    onRpc,
     patchWithCleanup,
     switchView,
 } from "@web/../tests/web_test_helpers";
@@ -274,6 +275,98 @@ test("offline, an uncached lead's card menu toggler is disabled and its body sho
     await contains(uncachedCard).click();
     expect(`.o_view_nocontent:contains('${HELPER_TEXT}')`).toHaveCount(1);
     expect(".o_form_view").toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// VAL-DIS-009 (B18/B19, scrutiny finding 1): a card menu opened online and
+// still open when the connection drops does nothing on Edit or Delete.
+// `DropdownItem`s are `<span>`/`<a role="menuitem">`, never `<button>`, so
+// the framework's own `SELECTORS_TO_DISABLE` pass (which only reaches the
+// toggler) cannot catch this; only a handler-level guard on
+// `KanbanRecord.triggerAction` can (`kanban_record_offline_patch.js`).
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, a card menu opened online can't Edit afterward; online it still can (desktop)", async () => {
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    expect(".dropdown-item:contains('Edit')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Edit')").click();
+    expect(".o_form_view").toHaveCount(0); // unreachable: no navigation, no RPC at all
+    expect(".o-dropdown--menu").toHaveCount(0); // the item click still closes the dropdown itself
+
+    await setOffline(false);
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    await contains(".dropdown-item:contains('Edit')").click();
+    expect(".o_form_view").toHaveCount(1);
+});
+
+test.tags("mobile");
+test("offline, a card menu opened online can't Edit afterward (mobile)", async () => {
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    expect(".dropdown-item:contains('Edit')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Edit')").click();
+    expect(".o_form_view").toHaveCount(0);
+    expect(".o-dropdown--menu").toHaveCount(0);
+});
+
+test.tags("desktop");
+test("offline, a card menu opened online can't Delete afterward; online it still asks to delete (desktop)", async () => {
+    onRpc("crm.lead", "web_unlink", () => expect.step("web_unlink"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    expect(".dropdown-item:contains('Delete')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Delete')").click();
+    expect(".o_dialog").toHaveCount(0); // no confirmation dialog opened
+    expect.verifySteps([]); // no web_unlink issued or queued
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2); // neither record was deleted
+
+    await setOffline(false);
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    await contains(".dropdown-item:contains('Delete')").click();
+    expect(".o_dialog:contains('Bye-bye, record!')").toHaveCount(1);
+    await contains(".o_dialog footer button:contains('No, keep it')").click();
+});
+
+test.tags("mobile");
+test("offline, a card menu opened online can't Delete afterward (mobile)", async () => {
+    onRpc("crm.lead", "web_unlink", () => expect.step("web_unlink"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    expect(".dropdown-item:contains('Delete')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Delete')").click();
+    expect(".o_dialog").toHaveCount(0);
+    expect.verifySteps([]);
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2);
 });
 
 // ---------------------------------------------------------------------------

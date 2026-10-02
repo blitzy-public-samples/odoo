@@ -50,6 +50,25 @@ class CrmKanbanHeader extends RottingKanbanHeader {
         }
         return super.onRotIconClicked(group);
     }
+
+    /**
+     * @override
+     *
+     * B79 / VAL-DIS-029: the progress-bar segments are plain
+     * `<div role="progressbar">`s (`column_progress.xml`), not
+     * `<button>`s; the base template only adds `pe-none` to their
+     * wrapper offline, which blocks a pointer hit but not a direct call
+     * to this handler. `onBarClicked` -> `ProgressBarState.selectBar` ->
+     * `group.applyFilter()` is a genuine `list.load()` round trip, the
+     * same "block the handler, don't let a `ConnectionLostError` surface"
+     * rule as `onRotIconClicked` above.
+     */
+    onBarClicked(value) {
+        if (this.crmOffline.isOffline()) {
+            return;
+        }
+        return super.onBarClicked(value);
+    }
 }
 
 export class CrmKanbanRenderer extends RottingKanbanRenderer {

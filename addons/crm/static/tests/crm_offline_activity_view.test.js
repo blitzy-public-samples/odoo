@@ -155,6 +155,68 @@ test("offline, the activity view's empty cell and footer are inert; online they 
 });
 
 // ---------------------------------------------------------------------------
+// B81 (scrutiny finding 22): the template dropdown's "Send Mail" item is a
+// `<div t-on-click>` (`activity_renderer.xml`'s `.o_send_mail_template`),
+// not a `<button>`, so the framework's `SELECTORS_TO_DISABLE` never
+// reaches it; `sendMailTemplate` had no offline guard of its own before
+// this fix.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test('offline, the activity view\'s "Send Mail" item is inert; online it still sends (desktop)', async () => {
+    const pyEnv = await seedActivities();
+    const [templateId] = pyEnv["mail.template"].create([{ name: "Welcome" }]);
+    pyEnv["mail.activity.type"].write([1], { mail_template_ids: [templateId] });
+    // `activity_send_mail` is a bespoke crm method the mock server has no
+    // default implementation for, so the hook must substitute a result
+    // itself (returning `undefined` would fall through to "Unimplemented
+    // ORM method").
+    onRpc("crm.lead", "activity_send_mail", () => {
+        expect.step("activity_send_mail");
+        return true;
+    });
+
+    await mountView({ resModel: "crm.lead", type: "activity", arch: Lead._views.activity });
+    expect(".o_view_controller.o_activity_view").toHaveCount(1);
+
+    await contains(".o_activity_type_cell [data-bs-toggle='dropdown']").click();
+    expect(".o_send_mail_template:contains('Welcome')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_send_mail_template:contains('Welcome')").click();
+    expect.verifySteps([]); // no activity_send_mail
+
+    await setOffline(false);
+    await contains(".o_activity_type_cell [data-bs-toggle='dropdown']").click();
+    await contains(".o_send_mail_template:contains('Welcome')").click();
+    expect.verifySteps(["activity_send_mail"]);
+});
+
+test.tags("mobile");
+test('offline, the activity view\'s "Send Mail" item is inert (mobile)', async () => {
+    const pyEnv = await seedActivities();
+    const [templateId] = pyEnv["mail.template"].create([{ name: "Welcome" }]);
+    pyEnv["mail.activity.type"].write([1], { mail_template_ids: [templateId] });
+    onRpc("crm.lead", "activity_send_mail", () => {
+        expect.step("activity_send_mail");
+        return true;
+    });
+
+    await mountView({ resModel: "crm.lead", type: "activity", arch: Lead._views.activity });
+
+    await contains(".o_activity_type_cell [data-bs-toggle='dropdown']").click();
+    expect(".o_send_mail_template:contains('Welcome')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_send_mail_template:contains('Welcome')").click();
+    expect.verifySteps([]);
+});
+
+// ---------------------------------------------------------------------------
 // Record link and "nothing cached" entry: same uncached-record-navigation
 // reasoning and proof idiom as `crm_offline_uncached_lead.test.js`'s
 // kanban/list `openRecord` guard -- a genuine online visit for "Visited

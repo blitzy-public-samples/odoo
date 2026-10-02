@@ -334,6 +334,42 @@ test("offline, a column config menu already open before going offline can't Dele
     await contains(".o_dialog footer button:contains(Discard)").click();
 });
 
+// B57 (scrutiny finding 12): the guard above only runs when "Delete" is
+// selected. If the connection drops *after* that confirmation dialog is
+// already open -- "Delete" clicked while still online -- its "Delete"
+// button carries `data-available-offline` and stays clickable; its
+// `confirm` callback is a closure created when the dialog was added, so a
+// guard only at `deleteGroup()`'s own entry (already past by then) cannot
+// stop it. `group_config_menu_patch.js` re-checks offline inside that
+// closure too.
+test("offline, a delete confirmation opened online does nothing if confirmed after going offline; online it still deletes", async () => {
+    onRpc("crm.stage", "unlink", () => expect.step("unlink"));
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        groupBy: ["stage_id"],
+        arch: pipelineArch,
+    });
+
+    const clickMenuItem = await toggleKanbanColumnActions(1);
+    await clickMenuItem("Delete"); // online: opens the confirmation dialog
+    expect(".o_dialog .modal-body:contains('delete this column')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_dialog footer button:contains(Delete)").click();
+    expect.verifySteps([]); // no unlink issued or queued
+    expect(getKanbanColumn(1)).not.toBe(undefined); // the column is still there
+
+    await setOffline(false);
+    const clickMenuItemAgain = await toggleKanbanColumnActions(1);
+    await clickMenuItemAgain("Delete");
+    expect(".o_dialog .modal-body:contains('delete this column')").toHaveCount(1);
+    await contains(".o_dialog footer button:contains(Delete)").click();
+    expect.verifySteps(["unlink"]); // online, the same button still deletes
+});
+
 // ---------------------------------------------------------------------------
 // B89 / VAL-DIS-016: the same `GroupConfigMenu`, used by a *list* grouped by
 // a many2one, scoped to `crm.activity.report` as well as `crm.lead`
@@ -405,6 +441,34 @@ test("offline, the progress bar is marked inert and the rotting badge is inert; 
     expect(".o_kanban_group:eq(0) .o_column_progress").not.toHaveClass("pe-none");
     await contains(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").click();
     expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered to the single rotting record
+});
+
+// B79 (scrutiny finding 14): the `pe-none` class above only blocks a real
+// pointer hit test; it does not guard the handler itself.
+// `contains(...).click()` dispatches the click event directly on the
+// target segment, the same way a direct call to the handler would, so
+// this proves `CrmKanbanHeader.onBarClicked`'s own guard, not just the
+// generic wrapper CSS the previous test already covers.
+test.tags("desktop");
+test("offline, clicking a progress bar segment directly applies no filter; online it still does", async () => {
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        groupBy: ["stage_id"],
+        arch: pipelineArch,
+    });
+
+    expect(getKanbanRecordTexts(0).length).toBe(2);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
+    expect(getKanbanRecordTexts(0).length).toBe(2); // unchanged: no filter applied, no reload
+
+    await setOffline(false);
+    await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
+    expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered
 });
 
 // ---------------------------------------------------------------------------

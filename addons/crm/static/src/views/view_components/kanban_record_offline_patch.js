@@ -37,4 +37,30 @@ patch(KanbanRecord.prototype, {
         }
         return super.onGlobalClick(ev, newWindow);
     },
+
+    /**
+     * B18/B19 (VAL-DIS-009) and B77 (VAL-DIS-026): "Edit"/"Delete" on a
+     * lead card and "Configuration" on a team card (both `type="open"` or
+     * `type="delete"` `<a role="menuitem">`s, never a `<button>`) are
+     * compiled into this one `triggerAction` choke point
+     * (`card_compiler.js`). The framework's `SELECTORS_TO_DISABLE` pass
+     * only reaches the menu's own toggler `<button>`, so a dropdown opened
+     * online and still open when the connection drops leaves these items
+     * fully clickable -- `onGlobalClick`'s guard above (and
+     * `CrmKanbanController.openRecord`'s uncached-lead check for a fresh
+     * open) never runs for them. Guard the handler itself, scoped to
+     * crm.lead/crm.team so every other model's kanban card menu is
+     * untouched, online or offline.
+     */
+    triggerAction(params) {
+        const { record } = this.props;
+        if (
+            ["crm.lead", "crm.team"].includes(record.resModel) &&
+            this.crmOffline.isOffline() &&
+            ["open", "delete"].includes(params.type)
+        ) {
+            return;
+        }
+        return super.triggerAction(...arguments);
+    },
 });

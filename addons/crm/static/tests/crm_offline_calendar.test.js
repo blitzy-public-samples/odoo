@@ -1,7 +1,7 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import { expect, test } from "@odoo/hoot";
 import { click, queryFirst, waitFor } from "@odoo/hoot-dom";
-import { mockDate } from "@odoo/hoot-mock";
+import { advanceTime, mockDate } from "@odoo/hoot-mock";
 import {
     contains,
     defineActions,
@@ -32,20 +32,25 @@ import { WebClient } from "@web/webclient/webclient";
  * `window_action.test.js`'s "[Offline] navigate through window actions"
  * use for other id-less or never-before-loaded actions.
  *
- * These tests reach `editRecord` through a double-click
+ * The `editRecord` tests below reach it through a double-click
  * (`calendar_common_renderer.js`'s `onEventClick`: a second click fired
  * before the first click's 250ms debounce elapses is treated as a
  * double-click and calls `onDblClick` -> `editRecord` directly), not
- * through the single-click popover. A single click opens
+ * through the single-click popover -- that isolates `editRecord`'s own
+ * guard from whatever a single click does.
+ *
+ * A single click is a *different*, independently-guarded path (scrutiny
+ * finding 23): `onEventClick`'s single-click branch calls `onClick` ->
+ * `openPopover` directly, never `editRecord`. Unguarded, that mounts
  * `CalendarCommonPopover`, which wraps a `CardPopover`
- * (`addons/web/static/src/views/card/card_popover/card_popover.js`) that
- * independently loads the record via its own `web_read` to render the
- * card -- a genuine, pre-existing (non-crm) network call that fails
- * offline for any resId with no real disk cache, regardless of this
- * guard, and prevents the popover itself from ever opening. Routing
- * through the popover would therefore test `CardPopover`'s own offline
- * behavior, not `editRecord`'s guard. The double-click path has no such
- * prerequisite read, so it isolates the guard precisely.
+ * (`addons/web/static/src/views/card/card_popover/card_popover.js`) whose
+ * own standalone `Record` independently issues a bare `web_read` with no
+ * offline cache of its own. `calendar_common_renderer_patch.js` (scoped to
+ * `crm.lead`) blocks `openPopover` itself for an unavailable lead, before
+ * `CardPopover` is ever mounted and before its `web_read` is ever
+ * attempted -- unlike the double-click path, there is no cache-race to
+ * declare here: the single-click tests below assert zero RPCs and no
+ * popover at all for an unvisited lead.
  *
  * "Visited online" (the real QA scenario: open the lead from the
  * pipeline, then switch to Calendar) means the lead's form was opened
@@ -129,6 +134,16 @@ async function doubleClickEvent(resId) {
     eventEl.scrollIntoView({ behavior: "instant", block: "center" });
     await click(eventEl);
     await click(eventEl);
+}
+
+// A genuine single click: unlike `doubleClickEvent` above, this waits out
+// `onEventClick`'s 250ms single-click debounce so it fires `onClick` ->
+// `openPopover`, never `onDblClick`/`editRecord`.
+async function singleClickEvent(resId) {
+    const eventEl = queryFirst(`.o_event[data-event-id='${resId}']`);
+    eventEl.scrollIntoView({ behavior: "instant", block: "center" });
+    await click(eventEl);
+    await advanceTime(260);
 }
 
 // `CalendarController.editRecord`'s non-dialog branch
@@ -271,4 +286,100 @@ test("online, double-clicking an available lead's event opens it (desktop)", asy
     await waitFor(".o_form_view");
     expect(".o_form_view").toHaveCount(1);
     expect.verifySteps(["web_read"]);
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 23 (VAL-DIS-008): single-clicking an event takes the
+// `openPopover` path, never `editRecord` -- the tests above never
+// exercise it. `calendar_common_renderer_patch.js` routes it through
+// `editRecord` instead while offline, so an unvisited lead does nothing
+// (no popover, no read) and a visited one opens its form instead of the
+// popover's always-failing read.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, single-clicking an unvisited lead's event mounts no popover and issues no read; online it still opens the popover (desktop)", async () => {
+    onRpc("crm.lead", "web_read", () => expect.step("web_read"));
+    await mountCalendar();
+    expect(".fc-event").toHaveCount(2);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await singleClickEvent(2);
+    expect.verifySteps([]); // unreachable: no popover, no RPC at all
+    expect(".o_popover").toHaveCount(0);
+    expect(".o_form_view").toHaveCount(0);
+
+    await setOffline(false);
+    await singleClickEvent(2);
+    expect(".o_popover").toHaveCount(1);
+    expect.verifySteps(["web_read"]);
+});
+
+test.tags("mobile");
+test("offline, single-clicking an unvisited lead's event mounts no popover and issues no read (mobile)", async () => {
+    onRpc("crm.lead", "web_read", () => expect.step("web_read"));
+    await mountCalendar();
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await singleClickEvent(2);
+    expect.verifySteps([]);
+    expect(".o_popover").toHaveCount(0);
+    expect(".o_form_view").toHaveCount(0);
+});
+
+test.tags("desktop");
+test("online, single-clicking an unvisited lead's event opens the popover (desktop)", async () => {
+    onRpc("crm.lead", "web_read", () => expect.step("web_read"));
+    await mountCalendar();
+
+    await singleClickEvent(2);
+    expect(".o_popover").toHaveCount(1);
+    expect.verifySteps(["web_read"]);
+});
+
+test.tags("desktop");
+test("offline, single-clicking a lead's event visited online through the same action opens its form instead of the popover (desktop)", async () => {
+    onRpc("crm.lead", "web_read", () => expect.step("web_read"));
+    await mountCalendar();
+    await visitLeadFormThenReturnToCalendar(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    // Same cache-race as the double-click "visited" tests above: `editRecord`
+    // still genuinely attempts `web_read` over the real network and still
+    // loses that race, so one `ConnectionLostError` is declared.
+    expect.errors(1);
+    await singleClickEvent(1);
+    await waitFor(".o_form_view");
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_field_widget[name=name] input").toHaveValue("Available Lead");
+    expect(".o_popover").toHaveCount(0); // opened through the form, not the popover
+    expect(".o_notification").toHaveCount(0);
+    expect.verifySteps([]);
+    expect.verifyErrors([WEB_READ_ERROR]);
+});
+
+test.tags("mobile");
+test("offline, single-clicking a lead's event visited online through the same action opens its form instead of the popover (mobile)", async () => {
+    onRpc("crm.lead", "web_read", () => expect.step("web_read"));
+    await mountCalendar();
+    await visitLeadFormThenReturnToCalendar(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect.errors(1);
+    await singleClickEvent(1);
+    await waitFor(".o_form_view");
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_field_widget[name=name] input").toHaveValue("Available Lead");
+    expect(".o_popover").toHaveCount(0);
+    expect(".o_notification").toHaveCount(0);
+    expect.verifySteps([]);
+    expect.verifyErrors([WEB_READ_ERROR]);
 });
