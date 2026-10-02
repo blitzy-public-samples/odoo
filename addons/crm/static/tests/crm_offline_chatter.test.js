@@ -118,6 +118,30 @@ class Lead extends models.Model {
 defineModels([Lead]);
 defineMailModels();
 
+/**
+ * Test stability (m2-fix-chatter-paste-drop-flake): clicking "Send message"
+ * toggles `composerType` (`chatter.js`'s `toggleComposer`), but the button
+ * carries `t-att-disabled="!this.state.thread.canPostMessage and
+ * this.thread().id"` (`chatter.xml`). `canPostMessage` is derived from
+ * `hasReadAccess`/`hasWriteAccess`, which start `undefined` and are only
+ * set once the chatter's own mount-time `fetchThreadData()`
+ * (`thread_model_patch.js`) round-trips through the same debounced
+ * `/mail/store` fetch `mockCrmOffline()` above guards before going offline
+ * -- here the fetch races the click itself, not the offline switch.
+ * `openFormView()` does not wait for that fetch, and hoot's `click()`
+ * checks `target.disabled` and silently skips dispatching any event on a
+ * disabled target (`hoot-dom/helpers/events.js`): an unlucky timing makes
+ * the click a complete no-op, with no error, and the composer never
+ * mounts -- surfacing moments later as a `waitFor(".o-mail-Composer-
+ * input")` timeout instead of a clear cause (the intermittent mobile-
+ * preset failure this closes). Waiting for the button to actually be
+ * enabled first makes the click deterministic regardless of system load.
+ */
+async function clickSendMessage() {
+    await waitFor(".o-mail-Chatter-sendMessage:enabled");
+    await contains(".o-mail-Chatter-sendMessage").click();
+}
+
 // ---------------------------------------------------------------------------
 // VAL-DIS-004: offline, the chatter's own buttons are disabled by the
 // framework (reachability proof, not a crm code path).
@@ -151,7 +175,7 @@ test("offline, Ctrl+Enter in an already-open composer posts nothing and raises n
     onRpcBefore("/mail/message/post", () => expect.step("message_post"));
     await start();
     await openFormView("crm.lead", 1);
-    await contains(".o-mail-Chatter-sendMessage").click();
+    await clickSendMessage();
     await insertText(".o-mail-Composer-input", "Hello while online");
     const setOffline = mockCrmOffline();
     await setOffline(true);
@@ -185,7 +209,7 @@ test("online, Ctrl+Enter in the composer still posts the message", async () => {
     onRpcBefore("/mail/message/post", () => expect.step("message_post"));
     await start();
     await openFormView("crm.lead", 1);
-    await contains(".o-mail-Chatter-sendMessage").click();
+    await clickSendMessage();
     await insertText(".o-mail-Composer-input", "Hello");
     await triggerHotkey("control+Enter");
 
@@ -208,7 +232,7 @@ test("offline, a non-crm.lead chatter's Ctrl+Enter still attempts message_post a
     const partnerId = pyEnv["res.partner"].create({ name: "A partner" });
     await start();
     await openFormView("res.partner", partnerId);
-    await contains(".o-mail-Chatter-sendMessage").click();
+    await clickSendMessage();
     await insertText(".o-mail-Composer-input", "Hi");
     const setOffline = mockCrmOffline();
     await setOffline(true);
@@ -484,13 +508,13 @@ test("offline, pasting or dropping a file into an already-open composer does not
     await startServer();
     await start();
     await openFormView("crm.lead", 1);
-    await contains(".o-mail-Chatter-sendMessage").click();
+    await clickSendMessage();
     // Unlike the Ctrl+Enter/follower tests above, nothing here types into
     // the composer afterwards, so there is no implicit wait for it to
     // actually be in the DOM; wait for it explicitly before going offline
-    // below, or the paste/drop can race the composer's own mount and
-    // time out finding it (observed intermittently on the scope-check
-    // copy of this test, further down this file).
+    // below (the click above is already deterministic -- see
+    // `clickSendMessage()` -- but OWL's own render of the newly-toggled
+    // composer still lands a tick later).
     await waitFor(".o-mail-Composer-input");
     const setOffline = mockCrmOffline();
     await setOffline(true);
@@ -527,12 +551,12 @@ test("offline, a non-crm.lead chatter's paste still attempts the upload (pre-exi
     const partnerId = pyEnv["res.partner"].create({ name: "A partner" });
     await start();
     await openFormView("res.partner", partnerId);
-    await contains(".o-mail-Chatter-sendMessage").click();
+    await clickSendMessage();
     // Nothing types into the composer before going offline, so there is
     // no implicit wait for it to actually be in the DOM; wait for it
-    // explicitly, or the paste can race the composer's own mount and
-    // time out finding it (the observed intermittent failure this guards
-    // against).
+    // explicitly (the click above is already deterministic -- see
+    // `clickSendMessage()` -- but OWL's own render of the newly-toggled
+    // composer still lands a tick later).
     await waitFor(".o-mail-Composer-input");
     const setOffline = mockCrmOffline();
     await setOffline(true);
