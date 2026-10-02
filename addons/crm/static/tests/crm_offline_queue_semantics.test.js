@@ -326,6 +326,12 @@ for (const preset of ["desktop", "mobile"]) {
     test(`a rejected replay is parked under "Sync issues" with no CRM-specific error UI (${preset})`, async () => {
         onRpc("crm.lead", "web_save", ({ args, parent }) => {
             if (args[1]?.name === "Rejected edit") {
+                // Recorded *before* throwing: proves the replay actually
+                // reached the server once, so the "not replayed again"
+                // check below (an empty step list) is a real retry count,
+                // not vacuously empty because the call was never attempted
+                // in the first place.
+                expect.step("web_save");
                 throw makeServerError({
                     type: "UserError",
                     message: "Blocked by a validation rule.",
@@ -345,6 +351,7 @@ for (const preset of ["desktop", "mobile"]) {
 
         await setOffline(false);
         await runAllTimers(); // let _syncORM attempt the replay and fail
+        expect.verifySteps(["web_save"]); // the replay was genuinely attempted once
 
         // Stays parked (not dropped), with the error recorded
         // (offline_plugin.js's `_syncORM` catch branch).
@@ -359,7 +366,18 @@ for (const preset of ["desktop", "mobile"]) {
         // Web's own systray surfaces it as "Sync issues", in red --
         // addons/web's existing UI (webclient/offline_systray/
         // offline_systray.js's `inError`/`labelIcon`), unaffected by crm's
-        // label patch (web_save already has a built-in STATUS entry).
+        // label patch (web_save already has a built-in STATUS entry). On
+        // desktop the button renders the text itself; on mobile
+        // (`uiService.isSmall`) the toggler is an icon-only `<div>` with
+        // no visible text at all (offline_systray.xml), so the same
+        // "Sync issues" wording only exists as its `aria-label`/tooltip.
+        if (preset === "desktop") {
+            expect(".o_menu_systray .o_nav_entry.o_offline_systray").toHaveText(/Sync issues/);
+        } else {
+            expect(
+                ".o_menu_systray .o_nav_entry.o_offline_systray i[data-icon='error']"
+            ).toHaveAttribute("aria-label", "Sync issues");
+        }
         expect(".o_menu_systray .o_nav_entry [data-icon='error']").toHaveCount(1);
         await contains(".o_menu_systray .o_nav_entry [data-icon='error']").click();
         expect(".o-dropdown--menu").toHaveCount(1);
@@ -373,6 +391,7 @@ for (const preset of ["desktop", "mobile"]) {
         await setOffline(true);
         await setOffline(false);
         await runAllTimers();
+        expect.verifySteps([]); // no second web_save attempt was made
         queued = Object.values(getService(OfflinePlugin)._ormToSync());
         expect(queued.length).toBe(1); // still the same single parked entry
     });

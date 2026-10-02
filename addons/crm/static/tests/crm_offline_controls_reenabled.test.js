@@ -1,5 +1,6 @@
 import {
     defineMailModels,
+    inputFiles,
     insertText,
     onRpcBefore,
     openFormView,
@@ -13,6 +14,7 @@ import {
     defineActions,
     defineModels,
     fields,
+    mockService,
     models,
     mountWithCleanup,
     onRpc,
@@ -87,6 +89,22 @@ class IrModuleModule extends models.Model {
 class Lead extends models.Model {
     _name = "crm.lead";
 
+    // mail's own `has_activities` wiring (base.js's `ServerModel.prototype`
+    // patch to `get_views()`) only fires for models extending
+    // `models.ServerModel`, not the plain `models.Model` every crm offline
+    // mock uses, so it is never in this class's prototype chain. Without
+    // this override the chatter's "Activity" button (chatter.xml:25,
+    // `t-if="this.webChatterProps.has_activities"`) never renders, so the
+    // VAL-FIX-013 "Schedule Activity works online again" assertion below
+    // would have nothing to click.
+    get_views(...args) {
+        const result = super.get_views(...args);
+        for (const modelName of Object.keys(result.models)) {
+            result.models[modelName].has_activities = true;
+        }
+        return result;
+    }
+
     name = fields.Char();
     probability = fields.Float();
     won_status = fields.Char();
@@ -160,6 +178,21 @@ test("offline, every M2-disabled control is inert together; online again, each w
     });
     onRpcBefore("/mail/message/post", () => expect.step("message_post"));
     onRpc("/web/action/load", () => expect.step("load_action"));
+    onRpcBefore("/mail/attachment/upload", () => expect.step("attachment_upload"));
+    // "Schedule Activity" (chatter.xml's `.o-mail-Chatter-activity`) opens
+    // the `mail.activity.schedule` wizard through the action service
+    // (store_service_patch.js's `scheduleActivity`), not an RPC of its
+    // own; record that it was asked for and close it immediately so the
+    // test does not hang on an unresolved dialog.
+    mockService("action", {
+        doAction(action, options) {
+            if (action?.res_model !== "mail.activity.schedule") {
+                return super.doAction(...arguments);
+            }
+            expect.step("schedule_activity_action");
+            options.onClose?.();
+        },
+    });
 
     await start();
     await openFormView("crm.lead", 1);
@@ -246,6 +279,31 @@ test("offline, every M2-disabled control is inert together; online again, each w
     await triggerHotkey("control+Enter");
     expect.verifySteps(["message_post"]);
     await waitFor(".o-mail-Message-body:contains('Hello while online')");
+
+    // Chatter's other two write controls, both still untouched above
+    // (VAL-FIX-013 names them individually, not just "re-enabled"):
+    // Log Note switches the composer into note mode...
+    expect(".o-mail-Chatter-logNote").not.toHaveAttribute("disabled");
+    await contains(".o-mail-Chatter-logNote").click();
+    expect(".o-mail-Chatter-logNote").toHaveClass("active");
+    // ...Schedule Activity opens the "Schedule Activity" wizard action...
+    expect(".o-mail-Chatter-activity").not.toHaveAttribute("disabled");
+    await contains(".o-mail-Chatter-activity").click();
+    expect.verifySteps(["schedule_activity_action"]);
+    // ...and Attach Files opens the hidden file input, through which a
+    // selected file genuinely uploads.
+    expect(".o-mail-Chatter-attachFiles").not.toHaveAttribute("disabled");
+    await contains(".o-mail-Chatter-attachFiles").click();
+    // Not plain ".o_input_file": the open Log Note composer above has its
+    // own (unrelated) hidden file input too; only the chatter-level
+    // `FileUploader` carries this class (chatter.xml's `fileUploadClass`).
+    await inputFiles(".o_input_file.o-mail-Chatter-fileUploader", [
+        new File(["hello"], "reenabled.txt"),
+    ]);
+    // Not just "the card appeared": it shows optimistically while
+    // `.o-isUploading` is still set, before the RPC resolves.
+    await waitFor(".o-mail-AttachmentCard:not(.o-isUploading)", { text: "reenabled.txt" });
+    expect.verifySteps(["attachment_upload"]);
 
     // PLS tooltip: the button re-opens the popover and re-issues the RPC.
     expect(".o_crm_pls_tooltip_button").not.toHaveAttribute("disabled");

@@ -9,6 +9,7 @@ import {
     fields,
     getService,
     models,
+    MockServer,
     mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
@@ -68,15 +69,28 @@ test("the systray labels every CRM-queued method without crashing (desktop)", as
         "Activity scheduled",
         "Activity done",
     ]);
-    // The four built-in labels are untouched by the patch. A real web_save
-    // producer always sets `extras.changes` (record.js); an empty object
-    // here is enough to exercise the base STATUS branch without crashing
-    // on the tooltip-building code that reads it.
+    // All five of the built-in labels are untouched by the patch, not
+    // just Created/Archived (VAL-QUEUE-004: "the built-in labels ... are
+    // unchanged"). A real web_save producer always sets `extras.changes`
+    // (record.js); an empty object here is enough to exercise the base
+    // STATUS branch without crashing on the tooltip-building code that
+    // reads it. `args[0].length` is what `offline_systray.js`'s
+    // `groupEntries()` reads to tell Created (`[]`, no id yet) from
+    // Edited (`[id]`) apart for a `web_save` entry.
     offline.scheduleORM("res.partner", "web_save", [[]], {}, {
         extras: { timeStamp: 6, actionName: "Contacts", displayName: "New Partner", changes: {} },
     });
+    offline.scheduleORM("res.partner", "web_save", [[9]], {}, {
+        extras: { timeStamp: 7, actionName: "Contacts", displayName: "Edited Partner", changes: {} },
+    });
     offline.scheduleORM("res.partner", "action_archive", [[9]], {}, {
-        extras: { timeStamp: 7, actionName: "Contacts", displayName: "Archived Partner" },
+        extras: { timeStamp: 8, actionName: "Contacts", displayName: "Archived Partner" },
+    });
+    offline.scheduleORM("res.partner", "action_unarchive", [[9]], {}, {
+        extras: { timeStamp: 9, actionName: "Contacts", displayName: "Unarchived Partner" },
+    });
+    offline.scheduleORM("res.partner", "web_unlink", [[9]], {}, {
+        extras: { timeStamp: 10, actionName: "Contacts", displayName: "Deleted Partner" },
     });
     await animationFrame();
     expect(queryAllTexts(".o-dropdown--menu .o-dropdown-item div.ms-auto")).toEqual([
@@ -86,7 +100,10 @@ test("the systray labels every CRM-queued method without crashing (desktop)", as
         "Activity scheduled",
         "Activity done",
         "Created",
+        "Edited",
         "Archived",
+        "Unarchived",
+        "Deleted",
     ]);
 });
 
@@ -122,6 +139,38 @@ test("the systray labels every CRM-queued method without crashing (mobile)", asy
         "Activity scheduled",
         "Activity done",
         "Call logged",
+    ]);
+
+    // The built-in labels are untouched by the patch under the mobile
+    // preset too (VAL-QUEUE-004 is "both presets"); the desktop test
+    // above already covers all five.
+    offline.scheduleORM("res.partner", "web_save", [[]], {}, {
+        extras: { timeStamp: 6, actionName: "Contacts", displayName: "New Partner", changes: {} },
+    });
+    offline.scheduleORM("res.partner", "web_save", [[9]], {}, {
+        extras: { timeStamp: 7, actionName: "Contacts", displayName: "Edited Partner", changes: {} },
+    });
+    offline.scheduleORM("res.partner", "action_archive", [[9]], {}, {
+        extras: { timeStamp: 8, actionName: "Contacts", displayName: "Archived Partner" },
+    });
+    offline.scheduleORM("res.partner", "action_unarchive", [[9]], {}, {
+        extras: { timeStamp: 9, actionName: "Contacts", displayName: "Unarchived Partner" },
+    });
+    offline.scheduleORM("res.partner", "web_unlink", [[9]], {}, {
+        extras: { timeStamp: 10, actionName: "Contacts", displayName: "Deleted Partner" },
+    });
+    await animationFrame();
+    expect(queryAllTexts(".o-dropdown--menu .o-dropdown-item div.ms-auto")).toEqual([
+        "Won",
+        "Restored",
+        "Activity scheduled",
+        "Activity done",
+        "Call logged",
+        "Created",
+        "Edited",
+        "Archived",
+        "Unarchived",
+        "Deleted",
     ]);
 });
 
@@ -214,6 +263,12 @@ test("offline, Restore queues action_restore, updates the form optimistically, a
     await setOffline(false);
     expect.verifySteps(["action_restore"]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    // The replay actually reached the server, not just "the queue is
+    // empty" (which an unregistered method would also leave behind if
+    // `_syncORM` silently dropped it): the mock server's lead is active
+    // again, same as the mock `action_restore` handler above would also
+    // produce from an online click.
+    expect(MockServer.env["crm.lead"].find((r) => r.id === 1).active).toBe(true);
 });
 
 test.tags("mobile");
@@ -231,16 +286,33 @@ test("offline, Restore queues action_restore, updates the form optimistically, a
     await setOffline(true);
 
     await contains("button[name='action_restore']").click();
-    expect.verifySteps([]);
+    expect.verifySteps([]); // no RPC: queued, not sent
 
+    // Same full queue-entry proof the desktop test above makes (args,
+    // extras.timeStamp), not just the method name.
     const queued = Object.values(getService(OfflinePlugin)._ormToSync());
     expect(queued.length).toBe(1);
-    expect(queued[0].value.method).toBe("action_restore");
+    const [{ value }] = queued;
+    expect(value.model).toBe("crm.lead");
+    expect(value.method).toBe("action_restore");
+    expect(value.args).toEqual([[1]]);
+    expect(typeof value.extras.timeStamp).toBe("number");
+
     expect("button[name='action_restore']").toHaveCount(0);
+    expect(".o_notification").toHaveCount(0);
+
+    // The systray already shows the queued call as "Restored" (mobile's
+    // toggler is a bare div, not the Dropdown's own button -- the same
+    // extra frame the "systray labels every CRM-queued method" mobile
+    // test above needs).
+    await contains(".o_menu_systray .o_nav_entry [data-icon='link_off']").click();
+    await animationFrame();
+    expect(".o-dropdown--menu .o-dropdown-item div.ms-auto").toHaveText("Restored");
 
     await setOffline(false);
     expect.verifySteps(["action_restore"]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(MockServer.env["crm.lead"].find((r) => r.id === 1).active).toBe(true);
 });
 
 test.tags("desktop");

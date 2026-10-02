@@ -97,6 +97,22 @@ import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 class Lead extends models.Model {
     _name = "crm.lead";
 
+    // mail's own `has_activities` wiring (base.js's `ServerModel.prototype`
+    // patch to `get_views()`) only fires for models extending
+    // `models.ServerModel`; this file's `Lead` extends plain `models.Model`,
+    // like every other crm offline mock, so the patch's `get_views` is never
+    // in its prototype chain. Without this override `webChatterProps.
+    // has_activities` stays false, the "Activity" button (chatter.xml:25)
+    // never renders, and VAL-DIS-004's "no uncaught error" would otherwise
+    // vacuously substitute for a real disabled-button check on it.
+    get_views(...args) {
+        const result = super.get_views(...args);
+        for (const modelName of Object.keys(result.models)) {
+            result.models[modelName].has_activities = true;
+        }
+        return result;
+    }
+
     name = fields.Char();
     activity_ids = fields.One2many({ relation: "mail.activity" });
     message_ids = fields.One2many({ relation: "mail.message" });
@@ -158,6 +174,7 @@ test("offline, the chatter's primary action buttons are disabled", async () => {
     for (const selector of [
         ".o-mail-Chatter-sendMessage",
         ".o-mail-Chatter-logNote",
+        ".o-mail-Chatter-activity",
         ".o-mail-Chatter-attachFiles",
         ".o-mail-Followers-button",
     ]) {
@@ -355,6 +372,39 @@ test("offline, an already-open followers dropdown closes (taking a follower's Re
     await waitForNone(".o-mail-Follower");
 });
 
+// `onClickUnfollow` (self removing their own followership through
+// `FollowerList`) is a separate code path from both `onClickFollow` above
+// and `Follower.onClickRemove` (a *different* follower's own "Remove",
+// just above) -- it only renders once the current user already follows
+// the thread (`follower_list.xml`'s `t-if="thread.selfFollower"`), so it
+// needs becoming a follower first instead of a seeded `mail.followers`
+// record for someone else.
+test("offline, an already-open followers dropdown closes (taking Unfollow with it); online it still works", async () => {
+    await startServer();
+    onRpcBefore("/mail/thread/unsubscribe", () => expect.step("unsubscribe"));
+    await start();
+    await openFormView("crm.lead", 1);
+    await click(".o-mail-Followers-button");
+    await click(".o-dropdown-item:text('Follow')");
+    await waitFor(".o-mail-Followers-counter:text('1')");
+
+    await click(".o-mail-Followers-button");
+    await waitFor(".o-dropdown-item:text('Unfollow')");
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    await waitForNone(".o-dropdown-item:text('Unfollow')");
+    expect(".o-mail-Followers-button").toHaveAttribute("disabled");
+    expect.verifySteps([]);
+    expect(".o-mail-Followers-counter").toHaveText("1"); // still following: nothing was sent
+
+    await setOffline(false);
+    await click(".o-mail-Followers-button");
+    await click(".o-dropdown-item:text('Unfollow')");
+    await expect.waitForSteps(["unsubscribe"]);
+    await waitFor(".o-mail-Followers-counter:text('0')");
+});
+
 // ---------------------------------------------------------------------------
 // Scope check: the follower-action patch only engages for a crm.lead
 // thread. For every other model, Follow still *attempts* `subscribe`
@@ -519,6 +569,12 @@ test("offline, a non-crm.lead chatter's message edit still attempts update_conte
 
 test("offline, pasting or dropping a file into an already-open composer does nothing; online it still works", async () => {
     await startServer();
+    // The DOM-only assertions below (no `.o-mail-AttachmentContainer`)
+    // would also pass if the upload were attempted but merely never
+    // finished rendering; recording the actual HTTP route proves the
+    // request itself was never sent, not just that its result never
+    // appeared.
+    onRpcBefore("/mail/attachment/upload", () => expect.step("attachment_upload"));
     await start();
     await openFormView("crm.lead", 1);
     await clickSendMessage();
@@ -549,10 +605,12 @@ test("offline, pasting or dropping a file into an already-open composer does not
     await waitFor(".o-Dropzone.o-mail-Composer-dropzone");
     await dropFiles(".o-Dropzone.o-mail-Composer-dropzone", [file]);
     expect(".o-mail-AttachmentContainer").toHaveCount(0);
+    expect.verifySteps([]); // neither the paste nor the drop ever reached the upload route
 
     await setOffline(false);
     await pasteFiles(".o-mail-Composer-input", [file]);
     await waitFor(".o-mail-AttachmentContainer:not(.o-isUploading):contains('text.txt')");
+    expect.verifySteps(["attachment_upload"]); // back online, the same paste genuinely uploads
 });
 
 // ---------------------------------------------------------------------------
@@ -606,6 +664,7 @@ test("offline, a non-crm.lead chatter's paste still attempts the upload (pre-exi
 
 test("offline, dropping a file onto the chatter's own dropzone (composer closed) does nothing; online it still works", async () => {
     await startServer();
+    onRpcBefore("/mail/attachment/upload", () => expect.step("attachment_upload"));
     await start();
     await openFormView("crm.lead", 1);
     // The composer is closed by default (`clickSendMessage()` is not
@@ -621,12 +680,14 @@ test("offline, dropping a file onto the chatter's own dropzone (composer closed)
     await waitFor(".o-Dropzone.o-mail-Chatter-dropzone");
     await dropFiles(".o-Dropzone.o-mail-Chatter-dropzone", [file]);
     expect(".o-mail-AttachmentContainer").toHaveCount(0);
+    expect.verifySteps([]); // the drop never reached the upload route
 
     await setOffline(false);
     await dragenterFiles(".o-mail-Chatter", [file]);
     await waitFor(".o-Dropzone.o-mail-Chatter-dropzone");
     await dropFiles(".o-Dropzone.o-mail-Chatter-dropzone", [file]);
     await waitFor(".o-mail-AttachmentContainer:not(.o-isUploading):contains('text.txt')");
+    expect.verifySteps(["attachment_upload"]); // back online, the same drop genuinely uploads
 });
 
 // ---------------------------------------------------------------------------
