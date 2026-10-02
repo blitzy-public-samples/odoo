@@ -4,6 +4,7 @@ import { localization } from "@web/core/l10n/localization";
 import { registry } from '@web/core/registry';
 import { usePopover } from "@web/core/popover/popover_hook";
 import { useService } from "@web/core/utils/hooks";
+import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
 
 
 export class CrmPlsTooltip extends Component {
@@ -29,6 +30,7 @@ export class CrmPlsTooltipButton extends Component {
         super.setup();
         this.orm = useService("orm");
         this.ui = useService("ui");
+        this.crmOffline = useCrmOffline();
         this.popover = usePopover(CrmPlsTooltip, {
             popoverClass: 'mt-2 me-2',
             position: "bottom-start",
@@ -37,6 +39,15 @@ export class CrmPlsTooltipButton extends Component {
     }
 
     async onClickPlsTooltipButton(ev) {
+        // Scrutiny finding 7 (VAL-DIS-003): the button is a plain
+        // `<button>` the framework already disables offline on its own,
+        // but this handler is also reachable directly, which would
+        // otherwise still save the record (queuing a dirty edit), call
+        // `prepare_pls_tooltip_data`, and reload -- none of that is
+        // wanted offline.
+        if (this.crmOffline.isOffline()) {
+            return;
+        }
         const tooltipButtonEl = ev.currentTarget;
         if (this.popover.isOpen) {
             this.popover.close();

@@ -26,7 +26,7 @@
         <AnimatedNumber position="after">
             <t t-elif="this.props.aggregate.value === 0"><b/></t>
 
-            <t t-if="this.showRecurringRevenue">
+            <t t-if="this.showRecurringRevenue and !this.crmOffline.isOffline()">
                 <t t-set="rrmAggregate" t-value="this.getRecurringRevenueGroupAggregate(this.props.group)"/>
                 <AnimatedNumber
                     t-if="rrmAggregate.value"

@@ -10,6 +10,7 @@ import { user } from "@web/core/user";
 import { ConfirmationDialog } from "@web/core/confirmation_dialog/confirmation_dialog";
 import { ErrorDialog } from "@web/core/errors/error_dialogs";
 import { PromoteMailPluginsDialog } from "@crm/components/promote_mail_plugins_dialog/promote_mail_plugins_dialog";
+import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
 
 export const MODULE_STATUS = {
     NOT_INSTALLED: "NOT_INSTALLED",
@@ -26,6 +27,7 @@ export class LeadGenerationDropdown extends Component {
         this.orm = useService("orm");
         this.dialogs = useService("dialog");
         this.action = useService("action");
+        this.crmOffline = useCrmOffline();
         this.newContentText = {
             FAILED_TO_INSTALL: _t('Failed to install "%(module_name)s"'),
             INSTALLING: _t('Installing "%(module_name)s"'),
@@ -118,6 +120,15 @@ export class LeadGenerationDropdown extends Component {
     }
 
     async toggleDropdown() {
+        // Scrutiny finding 6 (VAL-DIS-012): the toggler is a plain
+        // `<button>` the framework already disables offline on its own,
+        // but this handler is also reachable directly (programmatically,
+        // or from a toggler left open before the connection drops); guard
+        // it here too so no `ir.module.module` `search_read` or
+        // `checkAccessRight` is ever issued offline.
+        if (this.crmOffline.isOffline()) {
+            return;
+        }
         for (const dropdownContentElement in this.state.dropdownContentElements) {
             this.resetDescription(this.state.dropdownContentElements[dropdownContentElement]);
         }
@@ -180,6 +191,14 @@ export class LeadGenerationDropdown extends Component {
     }
 
     onClickAction(element) {
+        // Scrutiny finding 6 (VAL-DIS-012): same reasoning as
+        // `toggleDropdown` above -- the dropdown items are only reachable
+        // through the already-guarded toggler, but this handler can also
+        // be invoked directly, which would otherwise reach the
+        // install/import/access-request actions below.
+        if (this.crmOffline.isOffline()) {
+            return;
+        }
         if (!element.hasAccess) {
             return this.requestAccess(
                 element.moduleName,

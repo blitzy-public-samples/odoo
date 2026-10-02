@@ -143,6 +143,51 @@ test("offline, a CrmColumnProgress mount issues no has_group probe and renders n
 });
 
 // ---------------------------------------------------------------------------
+// Scrutiny finding 5 (VAL-FIX-009): `showRecurringRevenue` is computed only
+// once, in `onWillStart`, so a column mounted *online* (where it is set to
+// `true`) and only taken offline afterwards must still lose the aggregate
+// -- the test above only covers a mount that starts offline.
+// ---------------------------------------------------------------------------
+test("offline, after an online mount, the MRR aggregate disappears; it comes back online", async () => {
+    onRpc("res.users", "has_group", ({ args, parent }) => {
+        if (args[1] === "crm.group_use_recurring_revenues") {
+            expect.step("has_group");
+        }
+        return parent();
+    });
+    await mountWithCleanup(WebClient); // bring up the service registry (OfflinePlugin)
+    await mountWithCleanup(CrmColumnProgress, {
+        props: {
+            aggregate: { value: 14, title: "Revenue", currencies: [false] },
+            group: { count: 2, _config: { fields: {} } },
+            progressBar: { bars: [], isReady: true },
+            progressBarState: {
+                progressAttributes: { recurring_revenue_sum_field: "recurring_revenue_monthly" },
+                getAggregateValue: () => ({ value: 25, title: "Recurring Revenue" }),
+            },
+            onRotIconClicked: () => {},
+        },
+    });
+    expect.verifySteps(["has_group"]); // mounted online: the probe ran, true
+    expect(".o_animated_number[data-tooltip='Recurring Revenue']").toHaveCount(1);
+
+    // Unlike the offline-cold-mount test above, enough has already run by
+    // this point (the `CrmColumnProgress` mount and its `has_group` RPC)
+    // that the WebClient's own one-shot startup "/mail/store" fetch has
+    // settled before this `setOffline(true)`, so no background error races
+    // it here.
+    const setOffline = mockOffline();
+    await setOffline(true);
+    // `showRecurringRevenue` is still `true` (never recomputed), but the
+    // aggregate must be absent now, not shown as "0" or stale "25".
+    expect(".o_animated_number[data-tooltip='Recurring Revenue']").toHaveCount(0);
+    expect(".o_animated_number[data-tooltip='Revenue']").toHaveCount(1); // base aggregate unaffected
+
+    await setOffline(false);
+    expect(".o_animated_number[data-tooltip='Recurring Revenue']").toHaveCount(1); // back, with no remount
+});
+
+// ---------------------------------------------------------------------------
 // VAL-FIX-009 online guard: the probe is still issued online and the MRR
 // aggregate still renders, unaffected by the offline check added to
 // `onWillStart`. Goes through the full kanban view (unlike the offline test

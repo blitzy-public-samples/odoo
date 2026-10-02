@@ -29,7 +29,15 @@ export class CrmColumnProgress extends RottingColumnProgress {
     }
 
     getRecurringRevenueGroupAggregate(group) {
-        if (!this.showRecurringRevenue) {
+        // Scrutiny finding 5 (VAL-FIX-009): `showRecurringRevenue` is only
+        // computed once, in `onWillStart`, so a column mounted online and
+        // then taken offline would otherwise keep returning the real
+        // aggregate here (and the template would keep rendering it) for
+        // the rest of this component's life. Re-check `isOffline()`
+        // reactively on every read instead, so the aggregate disappears
+        // immediately on going offline and comes back as soon as the
+        // connection returns, with no need to remount.
+        if (!this.showRecurringRevenue || this.crmOffline.isOffline()) {
             return {};
         }
         const rrField = this.props.progressBarState.progressAttributes.recurring_revenue_sum_field;

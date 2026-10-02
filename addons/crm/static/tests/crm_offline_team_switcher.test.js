@@ -1,6 +1,7 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
-import { expect, test } from "@odoo/hoot";
+import { animationFrame, expect, test } from "@odoo/hoot";
 import {
+    assignTestEnv,
     contains,
     defineActions,
     defineModels,
@@ -8,14 +9,18 @@ import {
     getService,
     models,
     mockOffline,
+    mountView,
     mountWithCleanup,
+    mountWithSearch,
     onRpc,
     patchWithCleanup,
     switchView,
 } from "@web/../tests/web_test_helpers";
 import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
+import { getDefaultConfig } from "@web/views/view";
 import { TeamSwitcher } from "@crm/components/team_switcher/team_switcher";
+import { CrmSearchModel } from "@crm/views/crm_search_model";
 
 /**
  * Defect 3 (architecture.md §3.2 item 3 / offline_inventory.md rows
@@ -208,6 +213,68 @@ test("offline, the sales-manager probe is skipped even though the server would h
 });
 
 // ---------------------------------------------------------------------------
+// Scrutiny finding 2 (VAL-SKIP-001): a cold mount (no `teamSwitcherState`
+// carried in `config.state`) must never issue `get_team_switcher_data`
+// while offline. `mountView()` (not `doAction()`) sidesteps `/web/action/
+// load`'s own metadata fetch -- which a truly never-visited action id
+// cannot survive offline either (`window_action.test.js`'s "[Offline]
+// execute unavailable action") -- while still going through the exact same
+// `CrmSearchModel`/`CrmKanbanView` the pipeline action uses.
+// ---------------------------------------------------------------------------
+
+test("offline, mounting the crm kanban with a cold switcher cache issues no get_team_switcher_data call", async () => {
+    // `mountWithSearch()`'s own `env.config` assignment only has an effect
+    // on the test's very first mount (`app_test_helpers.js`'s `testEnv` is
+    // merged into `env` once, when the shared test `App` is created by
+    // whichever `mountWithCleanup()` call runs first) -- this test's first
+    // mount is the throwaway `WebClient` below, so it is set here instead.
+    assignTestEnv({ config: getDefaultConfig() });
+    onRpc("crm.team", "get_team_switcher_data", () => expect.step("get_team_switcher_data"));
+    // `mockOffline()`'s `setOffline()` needs a running test app/service
+    // registry (`getService(OfflinePlugin)`), so a throwaway WebClient is
+    // mounted first purely to bring that up; it does nothing else here,
+    // beyond its own background "/mail/store" poll failing once offline.
+    expect.errors(1);
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await setOffline(true);
+    expect.verifyErrors([
+        `Connection to "/mail/store" couldn't be established or was interrupted`,
+    ]);
+
+    // `mountWithSearch` builds a real `CrmSearchModel` straight from the
+    // given props (`with_search.js`'s `onWillStart` calls `searchModel.
+    // load(config)` directly, with no `View`/`get_views` indirection and
+    // no kanban root read): the exact `CrmSearchModel._initSwitcher()`
+    // path under test, with none of the unrelated incidental RPCs a full
+    // `mountView()`/`doAction()` of a never-visited kanban would also
+    // attempt (both genuinely uncached offline, but not what this test is
+    // about). `config.state` starts empty for every `mountWithSearch`
+    // call, so `teamSwitcherState` is guaranteed cold here regardless.
+    const switcher = await mountWithSearch(
+        TeamSwitcher,
+        {
+            resModel: "crm.lead",
+            context: { show_team_switcher: true },
+            searchViewArch: "<search/>",
+            searchViewFields: {},
+            SearchModel: CrmSearchModel,
+        },
+        {}
+    );
+    await animationFrame(); // flush the WithSearch -> searchModel.load() -> _initSwitcher() chain
+
+    // Unavailable (no teams cached): falls back to "All Teams" with an
+    // empty team list, exactly like the forced-502 case in the first test
+    // of this file -- the switcher's two fallback states (VAL-FIX-007) are
+    // "no team list" (this one) or a selected-team facet restored from the
+    // search state (the next test below).
+    expect(switcher.hasDropdown).toBe(false);
+    expect(switcher.currentLabel).toBe("All Teams");
+    expect.verifySteps([]); // get_team_switcher_data was never issued
+});
+
+// ---------------------------------------------------------------------------
 // VAL-FIX-007 / "don't regress": a team already selected in the search state
 // stays a facet across a view switch while offline, with no re-fetch.
 // ---------------------------------------------------------------------------
@@ -317,6 +384,138 @@ test("offline, selecting another team is unreachable through the disabled toggle
     await contains(".dropdown-item:contains('Mushroom Kingdom')").click();
     expect(".o_cp_team_switcher:contains('Mushroom Kingdom')").toHaveCount(1);
     expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2); // Lead 1 (Mushroom Kingdom) + Lead 3 (unassigned)
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 3 (VAL-DIS-010): the framework only disables `<button>`s
+// going offline (`OfflinePlugin.SELECTORS_TO_DISABLE`); it does not close a
+// dropdown already open before the connection drops, so the `DropdownItem`
+// spans inside stay in the DOM and clickable. Unlike the two tests above
+// (which close the menu before going offline), this one leaves it open.
+// ---------------------------------------------------------------------------
+
+// `DropdownItem`'s default `closingMode` is "all" (`dropdown_item.js`): any
+// item click closes the whole menu regardless of what the item's own
+// handler does, and the toggler is a disabled `<button>` offline, so it
+// cannot be reopened once closed. Each scenario below therefore opens its
+// own dropdown and exercises exactly one item, mirroring how a real user
+// can only make one such click before needing to reopen the menu.
+test("offline, a team-switcher dropdown left open before disconnecting: selecting another team is inert", async () => {
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    await contains(".o_cp_team_switcher").click(); // open it, and leave it open
+    expect(".dropdown-item:contains('Hyrule')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Hyrule')").click();
+    expect(".o_cp_team_switcher:contains('Hyrule')").toHaveCount(0); // selection unchanged ("All Teams")
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(3); // no reload: still every lead
+
+    await setOffline(false);
+
+    // Works again: close/reopen (the component was never remounted).
+    await contains(".o_cp_team_switcher").click();
+    await contains(".dropdown-item:contains('Hyrule')").click();
+    expect(".o_cp_team_switcher:contains('Hyrule')").toHaveCount(1);
+});
+
+test("offline, a team-switcher dropdown left open before disconnecting: Manage Teams is inert", async () => {
+    patchWithCleanup(user, { hasGroup: () => Promise.resolve(true) });
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    await contains(".o_cp_team_switcher").click(); // open it, and leave it open
+    expect(".dropdown-item:contains('Manage Teams')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Manage Teams')").click();
+    expect(".o_last_breadcrumb_item:contains('Team Config')").toHaveCount(0); // no navigation happened
+
+    await setOffline(false);
+
+    // Works again: close/reopen (the component was never remounted).
+    await contains(".o_cp_team_switcher").click();
+    await contains(".dropdown-item:contains('Manage Teams')").click();
+    expect(".o_last_breadcrumb_item:contains('Team Config')").toHaveCount(1);
+});
+
+test("offline, calling the team-switcher handlers directly does nothing", async () => {
+    expect.errors(1); // same background "/mail/store" race as the probe-skip test above
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await setOffline(true);
+    expect.verifyErrors([
+        `Connection to "/mail/store" couldn't be established or was interrupted`,
+    ]);
+
+    let selectionChanged = false;
+    const comp = await mountWithCleanup(TeamSwitcher, {
+        componentEnv: {
+            searchModel: {
+                state: { switcherTeamId: null, switcherTeams: [{ id: 2, name: "Hyrule" }] },
+                isTeamSwitcherEnabled: true,
+                _updateSwitcherSelection: () => {
+                    selectionChanged = true;
+                },
+            },
+        },
+    });
+    let doActionCalled = false;
+    patchWithCleanup(comp.actionService, {
+        doAction: () => {
+            doActionCalled = true;
+        },
+    });
+
+    comp.onSelect(2);
+    comp.onClickManageTeams();
+
+    expect(selectionChanged).toBe(false);
+    expect(doActionCalled).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 4 (VAL-FIX-006/VAL-FIX-013): `isSaleManager` must be
+// re-probed when the connection returns, even for a switcher that first
+// mounted offline (so `onWillStart`'s own probe never ran) -- without
+// requiring a remount.
+// ---------------------------------------------------------------------------
+
+test("a sales manager whose switcher first mounts offline sees Manage Teams after reconnecting, without remounting", async () => {
+    patchWithCleanup(user, { hasGroup: () => Promise.resolve(true) });
+    expect.errors(1);
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await setOffline(true);
+    expect.verifyErrors([
+        `Connection to "/mail/store" couldn't be established or was interrupted`,
+    ]);
+
+    const comp = await mountWithCleanup(TeamSwitcher, {
+        componentEnv: {
+            searchModel: {
+                state: { switcherTeamId: null, switcherTeams: [{ id: 2, name: "Hyrule" }] },
+                isTeamSwitcherEnabled: true,
+                _updateSwitcherSelection: () => {},
+            },
+        },
+    });
+    // Mounted offline: `onWillStart` never issued the probe, so there is
+    // nothing to see yet.
+    expect(comp.isSaleManager).toBe(false);
+    expect(".dropdown-item:contains('Manage Teams')").toHaveCount(0);
+
+    await setOffline(false);
+    await animationFrame(); // flush the reactive re-probe effect's `user.hasGroup()` promise
+
+    expect(comp.isSaleManager).toBe(true); // same component instance, never remounted
+    await contains(".o_cp_team_switcher").click();
+    expect(".dropdown-item:contains('Manage Teams')").toHaveCount(1);
 });
 
 // ---------------------------------------------------------------------------

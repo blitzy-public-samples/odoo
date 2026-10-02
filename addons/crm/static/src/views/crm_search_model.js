@@ -130,34 +130,49 @@ export class CrmSearchModel extends SearchModel {
         // Retrieve team switcher data
         let available = false;
         let teams = [];
-        try {
-            ({ available, teams } = await this.orm
-                .cache({
-                    type: "disk",
-                    update: "always",
-                    callback: (result, hasChanged) => {
-                        if (hasChanged) {
-                            this.state.switcherAvailable = result.available;
-                            this.state.switcherTeams = result.teams;
-                            this._initSwitcherSelection(true);
-                        }
-                    },
-                })
-                .call("crm.team", "get_team_switcher_data"));
-        } catch (error) {
-            if (!(error instanceof ConnectionLostError)) {
-                throw error;
+        // Scrutiny finding 2 (VAL-SKIP-001): `RPCCache.read()`
+        // (addons/web/static/src/core/network/rpc_cache.js) runs its
+        // network fallback unconditionally whenever `update: "always"` is
+        // set, even on a ram/disk cache hit, so routing through
+        // `this.orm.cache()` at all would still issue
+        // `get_team_switcher_data` while offline. There is no existing
+        // API to read an already-cached RPC-cache value without going
+        // through that fallback (`RPCCache` exposes no synchronous peek,
+        // and its backing store is a private module-level singleton in
+        // `rpc.js`), so skip the call entirely while offline instead of
+        // only catching its rejection afterwards: a cold offline page
+        // start degrades straight to "All Teams" (KNOWN-LIMIT, see the
+        // PR description / orchestrator decision VAL-SKIP-001). A team
+        // already selected earlier in this session is unaffected: it is
+        // restored above through `config.state.teamSwitcherState`, never
+        // through this call.
+        if (!this.offlinePlugin.isOffline()) {
+            try {
+                ({ available, teams } = await this.orm
+                    .cache({
+                        type: "disk",
+                        update: "always",
+                        callback: (result, hasChanged) => {
+                            if (hasChanged) {
+                                this.state.switcherAvailable = result.available;
+                                this.state.switcherTeams = result.teams;
+                                this._initSwitcherSelection(true);
+                            }
+                        },
+                    })
+                    .call("crm.team", "get_team_switcher_data"));
+            } catch (error) {
+                if (!(error instanceof ConnectionLostError)) {
+                    throw error;
+                }
+                // Still online when this call started, but it lost the
+                // connection mid-flight (e.g. a 502 from a reverse proxy):
+                // degrade the same way as a cache miss instead of
+                // rejecting this whole `_initSwitcher()` and, through it,
+                // `load()` — aborting the view's load instead of
+                // degrading to "All Teams" (architecture.md §3.2 item 3,
+                // offline_inventory.md rows A6/C20).
             }
-            // Offline with no ram/disk value cached yet for this call:
-            // `RPCCache.read()` (addons/web/static/src/core/network/
-            // rpc_cache.js) rejects instead of resolving with a fallback,
-            // which would otherwise reject this whole `_initSwitcher()`
-            // and, through it, `load()` — aborting the view's load instead
-            // of degrading to "All Teams" (architecture.md §3.2 item 3,
-            // offline_inventory.md rows A6/C20). The selected-team facet is
-            // restored separately, from the search state
-            // (`_importState`/`applySearch` below), not from this call, so
-            // it is unaffected by this fallback.
         }
         this.state.switcherAvailable = available;
         this.state.switcherTeams = teams;

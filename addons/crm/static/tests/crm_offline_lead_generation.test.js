@@ -93,6 +93,38 @@ test("offline, the lead generation toggler is disabled and unreachable; no modul
     expect(toggler).not.toHaveClass("o_disabled_offline");
 });
 
+// ---------------------------------------------------------------------------
+// Scrutiny finding 6 (VAL-DIS-012): the toggler and its items are only
+// reachable through the already-guarded DOM path above, but the DISABLE
+// convention also requires the direct programmatic/handler path to do
+// nothing. `toggleDropdown()`/`onClickAction()` have no offline guard of
+// their own before this fix -- calling them directly still reaches the
+// module `search_read`/access-right probe and the install/import actions.
+// ---------------------------------------------------------------------------
+
+test("offline, calling the lead generation handlers directly issues no RPC or action", async () => {
+    onRpc("ir.module.module", "search_read", () => expect.step("search_read"));
+    onRpc(({ method }) => {
+        if (method === "has_access") {
+            expect.step("has_access");
+        }
+    });
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    const comp = await mountWithCleanup(LeadGenerationDropdown);
+    await setOffline(true);
+
+    await comp.toggleDropdown();
+    expect(comp.dropdown.isOpen).toBe(false); // never opened
+    expect.verifySteps([]); // neither RPC was issued
+
+    // Direct call with an element that would otherwise reach either the
+    // access-request dialog or an install/import action.
+    comp.onClickAction(comp.sortedDropdownContentElements[0]);
+    expect(".o_dialog").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
 test("online, the lead generation toggler opens and issues the module search_read (guard)", async () => {
     onRpc("ir.module.module", "search_read", ({ parent }) => {
         expect.step("search_read");

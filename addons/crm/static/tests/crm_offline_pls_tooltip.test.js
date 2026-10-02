@@ -7,8 +7,11 @@ import {
     models,
     mockOffline,
     mountView,
+    mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
+import { WebClient } from "@web/webclient/webclient";
+import { CrmPlsTooltipButton } from "@crm/views/crm_form/crm_pls_tooltip_button";
 
 /**
  * Defect 6 (architecture.md §3.2 item 6 / offline_inventory.md rows
@@ -88,6 +91,45 @@ test("offline, the PLS tooltip button is disabled and unreachable; no prepare_pl
     await setOffline(false);
     expect(button).not.toHaveAttribute("disabled");
     expect(button).not.toHaveClass("o_disabled_offline");
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 7 (VAL-DIS-003): the button is only reachable through
+// the already-guarded DOM path above, but the DISABLE convention also
+// requires the direct handler path to do nothing.
+// `onClickPlsTooltipButton()` has no offline guard of its own before this
+// fix -- calling it directly still saves the record (queuing a dirty
+// edit), calls `prepare_pls_tooltip_data`, and reloads.
+// ---------------------------------------------------------------------------
+
+test("offline, calling the PLS tooltip handler directly issues no save, lookup or reload", async () => {
+    const calls = [];
+    const record = {
+        resId: 1,
+        save: () => {
+            calls.push("save");
+            return Promise.resolve(true);
+        },
+        load: () => {
+            calls.push("load");
+            return Promise.resolve();
+        },
+    };
+    onRpc("crm.lead", "prepare_pls_tooltip_data", () => expect.step("prepare_pls_tooltip_data"));
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    const comp = await mountWithCleanup(CrmPlsTooltipButton, { props: { record } });
+    // Unlike a `setOffline(true)` called immediately after mounting the
+    // WebClient, the extra `CrmPlsTooltipButton` mount above gives the
+    // WebClient's own one-shot startup "/mail/store" fetch time to settle
+    // first, so no background error races this one.
+    await setOffline(true);
+
+    await comp.onClickPlsTooltipButton({ currentTarget: document.createElement("button") });
+
+    expect(calls).toEqual([]); // neither save() nor load() was called
+    expect.verifySteps([]); // prepare_pls_tooltip_data was never called
+    expect(comp.popover.isOpen).toBe(false);
 });
 
 test("online, the PLS tooltip button still opens and calls prepare_pls_tooltip_data (guard)", async () => {

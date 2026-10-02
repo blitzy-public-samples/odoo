@@ -1,5 +1,5 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
-import { animationFrame, expect, queryAllTexts, test } from "@odoo/hoot";
+import { animationFrame, expect, queryAllTexts, runAllTimers, test } from "@odoo/hoot";
 import { press } from "@odoo/hoot-dom";
 import {
     contains,
@@ -167,7 +167,7 @@ class Lead extends models.Model {
                         data-hotkey="x" data-available-offline=""
                         invisible="won_status != 'lost'"/>
                 </header>
-                <field name="name"/>
+                <field name="name" required="1"/>
             </form>`,
         search: `<search/>`,
     };
@@ -288,4 +288,109 @@ test("online, Restore still issues the real action_restore RPC (desktop)", async
     expect.verifySteps(["action_restore"]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect("button[name='action_restore']").toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 11 (VAL-QUEUE-005): offline Restore on a dirty form must
+// save the edit first, like the online button does, instead of leaving it
+// unqueued. "name" is `required="1"` above so clearing it makes the form
+// invalid for the second test below.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, Restore on a dirty valid form queues web_save then action_restore, in that order (desktop)", async () => {
+    onRpc("crm.lead", "action_restore", function ({ args }) {
+        expect.step("action_restore");
+        this.env["crm.lead"].write(args[0], { active: true, won_status: "pending" });
+        return true;
+    });
+    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    // Flush the plugin's harmless "sync shortly after startup" pass
+    // (offline_plugin.js's constructor, 3s after mount while online) now,
+    // while the queue is empty, so it can't fire a second time
+    // concurrently with the explicit replay below once `runAllTimers` is
+    // in play (same gotcha as crm_offline_queue_semantics.test.js's "two
+    // offline writes to the same lead" test).
+    await runAllTimers();
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_field_widget[name='name'] input").edit("Renamed before Restore");
+    await contains("button[name='action_restore']").click();
+    expect.verifySteps([]); // both calls queued, neither sent yet
+
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync()).sort(
+        (a, b) => a.value.extras.timeStamp - b.value.extras.timeStamp
+    );
+    expect(queued.length).toBe(2);
+    expect(queued[0].value.model).toBe("crm.lead");
+    expect(queued[0].value.method).toBe("web_save");
+    expect(queued[0].value.args[1].name).toBe("Renamed before Restore");
+    expect(queued[1].value.method).toBe("action_restore");
+    expect(queued[1].value.args).toEqual([[1]]);
+    expect(queued[0].value.extras.timeStamp <= queued[1].value.extras.timeStamp).toBe(true);
+
+    // Optimistic UI still applies: the record is no longer dirty (it was
+    // just saved) and shows as restored.
+    expect("button[name='action_restore']").toHaveCount(0);
+    expect(".o_notification").toHaveCount(0);
+
+    await setOffline(false);
+    await runAllTimers(); // flush _syncORM's 1s pause between the two replays
+    expect.verifySteps(["web_save", "action_restore"]); // replayed in that order
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+});
+
+test.tags("mobile");
+test("offline, Restore on a dirty valid form queues web_save then action_restore, in that order (mobile)", async () => {
+    onRpc("crm.lead", "action_restore", function ({ args }) {
+        expect.step("action_restore");
+        this.env["crm.lead"].write(args[0], { active: true, won_status: "pending" });
+        return true;
+    });
+    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    await runAllTimers(); // flush the plugin's harmless startup sync pass before the queue is populated
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_field_widget[name='name'] input").edit("Renamed before Restore");
+    await contains("button[name='action_restore']").click();
+    expect.verifySteps([]);
+
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync()).sort(
+        (a, b) => a.value.extras.timeStamp - b.value.extras.timeStamp
+    );
+    expect(queued.length).toBe(2);
+    expect(queued[0].value.method).toBe("web_save");
+    expect(queued[1].value.method).toBe("action_restore");
+
+    await setOffline(false);
+    await runAllTimers(); // flush _syncORM's 1s pause between the two replays
+    expect.verifySteps(["web_save", "action_restore"]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+});
+
+test.tags("desktop");
+test("offline, Restore on an invalid form queues nothing (desktop)", async () => {
+    onRpc("crm.lead", "action_restore", () => expect.step("action_restore"));
+    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_field_widget[name='name'] input").edit("");
+    await contains("button[name='action_restore']").click();
+    expect.verifySteps([]); // neither call issued
+
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    // Not restored: the button is still there, the lead is still lost.
+    expect("button[name='action_restore']").toHaveCount(1);
 });

@@ -173,6 +173,26 @@ class CrmFormController extends formView.Controller {
     async beforeExecuteActionButton(clickParams) {
         if (this.crmOffline.isOffline() && this.model.root.resModel === "crm.lead") {
             if (clickParams.type === "object" && clickParams.name === "action_restore") {
+                // Scrutiny finding 11 (VAL-QUEUE-005): online, the base
+                // `beforeExecuteActionButton` saves the record before
+                // every non-"cancel" button runs, so a dirty edit made
+                // before clicking Restore is never lost. The offline
+                // path must do the same -- `record.save()` resolves
+                // `false` without touching the network when the form is
+                // invalid (`Record._save`'s `_checkValidity` guard), so
+                // nothing is queued at all in that case (not even
+                // Restore); it resolves `true` without touching the
+                // network when the form is clean, so only
+                // `action_restore` ends up queued, exactly as before.
+                // When the form is dirty and valid, `record.save()`
+                // itself queues `web_save` (via `CrmFormRecord._save`
+                // above) with an earlier `extras.timeStamp` than the
+                // `action_restore` queued right after it, so the two
+                // replay in save-then-restore order on reconnect.
+                const saved = await this.model.root.save();
+                if (!saved) {
+                    return false; // invalid form: queue nothing, not even Restore
+                }
                 this._queueRestoreOffline();
                 return false; // skip the real action_restore RPC
             }
