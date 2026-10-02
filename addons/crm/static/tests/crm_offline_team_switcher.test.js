@@ -8,7 +8,6 @@ import {
     fields,
     getService,
     models,
-    mockOffline,
     mountView,
     mountWithCleanup,
     mountWithSearch,
@@ -21,6 +20,7 @@ import { WebClient } from "@web/webclient/webclient";
 import { getDefaultConfig } from "@web/views/view";
 import { TeamSwitcher } from "@crm/components/team_switcher/team_switcher";
 import { CrmSearchModel } from "@crm/views/crm_search_model";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * Defect 3 (architecture.md §3.2 item 3 / offline_inventory.md rows
@@ -138,7 +138,7 @@ defineActions([
 // VAL-FIX-006 / VAL-FIX-007 / VAL-SKIP-001: a `get_team_switcher_data`
 // cache-miss degrades the search model instead of rejecting its load.
 // Mirrors crm_offline_rainbowman.test.js's "connection lost" test: the RPC
-// is forced to fail directly, decoupled from `mockOffline()`, because the
+// is forced to fail directly, decoupled from `mockCrmOffline()`, because the
 // fix catches `ConnectionLostError` regardless of why it was raised.
 // ---------------------------------------------------------------------------
 
@@ -184,12 +184,10 @@ test("offline, the sales-manager probe is skipped even though the server would h
             expect.step("has_group");
         }
     });
-    // `mockOffline()`'s `setOffline()` needs a running test app/service
+    // `mockCrmOffline()`'s `setOffline()` needs a running test app/service
     // registry (`getService(OfflinePlugin)`), so a throwaway WebClient is
-    // mounted first purely to bring that up; it does nothing else here,
-    // beyond its own background "/mail/store" poll failing once offline.
-    expect.errors(1);
-    const setOffline = mockOffline();
+    // mounted first purely to bring that up; it does nothing else here.
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     await setOffline(true);
     await mountWithCleanup(TeamSwitcher, {
@@ -207,9 +205,6 @@ test("offline, the sales-manager probe is skipped even though the server would h
     expect(".o_cp_team_switcher").toHaveCount(1);
     expect(".o_cp_team_switcher").toHaveAttribute("disabled");
     expect.verifySteps([]); // has_group was never called
-    expect.verifyErrors([
-        `Connection to "/mail/store" couldn't be established or was interrupted`,
-    ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -230,17 +225,12 @@ test("offline, mounting the crm kanban with a cold switcher cache issues no get_
     // mount is the throwaway `WebClient` below, so it is set here instead.
     assignTestEnv({ config: getDefaultConfig() });
     onRpc("crm.team", "get_team_switcher_data", () => expect.step("get_team_switcher_data"));
-    // `mockOffline()`'s `setOffline()` needs a running test app/service
+    // `mockCrmOffline()`'s `setOffline()` needs a running test app/service
     // registry (`getService(OfflinePlugin)`), so a throwaway WebClient is
-    // mounted first purely to bring that up; it does nothing else here,
-    // beyond its own background "/mail/store" poll failing once offline.
-    expect.errors(1);
-    const setOffline = mockOffline();
+    // mounted first purely to bring that up; it does nothing else here.
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     await setOffline(true);
-    expect.verifyErrors([
-        `Connection to "/mail/store" couldn't be established or was interrupted`,
-    ]);
 
     // `mountWithSearch` builds a real `CrmSearchModel` straight from the
     // given props (`with_search.js`'s `onWillStart` calls `searchModel.
@@ -300,7 +290,7 @@ test("offline, a previously selected team stays a search facet across a view swi
     expect("tr.o_data_row").toHaveCount(2);
     await switchView("kanban");
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
     // Reactivating the list view still attempts to refresh its records
     // (window_action.test.js's own "[Offline] navigate through window
@@ -337,7 +327,7 @@ test("offline, Manage Teams is unreachable through the disabled toggler; online 
     expect(".dropdown-item:contains('Manage Teams')").toHaveCount(1);
     await contains(".o_cp_team_switcher").click(); // close it before going offline
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // The toggler is a plain `<button>` without `data-available-offline`:
@@ -370,7 +360,7 @@ test("offline, selecting another team is unreachable through the disabled toggle
     expect(".o_cp_team_switcher:contains('Hyrule')").toHaveCount(1);
     expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_cp_team_switcher").click();
@@ -407,7 +397,7 @@ test("offline, a team-switcher dropdown left open before disconnecting: selectin
     await contains(".o_cp_team_switcher").click(); // open it, and leave it open
     expect(".dropdown-item:contains('Hyrule')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".dropdown-item:contains('Hyrule')").click();
@@ -430,7 +420,7 @@ test("offline, a team-switcher dropdown left open before disconnecting: Manage T
     await contains(".o_cp_team_switcher").click(); // open it, and leave it open
     expect(".dropdown-item:contains('Manage Teams')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".dropdown-item:contains('Manage Teams')").click();
@@ -445,13 +435,9 @@ test("offline, a team-switcher dropdown left open before disconnecting: Manage T
 });
 
 test("offline, calling the team-switcher handlers directly does nothing", async () => {
-    expect.errors(1); // same background "/mail/store" race as the probe-skip test above
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     await setOffline(true);
-    expect.verifyErrors([
-        `Connection to "/mail/store" couldn't be established or was interrupted`,
-    ]);
 
     let selectionChanged = false;
     const comp = await mountWithCleanup(TeamSwitcher, {
@@ -488,13 +474,9 @@ test("offline, calling the team-switcher handlers directly does nothing", async 
 
 test("a sales manager whose switcher first mounts offline sees Manage Teams after reconnecting, without remounting", async () => {
     patchWithCleanup(user, { hasGroup: () => Promise.resolve(true) });
-    expect.errors(1);
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     await setOffline(true);
-    expect.verifyErrors([
-        `Connection to "/mail/store" couldn't be established or was interrupted`,
-    ]);
 
     const comp = await mountWithCleanup(TeamSwitcher, {
         componentEnv: {

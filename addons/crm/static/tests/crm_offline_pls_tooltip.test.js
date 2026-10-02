@@ -5,13 +5,13 @@ import {
     defineModels,
     fields,
     models,
-    mockOffline,
     mountView,
     mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { WebClient } from "@web/webclient/webclient";
 import { CrmPlsTooltipButton } from "@crm/views/crm_form/crm_pls_tooltip_button";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * Defect 6 (architecture.md §3.2 item 6 / offline_inventory.md rows
@@ -74,7 +74,7 @@ const formView = {
 
 test("offline, the PLS tooltip button is disabled and unreachable; no prepare_pls_tooltip_data RPC or reload is issued", async () => {
     onRpc("crm.lead", "prepare_pls_tooltip_data", () => expect.step("prepare_pls_tooltip_data"));
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await mountView(formView);
 
     const button = ".o_crm_pls_tooltip_button";
@@ -116,13 +116,9 @@ test("offline, calling the PLS tooltip handler directly issues no save, lookup o
         },
     };
     onRpc("crm.lead", "prepare_pls_tooltip_data", () => expect.step("prepare_pls_tooltip_data"));
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     const comp = await mountWithCleanup(CrmPlsTooltipButton, { props: { record } });
-    // Unlike a `setOffline(true)` called immediately after mounting the
-    // WebClient, the extra `CrmPlsTooltipButton` mount above gives the
-    // WebClient's own one-shot startup "/mail/store" fetch time to settle
-    // first, so no background error races this one.
     await setOffline(true);
 
     await comp.onClickPlsTooltipButton({ currentTarget: document.createElement("button") });

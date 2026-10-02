@@ -73,4 +73,39 @@ patch(ListController.prototype, {
         }
         return super.openRecord(record, ...args);
     },
+
+    /**
+     * Finding 16 (VAL-DIS-017): `isNewButtonAvailableOffline` checks
+     * `isAvailableOffline(actionId, "list_quick_create", resId=false)`
+     * for an `editable` list (`list_controller.js`), which the framework
+     * sets true the first time *any* row on this action/view was quick-
+     * created online (`_visited`'s key has no per-model component) --
+     * so once that has happened once, this getter's base value stays
+     * true offline too, keeping `data-available-offline` on the New
+     * button and leaving the framework's own disabling pass with nothing
+     * to do (`SELECTORS_TO_DISABLE` only disables buttons that lack the
+     * attribute). Forcing it false here for these two out-of-scope
+     * models removes the attribute, so the framework disables the
+     * button itself (covering click, keyboard and the `c` hotkey) on
+     * top of the handler guard below.
+     */
+    get isNewButtonAvailableOffline() {
+        if (this.crmOffline.isOffline() && READONLY_OFFLINE_MODELS.includes(this.props.resModel)) {
+            return false;
+        }
+        return super.isNewButtonAvailableOffline;
+    },
+
+    /**
+     * Handler-path half of the same finding: `onClickCreate`
+     * (`list_controller.js`) calls this directly, so even a direct call
+     * bypassing the (now disabled) DOM button must still add no in-edit
+     * row and queue nothing on `crm.recurring.plan`/`crm.lost.reason`.
+     */
+    async createRecord(...args) {
+        if (this.crmOffline.isOffline() && READONLY_OFFLINE_MODELS.includes(this.props.resModel)) {
+            return;
+        }
+        return super.createRecord(...args);
+    },
 });

@@ -18,11 +18,11 @@ import {
     defineModels,
     fields,
     getService,
-    mockOffline,
     mockService,
     models,
     serverState,
 } from "@web/../tests/web_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * Defect 8 (architecture.md §3.2 item 8 / offline_inventory.md row B14):
@@ -72,22 +72,26 @@ import {
  *   and a dedicated `onDropFile()` guard (drop has no such internal
  *   check).
  *
- * Test stability (m2-test-stability-partner-link): mounting the chatter
- * (and typing into its composer) can leave one of @mail's own debounced
- * fetchStoreData() calls still pending (Store.FETCH_DATA_DEBOUNCE_DELAY,
- * @mail/core/common/store_service.js -- a 1ms debounce around the
- * /mail/store RPC). waitFor(".o-mail-Chatter-sendMessage") and
- * insertText() only wait for the DOM they touch, not for that unrelated
- * timer; if it is still pending when mockOffline() flips the connection,
- * the debounced RPC fires straight into the simulated outage and
+ * Test stability (m2-test-stability-partner-link / m2-fix-lists-queue-tests):
+ * mounting the chatter (and typing into its composer) can leave one of
+ * @mail's own debounced fetchStoreData() calls still pending
+ * (Store.FETCH_DATA_DEBOUNCE_DELAY, @mail/core/common/store_service.js --
+ * a 1ms debounce around the /mail/store RPC). waitFor(".o-mail-Chatter-
+ * sendMessage") and insertText() only wait for the DOM they touch, not
+ * for that unrelated timer; if it is still pending when the connection
+ * flips, the debounced RPC fires straight into the simulated outage and
  * surfaces as an uncaught ConnectionLostError moments later -- unrelated
  * to anything this file asserts, but enough to fail whichever test
- * happened to be running at the time (observed on all three offline
- * tests below, not only the two reported in this feature). An
- * animationFrame() before every mockOffline() call gives that timer a
- * chance to fire and resolve first, same technique as the pre-existing
- * one at the bottom of this file (there, for the *reported* error's own
- * tick).
+ * happened to be running at the time (observed on tests all over this
+ * file, and even in unrelated files elsewhere in the suite once the
+ * rejection resolves a tick late). mockCrmOffline()
+ * (crm_test_helpers.js), used throughout this file instead of the raw
+ * web_test_helpers mockOffline(), waits for the store's own
+ * isReadyPromise plus one more animationFrame() before every
+ * setOffline(true), so that fetch settles successfully while still
+ * online instead of racing the drop. The remaining standalone
+ * animationFrame() calls below are for an unrelated tick (the
+ * *reported* error's own settling, each noted at its call site).
  */
 
 class Lead extends models.Model {
@@ -124,9 +128,7 @@ test("offline, the chatter's primary action buttons are disabled", async () => {
     await start();
     await openFormView("crm.lead", 1);
     await waitFor(".o-mail-Chatter-sendMessage");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     for (const selector of [
@@ -151,15 +153,13 @@ test("offline, Ctrl+Enter in an already-open composer posts nothing and raises n
     await openFormView("crm.lead", 1);
     await contains(".o-mail-Chatter-sendMessage").click();
     await insertText(".o-mail-Composer-input", "Hello while online");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // The composer was already open and mounted before the connection
     // dropped: its DOM is untouched by `_offlineUI()` (it is not a
     // `<button>`), so without the patch Ctrl+Enter would still reach
-    // `sendMessage()` directly -- which, since `mockOffline()` also fails
+    // `sendMessage()` directly -- which, since `mockCrmOffline()` also fails
     // every actual RPC while offline, would surface as an uncaught
     // `ConnectionLostError` instead of silently succeeding (see the
     // non-crm.lead test below, where that is exactly what happens).
@@ -210,9 +210,7 @@ test("offline, a non-crm.lead chatter's Ctrl+Enter still attempts message_post a
     await openFormView("res.partner", partnerId);
     await contains(".o-mail-Chatter-sendMessage").click();
     await insertText(".o-mail-Composer-input", "Hi");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -241,9 +239,7 @@ test("offline, Follow in an already-open followers dropdown does nothing; online
     await openFormView("crm.lead", 1);
     await click(".o-mail-Followers-button");
     await waitFor(".o-dropdown-item:text('Follow')");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // The dropdown was already open before the connection dropped, and
@@ -280,9 +276,7 @@ test("offline, Add Followers in an already-open followers dropdown does nothing;
     await openFormView("crm.lead", 1);
     await click(".o-mail-Followers-button");
     await waitFor("a:text('Add Followers')");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await click("a:text('Add Followers')");
@@ -308,9 +302,7 @@ test("offline, removing a follower in an already-open followers dropdown does no
     await openFormView("crm.lead", 1);
     await click(".o-mail-Followers-button");
     await waitFor(".o-mail-Follower");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // "Remove this follower" is a plain `<span>`
@@ -339,9 +331,7 @@ test("offline, a non-crm.lead chatter's Follow still attempts subscribe and thro
     await openFormView("res.partner", partnerId);
     await click(".o-mail-Followers-button");
     await waitFor(".o-dropdown-item:text('Follow')");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -372,9 +362,7 @@ test("offline, a non-crm.lead chatter's remove-follower still attempts unsubscri
     await openFormView("res.partner", partnerId_1);
     await click(".o-mail-Followers-button");
     await waitFor(".o-mail-Follower");
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -415,9 +403,7 @@ test("offline, saving an already-open message edit does nothing by Ctrl+Enter or
     await insertText(".o-mail-Message .o-mail-Composer-input", "edited while online", {
         replace: true,
     });
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // The edit composer was already open before the connection dropped:
@@ -469,9 +455,7 @@ test("offline, a non-crm.lead chatter's message edit still attempts update_conte
     await click(".o-mail-Message [title='Expand']");
     await click(".o-dropdown-item:text('Edit')");
     await insertText(".o-mail-Message .o-mail-Composer-input", " edited", { replace: true });
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -501,9 +485,14 @@ test("offline, pasting or dropping a file into an already-open composer does not
     await start();
     await openFormView("crm.lead", 1);
     await contains(".o-mail-Chatter-sendMessage").click();
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    // Unlike the Ctrl+Enter/follower tests above, nothing here types into
+    // the composer afterwards, so there is no implicit wait for it to
+    // actually be in the DOM; wait for it explicitly before going offline
+    // below, or the paste/drop can race the composer's own mount and
+    // time out finding it (observed intermittently on the scope-check
+    // copy of this test, further down this file).
+    await waitFor(".o-mail-Composer-input");
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     const file = new File(["hello, world"], "text.txt", { type: "text/plain" });
@@ -539,9 +528,13 @@ test("offline, a non-crm.lead chatter's paste still attempts the upload (pre-exi
     await start();
     await openFormView("res.partner", partnerId);
     await contains(".o-mail-Chatter-sendMessage").click();
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-
-    const setOffline = mockOffline();
+    // Nothing types into the composer before going offline, so there is
+    // no implicit wait for it to actually be in the DOM; wait for it
+    // explicitly, or the paste can race the composer's own mount and
+    // time out finding it (the observed intermittent failure this guards
+    // against).
+    await waitFor(".o-mail-Composer-input");
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     getService("file_upload").bus.addEventListener("FILE_UPLOAD_ADDED", () =>
@@ -557,7 +550,7 @@ test("offline, a non-crm.lead chatter's paste still attempts the upload (pre-exi
     // crm.lead's silent no-op above which never gets this far. The
     // request itself then fails once it reaches the network -- hoot's
     // `MockXMLHttpRequest.send()` relays through `fetch()`, so
-    // `mockOffline()`'s catch-all still 502s it -- but that is the same
+    // `mockCrmOffline()`'s catch-all still 502s it -- but that is the same
     // outcome any model gets while actually offline; it is not the gap
     // this scope check is about.
     await expect.waitForSteps(["upload_added"]);

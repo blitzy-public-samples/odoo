@@ -7,7 +7,6 @@ import {
     fields,
     getService,
     makeServerError,
-    mockOffline,
     models,
     MockServer,
     mountView,
@@ -20,6 +19,7 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
 import { CrmStage } from "@crm/../tests/mock_server/mock_models/crm_stage";
 import { CrmTeam } from "@crm/../tests/mock_server/mock_models/crm_team";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * m2-queue-semantics-tests (VAL-QUEUE-001/002/003/007/008). AGENTS.md
@@ -91,6 +91,11 @@ class Lead extends models.Model {
                 <field name="name"/>
                 <field name="priority" widget="priority"/>
             </form>`,
+        list: `
+            <list>
+                <field name="name"/>
+                <field name="active" column_invisible="1"/>
+            </list>`,
         search: `<search/>`,
     };
 }
@@ -134,6 +139,13 @@ defineActions([
         type: "ir.actions.act_window",
         views: [[false, "form"]],
     },
+    {
+        id: 4, // list of leads, for the same-lead Archive/Unarchive sequence
+        name: "Leads",
+        res_model: "crm.lead",
+        type: "ir.actions.act_window",
+        views: [[false, "list"]],
+    },
 ]);
 
 const WEB_READ_ERROR = `Connection to "/web/dataset/call_kw/crm.lead/web_read" couldn't be established or was interrupted`;
@@ -169,7 +181,7 @@ for (const preset of ["desktop", "mobile"]) {
         // and `runAllTimers` are in play.
         await runAllTimers();
 
-        const setOffline = mockOffline();
+        const setOffline = mockCrmOffline();
         await setOffline(true);
 
         // Entry A: a kanban priority click. `PriorityField.updateRecord`
@@ -234,8 +246,9 @@ for (const preset of ["desktop", "mobile"]) {
 for (const preset of ["desktop", "mobile"]) {
     test.tags(preset);
     test(`no conflict dialog: a newer server-side change does not block the replay, and the offline edit wins (${preset})`, async () => {
-        const setOffline = mockOffline();
+        const setOffline = mockCrmOffline();
         await mountView({ resModel: "crm.lead", type: "form", resId: 1, arch: Lead._views.form });
+        const originalWriteDate = MockServer.env["crm.lead"].find((r) => r.id === 1).write_date;
         await setOffline(true);
 
         await contains(`.o_field_widget[name="name"] input`).edit("Offline name");
@@ -249,24 +262,54 @@ for (const preset of ["desktop", "mobile"]) {
         // "Someone else" edits the same lead directly on the server while
         // this tab is still offline: call the mock model's own `write`
         // directly (not through this tab's RPC layer, which is offline),
-        // the same way a different browser session would. AGENTS.md
-        // section 2: "no write_date comparison" -- the queue has no
-        // mechanism to even notice this.
-        MockServer.env["crm.lead"].write([1], { name: "Changed by someone else" });
+        // the same way a different browser session would, WITH an
+        // explicitly newer `write_date` than the one this tab last saw
+        // (VC: "the mock server's copy of the lead is then changed
+        // (newer `write_date`)"). The mock's own `write()`/`_write()`
+        // never bumps `write_date` on an ordinary field change
+        // (`mock_model.js`'s `write_date` field only defaults at create
+        // time), so it has to be set explicitly here to actually
+        // construct the scenario the assertion names, not merely assume
+        // the mock produces it on its own.
+        const newerWriteDate = new Date(
+            new Date(`${originalWriteDate.replace(" ", "T")}Z`).getTime() + 5 * 60 * 1000
+        )
+            .toISOString()
+            .slice(0, 19)
+            .replace("T", " ");
+        MockServer.env["crm.lead"].write([1], {
+            name: "Changed by someone else",
+            write_date: newerWriteDate,
+        });
+        expect(MockServer.env["crm.lead"].find((r) => r.id === 1).write_date).toBe(
+            newerWriteDate
+        );
+        expect(newerWriteDate > originalWriteDate).toBe(true); // genuinely newer, not just different
 
-        let webSaveCalls = 0;
-        onRpc("crm.lead", "web_save", ({ args, kwargs, parent }) => {
-            webSaveCalls++;
-            // Sent verbatim: the offline value, no merge with the
-            // concurrent change, and no write_date read/comparison.
-            expect(args[1]).toEqual({ name: "Offline name" });
-            expect("write_date" in kwargs).toBe(false);
+        // AGENTS.md section 2: "no write_date comparison" -- the queue
+        // has no mechanism to even notice this. Record *every* ORM call
+        // the replay issues, not just `web_save`: a conflict
+        // implementation that reads or compares `write_date` through a
+        // `read`/`web_read`/`search_read` before replaying would still
+        // pass a check that only counted `web_save` calls.
+        const rpcSteps = [];
+        onRpc("crm.lead", "*", ({ method, args, kwargs, parent }) => {
+            rpcSteps.push(method);
+            if (method === "web_save") {
+                // Sent verbatim: the offline value, no merge with the
+                // concurrent change, and no write_date read/comparison.
+                expect(args[1]).toEqual({ name: "Offline name" });
+                expect("write_date" in kwargs).toBe(false);
+            }
             return parent();
         });
 
         await setOffline(false);
 
-        expect(webSaveCalls).toBe(1);
+        // The only RPC the replay issues is web_save -- no read, web_read
+        // or search_read of write_date to compare against (VC: "no
+        // write_date read/comparison call is issued").
+        expect(rpcSteps).toEqual(["web_save"]);
         expect(".modal").toHaveCount(0); // no conflict dialog
         expect(MockServer.env["crm.lead"].find((r) => r.id === 1).name).toBe("Offline name"); // last write wins
         expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
@@ -293,7 +336,7 @@ for (const preset of ["desktop", "mobile"]) {
         await mountWithCleanup(WebClient);
         await getService("action").doAction(2);
 
-        const setOffline = mockOffline();
+        const setOffline = mockCrmOffline();
         await setOffline(true);
 
         await contains(`.o_field_widget[name="name"] input`).edit("Rejected edit");
@@ -350,7 +393,7 @@ for (const preset of ["desktop", "mobile"]) {
         await mountWithCleanup(WebClient);
         await getService("action").doAction(2);
 
-        const setOffline = mockOffline();
+        const setOffline = mockCrmOffline();
         await setOffline(true);
 
         // getStaticActionMenuItems() marks `delete: { availableOffline:
@@ -377,14 +420,30 @@ for (const preset of ["desktop", "mobile"]) {
 }
 
 // ---------------------------------------------------------------------------
-// VAL-QUEUE-008 (B69): action-menu Archive, then (separately) Unarchive on
-// crm.lead, queued offline and replayed. Two tests, like the generic
-// reference ([Offline] archiving a record / [Offline] Unarchiving a
-// record in form_view.test.js): a `ConnectionLostError` offline archive
-// never flips `record.data.active` locally (record.js's `_toggleArchive`
-// only calls `_load()` on the online success path), so a single record
-// cannot be driven through "Archive" then "Unarchive" by the UI in one
-// go: the "Unarchive" entry needs a record that was loaded archived.
+// VAL-QUEUE-008 (B69): action-menu Archive, then Unarchive, on crm.lead,
+// queued offline and replayed.
+//
+// The first two tests below are the generic reference's own two cases
+// ([Offline] archiving a record / [Offline] Unarchiving a record in
+// form_view.test.js), driven through the *form* controller on two
+// separate leads: `form_controller.js`'s archive/unarchive menu items are
+// each gated on `this.model.root.isActive`, and a `ConnectionLostError`
+// offline archive never flips `record.data.active` locally
+// (`relational_model/dynamic_list.js`'s `_toggleArchive` only reloads on
+// the online success path) -- so on a form, a lead archived offline still
+// shows "Archive" (not "Unarchive") afterwards, and the sequence cannot
+// be driven on one record there.
+//
+// The third test proves the actual same-lead sequence the finding asks
+// for, through the *list* controller instead: unlike the form,
+// `list_controller.js`'s `getStaticActionMenuItems()` marks both
+// `archive` and `unarchive` `isAvailable: () => this.archiveEnabled`,
+// with no `isActive` gating at all, so both menu entries stay offered
+// together regardless of the row's last-known active state. Offline
+// archive deselects the row without reloading the list
+// (`_toggleArchive`'s `ConnectionLostError` branch), so the row is still
+// right there, unchecked, afterwards -- re-checking it and choosing
+// "Unarchive" next genuinely queues a second entry for the same lead.
 // ---------------------------------------------------------------------------
 
 for (const preset of ["desktop", "mobile"]) {
@@ -397,7 +456,7 @@ for (const preset of ["desktop", "mobile"]) {
         await mountWithCleanup(WebClient);
         await getService("action").doAction(2); // lead 1, active
 
-        const setOffline = mockOffline();
+        const setOffline = mockCrmOffline();
         await setOffline(true);
 
         await toggleActionMenu();
@@ -428,7 +487,7 @@ for (const preset of ["desktop", "mobile"]) {
         await mountWithCleanup(WebClient);
         await getService("action").doAction(3); // lead 2, already archived
 
-        const setOffline = mockOffline();
+        const setOffline = mockCrmOffline();
         await setOffline(true);
 
         await toggleActionMenu();
@@ -444,5 +503,87 @@ for (const preset of ["desktop", "mobile"]) {
         expect.verifySteps(["action_unarchive"]);
         expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
         expect(MockServer.env["crm.lead"].find((r) => r.id === 2).active).toBe(true);
+    });
+}
+
+// Desktop-only: `ListRenderer.hasSelectors` (`list_renderer.js`) is
+// `allowSelectors && !this.uiService.isSmall` -- the row-selector column,
+// the only way to pick a row for the list's Archive/Unarchive action menu
+// entries, never renders on mobile for any list, online or offline (the
+// same reasoning the B59/B40 tests at the top of
+// `crm_offline_config_list_guards.test.js` rely on). There is nothing
+// mobile-specific to prove for a sequence that starts by checking a row.
+{
+    test.tags("desktop");
+    test(`offline, action-menu Archive then Unarchive on the SAME lead, from the list, queues both and replays in order (desktop)`, async () => {
+        const steps = [];
+        onRpc("crm.lead", ["action_archive", "action_unarchive"], ({ method, parent }) => {
+            steps.push(method);
+            return parent();
+        });
+        await mountWithCleanup(WebClient);
+        await getService("action").doAction(4); // leads list
+
+        // Flush the plugin's harmless "sync shortly after startup" pass
+        // (offline_plugin.js's constructor, 3s after mount while online)
+        // now, while the queue is empty, so it can't fire a second time
+        // concurrently with the explicit replay below once `advanceTime`
+        // and `runAllTimers` are in play (the same reasoning as
+        // VAL-QUEUE-001 above).
+        await runAllTimers();
+
+        const setOffline = mockCrmOffline();
+        await setOffline(true);
+
+        // Archive lead 1 (active) from the list's action menu.
+        await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+        await toggleActionMenu();
+        await toggleMenuItem("Archive");
+        expect(".modal").toHaveCount(1);
+        await contains(".modal-footer .btn-primary").click();
+        expect(steps).toEqual([]);
+
+        let queued = Object.values(getService(OfflinePlugin)._ormToSync());
+        expect(queued.length).toBe(1);
+        const archiveKey = queued[0].key;
+        const archiveTimeStamp = queued[0].value.extras.timeStamp;
+        expect(queued[0].value.method).toBe("action_archive");
+        expect(queued[0].value.args).toEqual([[1]]);
+
+        // The offline archive deselects the row (dynamic_list.js's
+        // `_toggleArchive` `ConnectionLostError` branch) without
+        // reloading the list or flipping `active` locally, so lead 1 is
+        // still right there, unchecked -- re-check it and Unarchive the
+        // *same* lead next.
+        expect(".o_data_row:eq(0) .o_list_record_selector input").not.toBeChecked();
+
+        // A later, unambiguous timestamp for the second entry regardless
+        // of real wall-clock jitter, the same idiom VAL-QUEUE-001 uses
+        // above: `Date.now()` is hoot-mocked, and every producer stamps
+        // `Date.now()` at save time (`getScheduleORMExtras`).
+        await advanceTime(2000);
+
+        await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+        await toggleActionMenu();
+        await toggleMenuItem("Unarchive"); // no confirmation dialog for unarchive
+        expect(steps).toEqual([]);
+
+        queued = Object.values(getService(OfflinePlugin)._ormToSync());
+        expect(queued.length).toBe(2);
+        const unarchiveEntry = queued.find((q) => q.key !== archiveKey);
+        expect(unarchiveEntry.value.method).toBe("action_unarchive");
+        expect(unarchiveEntry.value.args).toEqual([[1]]);
+        expect(unarchiveEntry.value.extras.timeStamp).toBeGreaterThan(archiveTimeStamp);
+
+        await setOffline(false);
+        await runAllTimers(); // flush _syncORM's 1s pause between the two replays
+
+        // Replayed in extras.timeStamp order (offline_plugin.js's
+        // `_syncORM` sorts by it): archive first, then unarchive, both on
+        // the one lead, and the queue ends empty.
+        expect(steps).toEqual(["action_archive", "action_unarchive"]);
+        expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+        // Archived then unarchived in order: back to active server-side.
+        expect(MockServer.env["crm.lead"].find((r) => r.id === 1).active).toBe(true);
     });
 }

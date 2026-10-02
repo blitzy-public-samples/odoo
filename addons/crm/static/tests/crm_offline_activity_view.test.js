@@ -6,7 +6,6 @@ import {
     defineModels,
     fields,
     getService,
-    mockOffline,
     models,
     mountView,
     mountWithCleanup,
@@ -15,6 +14,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { serializeDate, today } from "@web/core/l10n/dates";
 import { WebClient } from "@web/webclient/webclient";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * VAL-DIS-007 (B81): the `crm_activity` view's empty cell, "Schedule
@@ -112,7 +112,7 @@ test("offline, the activity view's empty cell and footer are inert; online they 
     expect(".o_view_controller.o_activity_view").toHaveCount(1);
     expect("tbody .o_data_row").toHaveCount(2);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains("tbody .o_data_row:eq(0) .o_activity_empty_cell").click();
@@ -138,7 +138,7 @@ test("offline, the activity view's empty cell and footer are inert; online they 
     await mountView({ resModel: "crm.lead", type: "activity", arch: Lead._views.activity });
     expect(".o_view_controller.o_activity_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains("tbody .o_data_row:eq(0) .o_activity_empty_cell").click();
@@ -182,7 +182,7 @@ test('offline, the activity view\'s "Send Mail" item is inert; online it still s
     await contains(".o_activity_type_cell [data-bs-toggle='dropdown']").click();
     expect(".o_send_mail_template:contains('Welcome')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_send_mail_template:contains('Welcome')").click();
@@ -209,7 +209,7 @@ test('offline, the activity view\'s "Send Mail" item is inert (mobile)', async (
     await contains(".o_activity_type_cell [data-bs-toggle='dropdown']").click();
     expect(".o_send_mail_template:contains('Welcome')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_send_mail_template:contains('Welcome')").click();
@@ -256,7 +256,7 @@ test("offline, the activity view opens a visited lead's row and leaves an unvisi
     await switchView("activity");
     expect(".o_view_controller.o_activity_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // "Never Visited Lead" first: the guard short-circuits before
@@ -288,7 +288,7 @@ test("offline, the activity view opens a visited lead's row and leaves an unvisi
     await switchView("activity");
     expect(".o_view_controller.o_activity_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_data_row:contains('Never Visited Lead') .o_activity_record").click();
@@ -311,7 +311,7 @@ test("offline, the activity view opens a visited lead's row and leaves an unvisi
 // uncached `get_views`/`/web/action/load` round-trip to resolve the
 // action itself before `CrmActivityModel.load()` is ever reached, which
 // fails first and for an unrelated reason. Forcing the root RPC directly
-// via `onRpc`, decoupled from `mockOffline()`, is the only way to reach
+// via `onRpc`, decoupled from `mockCrmOffline()`, is the only way to reach
 // `couldNotLoadRootOffline` at all -- the same idiom as
 // crm_offline_kanban_group_guards.test.js's own "a connection lost while
 // loading the forecast board..." test (KNOWN-LIMIT: the unreachability

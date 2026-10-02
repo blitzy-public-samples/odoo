@@ -57,21 +57,48 @@ const READONLY_OFFLINE_MODELS = ["crm.recurring.plan", "crm.lost.reason"];
  * forces a row already mid-edit out of edition (discarding, never saving)
  * the moment the connection drops.
  */
-const CELL_EDIT_DISABLED_MODELS = ["crm.lead", "crm.stage", "crm.team"];
+export const CELL_EDIT_DISABLED_MODELS = ["crm.lead", "crm.stage", "crm.team"];
 
 /**
  * True when `record`'s only possible editor offline on this list would be
  * the multi-edit one blocked above: offline, the model is in scope, the
  * list is in multi-edit mode and the record is checked. Shared by the
- * click guard, the keyboard guard and the mid-edit effect so the three
- * can't drift from each other.
+ * click guard, the keyboard guard and the mid-edit effect below so the
+ * three can't drift from each other, and by `priority_field_offline_patch.js`
+ * (finding 18: a widget that calls `record.update()` directly, bypassing
+ * `onCellClicked` entirely, reaches the exact same `_multiSave` path for a
+ * checked row). `record.resModel`/`record.model` are the same values the
+ * record's own list exposes (`DataPoint.resModel` reads `config.resModel`,
+ * and every record of a list shares that list's `model`), so a bare
+ * `Record` is all either caller needs -- no separate `list` parameter.
  */
-function blocksMultiEditOffline(crmOffline, list, record) {
+export function blocksMultiEditOffline(crmOffline, record) {
     return (
         crmOffline.isOffline() &&
-        CELL_EDIT_DISABLED_MODELS.includes(list.resModel) &&
-        list.model.multiEdit &&
+        CELL_EDIT_DISABLED_MODELS.includes(record?.resModel) &&
+        record?.model.multiEdit &&
         record?.selected
+    );
+}
+
+/**
+ * True when `record` must be forced out of edition offline for either
+ * reason this file enforces: the multi-edit entry point above
+ * (crm.lead/stage/team, checked row), or finding 17's distinct one --
+ * `crm.recurring.plan`/`crm.lost.reason` are plain `editable="bottom"`
+ * lists (no multi-edit involved at all), so a row already in inline
+ * create or edit when the connection drops must leave edition too, not
+ * just be blocked from *entering* it (`isInlineEditable` below only ever
+ * gates a fresh click). Used only by the mid-edit effect, since
+ * `onCellClicked`/`onCellKeydownReadOnlyMode` reach these two models
+ * through `isInlineEditable` instead (never through multi-edit, as
+ * neither list sets `multi_edit="1"`).
+ */
+function blocksEditOffline(crmOffline, list, record) {
+    return (
+        !!record &&
+        (blocksMultiEditOffline(crmOffline, record) ||
+            (crmOffline.isOffline() && READONLY_OFFLINE_MODELS.includes(list.resModel)))
     );
 }
 
@@ -80,20 +107,24 @@ patch(ListRenderer.prototype, {
         super.setup();
         this.crmOffline = useCrmOffline();
 
-        // A row can be mid cell-edit (checked, multi-edit, cell opened)
-        // when the connection drops. Nothing on the save path itself can
-        // be guarded (`_multiSave` has no offline branch and is not
-        // patched -- see the comment above), so the row is forced out of
+        // A row can be mid cell-edit when the connection drops: checked
+        // and multi-edited (crm.lead/stage/team) or inline-created/-edited
+        // (crm.recurring.plan/crm.lost.reason, finding 17). Nothing on
+        // either save path itself can be guarded (`_multiSave` has no
+        // offline branch and is not patched -- see the comment above; the
+        // other two models' lists have no handler on the save at all,
+        // only on entry into edition), so the row is forced out of
         // edition the moment offline is detected: `leaveEditMode({
-        // discard: true })` reverts the in-progress edit instead of
-        // leaving it to be committed later, so nothing can ever look
-        // saved without being sent or queued. `effect()` re-runs whenever
-        // `isOffline()` changes, independently of any unrelated render
-        // (same pattern as `crm_form.js`'s AI-switch guard).
+        // discard: true })` reverts the in-progress edit (or drops a
+        // brand new, not-yet-saved row entirely) instead of leaving it to
+        // be committed later, so nothing can ever look saved without
+        // being sent or queued. `effect()` re-runs whenever `isOffline()`
+        // changes, independently of any unrelated render (same pattern as
+        // `crm_form.js`'s AI-switch guard).
         const forceLeaveEditModeOffline = () => {
             const list = this.props.list;
             const edited = list.editedRecord;
-            if (blocksMultiEditOffline(this.crmOffline, list, edited)) {
+            if (blocksEditOffline(this.crmOffline, list, edited)) {
                 list.leaveEditMode({ discard: true });
             }
         };
@@ -125,7 +156,7 @@ patch(ListRenderer.prototype, {
 
     /** @override */
     async onCellClicked(record, column, ev, newWindow) {
-        if (blocksMultiEditOffline(this.crmOffline, this.props.list, record)) {
+        if (blocksMultiEditOffline(this.crmOffline, record)) {
             // Online, this is the *only* way `onCellClicked` opens a cell
             // editor on these three models (`multiEdit && record.selected`,
             // `list_renderer.js`, never gated by `canSelectRecord`). Doing
@@ -139,10 +170,7 @@ patch(ListRenderer.prototype, {
 
     /** @override */
     onCellKeydownReadOnlyMode(hotkey, cell, group, record) {
-        if (
-            hotkey === "enter" &&
-            blocksMultiEditOffline(this.crmOffline, this.props.list, record)
-        ) {
+        if (hotkey === "enter" && blocksMultiEditOffline(this.crmOffline, record)) {
             // Same guard as `onCellClicked` for the keyboard path: Enter
             // on a selected row's cell opens no editor offline either.
             // Returning `true` (handled) only swallows the key

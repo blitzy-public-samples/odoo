@@ -8,12 +8,12 @@ import {
     defineModels,
     fields,
     getService,
-    mockOffline,
     models,
     mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { WebClient } from "@web/webclient/webclient";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * VAL-DIS-008 (B82): every click path that opens a calendar event (single
@@ -188,7 +188,7 @@ test("offline, double-clicking an unvisited lead's event does nothing; online it
     await mountCalendar();
     expect(".fc-event").toHaveCount(2);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // The guard short-circuits before `super.editRecord`, so nothing
@@ -211,7 +211,7 @@ test("offline, double-clicking an unvisited lead's event does nothing (mobile)",
     onRpc("crm.lead", "web_read", () => expect.step("web_read"));
     await mountCalendar();
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await doubleClickEvent(2);
@@ -236,7 +236,7 @@ test("offline, double-clicking a lead's event visited online through the same ac
     await mountCalendar();
     await visitLeadFormThenReturnToCalendar(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // Fixed: `editRecord` now routes through `this.action.switchView`
@@ -264,7 +264,7 @@ test("offline, double-clicking a lead's event visited online through the same ac
     await mountCalendar();
     await visitLeadFormThenReturnToCalendar(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -303,7 +303,7 @@ test("offline, single-clicking an unvisited lead's event mounts no popover and i
     await mountCalendar();
     expect(".fc-event").toHaveCount(2);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await singleClickEvent(2);
@@ -322,7 +322,7 @@ test("offline, single-clicking an unvisited lead's event mounts no popover and i
     onRpc("crm.lead", "web_read", () => expect.step("web_read"));
     await mountCalendar();
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await singleClickEvent(2);
@@ -347,7 +347,7 @@ test("offline, single-clicking a lead's event visited online through the same ac
     await mountCalendar();
     await visitLeadFormThenReturnToCalendar(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // Same cache-race as the double-click "visited" tests above: `editRecord`
@@ -370,7 +370,7 @@ test("offline, single-clicking a lead's event visited online through the same ac
     await mountCalendar();
     await visitLeadFormThenReturnToCalendar(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);

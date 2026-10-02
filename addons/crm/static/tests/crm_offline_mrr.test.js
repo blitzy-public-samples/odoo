@@ -4,7 +4,6 @@ import { queryAllTexts } from "@odoo/hoot-dom";
 import {
     defineModels,
     fields,
-    mockOffline,
     models,
     mountView,
     mountWithCleanup,
@@ -14,6 +13,7 @@ import {
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { WebClient } from "@web/webclient/webclient";
 import { CrmColumnProgress } from "@crm/views/crm_kanban/crm_column_progress";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * Defect 5 (architecture.md §3.2 item 5 / offline_inventory.md row A7):
@@ -108,12 +108,12 @@ test("offline, a CrmColumnProgress mount issues no has_group probe and renders n
             expect.step("has_group");
         }
     });
-    // `mockOffline()`'s `setOffline()` needs a running test app/service
+    // `mockCrmOffline()`'s `setOffline()` needs a running test app/service
     // registry (`getService(OfflinePlugin)`), so a throwaway WebClient is
-    // mounted first purely to bring that up; it does nothing else here,
-    // beyond its own background "/mail/store" poll failing once offline.
-    expect.errors(1);
-    const setOffline = mockOffline();
+    // mounted first purely to bring that up; `mockCrmOffline()` settles its
+    // background "/mail/store" poll before the connection drops, so it
+    // never surfaces here.
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     await setOffline(true);
     await mountWithCleanup(CrmColumnProgress, {
@@ -132,9 +132,6 @@ test("offline, a CrmColumnProgress mount issues no has_group probe and renders n
     });
 
     expect.verifySteps([]); // has_group was never called
-    expect.verifyErrors([
-        `Connection to "/mail/store" couldn't be established or was interrupted`,
-    ]);
     // The base revenue aggregate still renders (it's a plain prop, not a
     // probed value); only the MRR line, gated on `showRecurringRevenue`,
     // is absent -- not shown as "0".
@@ -171,12 +168,7 @@ test("offline, after an online mount, the MRR aggregate disappears; it comes bac
     expect.verifySteps(["has_group"]); // mounted online: the probe ran, true
     expect(".o_animated_number[data-tooltip='Recurring Revenue']").toHaveCount(1);
 
-    // Unlike the offline-cold-mount test above, enough has already run by
-    // this point (the `CrmColumnProgress` mount and its `has_group` RPC)
-    // that the WebClient's own one-shot startup "/mail/store" fetch has
-    // settled before this `setOffline(true)`, so no background error races
-    // it here.
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
     // `showRecurringRevenue` is still `true` (never recomputed), but the
     // aggregate must be absent now, not shown as "0" or stale "25".

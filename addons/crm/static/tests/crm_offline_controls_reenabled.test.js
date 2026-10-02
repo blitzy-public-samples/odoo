@@ -8,13 +8,11 @@ import {
     triggerHotkey,
 } from "@mail/../tests/mail_test_helpers";
 import { expect, test, waitFor } from "@odoo/hoot";
-import { animationFrame } from "@odoo/hoot-dom";
 import {
     contains,
     defineActions,
     defineModels,
     fields,
-    mockOffline,
     models,
     mountWithCleanup,
     onRpc,
@@ -24,9 +22,7 @@ import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { LeadGenerationDropdown } from "@crm/components/lead_generation_dropdown/lead_generation_dropdown";
 import { TeamSwitcher } from "@crm/components/team_switcher/team_switcher";
 import { CrmColumnProgress } from "@crm/views/crm_kanban/crm_column_progress";
-
-const CONNECTION_LOST_MAIL_STORE =
-    'Connection to "/mail/store" couldn\'t be established or was interrupted';
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * VAL-FIX-013: a single offline → online cycle re-enables every M2-disabled
@@ -191,9 +187,7 @@ test("offline, every M2-disabled control is inert together; online again, each w
     await mountWithCleanup(LeadGenerationDropdown);
     expect.verifySteps(["has_group_team_switcher"]); // TeamSwitcher's own mount-time probe
 
-    await animationFrame(); // let any pending fetchStoreData() debounce settle first
-    expect.errors(1);
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // Every control is disabled or inert together, from one connection drop.
@@ -226,13 +220,23 @@ test("offline, every M2-disabled control is inert together; online again, each w
     expect(".o-mail-Message").toHaveCount(0);
     expect(".o-mail-Composer-input").toHaveValue("Hello while online"); // draft untouched
 
+    // Opening the Activities dropdown always issues its own
+    // `fetchStoreData("systray_get_activities")` (`ActivityMenu.onBeforeOpen`,
+    // @mail/core/web/activity_menu.js) -- unlike the controls above, this is
+    // not the mail store's one-time startup fetch that `mockCrmOffline()`
+    // already settled, but a fresh RPC triggered by this very click, which
+    // can only fail now that the connection is down (crm_offline_activity_menu
+    // .test.js's two offline tests declare the same error for the same reason).
+    expect.errors(1);
     await contains(".o_menu_systray i[aria-label='Activities']").click();
     expect(".o-mail-ActivityGroup[data-model_name='crm.lead']").toHaveCount(1);
     await contains(".o-mail-ActivityGroup[data-model_name='crm.lead']").click();
     expect(".o_last_breadcrumb_item:contains('My Pipeline Activities')").toHaveCount(0);
+    expect.verifyErrors([
+        `Connection to "/mail/store" couldn't be established or was interrupted`,
+    ]);
 
     expect.verifySteps([]); // no probe, RPC or navigation was ever attempted while offline
-    expect.verifyErrors([CONNECTION_LOST_MAIL_STORE]);
 
     await setOffline(false);
 

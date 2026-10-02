@@ -7,13 +7,13 @@ import {
     defineModels,
     fields,
     getService,
-    mockOffline,
     models,
     mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * VAL-QUEUE-004 (architecture.md §3.2 item 11 / offline_inventory.md
@@ -50,17 +50,8 @@ test("the systray labels every CRM-queued method without crashing (desktop)", as
     offline.scheduleORM("mail.activity", "action_done", [[5]], {}, {
         extras: { timeStamp: 5, actionName: "CRM", displayName: "Done Activity" },
     });
-    // `mountWithCleanup(WebClient)` always issues its own background
-    // "/mail/store" poll; going offline this fast races it (same
-    // declared-and-verified error as crm_offline_mrr.test.js's "a
-    // CrmColumnProgress mount issues no has_group probe..." test, which
-    // mounts the same bare WebClient for the same reason).
-    expect.errors(1);
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
-    expect.verifyErrors([
-        `Connection to "/mail/store" couldn't be established or was interrupted`,
-    ]);
 
     // Opening the dropdown is exactly what crashes today without the
     // patch (element.status is undefined for all five entries above).
@@ -117,12 +108,8 @@ test("the systray labels every CRM-queued method without crashing (mobile)", asy
     offline.scheduleORM("crm.lead", "action_log_call", [[5]], {}, {
         extras: { timeStamp: 5, actionName: "CRM", displayName: "Called Lead" },
     });
-    expect.errors(1); // same background "/mail/store" race as the desktop test above
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
-    expect.verifyErrors([
-        `Connection to "/mail/store" couldn't be established or was interrupted`,
-    ]);
 
     await contains(".o_menu_systray .o_nav_entry [data-icon='link_off']").click();
     await animationFrame(); // mobile's toggler is a bare div, not the Dropdown's own button (offline_systray.test.js's "scheduledORM: mobile" needs the same extra frame)
@@ -200,7 +187,7 @@ test("offline, Restore queues action_restore, updates the form optimistically, a
     await getService("action").doAction(1);
     expect("button[name='action_restore']").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains("button[name='action_restore']").click();
@@ -239,7 +226,7 @@ test("offline, Restore queues action_restore, updates the form optimistically, a
     await getService("action").doAction(1);
     expect("button[name='action_restore']").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains("button[name='action_restore']").click();
@@ -265,7 +252,7 @@ test("offline, the Restore hotkey queues action_restore too (desktop)", async ()
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await press(["alt", "x"]);
@@ -315,7 +302,7 @@ test("offline, Restore on a dirty valid form queues web_save then action_restore
     // offline writes to the same lead" test).
     await runAllTimers();
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_field_widget[name='name'] input").edit("Renamed before Restore");
@@ -356,7 +343,7 @@ test("offline, Restore on a dirty valid form queues web_save then action_restore
     await getService("action").doAction(1);
     await runAllTimers(); // flush the plugin's harmless startup sync pass before the queue is populated
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_field_widget[name='name'] input").edit("Renamed before Restore");
@@ -383,7 +370,7 @@ test("offline, Restore on an invalid form queues nothing (desktop)", async () =>
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_field_widget[name='name'] input").edit("");

@@ -5,12 +5,12 @@ import {
     defineModels,
     fields,
     models,
-    mockOffline,
     mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { WebClient } from "@web/webclient/webclient";
 import { LeadGenerationDropdown } from "@crm/components/lead_generation_dropdown/lead_generation_dropdown";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * Defect 4 (architecture.md §3.2 item 4 / offline_inventory.md rows
@@ -66,14 +66,14 @@ test("offline, the lead generation toggler is disabled and unreachable; no modul
             expect.step("has_access"); // checkAccessRight's underlying RPC
         }
     });
-    // `mockOffline()`'s `setOffline()` needs a running test app/service
+    // `mockCrmOffline()`'s `setOffline()` needs a running test app/service
     // registry (`getService(OfflinePlugin)`), so a throwaway WebClient is
     // mounted first purely to bring that up; it does nothing else here.
     // Unlike crm_offline_team_switcher.test.js's equivalent test, no
     // "/mail/store" error is declared: that poll already settles during
     // the `LeadGenerationDropdown` mount below, before `setOffline(true)`
     // flips the connection, so there's no in-flight request left to abort.
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     await mountWithCleanup(LeadGenerationDropdown);
 
@@ -109,7 +109,7 @@ test("offline, calling the lead generation handlers directly issues no RPC or ac
             expect.step("has_access");
         }
     });
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await mountWithCleanup(WebClient);
     const comp = await mountWithCleanup(LeadGenerationDropdown);
     await setOffline(true);

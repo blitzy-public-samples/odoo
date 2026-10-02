@@ -484,6 +484,137 @@ for (const { resModel, label, arch } of READONLY_LIST_CASES) {
 }
 
 // ---------------------------------------------------------------------------
+// Finding 16 (scrutiny round 1, VAL-DIS-017): the New button must stay
+// inert offline on these two models even after an online quick-create
+// visit. `isNewButtonAvailableOffline` (`list_controller.js`) checks
+// `isAvailableOffline(actionId, "list_quick_create", false)` for an
+// `editable` list, and the framework marks that key available the first
+// time a new row's blank onchange is loaded online
+// (`relational_model.js`'s `_setAvailableOffline`, `isMonoRecord` config)
+// -- with no per-model component, so this is true for *any* editable list
+// on the action once visited. Without a crm-side override the New
+// button's `data-available-offline` attribute would therefore read true
+// offline too, both re-enabling the button (the framework's own
+// `SELECTORS_TO_DISABLE` pass only disables buttons that *lack* the
+// attribute) and leaving `onClickCreate`'s handler path unguarded.
+//
+// `{ visible: false }`: on a small screen, `web.ControlPanel` collapses
+// `control-panel-buttons` into a "..." dropdown (`control_panel.xml`'s
+// `dropdownifyButtons`), and the always-present copy outside that
+// dropdown -- the one these buttons' fixed classes resolve to -- is only
+// CSS-hidden there, not absent; `contains()`'s `visible: false` is the
+// established way to still interact with it (`kanban_test_helpers.js`
+// uses the same option for an analogous collapsed-under-mobile toggle).
+// ---------------------------------------------------------------------------
+
+for (const { resModel, label, arch } of READONLY_LIST_CASES) {
+    test(`offline, the ${label} list's New button is inert even after an online quick-create visit; online it still creates and saves`, async () => {
+        onRpc(resModel, "web_save", ({ parent }) => {
+            expect.step("web_save");
+            return parent();
+        });
+        await mountView({ resModel, type: "list", arch });
+
+        // Prime `list_quick_create` as available offline the way a real
+        // session would: click New online once and discard the resulting
+        // blank row immediately, so no leftover row or queue entry from
+        // this priming step has to be accounted for below.
+        await contains(".o_list_button_add").click();
+        expect(".o_selected_row").toHaveCount(1);
+        await contains(".o_list_button_discard", { visible: false }).click();
+        expect(".o_selected_row").toHaveCount(0);
+
+        const setOffline = mockOffline();
+        await setOffline(true);
+
+        // The base getter's value is now true (primed above): without
+        // this fix the button would stay enabled and reachable.
+        expect(".o_list_button_add").toHaveProperty("disabled", true);
+        await contains(".o_list_button_add").click();
+        expect(".o_selected_row").toHaveCount(0); // no in-edit row entered
+        expect(".o_data_row").toHaveCount(2); // still just the two seed rows
+        expect.verifySteps([]); // no web_save sent or queued
+        expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+        expect(".o_notification").toHaveCount(0);
+
+        await setOffline(false);
+
+        // Online, New still works and the row can be saved as before.
+        expect(".o_list_button_add").toHaveProperty("disabled", false);
+        await contains(".o_list_button_add").click();
+        expect(".o_selected_row").toHaveCount(1);
+        // `confirm: false`: the default "auto" confirm sends an Enter
+        // keypress on `<input>` targets (hoot-dom's `edit()`), which on an
+        // editable-bottom list commits this row *and* opens a second
+        // blank one for continued typing -- the explicit Save click
+        // below would then save that second (empty) row too, double-
+        // counting `web_save`.
+        await contains(".o_selected_row [name='name'] input").edit("Quarterly", {
+            confirm: false,
+        });
+        await contains(".o_list_button_save", { visible: false }).click();
+        expect.verifySteps(["web_save"]);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Finding 17 (VAL-DIS-017): a row already in create or edit on these two
+// models when the connection drops must leave edition, discarding its
+// changes, rather than risk `DynamicList.leaveEditMode`'s normal save path
+// queuing a `web_save` on a model that must have nothing queued. Covers
+// both an *existing* row mid cell-edit and a *brand-new* row started
+// through New, both begun online.
+// ---------------------------------------------------------------------------
+
+for (const { resModel, label, arch } of READONLY_LIST_CASES) {
+    test(`offline, an existing ${label} row already mid cell-edit when the connection drops leaves edit mode instead of risking a silent save`, async () => {
+        onRpc(resModel, "web_save", () => expect.step("web_save"));
+        await mountView({ resModel, type: "list", arch });
+
+        // Online: open the row's cell editor (allowed online).
+        await contains(".o_data_row:eq(0) [name='name']").click();
+        await contains(".o_field_widget[name='name'] input").edit("mid-edit draft", {
+            confirm: false, // keep the draft unsubmitted, like a user mid-keystroke
+        });
+        expect(".o_selected_row").toHaveCount(1);
+
+        // The connection drops mid-edit: the row is forced out of edition
+        // (discarding the in-progress draft, never saving it).
+        const setOffline = mockOffline();
+        await setOffline(true);
+
+        expect(".o_selected_row").toHaveCount(0);
+        expect.verifySteps([]);
+        expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+        expect(MockServer.env[resModel].find((r) => r.id === 1).name).not.toBe("mid-edit draft");
+
+        await setOffline(false);
+    });
+
+    test(`offline, a brand-new ${label} row started online (New, not yet saved) is discarded, not saved or queued, when the connection drops`, async () => {
+        onRpc(resModel, "web_save", () => expect.step("web_save"));
+        await mountView({ resModel, type: "list", arch });
+
+        await contains(".o_list_button_add").click();
+        expect(".o_selected_row").toHaveCount(1);
+        await contains(".o_selected_row [name='name'] input").edit("Draft only", {
+            confirm: false, // keep the draft unsubmitted, like a user mid-keystroke
+        });
+
+        const setOffline = mockOffline();
+        await setOffline(true);
+
+        expect(".o_selected_row").toHaveCount(0); // the new, unsaved row is gone, not kept dirty
+        expect(".o_data_row").toHaveCount(2); // back to just the two seed rows
+        expect.verifySteps([]);
+        expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+        expect(MockServer.env[resModel].some((r) => r.name === "Draft only")).toBe(false);
+
+        await setOffline(false);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // B68: selected-record Action-menu Archive/Unarchive/Delete inert offline
 // on the Recurring Plans and Lost Reasons lists; nothing is queued on
 // either model. Desktop-only: selecting the row this action menu acts on

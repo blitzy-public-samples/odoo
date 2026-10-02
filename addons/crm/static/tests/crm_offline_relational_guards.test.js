@@ -6,7 +6,6 @@ import {
     defineModels,
     fields,
     getService,
-    mockOffline,
     models,
     mountView,
     mountWithCleanup,
@@ -15,6 +14,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * m2-relational-guards (VAL-DIS-019, VAL-DIS-022).
@@ -160,7 +160,7 @@ test("offline, clicking a tag on the lead form opens no color popover and issues
     onRpc("crm.tag", "web_save", () => expect.step("web_save"));
     await mountView({ resModel: "crm.lead", type: "form", resId: 1, arch: TAG_FORM_ARCH });
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_tag:eq(0)").click();
@@ -203,7 +203,7 @@ test("offline, a tag color popover already open when the connection drops closes
     await contains(".o_tag:eq(0)").click();
     expect(".o_tag_popover").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // "Disabled or absent" (DISABLE convention): the whole popover,
@@ -249,7 +249,7 @@ test("offline, in a selected lead-list row the tag popover does not open because
 
     await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // The row's own cell-edit entry point is already blocked offline
@@ -293,7 +293,7 @@ test("offline, a non-crm model's tag color popover still opens and queues the cr
         arch: TAG_FORM_ARCH,
     });
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_tag:eq(0)").click();
@@ -339,7 +339,7 @@ test("offline, the lost-reason readonly link is absent and issues no get_record_
 
     expect("a.o_form_uri").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
     expect("a.o_form_uri").toHaveCount(0);
     expect.verifySteps([]);
@@ -384,7 +384,7 @@ test("offline, the editable many2one's external button is absent; online it is p
 
     expect(".o_field_widget[name='lost_reason_id'] button.o_external_button").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // Same `canOpen` prop gates both the readonly link and this editable
@@ -426,7 +426,7 @@ test("offline, a many2one_avatar_user link on the merge-opportunity wizard model
 
     expect("a.o_form_uri").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
     expect("a.o_form_uri").toHaveCount(0);
 
@@ -461,7 +461,7 @@ test("online, a non-crm model's readonly many2one link navigates (scope check)",
 });
 
 test("offline, a non-crm model's readonly many2one link stays in the DOM (scope check)", async () => {
-    // Not clicked here: `mockOffline()` simulates a real connection loss,
+    // Not clicked here: `mockCrmOffline()` simulates a real connection loss,
     // so an actual RPC attempt would throw an unhandled
     // `ConnectionLostError` regardless of this feature -- unrelated to
     // whether this feature's guard applies. The point of this scope check
@@ -473,7 +473,7 @@ test("offline, a non-crm model's readonly many2one link stays in the DOM (scope 
         arch: `<form edit="0"><field name="name"/><field name="lost_reason_id"/></form>`,
     });
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
     expect("a.o_form_uri").toHaveCount(1);
 

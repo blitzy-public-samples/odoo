@@ -6,13 +6,10 @@ import {
     defineActions,
     defineModels,
     fields,
-    mockOffline,
     models,
     onRpc,
 } from "@web/../tests/web_test_helpers";
-
-const CONNECTION_LOST_MAIL_STORE =
-    'Connection to "/mail/store" couldn\'t be established or was interrupted';
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * Defect 7 (architecture.md §3.2 item 7 / offline_inventory.md rows A1/A2):
@@ -32,13 +29,21 @@ const CONNECTION_LOST_MAIL_STORE =
  * reach `openActivityGroup` at all. The Enter assertions below document
  * that framework fact instead of exercising a crm code path.
  *
- * Going offline through `mockOffline()` while a full `start()` app is
- * mounted also makes the mail store's own background `/mail/store` poll
- * fail once in the background (same as
- * crm_offline_team_switcher.test.js's "sales-manager probe" test);
- * declared with `expect.errors()`/`expect.verifyErrors()` wherever it
- * happens, unrelated to the activity-menu guard this file is about.
+ * `mockCrmOffline()` (crm_test_helpers.js) is used instead of the raw
+ * `mockOffline()`: going offline right after a full `start()` app mounts
+ * would otherwise race the mail store's own one-time startup
+ * `/mail/store` poll and throw an uncaught, unrelated `ConnectionLostError`
+ * before either test below gets anywhere.
+ *
+ * That settle does not cover `openActivityDropdown()`'s own click, though:
+ * opening the dropdown always calls `ActivityMenu.onBeforeOpen`, which
+ * issues a fresh `fetchStoreData("systray_get_activities")`
+ * (@mail/core/web/activity_menu.js) *after* the connection is already down
+ * -- a deterministic, expected failure, not the startup race, declared
+ * below in both offline tests.
  */
+const CONNECTION_LOST_MAIL_STORE =
+    'Connection to "/mail/store" couldn\'t be established or was interrupted';
 
 class Lead extends models.Model {
     _name = "crm.lead";
@@ -93,10 +98,10 @@ test("offline, clicking the crm.lead activity group issues no loadAction/doActio
     pyEnv["mail.activity"].create({ res_id: 1, res_model: "crm.lead" });
     onRpc("/web/action/load", () => expect.step("load_action"));
     onRpc("crm.lead", "web_search_read", () => expect.step("web_search_read"));
-    expect.errors(1);
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await start();
     await setOffline(true);
+    expect.errors(1);
     await openActivityDropdown();
 
     expect(".o-mail-ActivityGroup[data-model_name='crm.lead']").toHaveCount(1);
@@ -112,10 +117,10 @@ test("offline, pressing Enter while the crm.lead group is open issues no RPC (fr
     const pyEnv = await startServer();
     pyEnv["mail.activity"].create({ res_id: 1, res_model: "crm.lead" });
     onRpc("/web/action/load", () => expect.step("load_action"));
-    expect.errors(1);
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await start();
     await setOffline(true);
+    expect.errors(1);
     await openActivityDropdown();
 
     expect(".o-mail-ActivityGroup[data-model_name='crm.lead']").toHaveCount(1);

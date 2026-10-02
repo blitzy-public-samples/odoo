@@ -9,13 +9,13 @@ import {
     getService,
     MockServer,
     models,
-    mockOffline,
     mountView,
     mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * List cell editing is DISABLE offline (VAL-DIS-030, VAL-DIS-031,
@@ -66,11 +66,22 @@ class Lead extends models.Model {
 
     name = fields.Char();
     probability = fields.Integer({ default: 10 });
+    // Mirrors B54's real selection values (crm_stage.py's
+    // AVAILABLE_PRIORITIES), for the priority-star widget test below.
+    priority = fields.Selection({
+        selection: [
+            ["0", "Low"],
+            ["1", "Medium"],
+            ["2", "High"],
+            ["3", "Very High"],
+        ],
+        default: "0",
+    });
 
     _records = [
-        { id: 1, name: "First lead", probability: 10 },
-        { id: 2, name: "Second lead", probability: 20 },
-        { id: 3, name: "Third lead", probability: 30 },
+        { id: 1, name: "First lead", probability: 10, priority: "0" },
+        { id: 2, name: "Second lead", probability: 20, priority: "0" },
+        { id: 3, name: "Third lead", probability: 30, priority: "0" },
     ];
 
     _views = {
@@ -78,6 +89,7 @@ class Lead extends models.Model {
             <list multi_edit="1">
                 <field name="name"/>
                 <field name="probability"/>
+                <field name="priority" widget="priority"/>
             </list>`,
         form: `
             <form>
@@ -144,7 +156,7 @@ test("offline, the Leads list's row checkbox stays enabled but no cell editor op
     await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
     expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // Row selection itself stays available offline: the already-checked
@@ -183,7 +195,7 @@ test("offline, with two or more rows checked on the Leads list no cell is editab
     onRpc("crm.lead", "web_save", () => expect.step("web_save"));
     await mountView({ resModel: "crm.lead", type: "list", arch: Lead._views.list });
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // Check two rows while offline: selection keeps working for more than
@@ -231,7 +243,7 @@ test("offline, a Leads list row already mid cell-edit when the connection drops 
     // The connection drops mid-edit: the row is forced out of edition
     // (discarding the in-progress draft, never saving it) instead of
     // leaving an edit that could look saved without being sent or queued.
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect(".o_field_widget[name='name'] input").toHaveCount(0);
@@ -240,6 +252,104 @@ test("offline, a Leads list row already mid cell-edit when the connection drops 
     expect(MockServer.env["crm.lead"].find((r) => r.id === 1).name).toBe("First lead");
 
     await setOffline(false);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 18 (scrutiny round 1, VAL-DIS-030): the priority star carries
+// `data-available-offline` on its own `<button>`
+// (`priority_field.xml`), so the framework's own disabling pass never
+// touches it, and its click handler (`onStarClicked` -> `updateRecord` ->
+// `record.update()`) is a different entry point from
+// `ListRenderer.onCellClicked`/`onCellKeydownReadOnlyMode` above --
+// `t-on-click.stop` never lets the renderer's own handler see the click
+// at all. On a *checked* row of this `multi_edit="1"` list, that still
+// reaches `DynamicList._multiSave()` (`record.js`'s `selected &&
+// model.multiEdit` branch), the exact unqueued path this file exists to
+// keep crm.lead/crm.stage/crm.team list cell edits away from. On an
+// *unchecked* row the star is a standalone widget, not list cell editing
+// at all, and keeps queueing a plain per-record `web_save({priority})`
+// (B22/B53/B54's existing producer) exactly as before, online or offline.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, the priority star on a checked Opportunities row issues no web_save/web_save_multi and queues nothing, with no visible change; online it still multi-edit-saves", async () => {
+    const steps = [];
+    onRpc("crm.lead", ["web_save", "web_save_multi"], ({ method, parent }) => {
+        steps.push(method);
+        return parent();
+    });
+    await mountView({ resModel: "crm.lead", type: "list", arch: Lead._views.list });
+
+    await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+    expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // The star stays enabled (it carries its own `data-available-offline`,
+    // unlike a plain framework-owned button), but clicking it issues no
+    // RPC, queues nothing, and leaves the displayed value unchanged.
+    // `:eq(0)` is the first *rendered* star, for selection value "1"
+    // ("Medium"): the template skips a star for the first selection
+    // option ("0"/"Low", `t-if="!value_first"`), the same offset
+    // `crm_offline_queue_semantics.test.js`'s kanban priority click
+    // relies on.
+    expect(".o_data_row:eq(0) .o_priority button.o_priority_star:eq(0)").toHaveProperty(
+        "disabled",
+        false
+    );
+    await contains(".o_data_row:eq(0) .o_priority button.o_priority_star:eq(0)").click();
+
+    expect(steps).toEqual([]); // no web_save or web_save_multi sent or queued
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    // The underlying data is unaffected (the template's own `oi-filled`
+    // class on a hovered-over star is just a hover-preview highlight,
+    // `t-on-mouseenter="() => this.state.index = value_index"` --
+    // unrelated to whether the click's write went through -- so the
+    // server/record value, not a DOM class, is the only reliable signal
+    // that nothing changed).
+    expect(MockServer.env["crm.lead"].find((r) => r.id === 1).priority).toBe("0"); // unchanged
+    expect(".o_notification").toHaveCount(0);
+
+    await setOffline(false);
+
+    // Online, the same checked row's star still multi-edit-saves as
+    // before (B54's existing behavior, unregressed by this guard): a
+    // plain Selection value routes `_multiSave` through `orm.webSave`
+    // (`dynamic_list.js`), not `webSaveMulti` (that one is only used for
+    // Field Operations, e.g. the "+"/"-" increment widgets).
+    await contains(".o_data_row:eq(0) .o_priority button.o_priority_star:eq(0)").click();
+    expect(steps).toEqual(["web_save"]);
+    expect(MockServer.env["crm.lead"].find((r) => r.id === 1).priority).toBe("1");
+});
+
+test.tags("desktop");
+test("offline, the priority star on an unchecked Opportunities row still queues a plain web_save, unaffected by the checked-row guard", async () => {
+    onRpc("crm.lead", "web_save", ({ parent }) => {
+        expect.step("web_save");
+        return parent();
+    });
+    await mountView({ resModel: "crm.lead", type: "list", arch: Lead._views.list });
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // No row is checked: this is the ordinary per-record priority
+    // producer (B54), not list cell editing, and must keep queueing.
+    expect(".o_data_row:eq(0)").not.toHaveClass("o_data_row_selected");
+    await contains(".o_data_row:eq(0) .o_priority button.o_priority_star:eq(0)").click();
+
+    expect.verifySteps([]); // not sent while offline: queued instead
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync());
+    expect(queued.length).toBe(1);
+    expect(queued[0].value.model).toBe("crm.lead");
+    expect(queued[0].value.method).toBe("web_save");
+    expect(queued[0].value.args).toEqual([[1], { priority: "1" }]);
+
+    await setOffline(false);
+    expect.verifySteps(["web_save"]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(MockServer.env["crm.lead"].find((r) => r.id === 1).priority).toBe("1");
 });
 
 // ---------------------------------------------------------------------------
@@ -252,7 +362,7 @@ test("under the mobile preset, the Leads list renders no row selector, so no cel
     await mountView({ resModel: "crm.lead", type: "list", arch: Lead._views.list });
     expect(".o_list_record_selector").toHaveCount(0);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
     expect(".o_list_record_selector").toHaveCount(0);
 
@@ -285,7 +395,7 @@ for (const { resModel, label, arch, before } of FORM_SAVE_CASES) {
             await mountView({ resModel, type: "form", resId: 1, arch });
             expect(`.o_field_widget[name='name'] input`).toHaveValue(before);
 
-            const setOffline = mockOffline();
+            const setOffline = mockCrmOffline();
             await setOffline(true);
 
             const after = `Edited offline (${resModel})`;
@@ -316,7 +426,7 @@ test("offline, the systray shows a queued lead form save labeled 'Edited', with 
     await contains(".o_data_row:eq(0) [name='name']").click();
     expect(".o_form_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(`.o_field_widget[name='name'] input`).edit("Edited for the systray check");

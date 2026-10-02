@@ -6,7 +6,6 @@ import {
     defineModels,
     fields,
     getService,
-    mockOffline,
     models,
     mountWithCleanup,
     onRpc,
@@ -15,6 +14,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * Uncached lead opened offline (architecture.md §3.2 item 10 /
@@ -113,7 +113,7 @@ test("offline, the crm kanban opens a cached lead and shows the helper for an un
     await contains(".o_breadcrumb .o_back_button").click();
     expect(".o_kanban_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1); // web_read is genuinely attempted; it loses the race to the disk-cache hit
@@ -148,7 +148,7 @@ test("offline, the crm kanban opens a cached lead and shows the helper for an un
     await contains(".o_breadcrumb .o_back_button").click();
     expect(".o_kanban_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -184,7 +184,7 @@ test("offline, the crm list opens a cached lead and shows the helper for an unca
     await switchView("list");
     expect(".o_list_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -215,7 +215,7 @@ test("offline, the crm list opens a cached lead and shows the helper for an unca
     await switchView("list");
     expect(".o_list_view").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     expect.errors(1);
@@ -243,7 +243,7 @@ test.tags("desktop");
 test("offline, an uncached lead's card menu toggler is disabled and its body shows the helper (desktop)", async () => {
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1);
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     const uncachedCard = ".o_kanban_record:contains('Never Visited Lead')";
@@ -265,7 +265,7 @@ test.tags("mobile");
 test("offline, an uncached lead's card menu toggler is disabled and its body shows the helper (mobile)", async () => {
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1);
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     const uncachedCard = ".o_kanban_record:contains('Never Visited Lead')";
@@ -295,7 +295,7 @@ test("offline, a card menu opened online can't Edit afterward; online it still c
     await contains(`${card} .o_dropdown_kanban button`).click();
     expect(".dropdown-item:contains('Edit')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".dropdown-item:contains('Edit')").click();
@@ -317,7 +317,7 @@ test("offline, a card menu opened online can't Edit afterward (mobile)", async (
     await contains(`${card} .o_dropdown_kanban button`).click();
     expect(".dropdown-item:contains('Edit')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".dropdown-item:contains('Edit')").click();
@@ -335,7 +335,7 @@ test("offline, a card menu opened online can't Delete afterward; online it still
     await contains(`${card} .o_dropdown_kanban button`).click();
     expect(".dropdown-item:contains('Delete')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".dropdown-item:contains('Delete')").click();
@@ -360,7 +360,7 @@ test("offline, a card menu opened online can't Delete afterward (mobile)", async
     await contains(`${card} .o_dropdown_kanban button`).click();
     expect(".dropdown-item:contains('Delete')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".dropdown-item:contains('Delete')").click();
