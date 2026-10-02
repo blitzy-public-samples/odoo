@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<templates>
+    <!-- B81 (VAL-DIS-007): a primary inheritance of "mail.ActivityController"
+         scoped to crm_activity only, so every other model's activity view
+         keeps the base template (which has no couldNotLoadRootOffline
+         branch at all) untouched. -->
+    <t t-name="crm.ActivityView" t-inherit="mail.ActivityController" t-inherit-mode="primary">
+        <xpath expr="//t[@t-component='this.props.Renderer']" position="attributes">
+            <attribute name="t-if">!this.model.couldNotLoadRootOffline</attribute>
+        </xpath>
+        <xpath expr="//t[@t-component='this.props.Renderer']" position="after">
+            <t t-if="this.model.couldNotLoadRootOffline">
+                <OfflineActionHelper/>
+            </t>
+        </xpath>
+    </t>
+</templates>
