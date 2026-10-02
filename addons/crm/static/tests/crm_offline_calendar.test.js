@@ -1,8 +1,9 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import { expect, test } from "@odoo/hoot";
-import { animationFrame, click, queryFirst, waitFor } from "@odoo/hoot-dom";
+import { click, queryFirst, waitFor } from "@odoo/hoot-dom";
 import { mockDate } from "@odoo/hoot-mock";
 import {
+    contains,
     defineActions,
     defineModels,
     fields,
@@ -11,9 +12,7 @@ import {
     models,
     mountWithCleanup,
     onRpc,
-    patchWithCleanup,
 } from "@web/../tests/web_test_helpers";
-import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
 
 /**
@@ -23,8 +22,9 @@ import { WebClient } from "@web/webclient/webclient";
  * once there (`crm_calendar_controller.js`) instead of in each renderer.
  * Neither the real `crm.lead` calendar arch nor this test's arch sets
  * `event_open_popup`, so `hasEditDialog` is false and `editRecord` takes
- * its non-dialog branch: a brand-new, id-less `ir.actions.act_window`
- * handed to `doAction`
+ * its non-dialog branch, which this fix now routes through
+ * `this.action.switchView("form", {...})` while offline instead of the
+ * upstream `doAction` of a brand-new, id-less `ir.actions.act_window`
  * (`addons/web/static/src/views/calendar/calendar_controller.js`), which
  * needs a real action manager -- a bare `mountView` has none, so this
  * suite mounts the full `WebClient` and reaches the calendar through
@@ -47,18 +47,33 @@ import { WebClient } from "@web/webclient/webclient";
  * behavior, not `editRecord`'s guard. The double-click path has no such
  * prerequisite read, so it isolates the guard precisely.
  *
- * Unlike the kanban/list `openRecord` guard
- * (`crm_offline_uncached_lead.test.js`), there is no reachable crm UI path
- * that genuinely visits a lead's form *through the calendar's own action*:
- * the ad hoc action `editRecord` builds has no `id`, so nothing durably
- * marks it "visited" and nothing pre-populates its own `web_read`'s disk
- * cache either way. `isAvailableOffline` is faked instead, to exercise the
- * gate itself (the same idiom the library notes sanction for a search
- * state no crm UI path can reach, e.g. crm_offline_team_switcher.test.js).
- * Because nothing genuinely populates the form's own disk cache either,
- * "available" offline still genuinely attempts (and loses) its `web_read`
- * -- there is no cache entry to win the race, unlike
- * crm_offline_uncached_lead.test.js's "visited" lead.
+ * "Visited online" (the real QA scenario: open the lead from the
+ * pipeline, then switch to Calendar) means the lead's form was opened
+ * through *this same action* (`crm_lead_action_pipeline` has `calendar`
+ * and `form` both on one action record, so the actionId is identical
+ * whichever view you reach the form from). `OfflinePlugin.isAvailableOffline`
+ * is keyed on `actionId`, so faking it without also genuinely switching
+ * to the form view first would leave the "available" check lying to the
+ * UI while nothing actually populated the disk cache -- the same trap
+ * `crm_offline_uncached_lead.test.js`'s module comment warns against. This
+ * suite instead performs a real `switchView("form", {resId})` on the
+ * calendar's own action to visit the lead, then returns to the calendar,
+ * before going offline -- the same genuine-visit idiom, applied through
+ * the action rather than through a kanban/list click (this suite's arch
+ * has no kanban/list of its own).
+ *
+ * Like `crm_offline_uncached_lead.test.js`'s "visited" kanban/list case, a
+ * genuinely cached record's `web_read` is still attempted over the real
+ * network when reopened, and that attempt still loses the race to the
+ * local answer: the mock server's own `web_read` handler is never reached
+ * while offline (so no "web_read" step is recorded for it, confirmed
+ * below), yet the client-side call still rejects with a genuine
+ * `ConnectionLostError`, which every "visited" test below declares with
+ * `expect.errors(1)` and verifies. What the fix changes is only that the
+ * form opens and renders the lead's data correctly despite that losing
+ * attempt, with no error dialog, no notification, and no other uncaught
+ * error -- exactly architecture.md §2's cache race, applied through the
+ * calendar's own action instead of an orphaned one.
  */
 class Lead extends models.Model {
     _name = "crm.lead";
@@ -88,19 +103,18 @@ defineActions([
         name: "Leads Calendar",
         res_model: "crm.lead",
         type: "ir.actions.act_window",
-        views: [[false, "calendar"]],
+        // Both views on one action, like the real `crm_lead_action_pipeline`
+        // (`kanban,list,graph,pivot,form,calendar,activity`): visiting the
+        // form through this action, from any of its views, shares the one
+        // `actionId` offline availability is keyed on.
+        views: [
+            [false, "calendar"],
+            [false, "form"],
+        ],
     },
 ]);
 
 const WEB_READ_ERROR = `Connection to "/web/dataset/call_kw/crm.lead/web_read" couldn't be established or was interrupted`;
-// The ad hoc action `editRecord` builds has no `id`, so its `get_views` is
-// never pre-cached either (unlike a real, registered action's), and that
-// is the very first call it makes -- it never gets as far as `web_read`.
-const GET_VIEWS_ERROR = `Connection to "/web/dataset/call_kw/crm.lead/get_views" couldn't be established or was interrupted`;
-// Restoring the calendar after the ad hoc action fails also genuinely
-// retries its own reload (the same pattern crm_offline_uncached_lead.
-// test.js's "revisiting an already-visited kanban/list" comment notes).
-const SEARCH_READ_ERROR = `Connection to "/web/dataset/call_kw/crm.lead/search_read" couldn't be established or was interrupted`;
 
 // `.o_event`'s own harness sits off the viewport's visible top in month
 // view; fullcalendar's hit-testing needs the element actually scrolled
@@ -132,13 +146,25 @@ async function mountCalendar() {
     // would render at all (same idiom as calendar_view.test.js's own
     // `beforeEach`).
     mockDate("2024-01-15 10:00:00");
-    patchWithCleanup(OfflinePlugin.prototype, {
-        isAvailableOffline(actionId, viewType, resId) {
-            return viewType === "form" && resId === 1;
-        },
-    });
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1);
+}
+
+// Genuinely visits lead `resId`'s form *through the calendar's own action*
+// (the same `switchView` call the fix now also makes), then returns to the
+// calendar -- the one real way `isAvailableOffline(actionId, "form", resId)`
+// becomes true for this actionId, matching how visiting the same lead from
+// the pipeline kanban/list (another view of the very same action) would.
+async function visitLeadFormThenReturnToCalendar(resId) {
+    await getService("action").switchView("form", { resId, resIds: [1, 2] });
+    await waitFor(".o_form_view");
+    expect(".o_form_view").toHaveCount(1);
+    // Consumes this online visit's own "web_read" step so the caller's
+    // later checks only see what the offline reopen itself produces.
+    expect.verifySteps(["web_read"]);
+    await contains(".o_breadcrumb .o_back_button").click();
+    await waitFor(".o_calendar_view");
+    expect(".o_calendar_view").toHaveCount(1);
 }
 
 test.tags("desktop");
@@ -190,45 +216,50 @@ test("online, double-clicking an unvisited lead's event opens it (desktop)", asy
 });
 
 test.tags("desktop");
-test("offline, double-clicking an available-offline lead's event still genuinely attempts its own action and loses the race (desktop)", async () => {
-    onRpc("crm.lead", "get_views", () => expect.step("get_views"));
+test("offline, double-clicking a lead's event visited online through the same action opens its form (desktop)", async () => {
+    onRpc("crm.lead", "web_read", () => expect.step("web_read"));
     await mountCalendar();
+    await visitLeadFormThenReturnToCalendar(1);
 
     const setOffline = mockOffline();
     await setOffline(true);
 
-    // `isAvailableOffline` is faked to pass the gate, but this ad hoc
-    // action was never actually cached, so its very first call --
-    // `get_views`, since it has no `id` to load by -- genuinely fails and
-    // architecture.md §2's silent-restore leaves the calendar mounted, not
-    // a form. It never gets as far as `web_read`. Restoring the calendar
-    // also genuinely retries its own `search_read`, which fails too.
-    expect.errors(2);
+    // Fixed: `editRecord` now routes through `this.action.switchView`
+    // instead of an id-less ad hoc action, so this reopens the very same
+    // action/viewType/resId already visited above and the form renders
+    // the cached value. `web_read` is still genuinely attempted over the
+    // real network and still loses that race (it never reaches the mock
+    // server's handler while offline, so no further "web_read" step is
+    // recorded for it), so one `ConnectionLostError` is declared and
+    // verified; no other error, and no error dialog or notification is
+    // shown to the user.
+    expect.errors(1);
     await doubleClickEvent(1);
-    await waitFor(".fc-event"); // back on the calendar, not stuck
-    await animationFrame(); // let the trailing error finish logging
-    expect(".fc-event").toHaveCount(2);
-    expect(".o_form_view").toHaveCount(0);
-    expect.verifySteps(["get_views"]);
-    expect.verifyErrors([GET_VIEWS_ERROR, SEARCH_READ_ERROR]);
+    await waitFor(".o_form_view");
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_field_widget[name=name] input").toHaveValue("Available Lead");
+    expect(".o_notification").toHaveCount(0);
+    expect.verifySteps([]);
+    expect.verifyErrors([WEB_READ_ERROR]);
 });
 
 test.tags("mobile");
-test("offline, double-clicking an available-offline lead's event still genuinely attempts its own action and loses the race (mobile)", async () => {
-    onRpc("crm.lead", "get_views", () => expect.step("get_views"));
+test("offline, double-clicking a lead's event visited online through the same action opens its form (mobile)", async () => {
+    onRpc("crm.lead", "web_read", () => expect.step("web_read"));
     await mountCalendar();
+    await visitLeadFormThenReturnToCalendar(1);
 
     const setOffline = mockOffline();
     await setOffline(true);
 
-    expect.errors(2);
+    expect.errors(1);
     await doubleClickEvent(1);
-    await waitFor(".fc-event");
-    await animationFrame();
-    expect(".fc-event").toHaveCount(2);
-    expect(".o_form_view").toHaveCount(0);
-    expect.verifySteps(["get_views"]);
-    expect.verifyErrors([GET_VIEWS_ERROR, SEARCH_READ_ERROR]);
+    await waitFor(".o_form_view");
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_field_widget[name=name] input").toHaveValue("Available Lead");
+    expect(".o_notification").toHaveCount(0);
+    expect.verifySteps([]);
+    expect.verifyErrors([WEB_READ_ERROR]);
 });
 
 test.tags("desktop");
