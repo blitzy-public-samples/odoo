@@ -34,6 +34,23 @@ import { contains, defineModels, fields, mockOffline, models } from "@web/../tes
  * `message_post`. `core/common/composer_patch.js` closes that path for
  * `crm.lead` threads by making `sendMessage()` a no-op and forcing
  * `isSendButtonDisabled` while offline (VAL-FIX-012, VAL-DIS-004).
+ *
+ * Test stability (m2-test-stability-partner-link): mounting the chatter
+ * (and typing into its composer) can leave one of @mail's own debounced
+ * fetchStoreData() calls still pending (Store.FETCH_DATA_DEBOUNCE_DELAY,
+ * @mail/core/common/store_service.js -- a 1ms debounce around the
+ * /mail/store RPC). waitFor(".o-mail-Chatter-sendMessage") and
+ * insertText() only wait for the DOM they touch, not for that unrelated
+ * timer; if it is still pending when mockOffline() flips the connection,
+ * the debounced RPC fires straight into the simulated outage and
+ * surfaces as an uncaught ConnectionLostError moments later -- unrelated
+ * to anything this file asserts, but enough to fail whichever test
+ * happened to be running at the time (observed on all three offline
+ * tests below, not only the two reported in this feature). An
+ * animationFrame() before every mockOffline() call gives that timer a
+ * chance to fire and resolve first, same technique as the pre-existing
+ * one at the bottom of this file (there, for the *reported* error's own
+ * tick).
  */
 
 class Lead extends models.Model {
@@ -70,6 +87,7 @@ test("offline, the chatter's primary action buttons are disabled", async () => {
     await start();
     await openFormView("crm.lead", 1);
     await waitFor(".o-mail-Chatter-sendMessage");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
 
     const setOffline = mockOffline();
     await setOffline(true);
@@ -96,6 +114,7 @@ test("offline, Ctrl+Enter in an already-open composer posts nothing and raises n
     await openFormView("crm.lead", 1);
     await contains(".o-mail-Chatter-sendMessage").click();
     await insertText(".o-mail-Composer-input", "Hello while online");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
 
     const setOffline = mockOffline();
     await setOffline(true);
@@ -154,6 +173,7 @@ test("offline, a non-crm.lead chatter's Ctrl+Enter still attempts message_post a
     await openFormView("res.partner", partnerId);
     await contains(".o-mail-Chatter-sendMessage").click();
     await insertText(".o-mail-Composer-input", "Hi");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
 
     const setOffline = mockOffline();
     await setOffline(true);

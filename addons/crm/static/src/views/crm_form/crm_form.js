@@ -9,6 +9,10 @@ import { formView } from "@web/views/form/form_view";
 // the lead form arch (desktop and touch layouts), both as a plain `<a>`.
 const AI_SWITCH_SELECTOR = "a[name='action_set_automated_probability']";
 
+// B1/C6 (offline_inventory.md): the `stage_id` statusbar's inline and
+// dropdown buttons, see the comment at its usage below.
+const STATUSBAR_BUTTON_SELECTOR = ".o_statusbar_status button";
+
 class CrmFormRecord extends formView.Model.Record {
      /**
      * override of record _save mechanism intended to affect the main form record
@@ -109,6 +113,37 @@ class CrmFormController extends formView.Controller {
         });
         onPatched(syncAiSwitchOfflineState);
         onWillDestroy(() => disposeAiSwitchEffect());
+
+        // B1/C6 (architecture.md §3.2/§3.3, VAL-FIX-001): the stage
+        // statusbar's own buttons -- `web.StatusBarField`'s inline
+        // `<button t-att-data-value="...">` items and its before/after/
+        // collapsed dropdown togglers, inherited unchanged by
+        // `rotting_statusbar_duration` -- are plain `<button>`s with no
+        // `data-available-offline`. Left alone,
+        // `OfflinePlugin.SELECTORS_TO_DISABLE` disables every one of them
+        // on going offline, so a click never runs its handler, the record
+        // never becomes dirty, and the Save button never appears: stage
+        // moves via the statusbar (desktop inline buttons, mobile dropdown
+        // toggle) would silently stop working offline even though the
+        // underlying `web_save` is already queueable. Tag them
+        // unconditionally, online and offline alike: the framework only
+        // checks the attribute's presence (both on its initial disable
+        // pass and reactively, via its own `MutationObserver` on this same
+        // attribute), so marking them ahead of time is what keeps the
+        // buttons out of its disable pass entirely rather than racing it.
+        const markStatusbarButtonsAvailableOffline = () => {
+            const rootEl = this.rootRef();
+            if (!rootEl || this.model.root.resModel !== "crm.lead") {
+                return;
+            }
+            for (const el of rootEl.querySelectorAll(STATUSBAR_BUTTON_SELECTOR)) {
+                if (!el.hasAttribute("data-available-offline")) {
+                    el.setAttribute("data-available-offline", "");
+                }
+            }
+        };
+        onMounted(markStatusbarButtonsAvailableOffline);
+        onPatched(markStatusbarButtonsAvailableOffline);
     }
 
     /**

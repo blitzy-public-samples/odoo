@@ -1,3 +1,4 @@
+import { Many2One } from "@web/views/fields/many2one/many2one";
 import { Many2OneField } from "@web/views/fields/many2one/many2one_field";
 import { Many2OneAvatarUserField } from "@mail/views/web/fields/many2one_avatar_user_field/many2one_avatar_user_field";
 import { patch } from "@web/core/utils/patch";
@@ -17,37 +18,75 @@ import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
  * `data-available-offline`, so the framework already disables it
  * (proportionate proof: a DOM-only test, no handler guard needed there).
  *
- * `Many2One` itself never sees the host record (only the already-computed
- * `relation`/`value`/`canOpen`/... props built by `computeM2OProps()`), so
- * the guard sits one level up, in the field-wrapper classes that call
- * `computeM2OProps(this.props)` and own `this.props.record`: `Many2OneField`
- * (the default "many2one" widget, web) and `Many2OneAvatarUserField` (the
- * "many2one_avatar_user" widget, mail -- an existing crm dependency).
- * Forcing `canOpen` false offline removes the `<a>` from the template
- * entirely (`t-if="this.props.canOpen"` -- "absent" per the DISABLE
- * semantics convention) and leaves the button unrendered too
- * (`hasLinkButton` requires `canOpen`), a strict subset of what the
- * framework's button-disable pass already does, so there is no regression
- * there. Patching `Many2OneAvatarUserField` also covers crm's own
- * `Many2OneAvatarLeaderUserField` (`js/fields/
- * many2one_avatar_leader_user.js`, the lead form's `user_id` widget),
- * which extends it and calls `super.m2oProps`.
+ * Two layers, for two different field-wrapper situations:
  *
- * KNOWN-LIMIT (recorded in this feature's handoff): the lead form's
- * `partner_id` (`widget="res_partner_many2one"`) uses a third
- * field-wrapper class, `PartnerAutoCompleteMany2one`
- * (`partner_autocomplete` addon). `partner_autocomplete` is not in crm's
- * manifest `depends`; a static `import` of its module would be an
- * undeclared dependency and could break crm's whole asset bundle if that
- * addon is ever absent from an installation -- forbidden by the repo
- * AGENTS.md section 4 ("No new dependency"). Per this feature's stated
- * precedence, section 4 wins over architecture.md's BR10 ("every many2one
- * occurrence"): `partner_id`'s own-record-open link stays unguarded by
- * this patch, offline exactly as online.
+ * 1. `Many2One` itself never sees the host record (only the
+ *    already-computed `relation`/`value`/`canOpen`/... props built by
+ *    `computeM2OProps()`), so for the two wrapper classes crm already
+ *    knows about -- `Many2OneField` (the default "many2one" widget, web)
+ *    and `Many2OneAvatarUserField` (the "many2one_avatar_user" widget,
+ *    mail -- an existing crm dependency) -- `disableRecordOpenOffline()`
+ *    patches *their* `m2oProps` getter, which does own `this.props.record`,
+ *    and forces `canOpen` false offline. That removes the `<a>` from the
+ *    template entirely (`t-if="this.props.canOpen"` -- "absent" per the
+ *    DISABLE semantics convention) and leaves the button unrendered too
+ *    (`hasLinkButton` requires `canOpen`), a strict subset of what the
+ *    framework's button-disable pass already does for the button, so
+ *    there is no regression there. Patching `Many2OneAvatarUserField`
+ *    also covers crm's own `Many2OneAvatarLeaderUserField` (`js/fields/
+ *    many2one_avatar_leader_user.js`, the lead form's `user_id` widget),
+ *    which extends it and calls `super.m2oProps`.
+ *
+ * 2. The lead form's `partner_id` (`widget="res_partner_many2one"`) uses a
+ *    third field-wrapper class, `PartnerAutoCompleteMany2one`
+ *    (`partner_autocomplete` addon, not a crm dependency): it extends
+ *    `Component` directly, not `Many2OneField`, and computes its own
+ *    `m2oProps` from `computeM2OProps(this.props)` without going through
+ *    either patched class above. Statically `import`ing that class to
+ *    patch it the same way would be an undeclared dependency on an addon
+ *    that may be absent from an installation -- forbidden by the repo
+ *    AGENTS.md section 4 ("No new dependency"); per this feature's stated
+ *    precedence, section 4 wins over architecture.md's BR10 ("every
+ *    many2one occurrence"). What *is* a safe, already-existing crm
+ *    dependency is `Many2One` itself (`addons/web`), which
+ *    `PartnerAutoCompleteMany2one` reaches through its own
+ *    `PartnerMany2One extends Many2One` (`partner_autocomplete_many2one.js`):
+ *    patching `Many2One.prototype` reaches every many2one wrapper built on
+ *    it, present or future, with no import of the wrapper class needed.
+ *    `disableSharedRecordOpenOffline()` below patches `hasLinkButton`
+ *    (hides the editable button, same as layer 1) and `openRecordInAction`
+ *    (the method both the readonly `<a>` and the button's "action"/"tab"
+ *    modes call) to no-op offline. `Many2One` has no `props.record`
+ *    either, so scoping reads `this.env.model.config.resModel` instead --
+ *    set by every view controller that can render a many2one
+ *    (`useSubEnv({ model: this.model })` in `form_controller.js`,
+ *    `form_renderer.js`, `list_controller.js`, `kanban_controller.js`) and
+ *    inherited down to field components regardless of nesting depth,
+ *    exactly like `RottingStatusBarDurationField` already reads
+ *    `this.env.model.config.resModel` from a field widget
+ *    (`mail/static/src/js/rotting_mixin/rotting_statusbar.js`).
+ *
+ *    This layer cannot reproduce layer 1's "absent" readonly link: the
+ *    template's `t-if="this.props.canOpen"` reads the prop directly, and
+ *    `Many2One` cannot override a prop handed to it by its parent, only
+ *    its own methods. So for `partner_id` the readonly link stays
+ *    *present* but inert offline (no RPC, no navigation) rather than
+ *    disappearing -- which is exactly what this feature's own
+ *    expectedBehavior asks for ("issues no get_record_default_action...
+ *    and no navigation", not "is absent"), unlike BR10's "absent" wording
+ *    used for the two fields layer 1 already covers.
+ *
+ *    Layer 2 is intentionally *not* a replacement for layer 1: removing
+ *    the two `m2oProps` patches would regress `lost_reason_id`/`user_id`'s
+ *    committed "absent" assertions in
+ *    `crm_offline_relational_guards.test.js` (that file's own canOpen=
+ *    false-via-props mechanism is the only way to make the *link* vanish
+ *    from the DOM, not just stop navigating) -- so both layers run
+ *    together, each covering what the other cannot.
  *
  * Scoped to crm's own models (the lead and the two conversion wizards
- * that render these two widgets with `canOpen` true) so every other
- * addon's many2one field is untouched, online or offline.
+ * that render many2one fields with `canOpen` true) so every other addon's
+ * many2one field is untouched, online or offline.
  */
 const CRM_SCOPED_MODELS = [
     "crm.lead",
@@ -77,3 +116,35 @@ function disableRecordOpenOffline(FieldClass) {
 
 disableRecordOpenOffline(Many2OneField);
 disableRecordOpenOffline(Many2OneAvatarUserField);
+
+function disableSharedRecordOpenOffline(ComponentClass) {
+    patch(ComponentClass.prototype, {
+        setup() {
+            super.setup();
+            this.crmOffline = useCrmOffline();
+        },
+
+        get isCrmScopedOffline() {
+            return (
+                this.crmOffline.isOffline() &&
+                CRM_SCOPED_MODELS.includes(this.env.model?.config?.resModel)
+            );
+        },
+
+        get hasLinkButton() {
+            if (this.isCrmScopedOffline) {
+                return false;
+            }
+            return super.hasLinkButton;
+        },
+
+        async openRecordInAction(newWindow) {
+            if (this.isCrmScopedOffline) {
+                return;
+            }
+            return super.openRecordInAction(newWindow);
+        },
+    });
+}
+
+disableSharedRecordOpenOffline(Many2One);
