@@ -1,5 +1,5 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
-import { expect, test } from "@odoo/hoot";
+import { animationFrame, expect, test } from "@odoo/hoot";
 import { press } from "@odoo/hoot-dom";
 import {
     contains,
@@ -107,6 +107,7 @@ class Stage extends models.Model {
     _records = [{ id: 1, name: "New" }];
 
     _views = {
+        list: `<list><field name="name"/></list>`,
         form: `<form><field name="name"/></form>`,
     };
 }
@@ -119,6 +120,7 @@ class Team extends models.Model {
     _records = [{ id: 1, name: "Sales Team" }];
 
     _views = {
+        list: `<list><field name="name"/></list>`,
         form: `<form><field name="name"/></form>`,
     };
 }
@@ -130,6 +132,20 @@ defineActions([
         id: 1,
         name: "Leads",
         res_model: "crm.lead",
+        type: "ir.actions.act_window",
+        views: [[false, "list"], [false, "form"]],
+    },
+    {
+        id: 2,
+        name: "Stages",
+        res_model: "crm.stage",
+        type: "ir.actions.act_window",
+        views: [[false, "list"], [false, "form"]],
+    },
+    {
+        id: 3,
+        name: "Teams",
+        res_model: "crm.team",
         type: "ir.actions.act_window",
         views: [[false, "list"], [false, "form"]],
     },
@@ -417,25 +433,57 @@ for (const { resModel, label, arch, before } of FORM_SAVE_CASES) {
     }
 }
 
-test.tags("desktop");
-test("offline, the systray shows a queued lead form save labeled 'Edited', with no crash", async () => {
-    // Matches VAL-DIS-031's exact scenario: the record is opened from its
-    // list (cached/visited online), not mounted as a bare form.
-    await mountWithCleanup(WebClient);
-    await getService("action").doAction(1);
-    await contains(".o_data_row:eq(0) [name='name']").click();
-    expect(".o_form_view").toHaveCount(1);
+// VAL-DIS-031 (round-1 user testing): the original version of this test
+// only covered crm.lead, desktop-only. The systray's "Edited" label comes
+// from `web_save`'s own `extras.changes` (record.js), the same producer
+// FORM_SAVE_CASES above already proves for all three models, so the
+// systray rendering of it needs the same per-model coverage, plus a
+// mobile variant for the toggler quirk noted below.
+const SYSTRAY_CASES = [
+    { resModel: "crm.lead", label: "a lead", actionId: 1 },
+    { resModel: "crm.stage", label: "a stage", actionId: 2 },
+    { resModel: "crm.team", label: "a team", actionId: 3 },
+];
 
-    const setOffline = mockCrmOffline();
-    await setOffline(true);
+for (const { resModel, label, actionId } of SYSTRAY_CASES) {
+    for (const preset of ["desktop", "mobile"]) {
+        test.tags(preset);
+        test(`offline, the systray shows a queued ${label} form save labeled 'Edited', with no crash, and replays it on reconnect (${preset})`, async () => {
+            // Matches VAL-DIS-031's exact scenario: the record is opened
+            // from its list (cached/visited online), not mounted as a
+            // bare form.
+            onRpc(resModel, "web_save", ({ parent }) => {
+                expect.step("web_save");
+                return parent();
+            });
+            await mountWithCleanup(WebClient);
+            await getService("action").doAction(actionId);
+            await contains(".o_data_row:eq(0) [name='name']").click();
+            expect(".o_form_view").toHaveCount(1);
 
-    await contains(`.o_field_widget[name='name'] input`).edit("Edited for the systray check");
-    await contains("button.o_form_button_save").click();
-    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(1);
+            const setOffline = mockCrmOffline();
+            await setOffline(true);
 
-    await contains(".o_menu_systray .o_nav_entry [data-icon='link_off']").click();
-    expect(".o-dropdown--menu").toHaveCount(1);
-    expect(".o-dropdown--menu .o-dropdown-item div.ms-auto").toHaveText("Edited");
+            const after = `Edited offline for the systray check (${resModel})`;
+            await contains(`.o_field_widget[name='name'] input`).edit(after);
+            await contains("button.o_form_button_save").click();
+            expect.verifySteps([]); // not sent while offline
+            expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(1);
 
-    await setOffline(false);
-});
+            await contains(".o_menu_systray .o_nav_entry [data-icon='link_off']").click();
+            if (preset === "mobile") {
+                // mobile's toggler is a bare div, not the Dropdown's own
+                // button (crm_offline_systray_restore.test.js's mobile
+                // test needs the same extra frame).
+                await animationFrame();
+            }
+            expect(".o-dropdown--menu").toHaveCount(1);
+            expect(".o-dropdown--menu .o-dropdown-item div.ms-auto").toHaveText("Edited");
+
+            await setOffline(false);
+            expect.verifySteps(["web_save"]);
+            expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+            expect(MockServer.env[resModel].find((r) => r.id === 1).name).toBe(after);
+        });
+    }
+}

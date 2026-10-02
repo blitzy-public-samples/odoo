@@ -120,6 +120,14 @@ test("offline form save into the won stage queues the write and skips the rainbo
     expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0);
     expect.verifySteps([]); // get_rainbowman_message was never called
 
+    // VAL-FIX-001: the save completed and left the form showing the new
+    // stage as current, with no notification or error dialog surfacing
+    // the skipped lookup.
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_statusbar_status button[data-value='2']").toHaveClass("o_arrow_button_current");
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
+
     const queued = Object.values(getService(OfflinePlugin)._ormToSync());
     expect(queued.length).toBe(1);
     const [{ value }] = queued;
@@ -142,6 +150,17 @@ test("offline form save into the won stage queues the write and skips the rainbo
 
     expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0);
     expect.verifySteps([]);
+
+    // VAL-FIX-001 (mobile): the dropdown toggler shows the new stage's own
+    // label (StatusBarField.getCurrentLabel()), and no notification or
+    // error dialog surfaced the skipped lookup. `StatusBarField` keeps the
+    // other two `.dropdown-toggle` buttons (its folded before/after groups)
+    // in the DOM behind `d-none` on small screens, so the live one must be
+    // singled out rather than matched by tag alone.
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_statusbar_status button.dropdown-toggle:not(.d-none)").toHaveText("Won");
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
 
     const queued = Object.values(getService(OfflinePlugin)._ormToSync());
     expect(queued.length).toBe(1);
@@ -197,11 +216,19 @@ test("online form save into the won stage still issues the rainbowman lookup (mo
 
 test.tags("desktop");
 test("a connection lost while fetching the rainbowman message does not fail the save (desktop)", async () => {
-    onRpc("crm.lead", "get_rainbowman_message", () => new Response("", { status: 502 }));
+    // VAL-FIX-002: a recorded step proves the lookup was actually attempted
+    // (not merely absent because the test forgot to call it) before the
+    // handler returns the connection-lost response.
+    onRpc("crm.lead", "get_rainbowman_message", () => {
+        expect.step("get_rainbowman_message");
+        return new Response("", { status: 502 });
+    });
     await mountView({ ...formView, resId: 1 });
 
     await contains(".o_statusbar_status button[data-value='2']").click();
     await contains("button.o_form_button_save").click();
+
+    expect.verifySteps(["get_rainbowman_message"]);
 
     // The save went through (the renderer flags the just-completed save)
     // and no CRM error UI showed up for the lost lookup.
@@ -209,20 +236,27 @@ test("a connection lost while fetching the rainbowman message does not fail the 
     expect(".o_statusbar_status button[data-value='2']").toHaveClass("o_arrow_button_current");
     expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0);
     expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
 });
 
 test.tags("mobile");
 test("a connection lost while fetching the rainbowman message does not fail the save (mobile)", async () => {
-    onRpc("crm.lead", "get_rainbowman_message", () => new Response("", { status: 502 }));
+    onRpc("crm.lead", "get_rainbowman_message", () => {
+        expect.step("get_rainbowman_message");
+        return new Response("", { status: 502 });
+    });
     await mountView({ ...formView, resId: 1 });
 
     await contains(".o_statusbar_status button.dropdown-toggle").click();
     await contains(".o-dropdown--menu .dropdown-item:contains('Won')").click();
     await contains("button.o_form_button_save").click();
 
+    expect.verifySteps(["get_rainbowman_message"]);
+
     expect(".o_form_renderer").toHaveClass("o_form_saved");
     expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0);
     expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -242,6 +276,12 @@ test("offline kanban drag into the won stage queues the write and skips the rain
 
     expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0);
     expect.verifySteps([]);
+
+    // VAL-FIX-003: the card actually landed in the "Won" target column
+    // (group index 1, the drop target above), not just queued server-side.
+    expect(".o_kanban_group:eq(1) .o_kanban_record:contains(First lead)").toHaveCount(1);
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
 
     const queued = Object.values(getService(OfflinePlugin)._ormToSync());
     expect(queued.length).toBe(1);
@@ -279,6 +319,16 @@ test("offline kanban stage move via CrmKanbanModel skips the rainbowman lookup (
     await model.root.moveRecords([leadRecord.id], false, wonGroup.id);
 
     expect.verifySteps([]);
+
+    // VAL-FIX-003/VAL-SKIP-003 (mobile): there is no drag gesture to check
+    // a target column against, so the model-level equivalent is that the
+    // "Won" group's own record list -- what the mobile card list renders --
+    // now contains the moved lead, and no reward/notification/error-dialog
+    // UI appeared for the skipped lookup.
+    expect(wonGroup.records.some((r) => r.resId === 1)).toBe(true);
+    expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0);
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
 
     const queued = Object.values(getService(OfflinePlugin)._ormToSync());
     expect(queued.length).toBe(1);
