@@ -30,40 +30,32 @@ const HANDLE_DRAG_DISABLED_MODELS = ["crm.stage", "crm.recurring.plan", "crm.tea
 const READONLY_OFFLINE_MODELS = ["crm.recurring.plan", "crm.lost.reason"];
 
 /**
- * B40/B74/B88 multi-edit part (VAL-DIS-030, architecture.md §3.7): the
- * crm.lead lists (Leads/Opportunities and the inherited report/forecast
- * lists), the Stages list (`crm_stage_views.xml:22`) and the inherited
- * Sales Team list (`sales_team/views/crm_team_views.xml:100`) all carry
- * `multi_edit="1"` with no `editable` attribute, so
- * `ListRenderer.isInlineEditable`'s default (`!!this.props.editable`) is
- * false and the *only* way to open a cell editor, online or offline, is to
- * check a row first and let `onCellClicked`'s `multiEdit && record.selected`
- * branch (`list_renderer.js`) call `list.enterEditMode()`, which routes the
- * eventual save through `DynamicList._multiSave`
- * (`model/relational_model/dynamic_list.js`). Unlike every other save
- * producer -- `Record._save`'s own offline branch, `DynamicList
- * ._saveRecords`, `._deleteRecords`, `._toggleArchive` -- `_multiSave` has
- * no `ConnectionLostError` branch: on any save error, offline or not, it
+ * crm.lead, crm.stage and crm.team lists are `multi_edit="1"` with no
+ * `editable` attribute, so the only way to open a cell editor at all,
+ * online or offline, is to check a row first and let `onCellClicked`'s
+ * `multiEdit && record.selected` branch (`list_renderer.js`) call
+ * `list.enterEditMode()`, which routes the eventual save through
+ * `DynamicList._multiSave` (`model/relational_model/dynamic_list.js`).
+ * Unlike every other save producer, `_multiSave` has no
+ * `ConnectionLostError` branch: on any save error, offline or not, it
  * discards the edit on every selected record and re-throws. Queuing it
  * would mean patching a save path shared by every multi-edit list in every
- * installed app, not just these three crm models -- out of this fix's
- * addons/crm scope and against "never build a second offline engine" (the
- * repo AGENTS.md section 4 "Project rules" is explicit here, and wins over
- * architecture.md §3.7's own "B40/B74 ... still QUEUE" text, which this
- * feature's user decision supersedes). Per the framework-gap principle for
- * an action the framework doesn't queue, the control is disabled offline
- * instead -- but *unlike* a plain "no row can be checked" guard,
+ * installed app, not just these three models -- out of addons/crm's scope
+ * and against "never build a second offline engine" (AGENTS.md section 4).
+ * architecture.md §3.7 records the resulting decision: disable cell
+ * editing offline for these lists; the record is edited from its form
+ * instead, whose save already queues a plain `web_save`.
+ *
  * `onCellClicked`'s multi-edit branch is reached through `record.selected`
  * alone and never consults `canSelectRecord` (`list_renderer.js:1527`), so
- * disabling selection would not even close this entry point for a row
- * that was already checked before going offline. Row selection itself
- * must stay available offline (action-menu Archive/Unarchive/Delete,
- * B67/B69, still queue through it), so the guard instead sits on the
- * cell-edit entry points themselves: a click (`onCellClicked`) or Enter
- * (`onCellKeydownReadOnlyMode`) on a selected row's cell does nothing while
- * offline, and a row already mid-edit when the connection drops is forced
- * out of edition (discarding, never saving) by the `effect` below, so no
- * edit can ever reach `_multiSave` while offline on these three models.
+ * disabling selection would not close this entry point for a row already
+ * checked before going offline -- and row selection itself must stay
+ * available offline (action-menu Archive/Unarchive/Delete still queue
+ * through it). So the guard sits on the cell-edit entry points instead: a
+ * click (`onCellClicked`) or Enter (`onCellKeydownReadOnlyMode`) on a
+ * selected row's cell does nothing while offline, and the `effect` below
+ * forces a row already mid-edit out of edition (discarding, never saving)
+ * the moment the connection drops.
  */
 const CELL_EDIT_DISABLED_MODELS = ["crm.lead", "crm.stage", "crm.team"];
 

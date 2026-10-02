@@ -1,5 +1,6 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import { expect, test } from "@odoo/hoot";
+import { animationFrame } from "@odoo/hoot-dom";
 import { advanceTime } from "@odoo/hoot-mock";
 import { contains, defineModels, fields, mockOffline, models, mountView, onRpc } from "@web/../tests/web_test_helpers";
 
@@ -101,6 +102,7 @@ test("offline, every team dashboard link, the card click and the card menu are i
     });
     await mountView({ resModel: "crm.team", type: "kanban", arch: Team._views.kanban });
 
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
     const setOffline = mockOffline();
     await setOffline(true);
 
@@ -151,6 +153,7 @@ test("offline, every team dashboard link, the card click and the card menu are i
     });
     await mountView({ resModel: "crm.team", type: "kanban", arch: Team._views.kanban });
 
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
     const setOffline = mockOffline();
     await setOffline(true);
 

@@ -18,43 +18,36 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
 
 /**
- * m2-list-celledit-disable (VAL-DIS-030, VAL-DIS-031, architecture.md
- * §3.7/§3.8). User decision during milestone 2, superseding both
- * architecture.md §3.7's original "B40/B74 ... still QUEUE" text and this
- * row's milestone-1 inventory classification (`offline_inventory.md`):
- * list cell editing is DISABLE offline in the crm.lead lists (Leads,
- * Opportunities and the inherited report/forecast lists -- B88's
- * multi-edit part), the crm.stage list (B40) and the inherited crm.team
- * list (B74).
+ * List cell editing is DISABLE offline (VAL-DIS-030, VAL-DIS-031,
+ * architecture.md §3.7/§3.8) in the crm.lead lists (Leads, Opportunities
+ * and the inherited report/forecast lists), the crm.stage list and the
+ * inherited crm.team list.
  *
  * All three lists are `multi_edit="1"` with no `editable` attribute
  * (`crm_lead_views.xml:321,708`, `crm_stage_views.xml:22`,
  * `sales_team/views/crm_team_views.xml:100` retained by
- * `crm_team_views.xml:123`), so `ListRenderer.isInlineEditable`'s default
- * (`!!this.props.editable`) is already false and the *only* way to open a
- * cell editor at all, online or offline, is `onCellClicked`'s
- * `multiEdit && record.selected` branch (`list_renderer.js`) -- reached
- * through `record.selected` alone, never through `canSelectRecord`. An
- * eventual multi-edit save routes through `DynamicList._multiSave`
- * (`model/relational_model/dynamic_list.js`), which -- unlike every other
- * save producer -- has no `ConnectionLostError` branch: on any save error,
- * offline or not, it discards the edit on every selected record and
- * re-throws. Queuing it would mean patching a save path shared by every
- * multi-edit list in every installed app, not just these three crm models
- * -- out of this fix's addons/crm scope and against the repo AGENTS.md
- * section 4 "never build a second offline engine" rule (which wins here
- * over architecture.md §3.7's superseded "still QUEUE" text; this
- * feature's handoff records that as the resolved precedence conflict).
- * `addons/crm` therefore does NOT patch `_multiSave`; offline, these
- * records are edited from their form instead, whose save already queues a
- * plain `web_save` (VAL-DIS-031 below).
+ * `crm_team_views.xml:123`), so the only way to open a cell editor at all,
+ * online or offline, is `onCellClicked`'s `multiEdit && record.selected`
+ * branch (`list_renderer.js`) -- reached through `record.selected` alone,
+ * never through `canSelectRecord`. An eventual multi-edit save routes
+ * through `DynamicList._multiSave` (`model/relational_model/
+ * dynamic_list.js`), which -- unlike every other save producer -- has no
+ * `ConnectionLostError` branch: on any save error, offline or not, it
+ * discards the edit on every selected record and re-throws. Queuing it
+ * would mean patching a save path shared by every multi-edit list in every
+ * installed app, not just these three crm models -- out of addons/crm's
+ * scope and against AGENTS.md section 4's "never build a second offline
+ * engine" rule. architecture.md §3.7 records the resulting decision:
+ * `addons/crm` does not patch `_multiSave`; offline, these records are
+ * edited from their form instead, whose save already queues a plain
+ * `web_save` (VAL-DIS-031 below).
  *
  * Row selection itself stays available offline on all three lists
- * (`canSelectRecord` is untouched by this feature): B67/B69-style
- * action-menu Archive/Unarchive/Delete on a selected lead must keep
- * queueing (`crm_offline_queue_semantics.test.js`). The guard instead sits
- * on the cell-edit entry points themselves
- * (`onCellClicked`/`onCellKeydownReadOnlyMode`, scoped by resModel in
+ * (`canSelectRecord` is untouched): action-menu Archive/Unarchive/Delete
+ * on a selected lead must keep queueing
+ * (`crm_offline_queue_semantics.test.js`). The guard instead sits on the
+ * cell-edit entry points themselves (`onCellClicked`/
+ * `onCellKeydownReadOnlyMode`, scoped by resModel in
  * `list_renderer_offline_patch.js`), which also covers a row checked
  * before going offline and a row already mid-edit when the connection
  * drops: an `effect()` forces such a row out of edition (discarding, never
@@ -63,11 +56,9 @@ import { WebClient } from "@web/webclient/webclient";
  *
  * The crm.stage and crm.team equivalents of the "checked row, no cell
  * editor" and "mid-edit at disconnect" tests live in
- * `crm_offline_config_list_guards.test.js` (that feature's test file,
- * updated here per this feature's remit to change its stage/team
- * selection tests). This file covers the crm.lead list (not previously
- * tested for cell editing) and VAL-DIS-031 (one queued `web_save` per
- * model, replayed on reconnect) for all three models.
+ * `crm_offline_config_list_guards.test.js`. This file covers the
+ * crm.lead list and VAL-DIS-031 (one queued `web_save` per model,
+ * replayed on reconnect) for all three models.
  */
 
 class Lead extends models.Model {
