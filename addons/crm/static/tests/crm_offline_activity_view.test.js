@@ -241,6 +241,7 @@ defineActions([
 ]);
 
 const WEB_READ_ERROR = `Connection to "/web/dataset/call_kw/crm.lead/web_read" couldn't be established or was interrupted`;
+const HELPER_TEXT = "There is no data to display offline for the given filters";
 
 test("offline, the activity view opens a visited lead's row and leaves an unvisited one alone; online both open (desktop)", async () => {
     await seedActivities();
@@ -328,6 +329,7 @@ test("a connection lost while loading the activity view's root shows the offline
     await mountView({ resModel: "crm.lead", type: "activity", arch: Lead._views.activity });
     expect(".o_view_controller.o_activity_view").toHaveCount(1);
     expect(".o_view_nocontent").toHaveCount(1); // the generic OfflineActionHelper, not a crash
+    expect(`.o_view_nocontent:contains('${HELPER_TEXT}')`).toHaveCount(1); // the exact helper text, not just any empty state
     expect("tbody .o_data_row").toHaveCount(0);
     expect(".o_error_dialog").toHaveCount(0);
     expect(".o_notification").toHaveCount(0);
@@ -338,7 +340,9 @@ test("a connection lost while loading the activity view's root shows the offline
     onRpc("crm.lead", "web_search_read", () => new Response("", { status: 502 }));
     await mountView({ resModel: "crm.lead", type: "activity", arch: Lead._views.activity });
     expect(".o_view_nocontent").toHaveCount(1);
+    expect(`.o_view_nocontent:contains('${HELPER_TEXT}')`).toHaveCount(1); // the exact helper text, not just any empty state
     expect("tbody .o_data_row").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0); // VAL-DIS-007: no error dialog on mobile either
     expect(".o_notification").toHaveCount(0);
 });
 

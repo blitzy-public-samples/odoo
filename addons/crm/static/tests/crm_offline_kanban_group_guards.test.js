@@ -121,6 +121,12 @@ class Team extends models.Model {
         { id: 1, name: "Sales Team" },
         { id: 2, name: "Other Team" },
     ];
+
+    // Minimal, just enough for `editGroup()`'s FormViewDialog to open
+    // online without erroring (same idiom as `Stage._views.form` above).
+    _views = {
+        form: `<form><field name="name"/></form>`,
+    };
 }
 
 // A standalone model, distinct from `crm.lead`, so the config-menu guard's
@@ -268,6 +274,38 @@ test("offline, dragging a pipeline column grouped by sales team does not reseque
     expect.verifySteps(["web_resequence"]);
 });
 
+// B71-73 / VAL-DIS-016: the config toggler itself when grouped by a
+// non-stage many2one -- `GroupConfigMenu`'s own guard
+// (`group_config_menu_patch.js`) does not branch on which field the view
+// is grouped by, same as the drag guard above, but this proves the
+// *toggler* (the framework's own plain `<button>`, auto-disabled offline)
+// rather than only the drag.
+test("offline, the pipeline's column config toggler is disabled when grouped by sales team; online it opens the menu again", async () => {
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        groupBy: ["team_id"],
+        arch: pipelineArch,
+    });
+
+    const toggler = ".o_kanban_group:eq(0) .o_group_config .dropdown-toggle";
+    expect(toggler).not.toHaveAttribute("disabled");
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect(toggler).toHaveAttribute("disabled");
+    expect(toggler).toHaveClass("o_disabled_offline");
+
+    await setOffline(false);
+    expect(toggler).not.toHaveAttribute("disabled");
+    // Same `{ visible: false }` as `toggleKanbanColumnActions` above: the
+    // toggle's own icon button never satisfies hoot's strict visibility
+    // heuristic, offline or not.
+    await contains(toggler, { visible: false }).click();
+    expect(".dropdown-item:contains('Edit')").toHaveCount(1);
+});
+
 // ---------------------------------------------------------------------------
 // B57/B62/B71-73 / VAL-DIS-015/016: the kanban column config menu
 // ---------------------------------------------------------------------------
@@ -405,6 +443,38 @@ test("offline, the activity-report list's column config menu is inert if left op
     await contains(".o_dialog footer button:contains(Discard)").click();
 });
 
+// B89 / VAL-DIS-016: same list, same menu, the "Edit" item left open
+// instead of "Delete" -- `editGroup()` opens a `FormViewDialog` on the
+// group's own `crm.team` record (`group_config_menu_patch.js`'s
+// `isCrmView` guard also scopes `crm.activity.report`).
+test("offline, the activity-report list's column config menu can't Edit if left open; online it works again", async () => {
+    await mountView({
+        type: "list",
+        resModel: "crm.activity.report",
+        groupBy: ["team_id"],
+        arch: `<list><field name="name"/></list>`,
+    });
+
+    await contains(".o_group_header:eq(0) .o_group_config .dropdown-toggle", {
+        visible: false,
+    }).click();
+    expect(".dropdown-item:contains('Edit')").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".dropdown-item:contains('Edit')").click();
+    expect(".o_dialog").toHaveCount(0); // unreachable: no FormViewDialog opened
+
+    await setOffline(false);
+    await contains(".o_group_header:eq(0) .o_group_config .dropdown-toggle", {
+        visible: false,
+    }).click();
+    await contains(".dropdown-item:contains('Edit')").click();
+    expect(".o_dialog .o_form_view").toHaveCount(1);
+    await contains(".o_dialog header button[aria-label='Close']").click();
+});
+
 // ---------------------------------------------------------------------------
 // B79/B91 / VAL-DIS-029: the progress bar segment and the rotting badge
 // ---------------------------------------------------------------------------
@@ -471,6 +541,59 @@ test("offline, clicking a progress bar segment directly applies no filter; onlin
     expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered
 });
 
+// VAL-DIS-029 (user-testing evidence): mobile-tagged copies of the two
+// tests above. Both guards are DOM-class/handler-level, independent of
+// viewport size, so the same clicks and assertions apply unchanged under
+// the mobile preset.
+test.tags("mobile");
+test("offline, the progress bar is marked inert and the rotting badge is inert; online both work again (mobile)", async () => {
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        groupBy: ["stage_id"],
+        arch: pipelineArch,
+    });
+
+    expect(".o_kanban_group:eq(0) .o_column_progress").not.toHaveClass("pe-none");
+    expect(getKanbanRecordTexts(0).length).toBe(2);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect(".o_kanban_group:eq(0) .o_column_progress").toHaveClass("pe-none");
+
+    expect(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").toHaveCount(1);
+    await contains(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").click();
+    expect(getKanbanRecordTexts(0).length).toBe(2); // unchanged: the rotting filter never applied
+
+    await setOffline(false);
+    expect(".o_kanban_group:eq(0) .o_column_progress").not.toHaveClass("pe-none");
+    await contains(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").click();
+    expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered to the single rotting record
+});
+
+test.tags("mobile");
+test("offline, clicking a progress bar segment directly applies no filter; online it still does (mobile)", async () => {
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        groupBy: ["stage_id"],
+        arch: pipelineArch,
+    });
+
+    expect(getKanbanRecordTexts(0).length).toBe(2);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
+    expect(getKanbanRecordTexts(0).length).toBe(2); // unchanged: no filter applied, no reload
+
+    await setOffline(false);
+    await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
+    expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered
+});
+
 // ---------------------------------------------------------------------------
 // B80 / VAL-SKIP-004: the stage header hover tooltip
 // ---------------------------------------------------------------------------
@@ -503,6 +626,41 @@ test("offline, hovering a column title skips the tooltip without poisoning its m
     expect(".o-tooltip").toHaveCount(1); // the memo wasn't poisoned by the offline attempt
     expect(".o-tooltip").toHaveText("Description\nNew");
     expect.verifySteps(["read"]);
+});
+
+// VAL-SKIP-004 (user-testing evidence): mobile-tagged copy. Touch screens
+// have no hover state at all, so there is no mouse-driven tooltip to open
+// in the first place on mobile, online or offline -- this is a platform
+// fact, not an offline-specific behavior. What *is* offline-specific and
+// worth proving here is that a tap on the title -- the touch equivalent
+// interaction -- triggers no `read` RPC while offline either, so the skip
+// proof still holds on this preset even though the tooltip itself never
+// renders from a tap on any preset.
+test.tags("mobile");
+test("offline, tapping a column title issues no tooltip read; online a tap alone still issues none either (mobile)", async () => {
+    onRpc("crm.stage", "read", () => expect.step("read"));
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        groupBy: ["stage_id"],
+        arch: pipelineArch,
+    });
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await contains(".o_column_title:eq(0)").click();
+    await runAllTimers();
+    expect(".o-tooltip").toHaveCount(0);
+    expect.verifySteps([]); // no read while offline
+
+    await setOffline(false);
+    await contains(".o_column_title:eq(0)").click();
+    await runAllTimers();
+    expect(".o-tooltip").toHaveCount(0); // a tap, unlike a real hover, never opens it on any preset
+    expect.verifySteps([]); // so no read is issued online from a tap either -- confirms the offline
+    // assertion above is a genuine "skipped", not merely "the tooltip
+    // never fires from this interaction regardless of connectivity"
 });
 
 // ---------------------------------------------------------------------------
@@ -589,6 +747,61 @@ test("a connection lost while loading the forecast board shows the generic offli
 
     expect(".o_kanban_renderer").toHaveCount(0);
     expect(".o_view_nocontent").toHaveCount(1); // A24: the generic OfflineActionHelper, not a crash
+    expect(".o_notification").toHaveCount(0);
+    expect.verifyErrors([
+        `Connection to "/web/dataset/call_kw/crm.lead/web_read_group" couldn't be established or was interrupted`,
+    ]);
+});
+
+// VAL-DIS-013 (user-testing evidence): mobile-tagged copies of both
+// forecast tests above. Neither guard is desktop-specific
+// (`.o_column_quick_create` not being offered offline, and the generic
+// `OfflineActionHelper` on a root connection loss, are both plain DOM/data
+// conditions), so the same scenarios and assertions apply unchanged under
+// the mobile preset.
+test.tags("mobile");
+test('online, "add next period" reloads the forecast kanban with a wider window; offline it is not offered (mobile)', async () => {
+    mockDate("2024-05-15 00:00:00");
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        arch: forecastArch,
+        context: { forecast_field: "date_deadline" },
+        groupBy: ["date_deadline"],
+    });
+
+    expect(".o_column_quick_create").toHaveCount(1);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+    expect(".o_column_quick_create").toHaveCount(0); // A27: not offered offline
+
+    await setOffline(false);
+    expect(".o_column_quick_create").toHaveCount(1); // back online
+
+    onRpc("crm.lead", "web_read_group", () => expect.step("web_read_group"));
+    await quickCreateKanbanColumn();
+    await runAllTimers();
+    expect.verifySteps(["web_read_group"]); // addForecastColumn() genuinely reloads with the expanded window
+});
+
+test.tags("mobile");
+test("a connection lost while loading the forecast board shows the generic offline helper safely (mobile)", async () => {
+    mockDate("2024-05-15 00:00:00");
+    onRpc("crm.lead", "web_read_group", () => new Response("", { status: 502 }));
+    expect.errors(1);
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        arch: forecastArch,
+        context: { forecast_field: "date_deadline" },
+        groupBy: ["date_deadline"],
+    });
+
+    expect(".o_kanban_renderer").toHaveCount(0);
+    expect(".o_view_nocontent").toHaveCount(1); // A24: the generic OfflineActionHelper, not a crash
+    expect(".o_view_nocontent:contains('There is no data to display offline for the given filters')").toHaveCount(1);
+    expect(".o_error_dialog").toHaveCount(0); // no error dialog, only the declared connection error
     expect(".o_notification").toHaveCount(0);
     expect.verifyErrors([
         `Connection to "/web/dataset/call_kw/crm.lead/web_read_group" couldn't be established or was interrupted`,

@@ -676,6 +676,68 @@ for (const { resModel, label, arch } of READONLY_LIST_CASES) {
 }
 
 // ---------------------------------------------------------------------------
+// B68 (user-testing evidence): the test above only re-proves Delete
+// online; it never exercises Archive online, nor Unarchive at all (the
+// menu item an *already archived* row offers instead of Archive). Online
+// Archive first (so there is a genuinely archived row to Unarchive), then
+// offline Unarchive on it does nothing either, same `pe-none` + no-op
+// mechanism as Archive/Delete above; online it still works.
+// `context: { active_test: false }` keeps the archived row visible in the
+// list afterward (the mock server, like the real ORM, otherwise filters
+// it out of `web_search_read`).
+// ---------------------------------------------------------------------------
+
+for (const { resModel, label, arch } of READONLY_LIST_CASES) {
+    test.tags("desktop");
+    test(`online, the ${label} list's Action-menu Archive still archives; offline Unarchive on that archived row does nothing; online Unarchive works again`, async () => {
+        onRpc(resModel, ["action_archive", "action_unarchive"], ({ method, parent }) => {
+            expect.step(method);
+            return parent();
+        });
+        await mountView({
+            resModel,
+            type: "list",
+            arch,
+            actionMenus: {},
+            context: { active_test: false },
+        });
+
+        // Online: Archive record 1 (the online guard this feature adds).
+        await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+        await toggleActionMenu();
+        await toggleMenuItem("Archive");
+        expect(".modal").toHaveCount(1);
+        await contains(".modal-footer .btn-primary").click();
+        expect.verifySteps(["action_archive"]);
+        expect(MockServer.env[resModel].find((r) => r.id === 1).active).toBe(false);
+
+        const setOffline = mockOffline();
+        await setOffline(true);
+
+        // The now-archived row is still right there (`active_test: false`);
+        // select it and try Unarchive.
+        await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+        await toggleActionMenu();
+        expect(".o_menu_item:contains(Unarchive)").toHaveClass("pe-none");
+        await contains(".o_menu_item:contains(Unarchive)").click({ interactive: false });
+        expect(".modal").toHaveCount(0); // no confirmation dialog (Unarchive never shows one, online either)
+        expect.verifySteps([]); // no action_unarchive issued or queued
+        expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+        expect(MockServer.env[resModel].find((r) => r.id === 1).active).toBe(false); // still archived
+        expect(".o_notification").toHaveCount(0);
+
+        await setOffline(false);
+
+        // Online: Unarchive still works.
+        await toggleActionMenu();
+        expect(".o_menu_item:contains(Unarchive)").not.toHaveClass("pe-none");
+        await toggleMenuItem("Unarchive");
+        expect.verifySteps(["action_unarchive"]);
+        expect(MockServer.env[resModel].find((r) => r.id === 1).active).toBe(true);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // B48: the activity report list's row click issues no action_open_lead
 // offline, by click or by keyboard. Both presets.
 // ---------------------------------------------------------------------------

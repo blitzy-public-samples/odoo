@@ -59,7 +59,21 @@ class Lead extends models.Model {
     ];
 }
 
-defineModels([Lead]);
+// A minimal stand-in wizard, so the online representative-button checks
+// below (VAL-DIS-005's "Convert to Opportunities" and "Email") can assert
+// that a real `target: "new"` action actually opens, not just that
+// `/web/action/load` was reached.
+class Wizard extends models.Model {
+    _name = "some.wizard";
+
+    name = fields.Char();
+
+    _views = {
+        form: `<form><field name="name"/></form>`,
+    };
+}
+
+defineModels([Lead, Wizard]);
 defineMailModels();
 
 const LEADS_LIST_ARCH = `
@@ -114,12 +128,35 @@ test("offline, the Leads list header buttons are disabled once a row is selected
     expect("button[name='1']").not.toHaveAttribute("disabled");
     expect("button[name='2']").not.toHaveAttribute("disabled");
 
-    onRpc("/web/action/load", () => {
-        expect.step("load_action");
-        return { id: 1, type: "ir.actions.act_window", res_model: "crm.lead", views: [[false, "list"]] };
+    // VAL-DIS-005: an online representative check per header button, not
+    // just one shared between both list families -- branch on the
+    // requested action id so "Convert to Opportunities" (1) and "Mark
+    // Lost" (2) are each genuinely proven, not just the load route being
+    // reached once. "Convert to Opportunities" (`target: "new"`, a
+    // dialog) goes first and gets closed again: "Mark Lost"'s own action
+    // below has no `target`, so it replaces the mounted list itself
+    // (`doActionButton`'s default `target: "current"`) and must run last.
+    onRpc("/web/action/load", async (request) => {
+        const { params } = await request.json();
+        expect.step(`load_action:${params.action_id}`);
+        // `name="1"` compiles to `clickParams.name` as the raw XML string
+        // "1", carried verbatim into `_loadAction`'s `action_id` -- never
+        // coerced to a number.
+        if (params.action_id === "1") {
+            return { id: 1, type: "ir.actions.act_window", target: "new", res_model: "some.wizard", views: [[false, "form"]] };
+        }
+        return { id: 2, type: "ir.actions.act_window", res_model: "crm.lead", views: [[false, "list"]] };
     });
+    await contains("button[name='1']").click();
+    expect.verifySteps(["load_action:1"]);
+    expect(".o_dialog .o_form_view").toHaveCount(1); // "Convert to Opportunities" opens its wizard
+    await contains(".o_dialog header button[aria-label='Close']").click();
+
+    // Closing the dialog reloads the list behind it (its own `onClose`),
+    // which drops the row selection and the header buttons with it.
+    await contains(".o_data_row .o_list_record_selector input").click();
     await contains("button[name='2']").click();
-    expect.verifySteps(["load_action"]); // online, it still works
+    expect.verifySteps(["load_action:2"]); // "Mark Lost" still loads its action
 });
 
 test.tags("desktop");
@@ -145,12 +182,30 @@ test("offline, the Opportunities list header buttons are disabled once a row is 
     expect("button[name='2']").not.toHaveAttribute("disabled");
     expect("button[name='3']").not.toHaveAttribute("disabled");
 
-    onRpc("/web/action/load", () => {
-        expect.step("load_action");
+    // VAL-DIS-005: a distinct online representative for this list's own
+    // header button, "Email" (3), on top of the "Mark Lost" (2) check
+    // shared with the Leads list test above. "Email" (`target: "new"`)
+    // goes first and gets closed again; "Mark Lost" has no `target` and
+    // replaces the mounted list itself, so it must run last (same
+    // ordering reason as the Leads list test above).
+    onRpc("/web/action/load", async (request) => {
+        const { params } = await request.json();
+        expect.step(`load_action:${params.action_id}`);
+        // Same string-not-number `action_id` as the Leads list test above.
+        if (params.action_id === "3") {
+            return { id: 3, type: "ir.actions.act_window", target: "new", res_model: "some.wizard", views: [[false, "form"]] };
+        }
         return { id: 2, type: "ir.actions.act_window", res_model: "crm.lead", views: [[false, "list"]] };
     });
+    await contains("button[name='3']").click();
+    expect.verifySteps(["load_action:3"]);
+    expect(".o_dialog .o_form_view").toHaveCount(1); // "Email" opens its composer-style action
+    await contains(".o_dialog header button[aria-label='Close']").click();
+
+    // Same list-reload-on-dialog-close note as the Leads list test above.
+    await contains(".o_data_row .o_list_record_selector input").click();
     await contains("button[name='2']").click();
-    expect.verifySteps(["load_action"]);
+    expect.verifySteps(["load_action:2"]);
 });
 
 test("offline, the Opportunities list row 'Email' button and the reschedule dropdown toggler are disabled with no row selection needed; online they re-enable", async () => {

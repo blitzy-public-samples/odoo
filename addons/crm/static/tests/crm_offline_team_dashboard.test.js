@@ -2,7 +2,17 @@ import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import { expect, test } from "@odoo/hoot";
 import { animationFrame } from "@odoo/hoot-dom";
 import { advanceTime } from "@odoo/hoot-mock";
-import { contains, defineModels, fields, mockOffline, models, mountView, onRpc } from "@web/../tests/web_test_helpers";
+import {
+    contains,
+    defineModels,
+    fields,
+    getService,
+    models,
+    mountView,
+    onRpc,
+} from "@web/../tests/web_test_helpers";
+import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
 /**
  * VAL-DIS-026 (B32-B39, B76, B77, C19, C21): the team dashboard kanban's own
@@ -52,15 +62,18 @@ class Team extends models.Model {
     _name = "crm.team";
 
     name = fields.Char();
+    color = fields.Integer();
 
     _records = [{ id: 1, name: "Sales Team" }];
 
     _views = {
         kanban: `
             <kanban action="action_primary_channel_button" type="object">
+                <field name="color" invisible="1"/>
                 <templates>
                     <t t-name="menu">
                         <a role="menuitem" type="open" class="dropdown-item">Configuration</a>
+                        <field name="color" widget="kanban_color_picker"/>
                     </t>
                     <t t-name="card">
                         <field name="name"/>
@@ -78,7 +91,21 @@ class Team extends models.Model {
     };
 }
 
-defineModels([Team]);
+// A minimal stand-in wizard, so the B33 online representative check below
+// (same idiom as `crm_offline_lead_list_controls.test.js`) can assert that
+// a real `target: "new"` action actually opens, not just that
+// `/web/action/load` was reached.
+class Wizard extends models.Model {
+    _name = "some.wizard";
+
+    name = fields.Char();
+
+    _views = {
+        form: `<form><field name="name"/></form>`,
+    };
+}
+
+defineModels([Team, Wizard]);
 defineMailModels();
 
 const ACTION_LINKS = [
@@ -103,7 +130,7 @@ test("offline, every team dashboard link, the card click and the card menu are i
     await mountView({ resModel: "crm.team", type: "kanban", arch: Team._views.kanban });
 
     await animationFrame(); // let any pending fetchStoreData() debounce settle first
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     // B32/C19 and B33-B39: every `<a>` link issues no call_kw/doAction.
@@ -125,6 +152,7 @@ test("offline, every team dashboard link, the card click and the card menu are i
     await contains(".o_kanban_record .o_dropdown_kanban button").click();
     expect(".o-dropdown--menu").toHaveCount(0); // unreachable: "Configuration" never shows
     expect(".o_notification").toHaveCount(0);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0); // nothing queued by any of the above
 
     await setOffline(false);
     // `<a type="object">` kanban action buttons are compiled with a 300ms
@@ -163,7 +191,7 @@ test("offline, a team card menu opened online can't open Configuration afterward
     await contains(".o_kanban_record .o_dropdown_kanban button").click();
     expect(".dropdown-item:contains('Configuration')").toHaveCount(1);
 
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".dropdown-item:contains('Configuration')").click();
@@ -189,7 +217,7 @@ test("offline, every team dashboard link, the card click and the card menu are i
     await mountView({ resModel: "crm.team", type: "kanban", arch: Team._views.kanban });
 
     await animationFrame(); // let any pending fetchStoreData() debounce settle first
-    const setOffline = mockOffline();
+    const setOffline = mockCrmOffline();
     await setOffline(true);
 
     await contains(".o_b32_link").click();
@@ -209,4 +237,105 @@ test("offline, every team dashboard link, the card click and the card menu are i
     expect.verifySteps(["B32/C19"]);
     await contains(".o_kanban_record span").click();
     expect.verifySteps(["C21"]);
+});
+
+// ---------------------------------------------------------------------------
+// B33 (user-testing evidence): a genuine online navigation check for one
+// of the seven `type="action"` links (B33-B39), on top of B32/C21 above:
+// `doActionButton`'s `type: "action"` branch resolves the action through
+// its own `_loadAction` RPC, inline in its `type` switch -- never through
+// the "action" service's public `doAction` method -- so mocking
+// `/web/action/load` itself (same idiom as `crm_offline_lead_list_
+// controls.test.js`'s representative-button checks) is what actually
+// proves the round trip, not a service-level patch.
+// ---------------------------------------------------------------------------
+
+test("online, the team dashboard's \"Leads\" link (B33) genuinely loads its action and opens it; offline it is inert", async () => {
+    onRpc("/web/action/load", async (request) => {
+        const { params } = await request.json();
+        expect.step(`load_action:${params.action_id}`);
+        return { id: 1, type: "ir.actions.act_window", target: "new", res_model: "some.wizard", views: [[false, "form"]] };
+    });
+    await mountView({ resModel: "crm.team", type: "kanban", arch: Team._views.kanban });
+
+    await contains(".o_b33_link").click();
+    expect.verifySteps(["load_action:1"]);
+    expect(".o_dialog .o_form_view").toHaveCount(1);
+    await contains(".o_dialog header button[aria-label='Close']").click();
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    await contains(".o_b33_link").click();
+    expect.verifySteps([]); // beforeExecuteActionButton cancels it before any RPC is ever issued
+});
+
+// ---------------------------------------------------------------------------
+// B76 (VAL-DIS-026): the card-menu color picker. Same mechanism as the
+// lead kanban's B20 (`crm_offline_uncached_lead.test.js`): the picker's
+// own `<button>`s have no `data-available-offline`, so the framework's
+// `SELECTORS_TO_DISABLE`/`_offlineUI()` pass already disables them,
+// whether the menu was open before or opened fresh after going offline.
+// No crm code change for this control specifically.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, a team card's color picker buttons are disabled and issue no web_save; online a color still saves", async () => {
+    onRpc("crm.team", "web_save", ({ parent }) => {
+        expect.step("web_save");
+        return parent();
+    });
+    await mountView({ resModel: "crm.team", type: "kanban", arch: Team._views.kanban });
+
+    await contains(".o_kanban_record .o_dropdown_kanban button").click();
+    // The card menu (and its color picker) is a popover, portalled
+    // outside `.o_kanban_record`'s own DOM subtree -- scoping these
+    // selectors under it would never match, open or not.
+    expect(".o_kanban_colorpicker button").not.toHaveCount(0);
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    const colorButton = ".o_kanban_colorpicker .o_colorlist_item_color_1"; // index 0 is "No color"
+    expect(colorButton).toHaveAttribute("disabled");
+    expect(colorButton).toHaveClass("o_disabled_offline");
+
+    // A genuine native `disabled` button, unlike the "Configuration"
+    // dropdown item above (clickable, blocked only by a JS guard, which
+    // closes the dropdown as a side effect of being clicked): the click
+    // below is never dispatched, so the menu stays open throughout -- no
+    // re-click needed to reopen it.
+    await contains(colorButton).click();
+    expect.verifySteps([]); // unreachable: no web_save issued or queued
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+
+    await setOffline(false);
+    expect(colorButton).not.toHaveAttribute("disabled");
+    await contains(colorButton).click();
+    expect.verifySteps(["web_save"]); // online, selecting a color still saves
+});
+
+test.tags("mobile");
+test("offline, a team card's color picker buttons are disabled and issue no web_save (mobile)", async () => {
+    onRpc("crm.team", "web_save", ({ parent }) => {
+        expect.step("web_save");
+        return parent();
+    });
+    await mountView({ resModel: "crm.team", type: "kanban", arch: Team._views.kanban });
+
+    await contains(".o_kanban_record .o_dropdown_kanban button").click();
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    const colorButton = ".o_kanban_colorpicker .o_colorlist_item_color_1";
+    expect(colorButton).toHaveAttribute("disabled");
+    expect(colorButton).toHaveClass("o_disabled_offline");
+
+    await contains(colorButton).click();
+    expect.verifySteps([]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+
+    await setOffline(false);
+    expect(colorButton).not.toHaveAttribute("disabled");
 });

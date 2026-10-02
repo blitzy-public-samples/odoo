@@ -164,7 +164,11 @@ defineActions([
 
 test.tags("desktop");
 test("offline, the Leads list's row checkbox stays enabled but no cell editor opens with one checked row, including a row checked before going offline; online cell editing still works", async () => {
-    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    const steps = [];
+    onRpc("crm.lead", ["web_save", "web_save_multi"], ({ method, parent }) => {
+        steps.push(method);
+        return parent();
+    });
     await mountView({ resModel: "crm.lead", type: "list", arch: Lead._views.list });
 
     // Checked online, before going offline (VAL-DIS-030's "including rows
@@ -188,11 +192,12 @@ test("offline, the Leads list's row checkbox stays enabled but no cell editor op
     // editor.
     await contains(".o_data_row:eq(0) [name='name']").click();
     expect(".o_field_widget[name='name'] input").toHaveCount(0);
+    expect(".o_data_row:eq(0) [name='name']").toHaveText("First lead"); // the cell still shows its original value
     await contains(".o_data_row:eq(0) [name='probability']").focus();
     await press("Enter");
     expect(".o_field_widget[name='probability'] input").toHaveCount(0);
 
-    expect.verifySteps([]); // no web_save sent or queued
+    expect(steps).toEqual([]); // neither web_save nor web_save_multi sent or queued
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(".o_notification").toHaveCount(0);
 
@@ -203,12 +208,16 @@ test("offline, the Leads list's row checkbox stays enabled but no cell editor op
     await contains(".o_data_row:eq(0) [name='name']").click();
     await contains(".o_field_widget[name='name'] input").edit("Renamed lead");
     await contains(".o_list_renderer").click();
-    expect.verifySteps(["web_save"]);
+    expect(steps).toEqual(["web_save"]);
 });
 
 test.tags("desktop");
 test("offline, with two or more rows checked on the Leads list no cell is editable on any of them; online they still are", async () => {
-    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    const steps = [];
+    onRpc("crm.lead", ["web_save", "web_save_multi"], ({ method, parent }) => {
+        steps.push(method);
+        return parent();
+    });
     await mountView({ resModel: "crm.lead", type: "list", arch: Lead._views.list });
 
     const setOffline = mockCrmOffline();
@@ -224,10 +233,12 @@ test("offline, with two or more rows checked on the Leads list no cell is editab
     // Neither checked row's cell opens an editor.
     await contains(".o_data_row:eq(0) [name='name']").click();
     expect(".o_field_widget[name='name'] input").toHaveCount(0);
+    expect(".o_data_row:eq(0) [name='name']").toHaveText("First lead");
     await contains(".o_data_row:eq(1) [name='name']").click();
     expect(".o_field_widget[name='name'] input").toHaveCount(0);
+    expect(".o_data_row:eq(1) [name='name']").toHaveText("Second lead");
 
-    expect.verifySteps([]);
+    expect(steps).toEqual([]); // neither web_save nor web_save_multi
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
 
     await setOffline(false);
@@ -240,12 +251,16 @@ test("offline, with two or more rows checked on the Leads list no cell is editab
     await contains(".o_list_renderer").click();
     expect(".modal").toHaveCount(1);
     await contains(".modal-footer .btn-primary").click();
-    expect.verifySteps(["web_save"]);
+    expect(steps).toEqual(["web_save"]);
 });
 
 test.tags("desktop");
 test("offline, a Leads list row already mid cell-edit when the connection drops leaves edit mode instead of risking a silent save", async () => {
-    onRpc("crm.lead", "web_save", () => expect.step("web_save"));
+    const steps = [];
+    onRpc("crm.lead", ["web_save", "web_save_multi"], ({ method, parent }) => {
+        steps.push(method);
+        return parent();
+    });
     await mountView({ resModel: "crm.lead", type: "list", arch: Lead._views.list });
 
     // Online: check the row and open its cell editor (allowed online).
@@ -263,12 +278,80 @@ test("offline, a Leads list row already mid cell-edit when the connection drops 
     await setOffline(true);
 
     expect(".o_field_widget[name='name'] input").toHaveCount(0);
-    expect.verifySteps([]);
+    // The cell shows the record's real, unchanged value -- not the
+    // discarded "Mid-edit draft" left looking saved without being sent or
+    // queued.
+    expect(".o_data_row:eq(0) [name='name']").toHaveText("First lead");
+    expect(steps).toEqual([]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(MockServer.env["crm.lead"].find((r) => r.id === 1).name).toBe("First lead");
 
     await setOffline(false);
 });
+
+// ---------------------------------------------------------------------------
+// VAL-DIS-030 (user-testing evidence): the same cell-edit guard, proven
+// across the Opportunities-style and inherited report/forecast-style list
+// families, not just the bare arch above. `list_renderer_offline_patch.js`
+// scopes the guard by `record.resModel`, not by `js_class` or arch shape
+// (`CELL_EDIT_DISABLED_MODELS`), so this is evidence completeness across
+// view families, not a different code path.
+// ---------------------------------------------------------------------------
+
+const OPPORTUNITIES_LIKE_LIST_ARCH = `
+    <list js_class="crm_list" multi_edit="1">
+        <field name="name"/>
+        <field name="probability"/>
+        <field name="priority" widget="priority"/>
+    </list>`;
+
+// Mirrors the shape of the inherited report/forecast lists (B88): same
+// model, same guard, non-creatable and with the extra columns collapsed
+// the way a report list typically renders them, so the arch isn't just a
+// duplicate of the bare one above.
+const REPORT_STYLE_LIST_ARCH = `
+    <list js_class="crm_list" multi_edit="1" create="0">
+        <field name="name"/>
+        <field name="probability" column_invisible="True"/>
+        <field name="priority" widget="priority" column_invisible="True"/>
+    </list>`;
+
+const LIST_ARCH_FAMILIES = [
+    { label: "Opportunities-like", arch: OPPORTUNITIES_LIKE_LIST_ARCH },
+    { label: "report/forecast-style", arch: REPORT_STYLE_LIST_ARCH },
+];
+
+for (const { label, arch } of LIST_ARCH_FAMILIES) {
+    test.tags("desktop");
+    test(`offline, the ${label} Leads list family also disables cell editing on a checked row, issuing no web_save/web_save_multi, with the cell showing its original value; online it still edits`, async () => {
+        const steps = [];
+        onRpc("crm.lead", ["web_save", "web_save_multi"], ({ method, parent }) => {
+            steps.push(method);
+            return parent();
+        });
+        await mountView({ resModel: "crm.lead", type: "list", arch });
+
+        await contains(".o_data_row:eq(0) .o_list_record_selector input").click();
+        expect(".o_data_row:eq(0)").toHaveClass("o_data_row_selected");
+
+        const setOffline = mockCrmOffline();
+        await setOffline(true);
+
+        await contains(".o_data_row:eq(0) [name='name']").click();
+        expect(".o_field_widget[name='name'] input").toHaveCount(0);
+        expect(".o_data_row:eq(0) [name='name']").toHaveText("First lead"); // unchanged display, not just no input
+
+        expect(steps).toEqual([]); // neither web_save nor web_save_multi
+        expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+
+        await setOffline(false);
+
+        await contains(".o_data_row:eq(0) [name='name']").click();
+        await contains(".o_field_widget[name='name'] input").edit("Renamed via family check");
+        await contains(".o_list_renderer").click();
+        expect(steps).toEqual(["web_save"]);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Finding 18 (scrutiny round 1, VAL-DIS-030): the priority star carries

@@ -186,6 +186,39 @@ test("an Install confirmation opened online cannot be confirmed after disconnect
     expect(".o_dialog").toHaveCount(0); // dialog closed itself; no error dialog shown
 });
 
+test.tags("mobile");
+test("an Install confirmation opened online cannot be confirmed after disconnecting; no button_immediate_install RPC, nothing queued, no error dialog (mobile)", async () => {
+    patchWithCleanup(user, { isAdmin: true });
+    onRpc("ir.module.module", "search_read", ({ parent }) => {
+        expect.step("search_read");
+        return parent();
+    });
+    onRpc("ir.module.module", "button_immediate_install", () => {
+        expect.step("button_immediate_install");
+        return true;
+    });
+    const setOffline = mockCrmOffline();
+    await mountWithCleanup(WebClient);
+    await mountWithCleanup(LeadGenerationDropdown);
+
+    // Open the dropdown and the Install confirmation while still online.
+    await contains(".o-dropdown-caret.btn-secondary").click();
+    expect.verifySteps(["search_read"]);
+    await contains("[data-module-xml-id='base.module_crm_iap_mine']").click();
+    expect(".modal-footer button.btn-primary").toHaveCount(1); // the Install confirmation is open
+
+    // The connection drops with the dialog still open; its Confirm button
+    // is not disabled by the framework (it carries `data-available-offline`
+    // like every `web.ConfirmationDialog` button).
+    await setOffline(true);
+    expect(".modal-footer button.btn-primary").not.toHaveAttribute("disabled");
+
+    await contains(".modal-footer button.btn-primary").click();
+    expect.verifySteps([]); // no button_immediate_install call, queued or sent
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_dialog").toHaveCount(0); // dialog closed itself; no error dialog shown
+});
+
 test.tags("desktop");
 test("online, an Install confirmation's own Confirm still issues button_immediate_install (guard)", async () => {
     patchWithCleanup(user, { isAdmin: true });

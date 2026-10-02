@@ -44,6 +44,7 @@ class Lead extends models.Model {
     _name = "crm.lead";
 
     name = fields.Char();
+    color = fields.Integer();
 
     _records = [
         { id: 1, name: "Visited Lead" },
@@ -52,16 +53,20 @@ class Lead extends models.Model {
 
     _views = {
         // The "menu" template matches the real pipeline card's "Edit" /
-        // "Delete" entries (kanban_record.xml:26) closely enough to prove
-        // the toggler is unreachable offline (VAL-DIS-009 / B18-B20):
-        // without it `KanbanRecord.showMenu` is false and the toggler
-        // wouldn't even be in the DOM to test against.
+        // "Delete" / color-picker entries (kanban_record.xml:26,
+        // crm_lead_views.xml:521's `<field name="color"
+        // widget="kanban_color_picker"/>`) closely enough to prove the
+        // toggler is unreachable offline (VAL-DIS-009 / B18-B20): without
+        // it `KanbanRecord.showMenu` is false and the toggler wouldn't
+        // even be in the DOM to test against.
         kanban: `
             <kanban js_class="crm_kanban">
+                <field name="color" invisible="1"/>
                 <templates>
                     <t t-name="menu">
                         <a role="menuitem" type="open" class="dropdown-item">Edit</a>
                         <a role="menuitem" type="delete" class="dropdown-item">Delete</a>
+                        <field name="color" widget="kanban_color_picker"/>
                     </t>
                     <t t-name="card"><field name="name"/></t>
                 </templates>
@@ -432,6 +437,102 @@ test("offline, a card-menu Delete confirmation opened online can't be confirmed 
     expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(".o_dialog").toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// B20 (VAL-DIS-009): the color picker inside the same card menu. Its
+// buttons (`web.KanbanColorPickerField`'s own template,
+// `kanban_color_picker_field.xml`) are plain `<button>`s with no
+// `data-available-offline`, so -- unlike "Edit"/"Delete" above, which are
+// `<a role="menuitem">`s needing the crm-side `triggerAction` guard --
+// `OfflinePlugin.SELECTORS_TO_DISABLE`'s own `_offlineUI()` pass already
+// disables them on its own, whether the menu was opened before or after
+// the connection drops (its `MutationObserver` re-runs the pass on any
+// DOM added while offline, including a freshly opened dropdown). No crm
+// code change: `selectColor()` has no offline guard of its own, but a
+// disabled `<button>` dispatches no click and cannot be focused, so it is
+// never reached by a real user action.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("offline, a card's color picker buttons are disabled and issue no web_save; online a color still saves (desktop)", async () => {
+    onRpc("crm.lead", "web_save", ({ parent }) => {
+        expect.step("web_save");
+        return parent();
+    });
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+    // The card menu (and its color picker) is a popover, portalled outside
+    // `.o_kanban_record`'s own DOM subtree -- scoping these selectors
+    // under `${card}` would never match, open or not.
+    expect(".o_kanban_colorpicker button").not.toHaveCount(0); // the color picker is in the menu
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    const colorButton = ".o_kanban_colorpicker .o_colorlist_item_color_1"; // index 0 is "No color"
+    expect(colorButton).toHaveAttribute("disabled");
+    expect(colorButton).toHaveClass("o_disabled_offline");
+
+    // Unlike the Edit/Delete `<a>` items above (clickable, blocked only by
+    // the crm-side `triggerAction` guard, so the dropdown still closes as
+    // a side effect of the click), this is a genuine native `disabled`
+    // `<button>`: the click is never dispatched at all, so the menu stays
+    // open across the whole transition below -- no re-click needed to
+    // reopen it.
+    await contains(colorButton).click();
+    expect.verifySteps([]); // unreachable: no web_save issued or queued
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+
+    await setOffline(false);
+    expect(colorButton).not.toHaveAttribute("disabled");
+    await contains(colorButton).click();
+    expect.verifySteps(["web_save"]); // online, selecting a color still saves
+});
+
+test.tags("mobile");
+test("offline, a card's color picker buttons are disabled and issue no web_save (mobile)", async () => {
+    onRpc("crm.lead", "web_save", ({ parent }) => {
+        expect.step("web_save");
+        return parent();
+    });
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const card = ".o_kanban_record:contains('Visited Lead')";
+    await contains(`${card} .o_dropdown_kanban button`).click();
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // Same portal note as the desktop test above: the colorpicker is not
+    // a descendant of `.o_kanban_record`.
+    const colorButton = ".o_kanban_colorpicker .o_colorlist_item_color_1";
+    expect(colorButton).toHaveAttribute("disabled");
+    expect(colorButton).toHaveClass("o_disabled_offline");
+
+    await contains(colorButton).click();
+    expect.verifySteps([]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+
+    await setOffline(false);
+    expect(colorButton).not.toHaveAttribute("disabled");
+});
+
+test.tags("desktop");
+test("offline, an uncached lead's color picker is unreachable too (its toggler is disabled, VAL-DIS-009/VAL-UNCACHED-003)", async () => {
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    const uncachedCard = ".o_kanban_record:contains('Never Visited Lead')";
+    await contains(`${uncachedCard} .o_dropdown_kanban button`).click();
+    expect(".o-dropdown--menu").toHaveCount(0); // same toggler guard as Edit/Delete: never opens
+    expect(".o_kanban_colorpicker").toHaveCount(0); // not rendered anywhere: the menu never opened
 });
 
 // ---------------------------------------------------------------------------
