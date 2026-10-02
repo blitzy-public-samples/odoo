@@ -254,9 +254,16 @@ test("offline, a non-crm.lead chatter's Ctrl+Enter still attempts message_post a
 // Follow/Unfollow/"Add Followers" and each follower's own "Remove" are not
 // `<button>`s, so a dropdown opened online and left open across the
 // connection drop stays fully clickable without the patch.
+//
+// Scrutiny round 2: a handler guard alone leaves the dropdown's items
+// visibly enabled offline, which VAL-FIX-012 forbids. `follower_list_patch.js`
+// now closes the whole dropdown the moment the connection drops (for a
+// `crm.lead` thread); these three tests assert that visible closed state
+// -- the items are gone, not just inert -- in addition to the handler
+// guard still proven by the "no RPC" assertion.
 // ---------------------------------------------------------------------------
 
-test("offline, Follow in an already-open followers dropdown does nothing; online it still works", async () => {
+test("offline, an already-open followers dropdown closes (taking Follow with it); online it still works", async () => {
     await startServer();
     onRpcBefore("/mail/thread/subscribe", () => expect.step("subscribe"));
     await start();
@@ -266,12 +273,15 @@ test("offline, Follow in an already-open followers dropdown does nothing; online
     const setOffline = mockCrmOffline();
     await setOffline(true);
 
-    // The dropdown was already open before the connection dropped, and
-    // "Follow" is a `DropdownItem`/`<a>`, not a `<button>`: without the
-    // patch, clicking it here would still reach `thread.follow()` and
-    // attempt `/mail/thread/subscribe` (same open-before-offline gap as
-    // the composer's Ctrl+Enter above).
-    await click(".o-dropdown-item:text('Follow')");
+    // Without the patch, "Follow" (a `DropdownItem`/`<a>`, not a
+    // `<button>`) would stay visibly enabled and clickable here, the same
+    // open-before-offline gap as the composer's Ctrl+Enter above. The
+    // patch instead closes the whole dropdown as soon as `isOffline()`
+    // flips, so the item is gone, not merely inert, and the toggler
+    // itself is disabled like any other offline `<button>` (first test of
+    // this file), leaving no way to reopen it.
+    await waitForNone(".o-dropdown-item:text('Follow')");
+    expect(".o-mail-Followers-button").toHaveAttribute("disabled");
     expect.verifySteps([]);
     expect(".o-mail-Followers-counter").toHaveText("0");
 
@@ -285,7 +295,7 @@ test("offline, Follow in an already-open followers dropdown does nothing; online
     await waitFor(".o-mail-Followers-counter:text('1')");
 });
 
-test("offline, Add Followers in an already-open followers dropdown does nothing; online it still works", async () => {
+test("offline, an already-open followers dropdown closes (taking Add Followers with it); online it still works", async () => {
     await startServer();
     mockService("action", {
         doAction(action, options) {
@@ -303,7 +313,8 @@ test("offline, Add Followers in an already-open followers dropdown does nothing;
     const setOffline = mockCrmOffline();
     await setOffline(true);
 
-    await click("a:text('Add Followers')");
+    await waitForNone("a:text('Add Followers')");
+    expect(".o-mail-Followers-button").toHaveAttribute("disabled");
     expect.verifySteps([]);
 
     await setOffline(false);
@@ -312,7 +323,7 @@ test("offline, Add Followers in an already-open followers dropdown does nothing;
     expect.verifySteps(["add_followers_action"]);
 });
 
-test("offline, removing a follower in an already-open followers dropdown does nothing; online it still works", async () => {
+test("offline, an already-open followers dropdown closes (taking a follower's Remove with it); online it still works", async () => {
     const pyEnv = await startServer();
     const partnerId = pyEnv["res.partner"].create({ name: "A follower" });
     pyEnv["mail.followers"].create({
@@ -329,13 +340,15 @@ test("offline, removing a follower in an already-open followers dropdown does no
     const setOffline = mockCrmOffline();
     await setOffline(true);
 
-    // "Remove this follower" is a plain `<span>`
-    // (`@mail/core/web/follower.xml`), reachable the same way.
-    await click("[title='Remove this follower']");
+    // "Remove this follower" is a plain `<span>` (`@mail/core/web/
+    // follower.xml`), inside the same dropdown content as `FollowerList`
+    // -- closing the dropdown unmounts it along with everything else.
+    await waitForNone(".o-mail-Follower");
+    expect(".o-mail-Followers-button").toHaveAttribute("disabled");
     expect.verifySteps([]);
-    await waitFor(".o-mail-Follower"); // still there, dropdown still open
 
     await setOffline(false);
+    await click(".o-mail-Followers-button");
     await click("[title='Remove this follower']");
     // Same fire-and-forget `onSelected` timing as the Follow test above.
     await expect.waitForSteps(["unsubscribe"]);
@@ -577,5 +590,68 @@ test("offline, a non-crm.lead chatter's paste still attempts the upload (pre-exi
     // `mockCrmOffline()`'s catch-all still 502s it -- but that is the same
     // outcome any model gets while actually offline; it is not the gap
     // this scope check is about.
+    await expect.waitForSteps(["upload_added"]);
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny round 2 (VAL-FIX-012, VAL-DIS-004): with the composer closed
+// (the chatter's default state), a *second*, independent dropzone --
+// registered by the chatter itself (`@mail/chatter/web/chatter_patch.js`'s
+// own `useCustomDropzone`, enabled whenever the thread `canPostMessage`,
+// regardless of `composerType`) -- still called `uploadFile()`
+// unconditionally. `chatter/web_portal_project/chatter_patch.js` closes
+// that gap by swapping in a guarded `attachmentUploader` for a `crm.lead`
+// thread while offline.
+// ---------------------------------------------------------------------------
+
+test("offline, dropping a file onto the chatter's own dropzone (composer closed) does nothing; online it still works", async () => {
+    await startServer();
+    await start();
+    await openFormView("crm.lead", 1);
+    // The composer is closed by default (`clickSendMessage()` is not
+    // called here, unlike the composer-dropzone test above) -- this is
+    // exactly the state in which the chatter-level dropzone, not the
+    // composer's own, is the one a drop reaches.
+    await waitFor(".o-mail-Chatter");
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    const file = new File(["hello, world"], "text.txt", { type: "text/plain" });
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    await waitFor(".o-Dropzone.o-mail-Chatter-dropzone");
+    await dropFiles(".o-Dropzone.o-mail-Chatter-dropzone", [file]);
+    expect(".o-mail-AttachmentContainer").toHaveCount(0);
+
+    await setOffline(false);
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    await waitFor(".o-Dropzone.o-mail-Chatter-dropzone");
+    await dropFiles(".o-Dropzone.o-mail-Chatter-dropzone", [file]);
+    await waitFor(".o-mail-AttachmentContainer:not(.o-isUploading):contains('text.txt')");
+});
+
+// ---------------------------------------------------------------------------
+// Scope check: the chatter-level dropzone guard only engages for a
+// crm.lead thread.
+// ---------------------------------------------------------------------------
+
+test("offline, a non-crm.lead chatter's own dropzone (composer closed) still attempts the upload (pre-existing @mail gap, out of scope)", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "A partner" });
+    await start();
+    await openFormView("res.partner", partnerId);
+    await waitFor(".o-mail-Chatter");
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    getService("file_upload").bus.addEventListener("FILE_UPLOAD_ADDED", () =>
+        expect.step("upload_added")
+    );
+    const file = new File(["hello, world"], "text.txt", { type: "text/plain" });
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    await waitFor(".o-Dropzone.o-mail-Chatter-dropzone");
+    await dropFiles(".o-Dropzone.o-mail-Chatter-dropzone", [file]);
+    // Unguarded here (this is the non-crm.lead scope check): the drop
+    // still reaches the `file_upload` service and fires the upload, same
+    // as the composer-dropzone scope check above.
     await expect.waitForSteps(["upload_added"]);
 });

@@ -506,20 +506,36 @@ for (const preset of ["desktop", "mobile"]) {
     });
 }
 
-// Desktop-only: `ListRenderer.hasSelectors` (`list_renderer.js`) is
-// `allowSelectors && !this.uiService.isSmall` -- the row-selector column,
-// the only way to pick a row for the list's Archive/Unarchive action menu
-// entries, never renders on mobile for any list, online or offline (the
-// same reasoning the B59/B40 tests at the top of
-// `crm_offline_config_list_guards.test.js` rely on). There is nothing
-// mobile-specific to prove for a sequence that starts by checking a row.
+// Desktop-only, by design, not merely by omission: `ListRenderer.hasSelectors`
+// (`list_renderer.js`) is `allowSelectors && !this.uiService.isSmall` -- the
+// row-selector column, the only way to pick a row for the list's
+// Archive/Unarchive action menu entries, never renders on mobile for any
+// list, online or offline (the same reasoning the B59/B40 tests at the top
+// of `crm_offline_config_list_guards.test.js` rely on). So this exact
+// same-lead Archive-then-Unarchive-from-the-list sequence cannot be driven
+// at all under the mobile preset -- there is no row selector to check a
+// second time. This is a confirmed KNOWN LIMIT (architecture.md section
+// 3.8, "Mobile list selection"), not something crm can work around: on
+// phones a lead is archived and unarchived from its own form instead (both
+// still queue there, each proved independently by
+// `crm_offline_action_menu_guards.test.js`'s and this file's mobile-tagged
+// Archive/Unarchive tests above, which stay as-is).
 {
     test.tags("desktop");
     test(`offline, action-menu Archive then Unarchive on the SAME lead, from the list, queues both and replays in order (desktop)`, async () => {
         const steps = [];
-        onRpc("crm.lead", ["action_archive", "action_unarchive"], ({ method, parent }) => {
+        // Records `[method, active]` right after each replayed call's own
+        // mock-server handler returns, so the lead's intermediate
+        // archived (not just its final restored) state is provable: a
+        // no-op archive followed by an unarchive would otherwise satisfy
+        // the ordered-steps and final-`true` assertions below just as
+        // well.
+        const transitions = [];
+        onRpc("crm.lead", ["action_archive", "action_unarchive"], async ({ method, parent }) => {
+            const result = await parent();
+            transitions.push([method, MockServer.env["crm.lead"].find((r) => r.id === 1).active]);
             steps.push(method);
-            return parent();
+            return result;
         });
         await mountWithCleanup(WebClient);
         await getService("action").doAction(4); // leads list
@@ -583,7 +599,14 @@ for (const preset of ["desktop", "mobile"]) {
         // the one lead, and the queue ends empty.
         expect(steps).toEqual(["action_archive", "action_unarchive"]);
         expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
-        // Archived then unarchived in order: back to active server-side.
+        // The lead actually went inactive once replayed `action_archive`
+        // completed, and only came back active once the replayed
+        // `action_unarchive` completed after it -- not just "ended up
+        // active again" (which a no-op pair would also satisfy).
+        expect(transitions).toEqual([
+            ["action_archive", false],
+            ["action_unarchive", true],
+        ]);
         expect(MockServer.env["crm.lead"].find((r) => r.id === 1).active).toBe(true);
     });
 }

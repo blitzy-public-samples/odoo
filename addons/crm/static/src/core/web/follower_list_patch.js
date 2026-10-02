@@ -1,3 +1,5 @@
+import { useOnChange } from "@odoo/owl";
+
 import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { patch } from "@web/core/utils/patch";
@@ -18,11 +20,32 @@ import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
  * followers are untouched, online or offline. The "Edit Notification
  * Preferences" action (`onClickEdit`, both components) opens a local
  * dialog with no RPC of its own, so it is out of scope here.
+ *
+ * Scrutiny round 2: the handler guards above stop any write RPC, but
+ * VAL-FIX-012 requires the write controls themselves to be disabled or
+ * absent, not just inert -- a dropdown opened online and left open across
+ * the disconnect still renders Follow/Unfollow/"Add Followers" (and, via
+ * the nested `Follower` component, every "Remove") as apparently enabled,
+ * focusable items. `mail.FollowerList` is only ever mounted inside the
+ * `Dropdown`'s `content` slot (`chatter.xml`), so closing the dropdown
+ * (`this.props.dropdown.close()`, the same call `onClickEdit` already
+ * uses) unmounts it -- and every nested `Follower` -- entirely. Watching
+ * `OfflinePlugin.isOffline()` (a signal) via `useOnChange` closes the menu
+ * at the moment the connection drops, for a `crm.lead` thread only; other
+ * models' dropdowns are left open as before.
  */
 patch(FollowerList.prototype, {
     setup() {
         super.setup();
         this.crmOffline = useCrmOffline();
+        useOnChange(
+            () => [this.crmOffline.isOffline()],
+            (isOffline) => {
+                if (isOffline && this.props.thread.model === "crm.lead") {
+                    this.props.dropdown.close();
+                }
+            }
+        );
     },
 
     get isCrmLeadOffline() {
