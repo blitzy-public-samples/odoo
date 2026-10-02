@@ -33,6 +33,15 @@ import { WebClient } from "@web/webclient/webclient";
  * feature's guard is even reached. The list test below proves that
  * composition holds, it does not re-implement VAL-DIS-030.
  *
+ * Scrutiny finding 20: blocking the write alone left the popover's "Hide
+ * in Kanban" `<input type="checkbox">` enabled and visually toggleable
+ * (never matched by the framework's button-only disable pass) for a
+ * popover opened online and left open across the connection drop.
+ * `many2many_tags_field_patch.js` now also closes an open popover
+ * reactively on going offline (scoped to `crm.lead`), so the control
+ * itself becomes absent instead of merely inert; see that file's header
+ * for why the popover is closed rather than its `<CheckBox>` disabled.
+ *
  * VAL-DIS-022 -- BR10: a many2one's own existing-record open/edit
  * navigation (`openRecordInAction`, distinct from `Many2XAutocomplete`'s
  * create/search-more gate) is reached through the readonly `<a
@@ -45,10 +54,12 @@ import { WebClient } from "@web/webclient/webclient";
  * `many2one_offline_patch.js` forces `canOpen` false offline on
  * `Many2OneField` and `Many2OneAvatarUserField`,
  * scoped to `crm.lead`, `crm.merge.opportunity` and
- * `crm.lead2opportunity.partner.mass`. KNOWN-LIMIT (see this feature's
- * handoff): the lead form's `partner_id`
+ * `crm.lead2opportunity.partner.mass`. The lead form's `partner_id`
  * (`widget="res_partner_many2one"`, `partner_autocomplete` addon, not a
- * crm dependency) is not patched and stays unguarded.
+ * crm dependency) goes through a third, shared-`Many2One`-level guard
+ * instead (`crm_offline_partner_link.test.js`), which additionally
+ * neutralizes `linkHref` (scrutiny finding 21) so a middle-click or
+ * "open in new tab" on the still-present link has nothing to follow.
  *
  * Every guard is proven not to leak to a non-crm model (`other.thing`
  * below), per "scoped to crm views/models".
@@ -178,14 +189,14 @@ test("online, clicking a tag on the lead form opens the color popover and writes
 
 // ---------------------------------------------------------------------------
 // VAL-DIS-019 -- B55/BR11: the popover was already open before the
-// connection dropped. Its color-list buttons get framework-disabled
-// (plain `<button>`s, proportionate proof); its "Hide in Kanban" checkbox
-// is an `<input type="checkbox">`, never matched by the framework's
-// button-only selector, so it needs this feature's own
-// `onTagVisibilityChange` guard.
+// connection dropped. Scrutiny finding 20: closing the popover reactively
+// (rather than leaving its color buttons framework-disabled but its
+// "Hide in Kanban" `<input type="checkbox">` still enabled and visually
+// toggleable) is what makes the control "absent" per the DISABLE
+// convention; see `many2many_tags_field_patch.js`'s header comment.
 // ---------------------------------------------------------------------------
 
-test("offline, a tag color popover already open when the connection drops has its color buttons framework-disabled and its Hide-in-Kanban checkbox blocked from writing crm.tag", async () => {
+test("offline, a tag color popover already open when the connection drops closes itself; its Hide-in-Kanban checkbox is unreachable", async () => {
     onRpc("crm.tag", "web_save", () => expect.step("web_save"));
     await mountView({ resModel: "crm.lead", type: "form", resId: 1, arch: TAG_FORM_ARCH });
 
@@ -195,16 +206,20 @@ test("offline, a tag color popover already open when the connection drops has it
     const setOffline = mockOffline();
     await setOffline(true);
 
-    expect(".o_tag_popover .o_colorlist button:eq(0)").toHaveProperty("disabled", true);
-    expect(".o_tag_popover .o_colorlist button:eq(0)").toHaveClass("o_disabled_offline");
-
-    await contains(".o_tag_popover input[type='checkbox']").click();
+    // "Disabled or absent" (DISABLE convention): the whole popover,
+    // color buttons and checkbox alike, is gone instead of staying open
+    // with some controls merely inert.
+    expect(".o_tag_popover").toHaveCount(0);
 
     expect.verifySteps([]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync())).toEqual([]);
     expect(".o_notification").toHaveCount(0);
 
     await setOffline(false);
+
+    // Online again, the popover opens and behaves exactly as before.
+    await contains(".o_tag:eq(0)").click();
+    expect(".o_tag_popover").toHaveCount(1);
     expect(".o_tag_popover .o_colorlist button:eq(0)").toHaveProperty("disabled", false);
 });
 

@@ -52,6 +52,14 @@ import { buildM2OFieldDescription, many2OneFieldProps } from "@web/views/fields/
  * *present but inert* offline (no RPC, no navigation) instead of
  * *absent*, unlike `lost_reason_id`/`user_id` in
  * `crm_offline_relational_guards.test.js`.
+ *
+ * Scrutiny finding 21 (VAL-DIS-022): "present but inert" was not enough
+ * on its own -- a middle-click or "Open link in new tab" follows the
+ * `<a href>` directly, bypassing `openRecordInAction`'s click guard
+ * entirely. `disableSharedRecordOpenOffline` now also patches `linkHref`
+ * so the href itself is empty while scoped crm offline; the test below
+ * asserts that in addition to the click-and-no-RPC behavior it already
+ * covered.
  */
 
 class TestMany2OneField extends Component {
@@ -110,6 +118,7 @@ test("offline, the lead form's partner_id readonly link issues no get_record_def
     await mountView({ resModel: "crm.lead", type: "form", resId: 1, arch: FORM_ARCH });
 
     expect("a.o_form_uri").toHaveCount(1);
+    expect("a.o_form_uri").toHaveAttribute("href", "/odoo/res.partner/1");
 
     const setOffline = mockOffline();
     await setOffline(true);
@@ -123,7 +132,14 @@ test("offline, the lead form's partner_id readonly link issues no get_record_def
     await contains("a.o_form_uri").click();
     expect.verifySteps([]);
 
+    // Scrutiny finding 21: the href itself is neutralized too, so a
+    // middle-click or "Open link in new tab" -- which never goes through
+    // the click handler just asserted above -- has nothing to navigate
+    // to either.
+    expect("a.o_form_uri").not.toHaveAttribute("href");
+
     await setOffline(false);
+    expect("a.o_form_uri").toHaveAttribute("href", "/odoo/res.partner/1");
     await contains("a.o_form_uri").click();
     expect.verifySteps(["get_record_default_action"]);
 });
@@ -144,13 +160,14 @@ test("offline, a non-crm model's partner_id readonly link still attempts get_rec
     const setOffline = mockOffline();
     await setOffline(true);
 
-    // Not this feature's guard to apply here: the click reaches
-    // `openRecordInAction` exactly as it would online. `mockOffline()`
-    // fails the RPC itself (a real `ConnectionLostError`, unrelated to
-    // this feature, same as the committed scope-check convention in
-    // `crm_offline_relational_guards.test.js`), but the call is still
-    // attempted -- this feature's guard would otherwise return *before*
-    // ever calling `orm.call`.
+    // Not this feature's guard to apply here: the href stays intact and
+    // the click reaches `openRecordInAction` exactly as it would online.
+    // `mockOffline()` fails the RPC itself (a real `ConnectionLostError`,
+    // unrelated to this feature, same as the committed scope-check
+    // convention in `crm_offline_relational_guards.test.js`), but the
+    // call is still attempted -- this feature's guard would otherwise
+    // return *before* ever calling `orm.call`.
+    expect("a.o_form_uri").toHaveAttribute("href", "/odoo/res.partner/1");
     expect.errors(1);
     await contains("a.o_form_uri").click();
     expect.verifyErrors([

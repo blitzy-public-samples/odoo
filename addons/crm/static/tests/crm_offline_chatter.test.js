@@ -1,15 +1,28 @@
 import {
+    click,
     defineMailModels,
+    dragenterFiles,
+    dropFiles,
     insertText,
     onRpcBefore,
     openFormView,
+    pasteFiles,
     start,
     startServer,
     triggerHotkey,
 } from "@mail/../tests/mail_test_helpers";
-import { expect, test, waitFor } from "@odoo/hoot";
+import { expect, test, waitFor, waitForNone } from "@odoo/hoot";
 import { animationFrame } from "@odoo/hoot-dom";
-import { contains, defineModels, fields, mockOffline, models } from "@web/../tests/web_test_helpers";
+import {
+    contains,
+    defineModels,
+    fields,
+    getService,
+    mockOffline,
+    mockService,
+    models,
+    serverState,
+} from "@web/../tests/web_test_helpers";
 
 /**
  * Defect 8 (architecture.md §3.2 item 8 / offline_inventory.md row B14):
@@ -34,6 +47,30 @@ import { contains, defineModels, fields, mockOffline, models } from "@web/../tes
  * `message_post`. `core/common/composer_patch.js` closes that path for
  * `crm.lead` threads by making `sendMessage()` a no-op and forcing
  * `isSendButtonDisabled` while offline (VAL-FIX-012, VAL-DIS-004).
+ *
+ * Scrutiny round-1 (confusingly, these are numbered independently of the
+ * "Defect 8" above, which is this file's own pre-existing architecture.md
+ * item number -- the three below are the *scrutiny* findings 8, 9 and 10):
+ *
+ * - Finding 8 (VAL-FIX-012, VAL-DIS-004): the followers dropdown's
+ *   Follow/Unfollow/"Add Followers" (`FollowerList`, `mail/core/web/
+ *   follower_list.js`) and each follower's own "Remove"
+ *   (`Follower.onClickRemove`, `mail/core/web/follower.js`) are not
+ *   `<button>`s either, so a dropdown opened online and left open across
+ *   the connection drop stays fully clickable the same way the composer
+ *   does above. `core/web/follower_list_patch.js` guards all four for a
+ *   `crm.lead` thread.
+ * - Finding 9 (VAL-DIS-004): editing an already-posted message
+ *   (`Composer.editMessage()`, reached by Ctrl+Enter or the "save" text
+ *   link in edit mode, not by `sendMessage()`) had no offline guard at
+ *   all. `composer_patch.js` now guards `editMessage()` too, scoped by
+ *   the *edited message's* own thread.
+ * - Finding 10 (VAL-FIX-012, VAL-DIS-004): pasting or dropping a file
+ *   into an already-open composer started an attachment upload with no
+ *   offline check. `composer_patch.js` guards this via the `allowUpload`
+ *   getter (covers paste, since mail's own `onPaste` already gates on it)
+ *   and a dedicated `onDropFile()` guard (drop has no such internal
+ *   check).
  *
  * Test stability (m2-test-stability-partner-link): mounting the chatter
  * (and typing into its composer) can leave one of @mail's own debounced
@@ -188,4 +225,340 @@ test("offline, a non-crm.lead chatter's Ctrl+Enter still attempts message_post a
         `Connection to "/mail/message/post" couldn't be established or was interrupted`,
     ]);
     expect(".o-mail-Message").toHaveCount(0); // never actually posted
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 8 (VAL-FIX-012, VAL-DIS-004): the followers dropdown's
+// Follow/Unfollow/"Add Followers" and each follower's own "Remove" are not
+// `<button>`s, so a dropdown opened online and left open across the
+// connection drop stays fully clickable without the patch.
+// ---------------------------------------------------------------------------
+
+test("offline, Follow in an already-open followers dropdown does nothing; online it still works", async () => {
+    await startServer();
+    onRpcBefore("/mail/thread/subscribe", () => expect.step("subscribe"));
+    await start();
+    await openFormView("crm.lead", 1);
+    await click(".o-mail-Followers-button");
+    await waitFor(".o-dropdown-item:text('Follow')");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    // The dropdown was already open before the connection dropped, and
+    // "Follow" is a `DropdownItem`/`<a>`, not a `<button>`: without the
+    // patch, clicking it here would still reach `thread.follow()` and
+    // attempt `/mail/thread/subscribe` (same open-before-offline gap as
+    // the composer's Ctrl+Enter above).
+    await click(".o-dropdown-item:text('Follow')");
+    expect.verifySteps([]);
+    expect(".o-mail-Followers-counter").toHaveText("0");
+
+    await setOffline(false);
+    await click(".o-mail-Followers-button");
+    await click(".o-dropdown-item:text('Follow')");
+    // DropdownItem's onClick fires `onSelected` without awaiting it, so the
+    // subscribe RPC can still be in flight when `click()` resolves; wait
+    // for the step instead of asserting it immediately.
+    await expect.waitForSteps(["subscribe"]);
+    await waitFor(".o-mail-Followers-counter:text('1')");
+});
+
+test("offline, Add Followers in an already-open followers dropdown does nothing; online it still works", async () => {
+    await startServer();
+    mockService("action", {
+        doAction(action, options) {
+            if (action?.res_model !== "mail.followers.edit") {
+                return super.doAction(...arguments);
+            }
+            expect.step("add_followers_action");
+            options.onClose?.();
+        },
+    });
+    await start();
+    await openFormView("crm.lead", 1);
+    await click(".o-mail-Followers-button");
+    await waitFor("a:text('Add Followers')");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    await click("a:text('Add Followers')");
+    expect.verifySteps([]);
+
+    await setOffline(false);
+    await click(".o-mail-Followers-button");
+    await click("a:text('Add Followers')");
+    expect.verifySteps(["add_followers_action"]);
+});
+
+test("offline, removing a follower in an already-open followers dropdown does nothing; online it still works", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "A follower" });
+    pyEnv["mail.followers"].create({
+        partner_id: partnerId,
+        is_active: true,
+        res_id: 1,
+        res_model: "crm.lead",
+    });
+    onRpcBefore("/mail/thread/unsubscribe", () => expect.step("unsubscribe"));
+    await start();
+    await openFormView("crm.lead", 1);
+    await click(".o-mail-Followers-button");
+    await waitFor(".o-mail-Follower");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    // "Remove this follower" is a plain `<span>`
+    // (`@mail/core/web/follower.xml`), reachable the same way.
+    await click("[title='Remove this follower']");
+    expect.verifySteps([]);
+    await waitFor(".o-mail-Follower"); // still there, dropdown still open
+
+    await setOffline(false);
+    await click("[title='Remove this follower']");
+    // Same fire-and-forget `onSelected` timing as the Follow test above.
+    await expect.waitForSteps(["unsubscribe"]);
+    await waitForNone(".o-mail-Follower");
+});
+
+// ---------------------------------------------------------------------------
+// Scope check: the follower-action patch only engages for a crm.lead
+// thread. For every other model, Follow still *attempts* `subscribe`
+// while offline, same pre-existing @mail gap as above.
+// ---------------------------------------------------------------------------
+
+test("offline, a non-crm.lead chatter's Follow still attempts subscribe and throws an uncaught error (pre-existing @mail gap, out of scope)", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "A partner" });
+    await start();
+    await openFormView("res.partner", partnerId);
+    await click(".o-mail-Followers-button");
+    await waitFor(".o-dropdown-item:text('Follow')");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect.errors(1);
+    await click(".o-dropdown-item:text('Follow')");
+    await animationFrame();
+
+    expect.verifyErrors([
+        `Connection to "/mail/thread/subscribe" couldn't be established or was interrupted`,
+    ]);
+    expect(".o-mail-Followers-counter").toHaveText("0"); // never actually followed
+});
+
+// `Follower.onClickRemove` is a separate override, in a separate class,
+// scoped independently of `FollowerList`'s -- worth its own scope check.
+test("offline, a non-crm.lead chatter's remove-follower still attempts unsubscribe and throws an uncaught error (pre-existing @mail gap, out of scope)", async () => {
+    const pyEnv = await startServer();
+    const [partnerId_1, partnerId_2] = pyEnv["res.partner"].create([
+        { name: "Partner1" },
+        { name: "Partner2" },
+    ]);
+    pyEnv["mail.followers"].create({
+        partner_id: partnerId_2,
+        is_active: true,
+        res_id: partnerId_1,
+        res_model: "res.partner",
+    });
+    await start();
+    await openFormView("res.partner", partnerId_1);
+    await click(".o-mail-Followers-button");
+    await waitFor(".o-mail-Follower");
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect.errors(1);
+    await click("[title='Remove this follower']");
+    await animationFrame();
+
+    expect.verifyErrors([
+        `Connection to "/mail/thread/unsubscribe" couldn't be established or was interrupted`,
+    ]);
+    await waitFor(".o-mail-Follower"); // never actually removed
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 9 (VAL-DIS-004): editing an already-posted message
+// reaches `Composer.editMessage()` by Ctrl+Enter or the "save" text link,
+// neither of which goes through `sendMessage()` -- the guard above never
+// ran for an edit, and edit mode's "save" is a plain, never-disabled span.
+// ---------------------------------------------------------------------------
+
+test("offline, saving an already-open message edit does nothing by Ctrl+Enter or the save link; online it still works", async () => {
+    const pyEnv = await startServer();
+    pyEnv["mail.message"].create({
+        author_id: serverState.partnerId,
+        body: "original message",
+        message_type: "comment",
+        model: "crm.lead",
+        res_id: 1,
+    });
+    onRpcBefore("/mail/message/update_content", () => expect.step("update_content"));
+    await start();
+    await openFormView("crm.lead", 1);
+    // Unlike a real mail.thread model (e.g. res.partner below), this mock
+    // Lead has no reaction feature, so "Edit" (the lowest-sequence action
+    // for a self-authored message) is the sole quick action -- its own
+    // `title="Edit"` button, not inside the "..." overflow dropdown.
+    await click(".o-mail-Message [title='Edit']");
+    await waitFor(".o-mail-Message .o-mail-Composer.o-focused");
+    await insertText(".o-mail-Message .o-mail-Composer-input", "edited while online", {
+        replace: true,
+    });
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    // The edit composer was already open before the connection dropped:
+    // without the patch, either path below would still reach
+    // `editMessage()` and attempt `update_content`.
+    await triggerHotkey("control+Enter");
+    expect.verifySteps([]);
+    expect(".o-mail-Message .o-mail-Composer-input").toHaveValue("edited while online");
+    // The "save" text link only renders `!this.ui.isSmall`
+    // (`composer.xml`); on a small screen, Ctrl+Enter above is the only
+    // way to reach `editMessage()` at all, so there is nothing extra to
+    // click here under the mobile preset.
+    const ui = getService("ui");
+    if (!ui.isSmall) {
+        await click(".o-mail-Message button:text('save')");
+        expect.verifySteps([]);
+        expect(".o-mail-Message .o-mail-Composer-input").toHaveValue("edited while online");
+    }
+    expect(".o-mail-Message-body:contains('(edited)')").toHaveCount(0);
+
+    await setOffline(false);
+    if (!ui.isSmall) {
+        await click(".o-mail-Message button:text('save')");
+    } else {
+        await triggerHotkey("control+Enter");
+    }
+    // Same fire-and-forget `onClickCancelOrSaveEditText` timing as the
+    // follower RPCs above (it calls `editMessage()` without awaiting it).
+    await expect.waitForSteps(["update_content"]);
+    await waitFor(".o-mail-Message-body:contains('edited while online (edited)')");
+});
+
+// ---------------------------------------------------------------------------
+// Scope check: the edit-message patch only engages for a crm.lead thread.
+// ---------------------------------------------------------------------------
+
+test("offline, a non-crm.lead chatter's message edit still attempts update_content and throws an uncaught error (pre-existing @mail gap, out of scope)", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "A partner" });
+    pyEnv["mail.message"].create({
+        author_id: serverState.partnerId,
+        body: "original message",
+        message_type: "comment",
+        model: "res.partner",
+        res_id: partnerId,
+    });
+    await start();
+    await openFormView("res.partner", partnerId);
+    await click(".o-mail-Message [title='Expand']");
+    await click(".o-dropdown-item:text('Edit')");
+    await insertText(".o-mail-Message .o-mail-Composer-input", " edited", { replace: true });
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect.errors(1);
+    // The "save" text link only renders `!this.ui.isSmall`
+    // (`composer.xml`); Ctrl+Enter reaches the same `editMessage()` call
+    // either way.
+    if (getService("ui").isSmall) {
+        await triggerHotkey("control+Enter");
+    } else {
+        await click(".o-mail-Message button:text('save')");
+    }
+    await animationFrame();
+
+    expect.verifyErrors([
+        `Connection to "/mail/message/update_content" couldn't be established or was interrupted`,
+    ]);
+});
+
+// ---------------------------------------------------------------------------
+// Scrutiny finding 10 (VAL-FIX-012, VAL-DIS-004): pasting or dropping a
+// file into an already-open composer started an attachment upload with
+// no offline check at all.
+// ---------------------------------------------------------------------------
+
+test("offline, pasting or dropping a file into an already-open composer does nothing; online it still works", async () => {
+    await startServer();
+    await start();
+    await openFormView("crm.lead", 1);
+    await contains(".o-mail-Chatter-sendMessage").click();
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    const file = new File(["hello, world"], "text.txt", { type: "text/plain" });
+    // Paste: mail's own `onPaste` already gates on the `allowUpload`
+    // getter this feature overrides, so this proves that override closes
+    // the path on its own.
+    await pasteFiles(".o-mail-Composer-input", [file]);
+    expect(".o-mail-AttachmentContainer").toHaveCount(0);
+    // Drop: the dropzone's own enablement predicate reads the raw
+    // `allowUpload` *prop* (always true from the chatter), not the
+    // getter, so it still renders -- `onDropFile` needs its own guard,
+    // which this proves. The chatter itself also registers its own
+    // dropzone (`chatter_patch.js`) that reacts to the same drag event, so
+    // two `.o-Dropzone` elements coexist; target the composer's own
+    // (`extraClass: "o-mail-Composer-dropzone"` in `composer.js`).
+    await dragenterFiles(".o-mail-Composer-input", [file]);
+    await waitFor(".o-Dropzone.o-mail-Composer-dropzone");
+    await dropFiles(".o-Dropzone.o-mail-Composer-dropzone", [file]);
+    expect(".o-mail-AttachmentContainer").toHaveCount(0);
+
+    await setOffline(false);
+    await pasteFiles(".o-mail-Composer-input", [file]);
+    await waitFor(".o-mail-AttachmentContainer:not(.o-isUploading):contains('text.txt')");
+});
+
+// ---------------------------------------------------------------------------
+// Scope check: the paste/drop patch only engages for a crm.lead thread.
+// ---------------------------------------------------------------------------
+
+test("offline, a non-crm.lead chatter's paste still attempts the upload (pre-existing @mail gap, out of scope)", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "A partner" });
+    await start();
+    await openFormView("res.partner", partnerId);
+    await contains(".o-mail-Chatter-sendMessage").click();
+    await animationFrame(); // let any pending fetchStoreData() debounce settle first
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    getService("file_upload").bus.addEventListener("FILE_UPLOAD_ADDED", () =>
+        expect.step("upload_added")
+    );
+    const file = new File(["hello, world"], "text.txt", { type: "text/plain" });
+    await pasteFiles(".o-mail-Composer-input", [file]);
+    // Unlike the message-post/edit/follower RPCs above, the file upload
+    // goes through the raw `XMLHttpRequest` the `file_upload` service
+    // builds (`file_upload_service.js`), not `orm`/`rpc`; unguarded here
+    // (this is the non-crm.lead scope check), the paste still reaches
+    // that service and fires the upload (`FILE_UPLOAD_ADDED`), instead of
+    // crm.lead's silent no-op above which never gets this far. The
+    // request itself then fails once it reaches the network -- hoot's
+    // `MockXMLHttpRequest.send()` relays through `fetch()`, so
+    // `mockOffline()`'s catch-all still 502s it -- but that is the same
+    // outcome any model gets while actually offline; it is not the gap
+    // this scope check is about.
+    await expect.waitForSteps(["upload_added"]);
 });

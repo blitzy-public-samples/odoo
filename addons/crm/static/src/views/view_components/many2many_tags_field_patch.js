@@ -1,3 +1,4 @@
+import { effect, onWillDestroy } from "@odoo/owl";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
 import { patch } from "@web/core/utils/patch";
 import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
@@ -30,6 +31,22 @@ import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
  * `onTagClick`. Same reasoning as `group_config_menu_patch.js`'s
  * handler-level guard for an already-open dropdown.
  *
+ * Scrutiny finding 20 (VAL-DIS-019): blocking the write is not enough on
+ * its own. The popover's `ColorList` buttons are plain `<button>`s, so the
+ * framework disables them when the connection drops (proportionate
+ * proof); but the "Hide in Kanban" `<CheckBox>` renders a plain
+ * `<input type="checkbox">`, which the framework's button-only selector
+ * never matches, so without more it would stay enabled and keep toggling
+ * its own checked state in the DOM -- nothing is written, but the control
+ * itself is neither "disabled" nor "absent", the two outcomes the shared
+ * DISABLE convention allows. `Many2ManyTagsFieldColorListPopover` is not
+ * exported, so it cannot be patched directly to add a `disabled` prop to
+ * its `<CheckBox>`; closing the (exported) popover handle itself instead
+ * removes the whole control from the DOM, which satisfies "absent". The
+ * `effect()` below watches `isOffline()` and closes an open popover
+ * reactively, so it also covers the already-open case, not just future
+ * opens (which `onTagClick`'s own guard already blocks).
+ *
  * Scoped to `crm.lead` so every other addon's `many2many_tags` field (e.g.
  * project tags) is untouched, online or offline.
  */
@@ -37,6 +54,12 @@ patch(Many2ManyTagsField.prototype, {
     setup() {
         super.setup();
         this.crmOffline = useCrmOffline();
+        const disposeTagPopoverEffect = effect(() => {
+            if (this.isCrmLeadTags && this.crmOffline.isOffline() && this.popover.isOpen) {
+                this.popover.close();
+            }
+        });
+        onWillDestroy(disposeTagPopoverEffect);
     },
 
     get isCrmLeadTags() {

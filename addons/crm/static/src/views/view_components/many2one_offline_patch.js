@@ -76,6 +76,19 @@ import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
  *    and no navigation", not "is absent"), unlike BR10's "absent" wording
  *    used for the two fields layer 1 already covers.
  *
+ *    Scrutiny finding 21 (VAL-DIS-022): "present but inert" still left
+ *    one path open. `openRecordInAction` only guards the primary click
+ *    (`t-on-click.prevent.stop`, `many2one.xml:24`); the same `<a
+ *    href="...">` keeps its real `linkHref` value regardless, and a
+ *    middle-click or the browser's "Open link in new tab" follows that
+ *    `href` natively, bypassing the click handler (and this component)
+ *    entirely. `linkHref` is patched here too, so the href itself is
+ *    empty while scoped crm offline -- `t-att-href` then omits the
+ *    attribute altogether, so there is nothing for a native navigation to
+ *    follow. This still can't make the `<a>` itself absent (same
+ *    `canOpen`-is-a-prop limit as above), but "no usable href" is exactly
+ *    what this feature's expectedBehavior asks for.
+ *
  *    Layer 2 is intentionally *not* a replacement for layer 1: removing
  *    the two `m2oProps` patches would regress `lost_reason_id`/`user_id`'s
  *    committed "absent" assertions in
@@ -136,6 +149,16 @@ function disableSharedRecordOpenOffline(ComponentClass) {
                 return false;
             }
             return super.hasLinkButton;
+        },
+
+        get linkHref() {
+            if (this.isCrmScopedOffline) {
+                // `undefined` makes `t-att-href` omit the attribute
+                // entirely (many2one.xml:24), so there is no href left for
+                // a middle-click or "Open link in new tab" to follow.
+                return undefined;
+            }
+            return super.linkHref;
         },
 
         async openRecordInAction(newWindow) {
