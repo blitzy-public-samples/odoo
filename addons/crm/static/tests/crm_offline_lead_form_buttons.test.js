@@ -14,17 +14,24 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 
 /**
  * m2-framework-disabled-proofs (VAL-DIS-001). Rows B2, B4, B6, B7, B12,
- * B13, C8, C10, C11, C12 are all plain `<button type="object">` or
+ * B13, C10, C11, C12 are all plain `<button type="object">` or
  * `<button type="action">` elements on `crm_lead_view_form`
  * (`views/crm_lead_views.xml:12-17,33-50,212-228`) that carry no
  * `data-available-offline`. `OfflinePlugin.SELECTORS_TO_DISABLE`
  * (`button:not([data-available-offline]):not([disabled])`) already
- * disables every one of them offline, including the Won button
- * (`action_set_won_rainbowman`, C8) -- milestone 3 is what gives Won its
- * own offline producer; today it is still a bare disabled button, so "no
- * `action_set_won_rainbowman` call is issued or queued offline" already
- * holds with no crm code. This test only proves the framework's own
- * disablement reaches every row; no crm change is needed (no gap found).
+ * disables every one of them offline. This test only proves the
+ * framework's own disablement reaches every row; no crm change is needed
+ * (no gap found).
+ *
+ * The Won button (`action_set_won_rainbowman`, B1/C6/C8) used to be part
+ * of this same disabled-buttons proof -- before milestone 3 it was still
+ * a bare button with no offline producer, so the framework's generic
+ * disablement already covered it. m3-mark-won gives Won its own offline
+ * producer (`CrmFormController._queueWonOffline`, `data-available-offline`
+ * on the real button) and its own dedicated test file
+ * (`crm_offline_mark_won.test.js`, VAL-DATA-005/006/007); it is removed
+ * from this file's coverage so this file's remaining buttons keep
+ * matching the real markup verbatim (the comment below).
  *
  * `data-hotkey` doesn't bypass this: the hotkey plugin's own target
  * selector is `[data-hotkey]:not(:disabled)`
@@ -104,9 +111,6 @@ class Lead extends models.Model {
         },
     ];
 
-    action_set_won_rainbowman() {
-        return false;
-    }
     action_convert_to_opportunity() {
         return false;
     }
@@ -141,9 +145,6 @@ defineMailModels();
 const FORM_ARCH = `
     <form class="o_lead_opportunity_form" js_class="crm_form">
         <header>
-            <button name="action_set_won_rainbowman" string="Won"
-                type="object" class="oe_highlight" data-hotkey="w"
-                invisible="won_status == 'won' or type == 'lead' or not active"/>
             <button name="action_convert_to_opportunity" string="Convert to Opportunity" type="object"
                 class="oe_highlight" invisible="type == 'opportunity' or not active" data-hotkey="v"/>
             <button name="%(crm.crm_lead_lost_action)d" string="Lost" type="action" data-hotkey="l"
@@ -182,7 +183,6 @@ const FORM_ARCH = `
 
 test.tags("desktop");
 test("offline, the lead form's header and stat buttons are disabled and issue no RPC; online they work (opportunity record)", async () => {
-    onRpc("crm.lead", "action_set_won_rainbowman", () => expect.step("action_set_won_rainbowman"));
     onRpc("crm.lead", "action_schedule_meeting", ({ parent }) => {
         expect.step("action_schedule_meeting");
         return parent();
@@ -197,7 +197,6 @@ test("offline, the lead form's header and stat buttons are disabled and issue no
     await mountView({ resModel: "crm.lead", type: "form", resId: 1, arch: FORM_ARCH });
 
     const buttons = [
-        "button[name='action_set_won_rainbowman']",
         "button[name='action_schedule_meeting']",
         "button[name='action_show_potential_duplicates']",
         "button[name='mail_action_blacklist_remove']",
@@ -215,7 +214,7 @@ test("offline, the lead form's header and stat buttons are disabled and issue no
         expect(sel).toHaveClass("o_disabled_offline");
         await contains(sel).click();
     }
-    expect.verifySteps([]); // none of the five RPCs was issued or queued
+    expect.verifySteps([]); // none of the four RPCs was issued or queued
     // VAL-DIS-001: object-method buttons have nothing to queue (unlike a
     // form save), so the proof that none fired is also a proof the queue
     // stayed empty.
@@ -226,13 +225,11 @@ test("offline, the lead form's header and stat buttons are disabled and issue no
         expect(sel).not.toHaveAttribute("disabled");
         expect(sel).not.toHaveClass("o_disabled_offline");
     }
-    await contains("button[name='action_set_won_rainbowman']").click();
     await contains("button[name='action_schedule_meeting']").click();
     await contains("button[name='action_show_potential_duplicates']").click();
     await contains("button[name='mail_action_blacklist_remove']").click();
     await contains("button[name='phone_action_blacklist_remove']").click();
     expect.verifySteps([
-        "action_set_won_rainbowman",
         "action_schedule_meeting",
         "action_show_potential_duplicates",
         "mail_action_blacklist_remove",
@@ -301,7 +298,6 @@ test("online, clicking 'Lost' opens the mark-lost wizard (VAL-DIS-001)", async (
 
 test.tags("mobile");
 test("offline, the lead form's header button and the button-box/blacklist buttons are disabled once revealed; online they work (opportunity record)", async () => {
-    onRpc("crm.lead", "action_set_won_rainbowman", () => expect.step("action_set_won_rainbowman"));
     onRpc("crm.lead", "action_schedule_meeting", ({ parent }) => {
         expect.step("action_schedule_meeting");
         return parent();
@@ -315,10 +311,9 @@ test("offline, the lead form's header button and the button-box/blacklist button
 
     await mountView({ resModel: "crm.lead", type: "form", resId: 1, arch: FORM_ARCH });
 
-    // "Won" is the header's first visible button, so it stays inline on
-    // mobile with no dropdown to open; the blacklist buttons sit outside
-    // `oe_button_box` in the sheet body, so they're never collapsed either.
-    expect("button[name='action_set_won_rainbowman']").not.toHaveAttribute("disabled");
+    // The blacklist buttons sit outside `oe_button_box` in the sheet
+    // body, so they're never collapsed into a header or button-box
+    // dropdown.
     expect("button[name='mail_action_blacklist_remove']").not.toHaveAttribute("disabled");
     expect("button[name='phone_action_blacklist_remove']").not.toHaveAttribute("disabled");
 
@@ -336,8 +331,6 @@ test("offline, the lead form's header button and the button-box/blacklist button
     const setOffline = mockOffline();
     await setOffline(true);
 
-    expect("button[name='action_set_won_rainbowman']").toHaveAttribute("disabled");
-    expect("button[name='action_set_won_rainbowman']").toHaveClass("o_disabled_offline");
     expect("button[name='mail_action_blacklist_remove']").toHaveAttribute("disabled");
     expect("button[name='mail_action_blacklist_remove']").toHaveClass("o_disabled_offline");
     expect("button[name='phone_action_blacklist_remove']").toHaveAttribute("disabled");
@@ -348,20 +341,17 @@ test("offline, the lead form's header button and the button-box/blacklist button
     expect("button[name='action_show_potential_duplicates']").toHaveAttribute("disabled");
     expect("button[name='action_show_potential_duplicates']").toHaveClass("o_disabled_offline");
 
-    await contains("button[name='action_set_won_rainbowman']").click();
     await contains("button[name='mail_action_blacklist_remove']").click();
     await contains("button[name='phone_action_blacklist_remove']").click();
     await contains("button[name='action_schedule_meeting']").click();
     await contains("button[name='action_show_potential_duplicates']").click();
-    expect.verifySteps([]); // none of the five RPCs was issued or queued
+    expect.verifySteps([]); // none of the four RPCs was issued or queued
     expect(Object.values(getService(OfflinePlugin)._ormToSync())).toEqual([]);
 
     await setOffline(false);
-    expect("button[name='action_set_won_rainbowman']").not.toHaveAttribute("disabled");
     expect("button[name='action_schedule_meeting']").not.toHaveAttribute("disabled");
     expect("button[name='action_show_potential_duplicates']").not.toHaveAttribute("disabled");
     expect("button[name='phone_action_blacklist_remove']").not.toHaveAttribute("disabled");
-    await contains("button[name='action_set_won_rainbowman']").click();
     await contains("button[name='action_schedule_meeting']").click();
     // `action_schedule_meeting`'s mock resolves with `act_window_close`,
     // which reloads the form and collapses the "More" dropdown back
@@ -371,7 +361,6 @@ test("offline, the lead form's header button and the button-box/blacklist button
     await contains("button[name='mail_action_blacklist_remove']").click();
     await contains("button[name='phone_action_blacklist_remove']").click();
     expect.verifySteps([
-        "action_set_won_rainbowman",
         "action_schedule_meeting",
         "action_show_potential_duplicates",
         "mail_action_blacklist_remove",

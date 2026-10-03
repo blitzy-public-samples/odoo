@@ -157,6 +157,16 @@ class CrmFormController extends formView.Controller {
      * `action_unarchive`, a bare `[[id]]` write like `action_restore` has
      * no framework producer, so crm must queue it itself.
      *
+     * B1/C6 (architecture.md §3.3, offline_inventory.md rows B1/C6,
+     * VAL-DATA-005): the "Won" button is `type="object"` and bound to
+     * `action_set_won_rainbowman`, which itself runs a heavy SQL read
+     * (`get_rainbowman_message`) and returns an effect action needing a
+     * live round trip (C8, DISABLE as a method). The approved offline
+     * producer bypasses that wrapper and queues the plain `action_set_won`
+     * (C6, QUEUE) directly, exactly like Restore bypasses nothing but
+     * queues its own bare `[[id]]` call -- same reasoning as the Restore
+     * doc below, same guard-before-`super()` requirement.
+     *
      * B8/B11/C7 (offline_inventory.md rows B8/B11/C7, VAL-DIS-002): the
      * AI-probability switch, reclassified to DISABLE by the milestone-2
      * user review -- predictive scoring is out of scope and the
@@ -172,6 +182,20 @@ class CrmFormController extends formView.Controller {
      */
     async beforeExecuteActionButton(clickParams) {
         if (this.crmOffline.isOffline() && this.model.root.resModel === "crm.lead") {
+            if (
+                clickParams.type === "object" &&
+                clickParams.name === "action_set_won_rainbowman"
+            ) {
+                // Same save-first reasoning as Restore just below: a dirty
+                // edit made before clicking Won must not be lost, and an
+                // invalid form must queue nothing, not even Won.
+                const saved = await this.model.root.save();
+                if (!saved) {
+                    return false;
+                }
+                this._queueWonOffline();
+                return false; // skip the real action_set_won_rainbowman RPC: no rainbowman lookup offline
+            }
             if (clickParams.type === "object" && clickParams.name === "action_restore") {
                 // Scrutiny finding 11 (VAL-QUEUE-005): online, the base
                 // `beforeExecuteActionButton` saves the record before
@@ -206,24 +230,32 @@ class CrmFormController extends formView.Controller {
         return super.beforeExecuteActionButton(clickParams);
     }
 
-    _queueRestoreOffline() {
+    /**
+     * Shared plumbing for every bare `crm.lead` `[[id]]` call this
+     * controller queues itself offline (Restore, Won): queues `method`
+     * through `useCrmOffline()`, breaking a `Date.now()` tie against this
+     * record's own pending offline save first.
+     *
+     * Scrutiny finding (VAL-QUEUE-005): `record.save()` in
+     * `beforeExecuteActionButton` just before this call may have queued a
+     * `web_save` for this very lead, stamped with `Date.now()` at the
+     * moment it was queued (`record.js` `_offlineSave`'s
+     * `_offlineTimeStamp`). This call's own `getScheduleORMExtras` below
+     * stamps its own `Date.now()` independently, and `_syncORM` orders
+     * replay by `extras.timeStamp` alone (`offline_plugin.js`) after
+     * reloading entries from IndexedDB in hash-key order, not insertion
+     * order -- so an equal millisecond timestamp is a real tie, not just a
+     * same-array ordering coincidence, and could let this call replay
+     * before the save it depends on. Read the pending save's actual
+     * queued timestamp back from the queue (`record.offlineId` is the
+     * public key `_offlineSave` scheduled it under) and force this
+     * timestamp strictly after it when they'd otherwise tie, without
+     * touching `_syncORM`'s own sort (framework replay semantics
+     * unchanged).
+     */
+    _queueLeadCallOffline(method) {
         const record = this.model.root;
         const extras = getScheduleORMExtras(this.model, [record]);
-        // Scrutiny finding (VAL-QUEUE-005): `record.save()` just above may
-        // have queued a `web_save` for this very lead, stamped with
-        // `Date.now()` at the moment it was queued
-        // (`record.js` `_offlineSave`'s `_offlineTimeStamp`). This call's
-        // own `getScheduleORMExtras` above stamps its own `Date.now()`
-        // independently, and `_syncORM` orders replay by `extras.timeStamp`
-        // alone (`offline_plugin.js`) after reloading entries from
-        // IndexedDB in hash-key order, not insertion order -- so an equal
-        // millisecond timestamp is a real tie, not just a same-array
-        // ordering coincidence, and could let Restore replay before the
-        // save it depends on. Read the pending save's actual queued
-        // timestamp back from the queue (`record.offlineId` is the public
-        // key `_offlineSave` scheduled it under) and force this timestamp
-        // strictly after it when they'd otherwise tie, without touching
-        // `_syncORM`'s own sort (framework replay semantics unchanged).
         const pendingSaveKey = record.offlineId;
         const pendingSave = pendingSaveKey
             ? this.model.offlinePlugin._ormToSync()[pendingSaveKey]
@@ -233,11 +265,15 @@ class CrmFormController extends formView.Controller {
         }
         this.crmOffline.queueCall(
             "crm.lead",
-            "action_restore",
+            method,
             [[record.resId]],
             { context: record.context },
             extras
         );
+    }
+
+    _queueRestoreOffline() {
+        this._queueLeadCallOffline("action_restore");
         // Optimistic UI: mirror the server-side effect of `action_restore`
         // (action_unarchive + probability reset, see models/crm_lead.py)
         // directly on `record.data` so the Restore/Lost buttons' own
@@ -256,8 +292,31 @@ class CrmFormController extends formView.Controller {
         // probability alone would already mark the lead won; that
         // discrepancy self-corrects once the queued call replays and the
         // view is reloaded.
+        const record = this.model.root;
         record.data.active = true;
         record.data.won_status = "pending";
+        record._setEvalContext();
+    }
+
+    /**
+     * B1/C6 (architecture.md §3.3, VAL-DATA-005): queues `action_set_won`
+     * (not the rainbowman-wrapped `action_set_won_rainbowman` the button
+     * itself names -- no rainbow-man lookup offline, SKIP already covers
+     * the rainbowman call) and shows the won state immediately.
+     */
+    _queueWonOffline() {
+        this._queueLeadCallOffline("action_set_won");
+        // Optimistic UI, same reasoning and the same `record.data`-only
+        // technique as `_queueRestoreOffline` above: `action_set_won`
+        // moves the lead to a won stage and sets probability to 100
+        // server-side (models/crm_lead.py), but which stage is only known
+        // server-side, so only `won_status` -- what the ribbon's own
+        // `invisible="won_status != 'won'"` actually reads -- is mirrored
+        // locally. Not written into `record._changes` for the same reason
+        // as Restore: `won_status` is compute+store with no inverse, so a
+        // later `web_save` that happened to include it would be rejected.
+        const record = this.model.root;
+        record.data.won_status = "won";
         record._setEvalContext();
     }
 }

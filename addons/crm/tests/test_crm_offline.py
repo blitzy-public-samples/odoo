@@ -196,3 +196,42 @@ class TestCrmOffline(TestCrmCommon):
             'Restoring a lead must reset its probability to the (recomputed) '
             'automated probability, the same result an online Restore gives'
         )
+
+    def test_action_set_won_replay_leaves_lead_won(self):
+        """ VAL-DATA-006 (architecture.md §3.3, offline_inventory.md rows
+        B1/C6): the offline "Won" button
+        (`crm_form.js`'s `CrmFormController._queueWonOffline`) queues a
+        bare `crm.lead.action_set_won([[id]])` -- not the
+        `action_set_won_rainbowman` the button itself names, since that
+        wrapper's `get_rainbowman_message` lookup needs a live round trip
+        (C8, DISABLE as a method). Replaying that queued call verbatim,
+        with no sudo (as the salesman who owns the lead, the same access
+        an offline user would have), must leave the lead exactly as
+        clicking "Won" online would: `won_status == 'won'`, probability
+        100 and moved to a won stage -- the same outcome
+        `test_crm_rainbowman.py`'s online test gets from
+        `action_set_won_rainbowman` itself (that method only adds the
+        rainbowman lookup on top of this same `action_set_won`).
+        """
+        lead = self.env['crm.lead'].create({
+            'name': 'Opportunity For Won',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        })
+        self.assertEqual(lead.won_status, 'pending')
+        self.assertNotEqual(lead.probability, 100)
+
+        # Replay exactly as `_syncORM` replays the queued `[[id]]` call:
+        # same model, method, args -- no sudo.
+        self.env['crm.lead'].with_user(self.user_sales_salesman).browse(lead.ids).action_set_won()
+        lead.invalidate_recordset()
+
+        self.assertTrue(lead.stage_id.is_won)
+        self.assertEqual(lead.probability, 100)
+        self.assertEqual(
+            lead.won_status, 'won',
+            'Replaying the queued action_set_won must leave the lead won, '
+            'the same result an online "Won" click gives'
+        )
