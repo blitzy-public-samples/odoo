@@ -302,16 +302,21 @@ test("offline cold start of the pipeline with a team selected renders the cached
 });
 
 test("offline cold start when the team list was never loaded online falls back to 'All Teams' with no error, even though the rest of the pipeline is cached (VAL-COLD-004)", async () => {
-    // `get_team_switcher_data` has no disk-cache entry while the pipeline's
-    // own `web_read_group` does: an actual, if narrow, way this happens is
-    // a module upgrade bumping `session.registry_hash`, which
-    // `IndexedDB`'s version check wipes *selectively* per table rather than
-    // all at once in-session; simulated the same way `action_plugin.js`
-    // does on an actual write (its `"CLEAR-CACHES"` call after
-    // `action_archive`/`action_unarchive`) -- `rpc.js:81-83`'s
-    // `rpcBus.trigger("CLEAR-CACHES", table)` reaches straight into the
-    // `RPCCache` by its table name (`params.method`, see `rpc.js:99-105`),
-    // leaving every other table's entries untouched.
+    // A genuine miss, not a CLEAR-CACHES simulation after the fact:
+    // `get_team_switcher_data` fails outright on its only online attempt
+    // (same forced 502 as `crm_offline_team_switcher.test.js`'s "connection
+    // lost" tests) and is therefore never written to the RPC disk cache at
+    // all -- `rpc_cache.js`'s `onRejected` only ever deletes a
+    // pending/ram entry, it never calls `IndexedDB.write` (only
+    // `onFullfilled` does that). The pipeline's own `web_read_group` is
+    // unaffected by that one call's failure and succeeds normally online,
+    // so *it* does get a disk entry, caching `team_switcher_enabled: false`
+    // (`_getContext`) -- the same value `_initSwitcher()`'s `catch` leaves
+    // behind on *any* `ConnectionLostError`, online or offline, so the
+    // kanban root's own cache key still matches on the cold offline start
+    // below even though its switcher companion was never cached anywhere.
+    onRpc("crm.team", "get_team_switcher_data", () => new Response("", { status: 502 }));
+    const readGroupCalls = recordLeadReadGroupCalls();
     onRpc("res.users", "has_group", ({ args }) => {
         if (args[1] === "sales_team.group_sale_manager") {
             expect.step("has_group");
@@ -319,44 +324,66 @@ test("offline cold start when the team list was never loaded online falls back t
     });
     const setOffline = mockCrmOffline();
 
+    // Online visit: the switcher probe fails and is never cached; the
+    // kanban's own request succeeds and *is* cached. A true miss's
+    // rejection has no ram/disk value to resolve from first, so it is the
+    // one promise `_initSwitcher()` itself awaits inside its own
+    // `try`/`catch` -- caught synchronously, not a dangling background
+    // rejection, so (like the forced-502 test in
+    // `crm_offline_team_switcher.test.js`) nothing needs declaring via
+    // `expect.errors()` for it, online or offline.
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1);
     expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(4);
+    expect(".o_cp_team_switcher").toHaveCount(1);
+    expect(".o_cp_team_switcher").toHaveText("All Teams");
+    expect(readGroupCalls).toHaveLength(1);
     // Online visit issues the sales-manager probe once, same as any other
     // online mount (A4); consumed here so the final `verifySteps` below is
     // only about the offline portion of this test.
     expect.verifySteps(["has_group"]);
-    rpcBus.trigger("CLEAR-CACHES", "get_team_switcher_data");
 
+    // Cold start: destroy this `WebClient` (a real unmount, not a revisit
+    // of a live controller), mount a brand new one with no `config.state`,
+    // go offline before the action even starts loading. No `CLEAR-CACHES`
+    // event anywhere in this test -- the switcher's disk entry simply
+    // never existed, online or offline.
     destroyApp();
     await mountWithCleanup(WebClient);
     await setOffline(true);
-    // The pipeline's own cache hit still fires its background refresh leg
-    // (see the VAL-COLD-001 tests above); `get_team_switcher_data` is a
-    // true miss this time, with no ram/disk value to resolve from first --
-    // its rejection is the main, awaited promise, caught synchronously
-    // inside `_initSwitcher()`'s own `try`/`catch` instead of surfacing as
-    // a separately-unhandled rejection. The mock XHR layer still logs it
-    // (same as any other `ConnectionLostError`, handled or not), so it
-    // still counts here alongside the kanban root's own dangling one.
-    expect.errors(2);
+    // Only the kanban's own `web_read_group` is a disk-cache *hit* here,
+    // so only its background refresh leg is a dangling, separately
+    // rejected promise that needs declaring (see the VAL-COLD-001 tests
+    // above). `get_team_switcher_data` is still a true miss, exactly like
+    // online: its rejection is still the main, awaited promise inside
+    // `_initSwitcher()`'s own `try`/`catch`, so it needs no declaration.
+    expect.errors(1);
     await getService("action").doAction(1);
-    // Unlike a disk-cache *hit* (the two tests above), a true miss here has
-    // no ram/disk value to resolve the switcher's own promise from first,
-    // so its rejection is not already-settled by the time `doAction`
-    // resolves on every preset -- an extra tick lets both of this test's
-    // `ConnectionLostError`s actually reach the mock XHR layer's logging
-    // before the assertions below run.
+    // See the VAL-COLD-001 tests above for why this tick is needed before
+    // `expect.verifyErrors` can rely on the background leg having already
+    // logged.
     await animationFrame();
 
     expect(".o_action_helper").toHaveCount(0); // the pipeline itself is cached
     expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(4);
-    expect(".o_cp_team_switcher:contains('All Teams')").toHaveCount(1);
+    // VAL-COLD-004: the switcher still renders, showing "All Teams" --
+    // not hidden entirely, even though its own data was never cached.
+    expect(".o_cp_team_switcher").toHaveCount(1);
+    expect(".o_cp_team_switcher").toHaveText("All Teams");
     expect(".o_notification").toHaveCount(0);
     expect(".o_error_dialog").toHaveCount(0);
+
+    // Same request as online (module docstring: this view's cold mount
+    // reissues it more than once, always identically) -- the cache hit on
+    // the whole-request key only happens because `team_switcher_enabled`
+    // matches too, even though the switcher's own data never did.
+    expect(readGroupCalls).toHaveLength(3);
+    for (const call of readGroupCalls.slice(1)) {
+        expect(call.context).toEqual(readGroupCalls[0].context);
+        expect(call.domain).toEqual(readGroupCalls[0].domain);
+    }
     expect.verifySteps([]); // has_group was never issued offline
     expect.verifyErrors([
-        `Connection to "/web/dataset/call_kw/crm.team/get_team_switcher_data" couldn't be established or was interrupted`,
         `Connection to "/web/dataset/call_kw/crm.lead/web_read_group" couldn't be established or was interrupted`,
     ]);
 });

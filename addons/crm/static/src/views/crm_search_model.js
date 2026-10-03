@@ -19,6 +19,19 @@ export class CrmSearchModel extends SearchModel {
             switcherAvailable: false, // Whether or not there's enough teams in DB to display the switcher.
             switcherTeams: [], // Teams to display in the switcher.
             switcherTeamId: null, // Selected team id ("undefined" = "All Teams")
+            // VAL-COLD-004 (architecture.md §3.2 item 3): true only for a
+            // genuine offline `get_team_switcher_data` cache miss (no disk
+            // entry ever written -- see `_initSwitcher`'s `catch` below).
+            // Kept apart from `switcherAvailable` on purpose: `_getContext`
+            // feeds `switcherAvailable` into `team_switcher_enabled`, which
+            // is part of the kanban/list root's own disk-cached
+            // `web_read_group` request key. If this flag also flipped that
+            // getter, a true miss would locally recompute a context that
+            // disagrees with whatever was cached online, turning a missing
+            // "All Teams" label into a second, cascading cache miss on the
+            // pipeline itself (the exact defect this flag fixes without
+            // reintroducing).
+            switcherOfflineFallback: false,
         });
     }
 
@@ -27,6 +40,17 @@ export class CrmSearchModel extends SearchModel {
      */
     get isTeamSwitcherEnabled() {
         return this.showTeamSwitcher && this.state.switcherAvailable;
+    }
+
+    /**
+     * Whether or not the switcher component should render. Unlike
+     * `isTeamSwitcherEnabled` (used for the `team_switcher_enabled` search
+     * context, see above), this also covers the offline cache-miss
+     * fallback: VAL-COLD-004 requires the switcher to still show "All
+     * Teams" even though `switcherAvailable` is `false` in that state.
+     */
+    get isTeamSwitcherVisible() {
+        return this.showTeamSwitcher && (this.state.switcherAvailable || this.state.switcherOfflineFallback);
     }
 
     /**
@@ -58,6 +82,7 @@ export class CrmSearchModel extends SearchModel {
             available: this.state.switcherAvailable,
             teams: this.state.switcherTeams,
             teamId: this.state.switcherTeamId,
+            offlineFallback: this.state.switcherOfflineFallback,
         };
         return state;
     }
@@ -72,6 +97,7 @@ export class CrmSearchModel extends SearchModel {
             this.state.switcherAvailable = state.teamSwitcherState.available;
             this.state.switcherTeams = state.teamSwitcherState.teams;
             this.state.switcherTeamId = state.teamSwitcherState.teamId;
+            this.state.switcherOfflineFallback = state.teamSwitcherState.offlineFallback;
         }
     }
 
@@ -130,6 +156,7 @@ export class CrmSearchModel extends SearchModel {
         // Retrieve team switcher data
         let available = false;
         let teams = [];
+        let offlineFallback = false;
         // User decision after M2 (VAL-SKIP-001/VAL-FIX-007 amended,
         // research/offline-reload-oops.md): always route through
         // `this.orm.cache()`, offline included, instead of skipping the
@@ -166,6 +193,9 @@ export class CrmSearchModel extends SearchModel {
                         if (hasChanged) {
                             this.state.switcherAvailable = result.available;
                             this.state.switcherTeams = result.teams;
+                            // A later background refresh actually got a
+                            // value: no longer a miss (VAL-COLD-004).
+                            this.state.switcherOfflineFallback = false;
                             this._initSwitcherSelection(true);
                         }
                     },
@@ -181,10 +211,19 @@ export class CrmSearchModel extends SearchModel {
             // "All Teams" instead of rejecting this whole `_initSwitcher()`
             // and, through it, `load()` — aborting the view's load
             // (architecture.md §3.2 item 3, offline_inventory.md rows
-            // A6/C20).
+            // A6/C20). VAL-COLD-004: by construction this `catch` only
+            // ever runs on a genuine disk-cache miss -- `RPCCache.read()`
+            // (rpc_cache.js) always resolves from a disk hit first, even
+            // though its parallel network leg can still reject afterwards
+            // (handled above, not here) -- so flag it so the switcher
+            // still renders "All Teams" (`isTeamSwitcherVisible` above)
+            // instead of disappearing entirely like a legitimate
+            // "not enough teams" `switcherAvailable: false` would.
+            offlineFallback = true;
         }
         this.state.switcherAvailable = available;
         this.state.switcherTeams = teams;
+        this.state.switcherOfflineFallback = offlineFallback;
         this._initSwitcherSelection();
     }
 

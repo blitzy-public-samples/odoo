@@ -149,17 +149,23 @@ test("a connection lost while fetching the team switcher data degrades to 'All T
     await getService("action").doAction(1);
 
     // CrmSearchModel.load() resolved instead of rejecting: the control
-    // panel mounted with the pipeline's own breadcrumb and its records.
+    // panel mounted with the pipeline's own records. The breadcrumb trail
+    // itself ("Pipeline") does not render here: `crm_breadcrumbs.xml`
+    // renders `<TeamSwitcher/>` *instead of* `web.Breadcrumbs` whenever a
+    // switcher is shown (`hasTeamSwitcher`/`isTeamSwitcherVisible`), by
+    // design -- exactly as in the VAL-COLD-001 cache-hit tests, which
+    // assert the switcher's own label instead.
     expect(".o_control_panel").toHaveCount(1);
-    expect(".o_last_breadcrumb_item:contains('Pipeline')").toHaveCount(1);
     // ":not(.o_kanban_ghost)" excludes the layout-filler placeholder cards
     // the (ungrouped) kanban renderer pads a short row with.
     expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(3);
-    // Degraded to "unavailable": CrmBreadcrumbs falls back to the default
-    // web.Breadcrumbs (no team switcher rendered at all) because
-    // `isTeamSwitcherEnabled` depends on `switcherAvailable`, which the
-    // catch left `false`.
-    expect(".o_cp_team_switcher").toHaveCount(0);
+    // VAL-COLD-004 (scrutiny round 1, revising this test's original
+    // "degrades to no switcher at all" assertion): a cache-miss rejection
+    // is `isTeamSwitcherVisible`'s offline fallback, not the "not enough
+    // teams" `switcherAvailable: false` case -- the switcher still
+    // renders, showing "All Teams" with no items to pick from.
+    expect(".o_cp_team_switcher").toHaveCount(1);
+    expect(".o_cp_team_switcher").toHaveText("All Teams");
     expect(".o_notification").toHaveCount(0);
 });
 
@@ -181,7 +187,9 @@ test("a connection lost while fetching the team switcher data still loads the cr
 
     expect(".o_list_view").toHaveCount(1);
     expect("tr.o_data_row").toHaveCount(3);
-    expect(".o_cp_team_switcher").toHaveCount(0); // degraded: no switcher dropdown rendered at all
+    // VAL-COLD-004: same fallback as the kanban test above.
+    expect(".o_cp_team_switcher").toHaveCount(1);
+    expect(".o_cp_team_switcher").toHaveText("All Teams");
     expect(".o_notification").toHaveCount(0);
     expect(".o_error_dialog").toHaveCount(0);
 });
