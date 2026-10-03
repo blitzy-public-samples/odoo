@@ -21,6 +21,13 @@ const EXCLUDED_ACTIVITY_TYPE_CATEGORIES = ["meeting", "upload_file"];
 // to crm.lead specifically.
 const ACTIVITY_TYPE_DOMAIN = ["|", ["res_model", "=", false], ["res_model", "=", "crm.lead"]];
 
+// VAL-DATA-020: "Log a call" must always leave a *Call* activity, not
+// whichever type happens to sort first in the cache (the shipped data
+// orders To-Do before Call) -- so unlike Schedule, its selector is
+// restricted to this category and the server enforces the same
+// invariant (crm_lead.py's action_log_call).
+const CALL_ACTIVITY_TYPE_CATEGORY = "phonecall";
+
 /**
  * Offline activity panel on the lead form (architecture.md §3.3,
  * VAL-DATA-008..016). Renders only while offline (`crmOffline.isOffline()`
@@ -30,10 +37,20 @@ const ACTIVITY_TYPE_DOMAIN = ["|", ["res_model", "=", false], ["res_model", "=",
  * together with everything already queued for this lead, each marked
  * "pending sync", and offers three producers:
  *  - Schedule: queues a client-resolved `mail.activity.create` (one call,
- *    no onchange, no `mail.activity.schedule` wizard, no `name_create`).
+ *    no onchange, no `mail.activity.schedule` wizard, no `name_create`),
+ *    with an assignee choice (VAL-DATA-010) resolved entirely from data
+ *    this device already has -- the current user (the default), the
+ *    lead's own cached salesperson (`record.data.user_id`, loaded by the
+ *    inheriting view like any other field), and whatever `res.users` rows
+ *    the framework's many2x cache already holds (`useCrmOffline()
+ *    .cachedMany2XRecords`) -- never a fresh RPC, and no new cache.
  *  - Done (on a server activity only): queues `action_done([[id]])` and
  *    nothing else -- no feedback dialog, no "Done & Schedule Next".
- *  - Log a call: queues one `crm.lead.action_log_call` call.
+ *  - Log a call: queues one `crm.lead.action_log_call` call, always with
+ *    a Call-category (`phonecall`) type (VAL-DATA-020) -- the control is
+ *    disabled when none is cached, and `crm_lead.py`'s `action_log_call`
+ *    enforces the same invariant server-side, since the queue replays
+ *    this verbatim with no second chance to fix a stale client's choice.
  * All three are plain `scheduleORM` calls through `useCrmOffline()`,
  * exactly like `CrmFormController`'s existing Won/Restore producers --
  * no new queue, store or cache. Local UI state uses OWL's `signal`
@@ -48,7 +65,9 @@ export class CrmLeadActivityPanel extends Component {
     props = useProps(standardWidgetProps);
 
     types = signal.Array([]);
+    assignableUsers = signal.Array([]);
     scheduleTypeId = signal(null);
+    scheduleUserId = signal(null);
     scheduleSummary = signal("");
     scheduleDeadline = signal(today().toISODate());
     logCallTypeId = signal(null);
@@ -60,7 +79,9 @@ export class CrmLeadActivityPanel extends Component {
         this.user = user;
         this.crmOffline = useCrmOffline();
 
-        onWillStart(() => this._loadActivityTypes());
+        onWillStart(() =>
+            Promise.all([this._loadActivityTypes(), this._loadAssignableUsers()])
+        );
     }
 
     /**
@@ -98,8 +119,42 @@ export class CrmLeadActivityPanel extends Component {
         this.types.set(types);
         if (types.length) {
             this.scheduleTypeId.set(types[0].id);
-            this.logCallTypeId.set(types[0].id);
         }
+        // VAL-DATA-020: Log a call must always default to -- and only
+        // offer -- a Call-category type, never just the first cached one
+        // (the shipped data orders To-Do before Call by sequence).
+        const callTypes = types.filter((type) => type.category === CALL_ACTIVITY_TYPE_CATEGORY);
+        this.logCallTypeId.set(callTypes.length ? callTypes[0].id : null);
+    }
+
+    /**
+     * Resolves who Schedule can assign the activity to, from data this
+     * device already has (VAL-DATA-010): the current user (always
+     * included, and the default -- Schedule must stay usable even with
+     * nothing else cached), the lead's own salesperson field (already
+     * loaded by the inheriting view, like `activity_ids`), and whatever
+     * `res.users` rows an earlier online many2one search already cached
+     * through the framework's many2x cache. No RPC either way, and no
+     * new cache: `cachedMany2XRecords` is a pure read of the existing one
+     * (`useCrmOffline`).
+     */
+    async _loadAssignableUsers() {
+        const candidates = new Map();
+        const addCandidate = (id, displayName) => {
+            if (id != null && !candidates.has(id)) {
+                candidates.set(id, { id, display_name: displayName });
+            }
+        };
+        addCandidate(this.user.userId, this.user.name);
+        const salesperson = this.record.data.user_id;
+        if (salesperson) {
+            addCandidate(salesperson.id, salesperson.display_name);
+        }
+        for (const cachedUser of await this.crmOffline.cachedMany2XRecords("res.users")) {
+            addCandidate(cachedUser.id, cachedUser.display_name);
+        }
+        this.assignableUsers.set([...candidates.values()]);
+        this.scheduleUserId.set(this.user.userId);
     }
 
     get record() {
@@ -115,12 +170,24 @@ export class CrmLeadActivityPanel extends Component {
         return this.isLeadSynced && this.types().length > 0;
     }
 
+    /** VAL-DATA-020: only usable with a Call-category type cached. */
+    get callTypes() {
+        return this.types().filter((type) => type.category === CALL_ACTIVITY_TYPE_CATEGORY);
+    }
+
     get canLogCall() {
-        return this.isLeadSynced && this.types().length > 0;
+        return this.isLeadSynced && this.callTypes.length > 0;
     }
 
     _typeName(typeId) {
         return this.types().find((type) => type.id === typeId)?.name || "";
+    }
+
+    _userName(userId) {
+        return (
+            this.assignableUsers().find((candidate) => candidate.id === userId)?.display_name ||
+            ""
+        );
     }
 
     formatDeadline(deadline) {
@@ -171,7 +238,7 @@ export class CrmLeadActivityPanel extends Component {
                     type: this._typeName(vals.activity_type_id),
                     summary: vals.summary || "",
                     deadline: this.formatDeadline(vals.date_deadline),
-                    user: vals.user_id === this.user.userId ? this.user.name : "",
+                    user: this._userName(vals.user_id),
                     pendingSync: true,
                     canMarkDone: false, // VAL-DATA-014: not usable until it syncs
                     isLogCall: false,
@@ -187,7 +254,7 @@ export class CrmLeadActivityPanel extends Component {
                     type: this._typeName(activityTypeId),
                     summary: summary || "",
                     deadline: "",
-                    user: userId === this.user.userId ? this.user.name : "",
+                    user: this._userName(userId),
                     pendingSync: true,
                     canMarkDone: false,
                     isLogCall: true,
@@ -214,7 +281,7 @@ export class CrmLeadActivityPanel extends Component {
         );
     }
 
-    /** VAL-DATA-010: one client-resolved `mail.activity.create`. */
+    /** VAL-DATA-010: one client-resolved `mail.activity.create`, with the chosen assignee. */
     onClickSchedule() {
         if (!this.crmOffline.isOffline() || !this.canSchedule) {
             return;
@@ -225,7 +292,7 @@ export class CrmLeadActivityPanel extends Component {
             activity_type_id: this.scheduleTypeId(),
             summary: this.scheduleSummary() || false,
             date_deadline: this.scheduleDeadline(),
-            user_id: this.user.userId,
+            user_id: this.scheduleUserId(),
         };
         this.crmOffline.queueCall("mail.activity", "create", [[vals]], {}, this._extras());
         this.scheduleSummary.set("");

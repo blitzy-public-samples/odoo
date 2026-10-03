@@ -1090,8 +1090,19 @@ class CrmLead(models.Model):
         access to this lead, so an offline user is held to the same
         rights as online. `note` becomes the done-feedback, matching what
         logging a call online leaves in the chatter: one done note, no
-        activity left open. """
+        activity left open.
+
+        VAL-DATA-020: "Log a call" means a *call*, not whatever activity
+        type a stale client sends -- the queue replays this verbatim with
+        no second chance to fix it (architecture.md §2), so the server
+        side enforces the invariant the UI is supposed to guarantee
+        instead of trusting it. Reading the type's category needs no
+        extra access: `mail.activity.type` is readable by every internal
+        user, the same group that can log a call at all. """
         self.ensure_one()
+        activity_type = self.env['mail.activity.type'].browse(activity_type_id)
+        if activity_type.category != 'phonecall':
+            raise UserError(_("Logging a call requires a Call activity type."))
         activity = self.env['mail.activity'].create({
             'res_model_id': self.env['ir.model']._get_id('crm.lead'),
             'res_id': self.id,

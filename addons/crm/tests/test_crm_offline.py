@@ -2,7 +2,7 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 from odoo import fields
-from odoo.exceptions import AccessError
+from odoo.exceptions import AccessError, UserError
 
 from odoo.addons.crm.tests.common import TestCrmCommon
 
@@ -370,3 +370,37 @@ class TestCrmOffline(TestCrmCommon):
             self.env['crm.lead'].with_user(self.user_sales_salesman).browse(unrelated_lead.id).action_log_call(
                 call_type.id, 'Should not be allowed', 'No access', self.user_sales_salesman.id,
             )
+
+    def test_action_log_call_rejects_non_call_activity_type(self):
+        """ VAL-DATA-020: the server side of the "Log a call means a call"
+        invariant (see action_log_call's docstring). A stale offline
+        client could have cached a To-Do as its first activity type and
+        queued it through `action_log_call` -- the queue replays whatever
+        was queued verbatim, with no server-side onchange to catch it
+        (architecture.md §2), so `action_log_call` itself must refuse any
+        `activity_type_id` whose category isn't 'phonecall', not just the
+        UI. No sudo involved: this must raise before any activity is
+        created, for a user who otherwise has full write access to the
+        lead.
+        """
+        lead = self.env['crm.lead'].create({
+            'name': 'Lead For Rejected Non-Call Type',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        })
+        todo_type = self.env.ref('mail.mail_activity_data_todo')
+        self.assertNotEqual(todo_type.category, 'phonecall')
+        salesman_lead = self.env['crm.lead'].with_user(self.user_sales_salesman).browse(lead.id)
+
+        with self.assertRaises(UserError):
+            salesman_lead.action_log_call(
+                todo_type.id, 'Should not be allowed', 'Not a call', self.user_sales_salesman.id,
+            )
+        self.assertFalse(
+            self.env['mail.activity'].with_context(active_test=False).search([
+                ('res_model', '=', 'crm.lead'), ('res_id', '=', lead.id),
+            ]),
+            'A rejected action_log_call must leave no activity behind, done or open'
+        )

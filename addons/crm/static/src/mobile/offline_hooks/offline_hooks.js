@@ -17,6 +17,7 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
  *  isRecordAvailableOffline: (actionId: number, resId: number|false) => boolean,
  *  queueCall: (model: string, method: string, args: any[], kwargs?: object, extras?: object) => string|number,
  *  pendingActivities: (leadId: number, activityIds?: number[]) => Array<{key: string, kind: "create"|"log_call"|"done", value: object}>,
+ *  cachedMany2XRecords: (resModel: string) => Promise<Array<{id: number, display_name: string}>>,
  * }}
  */
 export function useCrmOffline() {
@@ -90,6 +91,23 @@ export function useCrmOffline() {
                 }
             }
             return entries;
+        },
+
+        /**
+         * Every row the framework's many2x cache already holds for
+         * `resModel` (`OfflinePlugin.cacheMany2XSearch`/
+         * `searchMany2XRecords`, architecture.md §2 "Relational-field
+         * cache"): a blank name matches every cached row
+         * (`searchMany2XRecords`'s own `!normalizeSearch` branch), so this
+         * is a pure IndexedDB read of whatever an earlier online
+         * `Many2XAutocomplete` search already stored -- never a fresh
+         * RPC, online or offline, and never a second cache (first
+         * consumer: the offline activity panel's assignee choice,
+         * VAL-DATA-010). Resolves to `[]` outside a secure context, where
+         * the plugin's store is a no-op.
+         */
+        async cachedMany2XRecords(resModel) {
+            return (await offlinePlugin.searchMany2XRecords(resModel, "")) || [];
         },
     };
 }

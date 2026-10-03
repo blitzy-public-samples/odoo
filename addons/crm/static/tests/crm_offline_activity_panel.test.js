@@ -13,6 +13,7 @@ import {
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { today } from "@web/core/l10n/dates";
 import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
 import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
@@ -48,6 +49,11 @@ class Lead extends models.Model {
         selection: [["won", "Won"], ["pending", "In Progress"], ["lost", "Lost"]],
         default: "pending",
     });
+    // The lead's own salesperson (VAL-DATA-010): cached form data this
+    // panel's assignee choice reads directly from `record.data.user_id`,
+    // distinct from the `user_id` subfield of `activity_ids` below (that
+    // one is an activity's own assignee, on `mail.activity`).
+    user_id = fields.Many2one({ relation: "res.users" });
     activity_ids = fields.One2many({ relation: "mail.activity", string: "Activities" });
 
     _records = [
@@ -69,6 +75,13 @@ class Lead extends models.Model {
                 <sheet>
                     <field name="name" required="1"/>
                     <div class="d-none">
+                        <!-- Rendered, not invisible="1": a statically
+                             invisible many2one is fetched id-only
+                             (relational_model/utils.js's getFieldsSpec,
+                             the isAlwaysInvisible branch skips
+                             display_name), unlike the real lead form
+                             where this field is actually shown. -->
+                        <field name="user_id"/>
                         <field name="activity_ids">
                             <list>
                                 <field name="activity_type_id"/>
@@ -223,6 +236,77 @@ test("offline, Schedule queues one client-resolved mail.activity.create and show
 });
 
 // ---------------------------------------------------------------------------
+// VAL-DATA-010: Schedule offers an assignee choice resolved from data
+// already available offline -- the current user (default), the lead's own
+// cached salesperson, and whatever `res.users` rows the framework's many2x
+// cache already holds -- and queues the chosen assignee's user_id, not
+// always the current user.
+// ---------------------------------------------------------------------------
+
+test("offline, Schedule's assignee choice lists the current user, the lead's cached salesperson and the many2x-cached res.users, and queues a non-default assignee", async () => {
+    const { pyEnv, callId } = await seedActivityTypes();
+    // `res.users.name` is a related field (-> `partner_id.name`): a
+    // user's display name comes from its partner, not a direct `name`.
+    const salespersonId = pyEnv["res.users"].create({
+        partner_id: pyEnv["res.partner"].create({ name: "Team Lead" }),
+    });
+    pyEnv["crm.lead"].write([1], { user_id: salespersonId });
+    const colleagueId = pyEnv["res.users"].create({
+        partner_id: pyEnv["res.partner"].create({ name: "Office Colleague" }),
+    });
+
+    await mountWithCleanup(WebClient);
+
+    // Seeded the same way an *earlier* online many2one search would
+    // (`Many2XAutocomplete.search()` -> `OfflinePlugin.cacheMany2XSearch`,
+    // the same framework API `crm_offline_contact_lookup.test.js` uses for
+    // `res.partner`): this device never actually searched a `res.users`
+    // many2one field in this test, but the fix reads the many2x cache
+    // through that same existing API, not a direct IndexedDB write. Done
+    // before `doAction` below, since the panel resolves its assignee list
+    // once, in `onWillStart` -- exactly like a search that happened on an
+    // earlier visit, before this lead's form was ever opened.
+    const offlinePlugin = getService(OfflinePlugin);
+    await offlinePlugin.cacheMany2XSearch("res.users", [
+        { id: colleagueId, display_name: "Office Colleague" },
+    ]);
+
+    await getService("action").doAction(1); // online visit: loads the lead's own user_id
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // Default: the current user, so Schedule stays usable with nothing
+    // else cached (VAL-DATA-010's "current user as default").
+    expect(".o_crm_activity_schedule_user").toHaveValue(String(user.userId));
+    expect(".o_crm_activity_schedule_user").toHaveAttribute("data-available-offline");
+    const assigneeOptions = queryAllTexts(".o_crm_activity_schedule_user option");
+    expect([...assigneeOptions].sort()).toEqual(
+        [user.name, "Team Lead", "Office Colleague"].sort()
+    );
+
+    await contains(".o_crm_activity_schedule_summary").edit("Follow up with the colleague");
+    await contains(".o_crm_activity_schedule_user").select(String(colleagueId));
+    await contains(".o_crm_activity_schedule_button").click();
+
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync());
+    expect(queued.length).toBe(1);
+    const [{ value }] = queued;
+    expect(value.model).toBe("mail.activity");
+    expect(value.method).toBe("create");
+    expect(value.args[0][0]).toEqual({
+        res_model: "crm.lead",
+        res_id: 1,
+        activity_type_id: callId,
+        summary: "Follow up with the colleague",
+        date_deadline: today().toISODate(),
+        user_id: colleagueId, // not user.userId: the chosen, non-default assignee
+    });
+
+    expect(".o_crm_activity_panel_row .o_crm_activity_user").toHaveText("Office Colleague");
+});
+
+// ---------------------------------------------------------------------------
 // VAL-DATA-011: no cached activity type disables Schedule (and Log a call).
 // ---------------------------------------------------------------------------
 
@@ -270,10 +354,71 @@ test("offline, meeting and upload activity types are excluded from both type sel
     const scheduleOptions = queryAllTexts(".o_crm_activity_schedule_type option");
     const logCallOptions = queryAllTexts(".o_crm_activity_log_call_type option");
     expect(scheduleOptions).toEqual(["Call", "Email"]); // Meeting, Upload Document excluded
-    expect(logCallOptions).toEqual(["Call", "Email"]);
+    // VAL-DATA-020: Log a call only ever offers Call-category types, a
+    // narrower exclusion than Schedule's (Email is a cached, non-excluded
+    // type, but still not a Call).
+    expect(logCallOptions).toEqual(["Call"]);
     expect(".o_crm_activity_panel:contains('Meeting')").toHaveCount(0);
     expect(".o_crm_activity_panel:contains('Upload Document')").toHaveCount(0);
     expect.verifySteps([]); // calendar path never reached, online or offline
+});
+
+// ---------------------------------------------------------------------------
+// VAL-DATA-020: Log a call always uses a Call-category type, defaulting to
+// and only offering one even when a non-Call type sorts first in the cache
+// (the shipped data orders To-Do, sequence 2, before Call, sequence 6 --
+// m3-activity-python's finding).
+// ---------------------------------------------------------------------------
+
+test("offline, Log a call always defaults to and only offers a Call-category type, even when a non-Call type is cached first", async () => {
+    const pyEnv = await startServer();
+    removeBaselineActivityTypes(pyEnv);
+    const todoId = pyEnv["mail.activity.type"].create({ name: "To-Do" });
+    const callId = pyEnv["mail.activity.type"].create({ name: "Call", category: "phonecall" });
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // Schedule is unaffected by this fix: every non-excluded cached type,
+    // in cache order, still defaulting to the first one.
+    expect(queryAllTexts(".o_crm_activity_schedule_type option")).toEqual(["To-Do", "Call"]);
+    expect(".o_crm_activity_schedule_type").toHaveValue(String(todoId));
+
+    // Log a call: only the Call type is offered, and it is the default --
+    // the ordinary, unmodified click below queues it.
+    expect(queryAllTexts(".o_crm_activity_log_call_type option")).toEqual(["Call"]);
+    expect(".o_crm_activity_log_call_type").toHaveValue(String(callId));
+
+    await contains(".o_crm_activity_log_call_button").click();
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync());
+    expect(queued.length).toBe(1);
+    const [{ value }] = queued;
+    expect(value.model).toBe("crm.lead");
+    expect(value.method).toBe("action_log_call");
+    expect(value.args[1]).toBe(callId); // the Call type id, never todoId
+});
+
+test("offline, with a cached activity type but no Call-category one, Log a call is disabled while Schedule stays usable", async () => {
+    const pyEnv = await startServer();
+    removeBaselineActivityTypes(pyEnv);
+    pyEnv["mail.activity.type"].create({ name: "To-Do" });
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    expect(".o_crm_activity_schedule_button").not.toHaveAttribute("disabled");
+    expect(".o_crm_activity_log_call_button").toHaveAttribute("disabled");
+    expect(".o_crm_activity_log_call_type").toHaveAttribute("disabled");
+    expect(queryAllTexts(".o_crm_activity_log_call_type option")).toEqual([]);
+
+    await contains(".o_crm_activity_log_call_button").click();
+    expect(Object.values(getService(OfflinePlugin)._ormToSync())).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
