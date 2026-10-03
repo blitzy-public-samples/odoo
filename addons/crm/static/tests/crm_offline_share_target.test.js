@@ -46,7 +46,25 @@ class Team extends models.Model {
     ];
 }
 
-defineModels([Team]);
+// VAL-DIS-014 (user-testing round 2 evidence): a minimal `crm.lead`
+// stand-in, so the online Create tests below can let `ShareTargetItem.
+// process()` run for real -- `name_create` through to the opened form --
+// instead of stubbing it out, the way the generic web test
+// (`share_target.test.js`) does for its own assertions.
+class Lead extends models.Model {
+    _name = "crm.lead";
+
+    name = fields.Char();
+
+    _views = {
+        form: `<form><field name="name"/></form>`,
+    };
+}
+
+// `defineMailModels()` already provides its own `ir.attachment` mock
+// model (used by the `ir.attachment` `write` the create flow issues
+// below); adding another one here would double-register it.
+defineModels([Team, Lead]);
 defineMailModels();
 
 const pngFile = new File([new Uint8Array(1)], "shared.png", { type: "image/png" });
@@ -81,6 +99,78 @@ test("online, opening the share-target dialog on the Lead item issues the crm.te
     await contains(".modal-body button:contains('Lead')").click();
     expect.verifySteps(["web_search_read"]);
     expect(".modal-footer .btn-primary").not.toHaveAttribute("disabled");
+});
+
+// VAL-DIS-014 (user-testing round 2 evidence): the two tests above only
+// check that Create stays enabled online; they never click it. These two
+// click it for real and let `ShareTargetItem.process()` run its whole
+// chain (upload the file, `crm.lead.name_create`, link the attachment,
+// open the created lead's form) to prove the create flow genuinely
+// completes online, not just that the button isn't disabled.
+test.tags("desktop");
+test("online, clicking Create on the share-target dialog's Lead item uploads the file, creates the lead and opens it", async () => {
+    onRpc("crm.team", "web_search_read", ({ parent }) => parent());
+    onRpc("/web/binary/upload_attachment", () => {
+        expect.step("upload_attachment");
+        return [{ id: 666, filename: pngFile.name }];
+    });
+    onRpc("crm.lead", "name_create", ({ parent }) => {
+        expect.step("name_create");
+        return parent();
+    });
+    // The mocked upload above never actually creates attachment id 666 in
+    // the `ir.attachment` mock model's own records, so the real `write`
+    // implementation (which looks the record up by id) can't run; only
+    // record that the write happened, the same way the generic web test
+    // (`share_target.test.js`) checks `write`'s params without a real
+    // backing record either.
+    onRpc("ir.attachment", "write", () => {
+        expect.step("attachment_write");
+        return true;
+    });
+    await mountWithCleanup(WebClient);
+    getService("share_target").display([pngFile]);
+    await animationFrame();
+    expect(".o_dialog").toHaveCount(1);
+
+    await contains(".modal-body button:contains('Lead')").click();
+    await contains(".modal-footer .btn-primary").click();
+    await animationFrame();
+    await animationFrame();
+
+    expect.verifySteps(["upload_attachment", "name_create", "attachment_write"]);
+    expect(".o_dialog").toHaveCount(0); // the share-target dialog closed after Create
+    expect(".o_form_view").toHaveCount(1); // the created lead's own form opened
+});
+
+test.tags("mobile");
+test("online, clicking Create on the share-target dialog's Lead item uploads the file, creates the lead and opens it (mobile)", async () => {
+    onRpc("crm.team", "web_search_read", ({ parent }) => parent());
+    onRpc("/web/binary/upload_attachment", () => {
+        expect.step("upload_attachment");
+        return [{ id: 666, filename: pngFile.name }];
+    });
+    onRpc("crm.lead", "name_create", ({ parent }) => {
+        expect.step("name_create");
+        return parent();
+    });
+    onRpc("ir.attachment", "write", () => {
+        expect.step("attachment_write");
+        return true;
+    });
+    await mountWithCleanup(WebClient);
+    getService("share_target").display([pngFile]);
+    await animationFrame();
+    expect(".o_dialog").toHaveCount(1);
+
+    await contains(".modal-body button:contains('Lead')").click();
+    await contains(".modal-footer .btn-primary").click();
+    await animationFrame();
+    await animationFrame();
+
+    expect.verifySteps(["upload_attachment", "name_create", "attachment_write"]);
+    expect(".o_dialog").toHaveCount(0);
+    expect(".o_form_view").toHaveCount(1);
 });
 
 test.tags("desktop");

@@ -1,6 +1,6 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import { expect, test } from "@odoo/hoot";
-import { hover, queryAllTexts, runAllTimers } from "@odoo/hoot-dom";
+import { hover, queryAllTexts, queryOne, runAllTimers } from "@odoo/hoot-dom";
 import { mockDate } from "@odoo/hoot-mock";
 import {
     contains,
@@ -491,6 +491,17 @@ test("offline, the progress bar is marked inert and the rotting badge is inert; 
     expect(".o_kanban_group:eq(0) .o_column_progress").not.toHaveClass("pe-none");
     expect(getKanbanRecordTexts(0).length).toBe(2);
 
+    // VAL-DIS-029 (user-testing round 2 evidence): count the reload RPCs
+    // the click itself triggers -- `group.applyFilter()`'s `list.load()`
+    // issues one of these two methods, never one of the framework's four
+    // auto-queued producers -- rather than only inferring "no reload"
+    // from the unchanged record count.
+    let reloadCount = 0;
+    onRpc(["web_read_group", "web_search_read"], ({ parent }) => {
+        reloadCount++;
+        return parent();
+    });
+
     const setOffline = mockOffline();
     await setOffline(true);
 
@@ -504,13 +515,17 @@ test("offline, the progress bar is marked inert and the rotting badge is inert; 
     // it (crm_column_progress.xml), and it's a plain `<div>`, not a
     // `<button>` -- without the crm guard it would stay fully clickable.
     expect(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").toHaveCount(1);
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").click();
     expect(getKanbanRecordTexts(0).length).toBe(2); // unchanged: the rotting filter never applied
+    expect(reloadCount).toBe(0); // the click issued no web_read_group/web_search_read offline
 
     await setOffline(false);
     expect(".o_kanban_group:eq(0) .o_column_progress").not.toHaveClass("pe-none");
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").click();
     expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered to the single rotting record
+    expect(reloadCount).toBeGreaterThan(0); // online, the same click reloads the column
 });
 
 // B79 (scrutiny finding 14): the `pe-none` class above only blocks a real
@@ -530,15 +545,26 @@ test("offline, clicking a progress bar segment directly applies no filter; onlin
 
     expect(getKanbanRecordTexts(0).length).toBe(2);
 
+    // VAL-DIS-029: same click-scoped reload count as the test above.
+    let reloadCount = 0;
+    onRpc(["web_read_group", "web_search_read"], ({ parent }) => {
+        reloadCount++;
+        return parent();
+    });
+
     const setOffline = mockOffline();
     await setOffline(true);
 
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
     expect(getKanbanRecordTexts(0).length).toBe(2); // unchanged: no filter applied, no reload
+    expect(reloadCount).toBe(0);
 
     await setOffline(false);
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
     expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered
+    expect(reloadCount).toBeGreaterThan(0);
 });
 
 // VAL-DIS-029 (user-testing evidence): mobile-tagged copies of the two
@@ -557,19 +583,31 @@ test("offline, the progress bar is marked inert and the rotting badge is inert; 
     expect(".o_kanban_group:eq(0) .o_column_progress").not.toHaveClass("pe-none");
     expect(getKanbanRecordTexts(0).length).toBe(2);
 
+    // VAL-DIS-029 (user-testing round 2 evidence): same click-scoped
+    // reload count as the desktop test above.
+    let reloadCount = 0;
+    onRpc(["web_read_group", "web_search_read"], ({ parent }) => {
+        reloadCount++;
+        return parent();
+    });
+
     const setOffline = mockOffline();
     await setOffline(true);
 
     expect(".o_kanban_group:eq(0) .o_column_progress").toHaveClass("pe-none");
 
     expect(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").toHaveCount(1);
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").click();
     expect(getKanbanRecordTexts(0).length).toBe(2); // unchanged: the rotting filter never applied
+    expect(reloadCount).toBe(0); // the click issued no web_read_group/web_search_read offline
 
     await setOffline(false);
     expect(".o_kanban_group:eq(0) .o_column_progress").not.toHaveClass("pe-none");
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .badge.rounded-pill.text-bg-danger").click();
     expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered to the single rotting record
+    expect(reloadCount).toBeGreaterThan(0); // online, the same click reloads the column
 });
 
 test.tags("mobile");
@@ -583,15 +621,26 @@ test("offline, clicking a progress bar segment directly applies no filter; onlin
 
     expect(getKanbanRecordTexts(0).length).toBe(2);
 
+    // VAL-DIS-029: same click-scoped reload count as the desktop test above.
+    let reloadCount = 0;
+    onRpc(["web_read_group", "web_search_read"], ({ parent }) => {
+        reloadCount++;
+        return parent();
+    });
+
     const setOffline = mockOffline();
     await setOffline(true);
 
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
     expect(getKanbanRecordTexts(0).length).toBe(2); // unchanged: no filter applied, no reload
+    expect(reloadCount).toBe(0);
 
     await setOffline(false);
+    reloadCount = 0;
     await contains(".o_kanban_group:eq(0) .progress-bar.o_bar_has_records").click();
     expect(getKanbanRecordTexts(0).length).toBe(1); // now filtered
+    expect(reloadCount).toBeGreaterThan(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -661,6 +710,48 @@ test("offline, tapping a column title issues no tooltip read; online a tap alone
     expect.verifySteps([]); // so no read is issued online from a tap either -- confirms the offline
     // assertion above is a genuine "skipped", not merely "the tooltip
     // never fires from this interaction regardless of connectivity"
+});
+
+// VAL-SKIP-004 (user-testing round 2 evidence): the tap test above proves
+// the "skipped" claim for mobile's own real interaction, but it never
+// exercises `onTitleMouseEnter` at all (a tap dispatches `click`, not
+// `mouseenter`), so it can't show the memo recovers once the browser is
+// back online. `CrmKanbanHeader.onTitleMouseEnter`'s guard has no device
+// check (`crm_kanban_renderer.js`): the handler is bound with a plain
+// `t-on-mouseenter` regardless of screen size (`kanban_header.xml`), it's
+// hoot-dom's own `hover()` helper that, under the mobile preset's touch
+// emulation, mirrors a real touchscreen and never fires `mouseenter` at
+// all -- consistent with the tap test above never seeing a tooltip
+// either. Dispatching the `mouseenter`/`mouseleave` events directly is
+// the only way to reach that branch under the mobile preset, so this test
+// synthesizes them instead of going through `hover()`.
+test.tags("mobile");
+test("offline, hovering a column title skips the tooltip without poisoning its memo; online it still shows (mobile)", async () => {
+    onRpc("crm.stage", "read", () => expect.step("read"));
+    await mountView({
+        type: "kanban",
+        resModel: "crm.lead",
+        groupBy: ["stage_id"],
+        arch: pipelineArch,
+    });
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    queryOne(".o_column_title:eq(0)").dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await runAllTimers(); // past the 400ms debounce
+    expect(".o-tooltip").toHaveCount(0);
+    expect.verifySteps([]); // no read while offline, and no error
+
+    await setOffline(false);
+    // Same reason as the desktop hover test above: leave first so the
+    // debounced handler sees a fresh enter, not a no-op repeat.
+    queryOne(".o_column_title:eq(0)").dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
+    queryOne(".o_column_title:eq(0)").dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await runAllTimers();
+    expect(".o-tooltip").toHaveCount(1); // the offline attempt didn't poison the memo
+    expect(".o-tooltip").toHaveText("Description\nNew");
+    expect.verifySteps(["read"]); // exactly one read, issued only once back online
 });
 
 // ---------------------------------------------------------------------------

@@ -240,6 +240,57 @@ test("offline, the Opportunities list row 'Email' button and the reschedule drop
     expect(".o-dropdown--menu").toHaveCount(1); // online, the dropdown opens again
 });
 
+// VAL-DIS-005 (user-testing round 2 evidence): the desktop header-button
+// tests above select a row first, because the buttons only render once
+// `hasSelectedRecords` is true (`list_controller.xml`). On mobile no row
+// selector exists at all (`list_renderer.js`'s `allowSelectors`), so
+// there is no way to reach `hasSelectedRecords` -- the buttons can never
+// render, online or offline. These two tests mount each list family
+// directly under the mobile preset and assert that absence explicitly,
+// instead of only inferring it from the "no selector" fact proven
+// elsewhere.
+test.tags("mobile");
+test("offline, the Leads list renders no row selector and its header buttons never render; online the same holds (mobile)", async () => {
+    await mountView({ resModel: "crm.lead", type: "list", arch: LEADS_LIST_ARCH });
+
+    expect(".o_data_row .o_list_record_selector").toHaveCount(0);
+    expect("button:contains('Convert to Opportunities')").toHaveCount(0);
+    expect("button:contains('Mark Lost')").toHaveCount(0);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect(".o_data_row .o_list_record_selector").toHaveCount(0);
+    expect("button:contains('Convert to Opportunities')").toHaveCount(0);
+    expect("button:contains('Mark Lost')").toHaveCount(0);
+
+    await setOffline(false);
+    expect(".o_data_row .o_list_record_selector").toHaveCount(0);
+    expect("button:contains('Convert to Opportunities')").toHaveCount(0);
+    expect("button:contains('Mark Lost')").toHaveCount(0);
+});
+
+test.tags("mobile");
+test("offline, the Opportunities list renders no row selector and its header buttons never render; online the same holds (mobile)", async () => {
+    await mountView({ resModel: "crm.lead", type: "list", arch: OPPORTUNITIES_LIST_ARCH });
+
+    expect(".o_data_row .o_list_record_selector").toHaveCount(0);
+    expect("header button:contains('Mark Lost')").toHaveCount(0);
+    expect("header button:contains('Email')").toHaveCount(0);
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect(".o_data_row .o_list_record_selector").toHaveCount(0);
+    expect("header button:contains('Mark Lost')").toHaveCount(0);
+    expect("header button:contains('Email')").toHaveCount(0);
+
+    await setOffline(false);
+    expect(".o_data_row .o_list_record_selector").toHaveCount(0);
+    expect("header button:contains('Mark Lost')").toHaveCount(0);
+    expect("header button:contains('Email')").toHaveCount(0);
+});
+
 test.tags("mobile");
 test("offline, the Opportunities list row 'Email' button and the reschedule dropdown toggler are disabled with no row selection needed; online they re-enable (mobile)", async () => {
     await mountView({ resModel: "crm.lead", type: "list", arch: OPPORTUNITIES_LIST_ARCH });
