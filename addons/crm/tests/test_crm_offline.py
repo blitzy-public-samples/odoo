@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
+from odoo import fields
+from odoo.exceptions import AccessError
+
 from odoo.addons.crm.tests.common import TestCrmCommon
 
 
@@ -235,3 +238,135 @@ class TestCrmOffline(TestCrmCommon):
             'Replaying the queued action_set_won must leave the lead won, '
             'the same result an online "Won" click gives'
         )
+
+    def test_mail_activity_create_maps_res_model_to_res_model_id_for_crm_lead(self):
+        """ VAL-DATA-019 (architecture.md §3.3 "Schedule"): the offline
+        activity panel's Schedule control queues `mail.activity.create`
+        with `res_model` resolved to the literal string 'crm.lead' on the
+        client (no onchange, no extra round trip to look up the matching
+        `ir.model` id -- architecture.md §2). `res_model` is itself a
+        field related to `res_model_id`, so leaving `res_model_id` unset
+        would make the two inconsistent; `models/mail_activity.py`'s
+        `create()` override maps `res_model` -> `res_model_id` for
+        crm.lead when `res_model_id` is absent. Replaying that queued call
+        verbatim, with no sudo (as the salesman who owns the lead -- the
+        access an offline user actually has), must set `res_model_id`,
+        keep `res_model` consistent, and link the new activity into the
+        lead's `activity_ids`, exactly as an online create that already
+        passes `res_model_id` explicitly does.
+        """
+        lead = self.env['crm.lead'].create({
+            'name': 'Lead For Queued Activity Create',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        })
+        call_type = self.env.ref('mail.mail_activity_data_call')
+        salesman_activities = self.env['mail.activity'].with_user(self.user_sales_salesman)
+
+        # Replay exactly as `_syncORM` replays the queued Schedule
+        # activity's `create` call: `res_model` resolved client-side, no
+        # `res_model_id` -- no sudo.
+        activity = salesman_activities.create({
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': call_type.id,
+            'summary': 'Call back next week',
+            'user_id': self.user_sales_salesman.id,
+            'date_deadline': fields.Date.context_today(lead),
+        })
+
+        self.assertEqual(
+            activity.res_model_id, self.env['ir.model']._get('crm.lead'),
+            'create() must map res_model to res_model_id for crm.lead when res_model_id is absent'
+        )
+        self.assertEqual(activity.res_model, 'crm.lead')
+        self.assertIn(
+            activity, lead.activity_ids,
+            'The activity created from the queued res_model-only vals must be linked to the lead'
+        )
+
+        # Unchanged baseline case: an explicit res_model_id still works --
+        # the path every other caller already uses (e.g.
+        # activity_schedule, test_crm_activity.py's existing tests, which
+        # keep passing unmodified since the override only touches vals
+        # whose res_model equals 'crm.lead' and whose res_model_id is
+        # absent; a vals dict that already carries res_model_id is passed
+        # through untouched).
+        explicit_activity = salesman_activities.create({
+            'res_model_id': self.env['ir.model']._get_id('crm.lead'),
+            'res_id': lead.id,
+            'activity_type_id': call_type.id,
+            'summary': 'Explicit res_model_id',
+            'user_id': self.user_sales_salesman.id,
+            'date_deadline': fields.Date.context_today(lead),
+        })
+        self.assertEqual(explicit_activity.res_model, 'crm.lead')
+
+    def test_action_log_call_leaves_done_note_and_no_open_activity(self):
+        """ VAL-DATA-020 / expectedBehavior "action_log_call leaves a done
+        note and no open activity" (architecture.md §3.3 "Log a call"):
+        the offline panel queues one
+        `crm.lead.action_log_call(activity_type_id, summary, note,
+        user_id)` call -- the single scheduleORM entry has to both create
+        the Call activity and mark it done, since the queue replays
+        verbatim with no chaining between calls and no id remapping
+        (architecture.md §2). Replaying it, as the salesman who owns the
+        lead (no sudo: the method must not widen what an offline user can
+        do), must leave the chatter with one done note and the lead with
+        no open (active) activity -- the same result logging a call
+        online leaves.
+        """
+        lead = self.env['crm.lead'].create({
+            'name': 'Lead For Logged Call',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        })
+        call_type = self.env.ref('mail.mail_activity_data_call')
+        salesman_lead = self.env['crm.lead'].with_user(self.user_sales_salesman).browse(lead.id)
+
+        # Replay exactly as `_syncORM` replays the queued call: same
+        # model, method, args -- no sudo.
+        message_id = salesman_lead.action_log_call(
+            call_type.id, 'Called the prospect', 'Interested, will follow up next week',
+            self.user_sales_salesman.id,
+        )
+        lead.invalidate_recordset()
+
+        self.assertTrue(message_id, 'action_log_call must leave a done message in the chatter')
+        message = self.env['mail.message'].browse(message_id)
+        self.assertEqual(message.model, 'crm.lead')
+        self.assertEqual(message.res_id, lead.id)
+        self.assertIn('Interested, will follow up next week', message.body)
+        self.assertFalse(
+            lead.activity_ids,
+            'action_log_call must leave no open activity on the lead'
+        )
+
+        logged_activity = self.env['mail.activity'].with_context(active_test=False).search([
+            ('res_model', '=', 'crm.lead'), ('res_id', '=', lead.id),
+        ])
+        self.assertEqual(len(logged_activity), 1, 'Exactly one activity must have been created and then marked done')
+        self.assertFalse(
+            logged_activity.active,
+            'The logged call activity must be archived (done), not left open'
+        )
+        self.assertEqual(logged_activity.activity_type_id, call_type)
+
+        # No sudo: a user without write access to this lead (not its
+        # owner, no "all leads" group) must be denied -- the rights are
+        # not widened for the offline path.
+        unrelated_lead = self.env['crm.lead'].create({
+            'name': 'Lead Not Owned By The Salesman',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_manager.id,
+            'stage_id': self.stage_team1_1.id,
+        })
+        with self.assertRaises(AccessError):
+            self.env['crm.lead'].with_user(self.user_sales_salesman).browse(unrelated_lead.id).action_log_call(
+                call_type.id, 'Should not be allowed', 'No access', self.user_sales_salesman.id,
+            )
