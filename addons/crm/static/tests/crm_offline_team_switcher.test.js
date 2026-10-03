@@ -1,5 +1,5 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
-import { animationFrame, expect, test } from "@odoo/hoot";
+import { after, animationFrame, expect, test } from "@odoo/hoot";
 import {
     assignTestEnv,
     contains,
@@ -15,6 +15,7 @@ import {
     patchWithCleanup,
     switchView,
 } from "@web/../tests/web_test_helpers";
+import { rpcBus } from "@web/core/network/rpc";
 import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
 import { getDefaultConfig } from "@web/views/view";
@@ -231,27 +232,73 @@ test("offline, the sales-manager probe is skipped even though the server would h
 });
 
 // ---------------------------------------------------------------------------
-// Scrutiny finding 2 (VAL-SKIP-001): a cold mount (no `teamSwitcherState`
-// carried in `config.state`) must never issue `get_team_switcher_data`
-// while offline. `mountView()` (not `doAction()`) sidesteps `/web/action/
-// load`'s own metadata fetch -- which a truly never-visited action id
-// cannot survive offline either (`window_action.test.js`'s "[Offline]
-// execute unavailable action") -- while still going through the exact same
-// `CrmSearchModel`/`CrmKanbanView` the pipeline action uses.
+// User decision after M2 (VAL-SKIP-001/VAL-FIX-007 amended,
+// research/offline-reload-oops.md): a cold mount (no `teamSwitcherState`
+// carried in `config.state`) must still route `get_team_switcher_data`
+// through the framework's existing RPC disk cache while offline -- never
+// skip the call outright, since skipping it also left
+// `team_switcher_enabled` (`_getContext`) and the selected team's
+// `switcher_domain` (`_getDomain`) out of the search context on every cold
+// offline start, which made the kanban root's own cached `web_read_group`
+// miss too (its cache key is the whole request) and rendered
+// `OfflineActionHelper` instead of the cached pipeline -- see
+// crm_offline_cold_start.test.js for the cache-*hit* side of this (cached
+// pipeline + matching online/offline `web_read_group`). This test covers
+// the cache-*miss* side (VAL-COLD-004): a device that never loaded the
+// switcher data online degrades straight to "All Teams", with exactly one
+// attempted request and no error surfaced. `mountView()` (not
+// `doAction()`) sidesteps `/web/action/load`'s own metadata fetch -- which
+// a truly never-visited action id cannot survive offline either
+// (`window_action.test.js`'s "[Offline] execute unavailable action") --
+// while still going through the exact same `CrmSearchModel`/
+// `CrmKanbanView` the pipeline action uses.
 // ---------------------------------------------------------------------------
 
-test("offline, mounting the crm kanban with a cold switcher cache issues no get_team_switcher_data call", async () => {
+test("offline, mounting the crm kanban with a cold switcher cache attempts get_team_switcher_data once through the disk cache and falls back to 'All Teams' on a miss", async () => {
     // `mountWithSearch()`'s own `env.config` assignment only has an effect
     // on the test's very first mount (`app_test_helpers.js`'s `testEnv` is
     // merged into `env` once, when the shared test `App` is created by
     // whichever `mountWithCleanup()` call runs first) -- this test's first
     // mount is the throwaway `WebClient` below, so it is set here instead.
     assignTestEnv({ config: getDefaultConfig() });
-    onRpc("crm.team", "get_team_switcher_data", () => expect.step("get_team_switcher_data"));
-    // `mockCrmOffline()`'s `setOffline()` needs a running test app/service
-    // registry (`getService(OfflinePlugin)`), so a throwaway WebClient is
-    // mounted first purely to bring that up; it does nothing else here.
+    // Counting via `rpcBus`'s "RPC:REQUEST" event, not a model/method
+    // `onRpc()` listener: `mockCrmOffline()`'s network-wide `onRpc("/*",
+    // ...)` always wins route dispatch over the built-in
+    // `/web/dataset/call_kw` route that model/method listeners ride on
+    // (`mock_server.js`'s `_findRouteListeners`/`_handleRequest`: routes
+    // are tried most-recently-registered first and stop at the first one
+    // that returns a result, and that network-wide route is always
+    // registered after, hence tried before, the server's own built-in
+    // dispatcher), so a model/method listener would never fire while
+    // offline and could not prove what the client actually sent -- see
+    // crm_offline_cold_start.test.js's module docstring for the same
+    // reasoning. Using `OfflinePlugin.setOffline()` directly instead of
+    // `mockCrmOffline()` has its own trap: `OfflinePlugin` resets its
+    // offline flag to `false` on *any* RPC response that doesn't carry a
+    // `ConnectionLostError` (`offline_plugin.js`'s "RPC:RESPONSE"
+    // listener), and nothing stops an unrelated RPC from succeeding and
+    // flipping it back before `_initSwitcher()` even runs -- which is
+    // exactly why `has_group` used to leak through here. `mockCrmOffline()`
+    // avoids that: every response is a 502 while offline, so that listener
+    // never sees a success and the flag never reverts mid-test.
+    const switcherCalls = [];
+    const onRequest = ({ detail }) => {
+        const { params } = detail.data;
+        if (params.model === "crm.team" && params.method === "get_team_switcher_data") {
+            switcherCalls.push(params);
+        }
+    };
+    rpcBus.addEventListener("RPC:REQUEST", onRequest);
+    after(() => rpcBus.removeEventListener("RPC:REQUEST", onRequest));
+    onRpc("res.users", "has_group", ({ args }) => {
+        if (args[1] === "sales_team.group_sale_manager") {
+            expect.step("has_group");
+        }
+    });
     const setOffline = mockCrmOffline();
+    // A throwaway WebClient brings up the test app/service registry
+    // `mockCrmOffline()` needs (`mail.store`, among others); it does
+    // nothing else here.
     await mountWithCleanup(WebClient);
     await setOffline(true);
 
@@ -263,7 +310,10 @@ test("offline, mounting the crm kanban with a cold switcher cache issues no get_
     // `mountView()`/`doAction()` of a never-visited kanban would also
     // attempt (both genuinely uncached offline, but not what this test is
     // about). `config.state` starts empty for every `mountWithSearch`
-    // call, so `teamSwitcherState` is guaranteed cold here regardless.
+    // call, so `teamSwitcherState` is guaranteed cold here regardless, and
+    // this test's `RPCCache` (installed once per test, `mock_server.js`)
+    // never had anything written to its `crm.team`/`get_team_switcher_data`
+    // entry before now, so this is also a genuine disk-cache miss.
     const switcher = await mountWithSearch(
         TeamSwitcher,
         {
@@ -281,10 +331,22 @@ test("offline, mounting the crm kanban with a cold switcher cache issues no get_
     // empty team list, exactly like the forced-502 case in the first test
     // of this file -- the switcher's two fallback states (VAL-FIX-007) are
     // "no team list" (this one) or a selected-team facet restored from the
-    // search state (the next test below).
+    // search state (the next test below). The rejection is caught inside
+    // `_initSwitcher()`'s own `try`/`catch` (there is no ram/disk value to
+    // resolve from first, so `RPCCache.read()`'s returned promise itself
+    // rejects -- unlike the cache-*hit* case, this is not a dangling,
+    // separately-unhandled background rejection), so no dialog or
+    // notification appears and nothing needs declaring via
+    // `expect.errors()`.
     expect(switcher.hasDropdown).toBe(false);
     expect(switcher.currentLabel).toBe("All Teams");
-    expect.verifySteps([]); // get_team_switcher_data was never issued
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
+    // Exactly one attempt at get_team_switcher_data (VAL-SKIP-001/
+    // VAL-FIX-007/VAL-COLD-004's "one attempted request"); has_group (A4)
+    // is still never issued at all while offline.
+    expect(switcherCalls).toHaveLength(1);
+    expect.verifySteps([]);
 });
 
 // ---------------------------------------------------------------------------

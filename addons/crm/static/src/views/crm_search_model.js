@@ -130,49 +130,58 @@ export class CrmSearchModel extends SearchModel {
         // Retrieve team switcher data
         let available = false;
         let teams = [];
-        // Scrutiny finding 2 (VAL-SKIP-001): `RPCCache.read()`
-        // (addons/web/static/src/core/network/rpc_cache.js) runs its
-        // network fallback unconditionally whenever `update: "always"` is
-        // set, even on a ram/disk cache hit, so routing through
-        // `this.orm.cache()` at all would still issue
-        // `get_team_switcher_data` while offline. There is no existing
-        // API to read an already-cached RPC-cache value without going
-        // through that fallback (`RPCCache` exposes no synchronous peek,
-        // and its backing store is a private module-level singleton in
-        // `rpc.js`), so skip the call entirely while offline instead of
-        // only catching its rejection afterwards: a cold offline page
-        // start degrades straight to "All Teams" (KNOWN-LIMIT, see the
-        // PR description / orchestrator decision VAL-SKIP-001). A team
-        // already selected earlier in this session is unaffected: it is
+        // User decision after M2 (VAL-SKIP-001/VAL-FIX-007 amended,
+        // research/offline-reload-oops.md): always route through
+        // `this.orm.cache()`, offline included, instead of skipping the
+        // call while `isOffline()`. `RPCCache.read()`
+        // (addons/web/static/src/core/network/rpc_cache.js) resolves from
+        // its disk entry (if any) synchronously, in parallel with -- not
+        // blocked by -- the network leg it always also attempts for
+        // `update: "always"`; a disk hit therefore still resolves this
+        // call even though the parallel network attempt then rejects with
+        // `ConnectionLostError` (silently: the rejection is only observed
+        // by the pending-request bookkeeping once a value already settled
+        // the promise, per `rpc_cache.js`'s `onRejected`, and bubbles as an
+        // uncaught rejection the framework's `lostConnectionHandler`
+        // swallows, same as a 502 mid-flight below). The previous
+        // "skip entirely offline" fix (scrutiny finding 2) left
+        // `team_switcher_enabled` (`_getContext` below) and the selected
+        // team's `switcher_domain` (`_getDomain` below) out of the search
+        // context on every cold offline start, which made the cached
+        // `web_read_group` for the kanban/list root also miss (its cache
+        // key is the whole request, `rpc.js`) and rendered
+        // `OfflineActionHelper` instead of the cached pipeline -- the
+        // defect this call restores the fix for. Only a true cache miss
+        // (this device never loaded the switcher data online) rejects and
+        // falls through to "All Teams" below; a team already selected
+        // earlier in this session is unaffected either way, since it is
         // restored above through `config.state.teamSwitcherState`, never
         // through this call.
-        if (!this.offlinePlugin.isOffline()) {
-            try {
-                ({ available, teams } = await this.orm
-                    .cache({
-                        type: "disk",
-                        update: "always",
-                        callback: (result, hasChanged) => {
-                            if (hasChanged) {
-                                this.state.switcherAvailable = result.available;
-                                this.state.switcherTeams = result.teams;
-                                this._initSwitcherSelection(true);
-                            }
-                        },
-                    })
-                    .call("crm.team", "get_team_switcher_data"));
-            } catch (error) {
-                if (!(error instanceof ConnectionLostError)) {
-                    throw error;
-                }
-                // Still online when this call started, but it lost the
-                // connection mid-flight (e.g. a 502 from a reverse proxy):
-                // degrade the same way as a cache miss instead of
-                // rejecting this whole `_initSwitcher()` and, through it,
-                // `load()` — aborting the view's load instead of
-                // degrading to "All Teams" (architecture.md §3.2 item 3,
-                // offline_inventory.md rows A6/C20).
+        try {
+            ({ available, teams } = await this.orm
+                .cache({
+                    type: "disk",
+                    update: "always",
+                    callback: (result, hasChanged) => {
+                        if (hasChanged) {
+                            this.state.switcherAvailable = result.available;
+                            this.state.switcherTeams = result.teams;
+                            this._initSwitcherSelection(true);
+                        }
+                    },
+                })
+                .call("crm.team", "get_team_switcher_data"));
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
             }
+            // No disk value cached for this call (never loaded online on
+            // this device) and the network leg failed, offline or
+            // mid-flight (e.g. a 502 from a reverse proxy): degrade to
+            // "All Teams" instead of rejecting this whole `_initSwitcher()`
+            // and, through it, `load()` — aborting the view's load
+            // (architecture.md §3.2 item 3, offline_inventory.md rows
+            // A6/C20).
         }
         this.state.switcherAvailable = available;
         this.state.switcherTeams = teams;
