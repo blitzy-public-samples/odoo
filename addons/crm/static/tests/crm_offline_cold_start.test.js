@@ -217,6 +217,15 @@ test("offline cold start of the pipeline with no team selected renders the cache
     // `crm_offline_team_switcher.test.js`.
     expect.errors(2);
     await getService("action").doAction(1);
+    // Both background legs are real network round-trips (the mock XHR
+    // layer, same as a real `XMLHttpRequest`), so their rejection does not
+    // necessarily land before `doAction()`'s own promise resolves from the
+    // disk-cache hit -- without this tick, `expect.verifyErrors` below runs
+    // before either has actually logged, intermittently reading `[]` where
+    // the two errors declared above are expected (the exact flake this
+    // extra tick removes; see the VAL-COLD-004 test further down for the
+    // same reasoning on a cache-miss background leg).
+    await animationFrame();
 
     // The cached pipeline rendered, not `OfflineActionHelper`.
     expect(".o_action_helper").toHaveCount(0);
@@ -269,6 +278,10 @@ test("offline cold start of the pipeline with a team selected renders the cached
     // leg rejects after resolving from the cache; declared, not a failure.
     expect.errors(2);
     await getService("action").doAction(1);
+    // See the no-team-selected test above for why this tick is needed
+    // before `expect.verifyErrors` can rely on both background legs
+    // having already logged.
+    await animationFrame();
 
     expect(".o_action_helper").toHaveCount(0);
     expect(".o_cp_team_switcher:contains('Hyrule')").toHaveCount(1); // selection restored

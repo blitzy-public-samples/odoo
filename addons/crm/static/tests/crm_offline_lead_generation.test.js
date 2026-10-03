@@ -184,6 +184,13 @@ test("an Install confirmation opened online cannot be confirmed after disconnect
     expect.verifySteps([]); // no button_immediate_install call, queued or sent
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(".o_dialog").toHaveCount(0); // dialog closed itself; no error dialog shown
+
+    // Reconnect before the test ends: every other offline test in this
+    // suite leaves its mocked connection online again, and ending offline
+    // would leave the real `OfflinePlugin`'s reconnection probing (its
+    // `/web/webclient/version_info` backoff ping, AGENTS.md section 2)
+    // armed on a `setTimeout` outside this torn-down test's own cleanup.
+    await setOffline(false);
 });
 
 test.tags("mobile");
@@ -217,6 +224,10 @@ test("an Install confirmation opened online cannot be confirmed after disconnect
     expect.verifySteps([]); // no button_immediate_install call, queued or sent
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(".o_dialog").toHaveCount(0); // dialog closed itself; no error dialog shown
+
+    // See the desktop variant above for why this test reconnects before
+    // ending instead of finishing while still offline.
+    await setOffline(false);
 });
 
 test.tags("desktop");
