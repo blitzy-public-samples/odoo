@@ -196,7 +196,15 @@ test("offline, every M2-disabled control is inert together; online again, each w
 
     await start();
     await openFormView("crm.lead", 1);
-    await waitFor(".o-mail-Chatter-sendMessage");
+    // f297e5e5 / m2-fix-chatter-paste-drop-flake: "Send message" carries
+    // t-att-disabled driven by hasReadAccess/hasWriteAccess, set only once
+    // the chatter's own mount-time fetchThreadData() round-trips through
+    // the debounced /mail/store fetch; waiting for plain
+    // ".o-mail-Chatter-sendMessage" can still race that fetch and click a
+    // disabled button, which hoot's click() silently no-ops. Wait for
+    // :enabled first, same fix as crm_offline_chatter.test.js's
+    // clickSendMessage() helper.
+    await waitFor(".o-mail-Chatter-sendMessage:enabled");
     // Open the composer and leave it open with a draft, same setup as
     // crm_offline_chatter.test.js's Ctrl+Enter-bypass test.
     await contains(".o-mail-Chatter-sendMessage").click();

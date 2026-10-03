@@ -98,6 +98,70 @@ class TestCrmOffline(TestCrmCommon):
         self.assertEqual(online_lead.partner_id.phone, online_lead.phone,
                           'Partner phone should have moved away from its stale value')
 
+    def test_web_save_queued_lead_edit_equals_online_write(self):
+        """ VAL-DATA-018 (architecture.md §3.3 "Leads/stages/teams reads,
+        edits, creates, stage moves: framework already covers them -- prove
+        with tests, don't reimplement"): the JS-side proof
+        (crm_offline_data_queue_replay.test.js's "offline, editing several
+        fields of a lead ... queues one web_save") already shows an
+        ordinary offline edit of several lead fields -- not the
+        email/phone force-save defect's special case covered above -- gets
+        queued as a plain `web_save`. This is the server-side half: that
+        replaying such a queued call verbatim, with no sudo (as the
+        salesperson assigned to the lead, the access an offline user
+        actually has), leaves the lead -- and the partner it still
+        propagates email/phone to -- in exactly the same state an online
+        write of the identical vals would.
+        """
+        partner_online = self.env['res.partner'].create({'name': 'Queued Edit Partner (online)'})
+        partner_offline = self.env['res.partner'].create({'name': 'Queued Edit Partner (offline)'})
+        lead_values = {
+            'name': 'Queued Edit Lead',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        }
+        online_lead = self.env['crm.lead'].create({**lead_values, 'partner_id': partner_online.id})
+        offline_lead = self.env['crm.lead'].create({**lead_values, 'partner_id': partner_offline.id})
+
+        # An ordinary user-initiated edit (not the force-copy path): the
+        # user directly changes description, expected_revenue and the
+        # lead's own email_from/phone.
+        changes = {
+            'description': 'Edited through the offline queue',
+            'expected_revenue': 4242.0,
+            'email_from': 'queued.edit@test.example.com',
+            'phone': '+1 202 555 0099',
+        }
+
+        salesman_online = self.env['crm.lead'].with_user(self.user_sales_salesman).browse(online_lead.id)
+        salesman_offline = self.env['crm.lead'].with_user(self.user_sales_salesman).browse(offline_lead.id)
+
+        # Online: the client issues web_save immediately.
+        salesman_online.web_save(changes, {})
+        # Offline: the identical call -- same model, method, same args and
+        # kwargs, no onchange, no field merge (architecture.md §2) -- is
+        # instead queued and replayed verbatim on reconnect.
+        salesman_offline.web_save(changes, {})
+
+        self.assertEqual(online_lead.description, offline_lead.description)
+        self.assertEqual(online_lead.expected_revenue, offline_lead.expected_revenue)
+        self.assertEqual(online_lead.email_from, offline_lead.email_from)
+        self.assertEqual(online_lead.phone, offline_lead.phone)
+        self.assertEqual(
+            online_lead.partner_id.email, offline_lead.partner_id.email,
+            'Replaying the queued web_save must propagate the email to the '
+            'partner exactly as an online write of the same vals would'
+        )
+        self.assertEqual(
+            online_lead.partner_id.phone, offline_lead.partner_id.phone,
+            'Replaying the queued web_save must propagate the phone to the '
+            'partner exactly as an online write of the same vals would'
+        )
+        self.assertEqual(online_lead.partner_id.email, online_lead.email_from)
+        self.assertEqual(online_lead.partner_id.phone, online_lead.phone)
+
     def test_action_restore_replay_restores_lead_like_online(self):
         """ B3/C4 (architecture.md §3.7, offline_inventory.md rows B3/C4,
         VAL-QUEUE-006): the offline "Restore" button
