@@ -1,6 +1,13 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
-import { expect, test } from "@odoo/hoot";
-import { contains, defineModels, fields, mockOffline, models, mountView } from "@web/../tests/web_test_helpers";
+import { expect, test, waitFor } from "@odoo/hoot";
+import {
+    contains,
+    defineModels,
+    fields,
+    mockOffline,
+    models,
+    mountView,
+} from "@web/../tests/web_test_helpers";
 
 /**
  * m2-framework-disabled-proofs (VAL-DIS-023). B85 (the merge wizard's
@@ -27,6 +34,43 @@ import { contains, defineModels, fields, mockOffline, models, mountView } from "
  *   crm_team_views.xml:62-73`) declares no `menu` slot and no delete
  *   affector at all, offline or online, so there is no "remove" row
  *   control to prove here.
+ *
+ * M2 user-testing round-1 (VAL-DIS-023): `crm_team_member_ids` was
+ * mocked as a `Many2many` to `res.users` below; the real field is a
+ * `One2many('crm.team.member', 'crm_team_id')` (`sales_team/models/
+ * crm_team.py`), fixed here. The relation kind matters a lot more than
+ * just a cosmetic dialog label: `addons/web/static/src/views/fields/
+ * field.js`'s `validFieldTypes` table marks `one2many` as
+ * `{ availableOffline: false }` (unlike `many2many`, which is `true`),
+ * and `Field.fieldComponentProps` forces `readonly` for any field whose
+ * type isn't offline-available the moment `OfflinePlugin.isOffline()`
+ * is true -- independently of and earlier than the generic
+ * button-`disabled` pass `SELECTORS_TO_DISABLE` does. So for a true
+ * one2many like `crm_team_member_ids`, going offline makes the whole
+ * `X2ManyField` instance readonly: `canCreate` becomes `false` and the
+ * kanban's "Add" button (`x2many_field.js`'s `rendererProps`, gated on
+ * `this.canCreate`) is never rendered at all -- not merely disabled.
+ * The previous (wrong) `Many2many` mock hid this: many2many stays
+ * writable offline, so its "Add" button renders and only picks up the
+ * generic disabled-button treatment, which is what the pre-fix version
+ * of this test asserted for both fields alike. `member_ids` (the real
+ * many2many a few lines below) still goes through that generic path;
+ * only `crm_team_member_ids` goes through the stronger, field-type-wide
+ * guard. Both are still proof that the control is unreachable offline,
+ * by different (and equally in-scope, equally crm-code-free) framework
+ * mechanisms -- confirmed with `console.log`-level introspection of
+ * `X2ManyField.prototype.canCreate` during triage, not merely reasoned
+ * from reading the source.
+ *
+ * The relation kind also matters for the delete test further down:
+ * `useOpenX2ManyRecord.openRecord()` (`relational_utils.js`) labels the
+ * x2many dialog's delete button "Delete" for a one2many and "Remove"
+ * for a many2many (`deleteButtonLabel`), and that button --
+ * `.o_btn_remove` in `web.X2ManyFieldDialogDefaultButtons`
+ * (`relational_utils.xml`) -- is, like every other button in that
+ * dialog's footer bar it shares (Save, Save & New, Discard), a plain
+ * `<button>` with no `data-available-offline`, so the framework
+ * disables all of them with no crm code to change.
  *
  * Scrutiny finding 28 (VAL-DIS-023): `member_ids` is permanently
  * `invisible="is_membership_multi or not is_membership_multi"` (a
@@ -71,21 +115,37 @@ class MergeWizard extends models.Model {
     _records = [{ id: 1, opportunity_ids: [1, 2] }];
 }
 
+class TeamMember extends models.Model {
+    _name = "crm.team.member";
+
+    name = fields.Char();
+    crm_team_id = fields.Many2one({ relation: "crm.team" });
+
+    _records = [{ id: 1, name: "Mitchell Admin", crm_team_id: 2 }];
+}
+
 class Team extends models.Model {
     _name = "crm.team";
 
     name = fields.Char();
     assignment_enabled = fields.Boolean();
     member_ids = fields.Many2many({ relation: "res.users" });
-    crm_team_member_ids = fields.Many2many({ relation: "res.users" });
+    // The real field (`sales_team/models/crm_team.py`) is a
+    // `One2many('crm.team.member', 'crm_team_id')`, not a many2many --
+    // see the module docstring above for why the distinction matters.
+    crm_team_member_ids = fields.One2many({
+        relation: "crm.team.member",
+        relation_field: "crm_team_id",
+    });
 
     _records = [
         { id: 1, name: "Sales Team", assignment_enabled: false, member_ids: [], crm_team_member_ids: [] },
         { id: 2, name: "Assignment Team", assignment_enabled: true, member_ids: [], crm_team_member_ids: [] },
+        { id: 3, name: "Team With a Member", assignment_enabled: true, member_ids: [], crm_team_member_ids: [1] },
     ];
 }
 
-defineModels([Lead, MergeWizard, Team]);
+defineModels([Lead, MergeWizard, TeamMember, Team]);
 defineMailModels();
 
 const MERGE_WIZARD_ARCH = `
@@ -199,7 +259,7 @@ test("offline, the team form's member_ids kanban 'Add' button is disabled; onlin
 // claimed -- when `assignment_enabled` is `True`.
 // ---------------------------------------------------------------------------
 
-test("offline, with assignment_enabled, the team form's crm_team_member_ids kanban 'Add' button is disabled; online it works", async () => {
+test("offline, with assignment_enabled, the team form's crm_team_member_ids kanban 'Add' button is removed (one2many fields go fully readonly offline); online it works", async () => {
     await mountView({ resModel: "crm.team", type: "form", resId: 2, arch: TEAM_FORM_ARCH_WITH_ASSIGNMENT });
 
     // member_ids is hidden and crm_team_member_ids renders instead, same
@@ -212,12 +272,54 @@ test("offline, with assignment_enabled, the team form's crm_team_member_ids kanb
     const setOffline = mockOffline();
     await setOffline(true);
 
-    expect(addBtn).toHaveAttribute("disabled");
-    expect(addBtn).toHaveClass("o_disabled_offline");
-    await contains(addBtn).click();
-    expect(".modal").toHaveCount(0); // the "add members" dialog never opens
+    // Unlike member_ids's generic disabled-button treatment above, a
+    // one2many field is forced fully readonly by field.js's
+    // validFieldTypes offline (fieldComponentProps' readonly, passed
+    // into X2ManyField as a prop -- not the arch-attribute readonly
+    // that drives this wrapper's own o_readonly_modifier class), so
+    // canCreate is false and the "Add" control is never rendered --
+    // stronger than merely disabled.
+    expect(addBtn).toHaveCount(0);
 
     await setOffline(false);
+    expect(addBtn).toHaveCount(1);
     expect(addBtn).not.toHaveAttribute("disabled");
-    expect(addBtn).not.toHaveClass("o_disabled_offline");
+});
+
+// ---------------------------------------------------------------------------
+// M2 user-testing round-1 (VAL-DIS-023, BR12): the "Add" tests above only
+// prove `crm_team_member_ids`'s generic kanban "Add" control. BR12 also
+// names the x2many's own add/remove *row* pair -- the one still missing
+// here is removing an existing card through the dialog opened by clicking
+// it (`useOpenX2ManyRecord`'s kanban-click path, since the card template
+// declares no inline delete affector of its own, see the module
+// docstring).
+// ---------------------------------------------------------------------------
+
+test("offline, with assignment_enabled, deleting a crm_team_member_ids card through its dialog is disabled; online it still works", async () => {
+    await mountView({ resModel: "crm.team", type: "form", resId: 3, arch: TEAM_FORM_ARCH_WITH_ASSIGNMENT });
+
+    expect("[name='crm_team_member_ids'] .o_card_record").toHaveCount(1);
+    await contains("[name='crm_team_member_ids'] .o_card_record").click();
+    await waitFor(".modal .o_form_view");
+
+    const deleteBtn = ".modal .o_btn_remove";
+    expect(deleteBtn).toHaveCount(1);
+    expect(deleteBtn).toHaveText("Delete"); // one2many label (deleteButtonLabel), not many2many's "Remove"
+    expect(deleteBtn).not.toHaveAttribute("disabled");
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    expect(deleteBtn).toHaveAttribute("disabled");
+    expect(deleteBtn).toHaveClass("o_disabled_offline");
+    await contains(deleteBtn).click();
+    expect(".modal").toHaveCount(1); // the dialog is still open, nothing removed
+    expect("[name='crm_team_member_ids'] .o_card_record").toHaveCount(1);
+
+    await setOffline(false);
+    expect(deleteBtn).not.toHaveAttribute("disabled");
+    await contains(deleteBtn).click();
+    expect(".modal").toHaveCount(0); // online, removing the record closes the dialog
+    expect("[name='crm_team_member_ids'] .o_card_record").toHaveCount(0);
 });

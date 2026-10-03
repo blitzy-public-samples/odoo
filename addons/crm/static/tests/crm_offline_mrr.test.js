@@ -2,13 +2,16 @@ import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import { expect, test } from "@odoo/hoot";
 import { queryAllTexts } from "@odoo/hoot-dom";
 import {
+    defineActions,
     defineModels,
     fields,
+    getService,
     models,
     mountView,
     mountWithCleanup,
     onRpc,
     patchWithCleanup,
+    switchView,
 } from "@web/../tests/web_test_helpers";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { WebClient } from "@web/webclient/webclient";
@@ -88,11 +91,37 @@ class Lead extends models.Model {
             stage_id: 1,
         },
     ];
+
+    _views = {
+        kanban: `
+            <kanban js_class="crm_kanban">
+                <field name="activity_state"/>
+                <progressbar field="activity_state" colors='{"planned": "success", "today": "warning", "overdue": "danger"}' sum_field="expected_revenue" recurring_revenue_sum_field="recurring_revenue_monthly"/>
+                <templates>
+                    <t t-name="card"><field name="name" class="p-2"/></t>
+                </templates>
+            </kanban>`,
+        list: `<list js_class="crm_list"><field name="name"/></list>`,
+        search: `<search/>`,
+    };
 }
 
 defineModels([Lead, Users, Stage, Team]);
 defineMailModels();
 patchWithCleanup(AnimatedNumber, { enableAnimations: false });
+defineActions([
+    {
+        id: 1,
+        name: "Pipeline",
+        res_model: "crm.lead",
+        type: "ir.actions.act_window",
+        context: { group_by: ["stage_id"] },
+        views: [
+            [false, "kanban"],
+            [false, "list"],
+        ],
+    },
+]);
 
 // ---------------------------------------------------------------------------
 // VAL-FIX-009 / VAL-SKIP-002: a `CrmColumnProgress` mount never issues the
@@ -210,4 +239,63 @@ test("online, the pipeline kanban still issues the has_group probe and shows the
     expect.verifySteps(["has_group"]);
     expect(".o_animated_number[data-tooltip='Recurring Revenue']").toHaveCount(1);
     expect(queryAllTexts(".o_kanban_counter")).toEqual(["14\n+25"]);
+});
+
+// ---------------------------------------------------------------------------
+// M2 user-testing round-1 (VAL-SKIP-002): the two offline tests above only
+// cover a `CrmColumnProgress` mounted directly (hand-built props, no view)
+// or a component that was already mounted *before* going offline. Neither
+// proves the amended contract's "(re)mounting the pipeline kanban" wording
+// through a real kanban controller that is destroyed and recreated while
+// already offline (as crm_offline_team_switcher.test.js's own "remounting
+// the pipeline kanban" test does for the team switcher's probe). Switching
+// to list and back forces exactly that teardown/rebuild of the kanban
+// controller and its `CrmColumnProgress` group header.
+// ---------------------------------------------------------------------------
+
+test("offline, remounting the pipeline kanban after a view switch still renders the progress bar, with no has_group reissued", async () => {
+    onRpc("res.users", "has_group", ({ args, parent }) => {
+        const result = parent();
+        if (args[1] === "crm.group_use_recurring_revenues") {
+            expect.step("has_group");
+        }
+        return result;
+    });
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    expect.verifySteps(["has_group"]); // the initial, online, mount (one stage_id group)
+    expect(".o_column_progress").toHaveCount(1);
+    expect(".o_animated_number[data-tooltip='Recurring Revenue']").toHaveCount(1);
+
+    await switchView("list");
+    // The action's own group_by context (needed for the kanban's progress
+    // bar) carries over to the list view too, so it renders one group
+    // header rather than ungrouped rows.
+    expect(".o_group_header").toHaveCount(1);
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+    // Remounting the kanban controller still attempts to refresh its
+    // records (the same cost crm_offline_team_switcher.test.js's own
+    // remount test declares); unrelated to the has_group probe, which is
+    // what this test is about.
+    expect.errors(1);
+    await switchView("kanban"); // remount: a fresh kanban controller + progress-bar group header
+
+    // Remounted while offline: the progress bar still renders, with no
+    // has_group reissued -- `showRecurringRevenue` defaults to `false` on
+    // this fresh mount (the test above this one), so the MRR aggregate
+    // itself is correctly absent even though the base progress bar is
+    // present.
+    expect(".o_column_progress").toHaveCount(1);
+    expect(".o_animated_number[data-tooltip='Recurring Revenue']").toHaveCount(0);
+    expect.verifySteps([]);
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
+    expect.verifyErrors([
+        `Connection to "/web/dataset/call_kw/crm.lead/web_read_group" couldn't be established or was interrupted`,
+    ]);
+
+    await setOffline(false);
 });

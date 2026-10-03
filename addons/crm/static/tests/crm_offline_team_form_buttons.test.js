@@ -4,12 +4,14 @@ import {
     contains,
     defineModels,
     fields,
+    getService,
     mockOffline,
     mockService,
     models,
     mountView,
     onRpc,
 } from "@web/../tests/web_test_helpers";
+import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 
 /**
  * m2-framework-disabled-proofs (VAL-DIS-025). Rows B30/C17
@@ -29,11 +31,14 @@ import {
  *
  * On mobile, `ButtonBox` collapses `action_open_opportunities` into its
  * own "More" dropdown (`maxVisibleButtons` is 0 at the XS size --
- * `button_box.js`); "Assign Leads" is the header's only button, so it
- * stays inline either way (`StatusBarButtons` only moves buttons past
- * the first into a dropdown). The main test below is desktop-only for
- * that reason; the mobile test further down opens the stat button's
- * dropdown first and proves the same disablement holds once revealed.
+ * `button_box.js`); "Assign Leads" is the header's only button, and
+ * "Activate Multi-team" sits in the alert banner above the button box,
+ * so both stay inline either way (`StatusBarButtons` only moves buttons
+ * past the first into a dropdown, and the button box is a separate
+ * component from the alert). The main test below is desktop-only for
+ * that reason; the two mobile tests further down cover, respectively,
+ * the stat button (behind the "More" dropdown) and Assign Leads +
+ * Activate Multi-team (inline, plus a queue-zero check).
  */
 class Team extends models.Model {
     _name = "crm.team";
@@ -203,4 +208,55 @@ test("offline, the Opportunities stat button is disabled once its mobile 'More' 
     expect(statBtn).not.toHaveAttribute("disabled");
     await contains(statBtn).click();
     expect.verifySteps(["action_open_opportunities"]); // online, it still works
+});
+
+test.tags("mobile");
+test("offline, the team form's Assign Leads and Activate Multi-team stay inline and disabled on mobile, with nothing queued; online they work", async () => {
+    onRpc("res.users", "has_group", () => true);
+    onRpc("crm.team", "action_assign_leads", ({ parent }) => {
+        expect.step("action_assign_leads");
+        return parent();
+    });
+    onRpc("ir.config_parameter", "set_bool", (args) => {
+        expect.step("set_bool");
+        expect(args.args).toEqual(["sales_team.membership_multi", true]);
+        return true;
+    });
+
+    await mountView({ resModel: "crm.team", type: "form", resId: 1, arch: FORM_ARCH });
+
+    const assignBtn = "button[name='action_assign_leads']";
+    const multiTeamBtn = "button[name='crm_team_activate_multi_membership']";
+    // Unlike the stat button, neither of these is collapsed into the
+    // button-box's mobile "More" dropdown: "Assign Leads" is in the
+    // header, "Activate Multi-team" in the alert banner above the button
+    // box, so both stay inline at the XS size and the disablement is
+    // visible without opening anything first.
+    for (const sel of [assignBtn, multiTeamBtn]) {
+        expect(sel).not.toHaveAttribute("disabled");
+    }
+
+    const setOffline = mockOffline();
+    await setOffline(true);
+
+    for (const sel of [assignBtn, multiTeamBtn]) {
+        expect(sel).toHaveAttribute("disabled");
+        expect(sel).toHaveClass("o_disabled_offline");
+    }
+    await contains(assignBtn).click();
+    expect(".modal").toHaveCount(0); // "Assign Leads"'s confirm dialog never opens offline
+    await contains(multiTeamBtn).click();
+    expect.verifySteps([]); // neither RPC fired
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync()).length).toBe(0); // and nothing queued
+
+    await setOffline(false);
+    for (const sel of [assignBtn, multiTeamBtn]) {
+        expect(sel).not.toHaveAttribute("disabled");
+    }
+    await contains(assignBtn).click();
+    expect(".modal").toHaveCount(1);
+    await contains(".modal .btn-primary").click();
+    expect.verifySteps(["action_assign_leads"]);
+    await contains(multiTeamBtn).click();
+    expect.verifySteps(["set_bool"]);
 });

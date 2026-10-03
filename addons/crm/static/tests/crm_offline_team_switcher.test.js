@@ -163,6 +163,29 @@ test("a connection lost while fetching the team switcher data degrades to 'All T
 });
 
 // ---------------------------------------------------------------------------
+// VAL-FIX-007 add-on: the same cache-miss degradation, through the list
+// view instead of the kanban -- the contract names "the CRM kanban and
+// list" together, and the test above only covers the kanban.
+// ---------------------------------------------------------------------------
+
+test("a connection lost while fetching the team switcher data still loads the crm list view, with its fallback and no error dialog", async () => {
+    onRpc("crm.team", "get_team_switcher_data", () => new Response("", { status: 502 }));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    // Requesting "list" as the doAction viewType is ignored on the mobile
+    // preset (it forces the kanban, its primary mobile view); switching to
+    // it afterward instead works on both presets
+    // (crm_offline_uncached_lead.test.js's own list-view tests do the same).
+    await switchView("list");
+
+    expect(".o_list_view").toHaveCount(1);
+    expect("tr.o_data_row").toHaveCount(3);
+    expect(".o_cp_team_switcher").toHaveCount(0); // degraded: no switcher dropdown rendered at all
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
 // VAL-SKIP-001 / A4: a team-switcher mount never issues the sales-manager
 // probe while offline. Mounts the component directly (as
 // crm_offline_hooks.test.js does for useCrmOffline) with a minimal fake
@@ -517,4 +540,61 @@ test("online, the sales-manager probe is still issued", async () => {
     await getService("action").doAction(1);
 
     expect.verifySteps(["has_group"]);
+});
+
+// ---------------------------------------------------------------------------
+// M2 user-testing round-1 (VAL-FIX-007, VAL-SKIP-001): every team-switcher
+// test above either mounts the component directly or exercises only the
+// view's *first*, online, mount. None of them prove the amended contract's
+// "(re)mounting" wording -- that a kanban controller destroyed and
+// recreated while already offline (not a cold, never-visited mount, which
+// hits `OfflineActionHelper` instead -- out of scope here, see
+// crm_offline_uncached_lead.test.js) still renders its records and the
+// switcher fallback, and still issues neither probe. Switching to list and
+// back forces exactly that teardown/rebuild of the kanban controller,
+// while `CrmSearchModel` (and so the team switcher's own mount) survives
+// the switch unchanged -- already shown by the "stays a search facet
+// across a view switch" test above, so the point here is specifically the
+// *kanban controller's own* mount, not the switcher component's.
+// ---------------------------------------------------------------------------
+
+test("offline, remounting the pipeline kanban after a view switch still renders its records and the switcher fallback, with neither probe reissued", async () => {
+    onRpc("res.users", "has_group", ({ args }) => {
+        if (args[1] === "sales_team.group_sale_manager") {
+            expect.step("has_group");
+        }
+    });
+    onRpc("crm.team", "get_team_switcher_data", () => expect.step("get_team_switcher_data"));
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(3);
+    expect(".o_cp_team_switcher:contains('All Teams')").toHaveCount(1);
+
+    await switchView("list");
+    expect("tr.o_data_row").toHaveCount(3);
+    expect.verifySteps(["get_team_switcher_data", "has_group"]); // the initial, online, mount
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+    // Remounting the kanban controller still attempts to refresh its
+    // records (the same "revisiting a view while offline" cost the
+    // facet-preservation test above declares for the list view); unrelated
+    // to the two probes, which is what this test is about.
+    expect.errors(1);
+    await switchView("kanban"); // remount: a fresh kanban controller
+
+    // Remounted while offline: the switcher fallback still renders, and
+    // neither probe fired again on this fresh mount.
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(3);
+    expect(".o_cp_team_switcher:contains('All Teams')").toHaveCount(1);
+    expect.verifySteps([]);
+    expect(".o_notification").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
+    expect.verifyErrors([
+        `Connection to "/web/dataset/call_kw/crm.lead/web_search_read" couldn't be established or was interrupted`,
+    ]);
+
+    await setOffline(false);
 });
