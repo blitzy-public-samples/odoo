@@ -1,6 +1,6 @@
 import { defineMailModels, startServer } from "@mail/../tests/mail_test_helpers";
 import { expect, runAllTimers, test } from "@odoo/hoot";
-import { queryAllTexts, queryOne } from "@odoo/hoot-dom";
+import { animationFrame, queryAllTexts, queryOne } from "@odoo/hoot-dom";
 import {
     contains,
     defineActions,
@@ -455,6 +455,137 @@ test("offline-queued create, action_done and action_log_call all replay verbatim
     ]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(".o_crm_activity_panel").toHaveCount(0); // back online: the panel itself disappears
+});
+
+// ---------------------------------------------------------------------------
+// VAL-DATA-017 (m3-closeout): the systray's label patch
+// (offline_systray_patch.js) was proved against entries seeded directly
+// with `scheduleORM` (crm_offline_systray_restore.test.js's "the systray
+// labels every CRM-queued method without crashing" tests, VAL-QUEUE-004).
+// This test queues the same four methods through their real milestone-3
+// producers instead -- the Won button, and this panel's own Schedule,
+// Done and Log a call controls -- to prove the extras shape those
+// producers actually build (`getScheduleORMExtras` via `queueCall`/
+// `_queueLeadCallOffline`) is what the patch expects, not just the shape
+// a hand-built scheduleORM() call happens to have.
+// ---------------------------------------------------------------------------
+
+test("the systray shows real milestone-3 producers (Won, Schedule, Done, Log a call) with their labels, with no crash", async () => {
+    const { pyEnv, callId } = await seedActivityTypes();
+    const activityId = pyEnv["mail.activity"].create({
+        res_model: "crm.lead",
+        res_id: 1,
+        activity_type_id: callId,
+        summary: "Existing activity",
+    });
+    pyEnv["crm.lead"].write([1], { activity_ids: [activityId] });
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    // Flush the plugin's harmless startup sync (3s after mount, offline_plugin.js's
+    // constructor) now, while the queue is empty, so it can't race the four
+    // producers queued below once mockCrmOffline's fake timers are in play.
+    await runAllTimers();
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // Schedule -> mail.activity create (CrmLeadActivityPanel.onClickSchedule)
+    await contains(".o_crm_activity_schedule_summary").edit("New follow-up");
+    await contains(".o_crm_activity_schedule_button").click();
+    // Done, on the pre-existing server activity -> mail.activity action_done
+    // (the newly scheduled row above offers no Done control, VAL-DATA-014,
+    // so this still targets exactly one element).
+    await contains(".o_crm_activity_panel_row .o_crm_activity_done").click();
+    // Log a call -> crm.lead action_log_call (CrmLeadActivityPanel.onClickLogCall)
+    await contains(".o_crm_activity_log_call_summary").edit("Called the lead");
+    await contains(".o_crm_activity_log_call_button").click();
+    // Won -> crm.lead action_set_won (CrmFormController._queueWonOffline)
+    await contains("button[name='action_set_won_rainbowman']").click();
+
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(4);
+
+    await contains(".o_menu_systray .o_nav_entry [data-icon='link_off']").click();
+    await animationFrame(); // mobile's toggler is a bare div, not the Dropdown's own button
+    expect(".o-dropdown--menu").toHaveCount(1); // opens without the addons/web crash (architecture.md §3.2 item 11)
+
+    const labels = queryAllTexts(".o-dropdown--menu .o-dropdown-item div.ms-auto");
+    expect(labels.length).toBe(4);
+    expect([...labels].sort()).toEqual(
+        ["Activity done", "Activity scheduled", "Call logged", "Won"].sort()
+    );
+});
+
+// ---------------------------------------------------------------------------
+// VAL-CROSS-001 (m3-closeout): mixed producers on one lead replay in order.
+// A form edit (the framework's own `web_save` producer), an activity
+// schedule (`mail.activity.create`, this panel's own producer) and
+// mark-won (`action_set_won`, `CrmFormController`'s own producer) are
+// queued in that order within one offline session on one lead; on
+// reconnect the three RPCs must run in the same order, and both the queue
+// and the systray must end up empty.
+// ---------------------------------------------------------------------------
+
+test("mixed producers on one lead (form edit, activity schedule, mark-won) replay in order", async () => {
+    await seedActivityTypes();
+    const steps = [];
+    onRpc("crm.lead", "web_save", ({ parent }) => {
+        steps.push("web_save");
+        return parent();
+    });
+    onRpc("mail.activity", "create", function ({ args }) {
+        steps.push("mail.activity create");
+        return this.env["mail.activity"].create(args[0][0]);
+    });
+    onRpc("crm.lead", "action_set_won", function ({ args }) {
+        steps.push("action_set_won");
+        this.env["crm.lead"].write(args[0], { won_status: "won" });
+        return true;
+    });
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    await runAllTimers(); // flush the startup sync, same reasoning as the test above
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // 1. a form edit, saved explicitly -> queues web_save (the framework's
+    // own producer, record.js's `_offlineSave`; crm adds nothing here).
+    await contains(".o_field_widget[name='name'] input").edit("Edited offline");
+    await contains(".o_form_button_save").click();
+
+    // 2. an activity schedule -> queues mail.activity.create.
+    // `onClickSchedule` never saves the record itself, so this cannot
+    // reorder the edit queued just above.
+    await contains(".o_crm_activity_schedule_summary").edit("Follow up");
+    await contains(".o_crm_activity_schedule_button").click();
+
+    // 3. mark-won. The form is clean again after step 1's save, so
+    // `beforeExecuteActionButton`'s own `record.save()` call resolves
+    // true without queuing a second web_save; only action_set_won is added.
+    await contains("button[name='action_set_won_rainbowman']").click();
+
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync());
+    expect(queued.length).toBe(3);
+
+    await setOffline(false);
+    // Two 1s pauses between the three replayed calls (offline_plugin.js's
+    // `_syncORM`); the same two-runAllTimers() idiom the activity-replay
+    // test above uses for its own three queued entries.
+    await runAllTimers();
+    await runAllTimers();
+
+    expect(steps).toEqual(["web_save", "mail.activity create", "action_set_won"]);
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    // The systray's own Dropdown only renders while offline or while
+    // something is still queued (offline_systray.xml); online with an
+    // empty queue, it is gone entirely, not just empty-looking.
+    expect(".o_menu_systray .o_offline_systray").toHaveCount(0);
+    // Back online: the panel itself disappears (VAL-DATA-009), taking
+    // every "pending sync" mark with it.
+    expect(".o_crm_activity_panel").toHaveCount(0);
+    expect(MockServer.env["crm.lead"].find((r) => r.id === 1).won_status).toBe("won");
 });
 
 // ---------------------------------------------------------------------------
