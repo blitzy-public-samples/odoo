@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <t t-name="crm.CrmLeadActivityPanel">
+        <div class="o_crm_activity_panel card mt-3" t-if="this.crmOffline.isOffline()">
+            <div class="card-body">
+                <h6 class="card-title">Activities</h6>
+                <p t-if="!this.isLeadSynced" class="text-muted mb-2 o_crm_activity_panel_unsynced_lead">
+                    This lead was created offline. Activities will be available once it syncs.
+                </p>
+                <ul class="list-unstyled mb-2 o_crm_activity_panel_list">
+                    <li t-foreach="this.rows" t-as="row" t-key="row.key"
+                        class="o_crm_activity_panel_row d-flex justify-content-between align-items-start py-1 border-bottom">
+                        <div class="flex-grow-1">
+                            <span class="o_crm_activity_type fw-bold" t-esc="row.type"/>
+                            <span t-if="row.summary" class="o_crm_activity_summary ms-1" t-esc="row.summary"/>
+                            <span t-if="row.deadline" class="o_crm_activity_deadline text-muted ms-1" t-esc="row.deadline"/>
+                            <span t-if="row.user" class="o_crm_activity_user text-muted ms-1" t-esc="row.user"/>
+                            <span t-if="row.pendingSync" class="badge text-bg-warning ms-1 o_crm_activity_pending_sync">Pending sync</span>
+                        </div>
+                        <button t-if="!row.isLogCall and row.activityId"
+                            class="btn btn-sm btn-link o_crm_activity_done"
+                            data-available-offline=""
+                            t-att-disabled="!row.canMarkDone"
+                            t-on-click="() => this.onClickDone(row.activityId)">Done</button>
+                    </li>
+                </ul>
+
+                <div class="o_crm_activity_panel_schedule mb-2">
+                    <div class="fw-bold mb-1">Schedule</div>
+                    <select class="form-select form-select-sm mb-1 o_crm_activity_schedule_type"
+                        t-model.number="this.scheduleTypeId"
+                        t-att-disabled="!this.canSchedule">
+                        <option t-foreach="this.types()" t-as="type" t-key="type.id" t-att-value="type.id" t-esc="type.name"/>
+                    </select>
+                    <input type="text" placeholder="Summary" class="form-control form-control-sm mb-1 o_crm_activity_schedule_summary"
+                        t-model="this.scheduleSummary" t-att-disabled="!this.canSchedule"/>
+                    <input type="date" class="form-control form-control-sm mb-1 o_crm_activity_schedule_deadline"
+                        t-model="this.scheduleDeadline" t-att-disabled="!this.canSchedule"/>
+                    <button class="btn btn-sm btn-primary o_crm_activity_schedule_button"
+                        data-available-offline=""
+                        t-att-disabled="!this.canSchedule"
+                        t-on-click="this.onClickSchedule">Schedule</button>
+                </div>
+
+                <div class="o_crm_activity_panel_log_call">
+                    <div class="fw-bold mb-1">Log a call</div>
+                    <select class="form-select form-select-sm mb-1 o_crm_activity_log_call_type"
+                        t-model.number="this.logCallTypeId"
+                        t-att-disabled="!this.canLogCall">
+                        <option t-foreach="this.types()" t-as="type" t-key="type.id" t-att-value="type.id" t-esc="type.name"/>
+                    </select>
+                    <input type="text" placeholder="Summary" class="form-control form-control-sm mb-1 o_crm_activity_log_call_summary"
+                        t-model="this.logCallSummary" t-att-disabled="!this.canLogCall"/>
+                    <textarea placeholder="Note" class="form-control form-control-sm mb-1 o_crm_activity_log_call_note"
+                        t-model="this.logCallNote" t-att-disabled="!this.canLogCall"></textarea>
+                    <button class="btn btn-sm btn-secondary o_crm_activity_log_call_button"
+                        data-available-offline=""
+                        t-att-disabled="!this.canLogCall"
+                        t-on-click="this.onClickLogCall">Log a call</button>
+                </div>
+            </div>
+        </div>
+    </t>
+</templates>

@@ -1,5 +1,5 @@
-import { expect, test } from "@odoo/hoot";
-import { Component, xml } from "@odoo/owl";
+import { animationFrame, expect, test } from "@odoo/hoot";
+import { Component, useProps, xml } from "@odoo/owl";
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import {
     contains,
@@ -87,4 +87,74 @@ test("useCrmOffline.queueCall schedules a verbatim ORM call tagged with a timeSt
     expect(value.kwargs).toEqual({ context: { a: 1 } });
     expect(value.extras.actionName).toBe("Won");
     expect(typeof value.extras.timeStamp).toBe("number");
+});
+
+/**
+ * m3-activity-panel (architecture.md §3.1, VAL-DATA-009/013/015): the
+ * offline activity panel needs to tell apart, among everything queued,
+ * which entries belong to one particular lead -- a queued `mail.activity`
+ * `create` or `crm.lead` `action_log_call` names the lead directly, but a
+ * bare `action_done([[id]])` only names the activity, so the caller must
+ * pass in the ids it already knows are this lead's own activities.
+ */
+class PendingActivitiesComponent extends Component {
+    static template = xml`<span class="o_pending_activities" t-esc="this.kinds"/>`;
+    props = useProps();
+
+    setup() {
+        this.crmOffline = useCrmOffline();
+    }
+    get kinds() {
+        return JSON.stringify(
+            this.crmOffline
+                .pendingActivities(this.props.leadId, this.props.activityIds || [])
+                .map((e) => e.kind)
+        );
+    }
+}
+
+test("useCrmOffline.pendingActivities finds queued mail.activity.create and crm.lead.action_log_call by lead id", async () => {
+    await mountWithCleanup(PendingActivitiesComponent, { props: { leadId: 7 } });
+    expect(".o_pending_activities").toHaveText("[]");
+
+    const offlinePlugin = getService(OfflinePlugin);
+    offlinePlugin.scheduleORM(
+        "mail.activity",
+        "create",
+        [[{ res_model: "crm.lead", res_id: 7, activity_type_id: 1, summary: "Call back" }]],
+        {},
+        { extras: { timeStamp: Date.now() } }
+    );
+    // Targets a different lead: must not match.
+    offlinePlugin.scheduleORM(
+        "mail.activity",
+        "create",
+        [[{ res_model: "crm.lead", res_id: 99, activity_type_id: 1 }]],
+        {},
+        { extras: { timeStamp: Date.now() } }
+    );
+    offlinePlugin.scheduleORM(
+        "crm.lead",
+        "action_log_call",
+        [[7], 2, "Called", "Interested", 1],
+        {},
+        { extras: { timeStamp: Date.now() } }
+    );
+    await animationFrame();
+    expect(".o_pending_activities").toHaveText(JSON.stringify(["create", "log_call"]));
+});
+
+test("useCrmOffline.pendingActivities only matches action_done entries among the given activityIds", async () => {
+    await mountWithCleanup(PendingActivitiesComponent, { props: { leadId: 7, activityIds: [42] } });
+    expect(".o_pending_activities").toHaveText("[]");
+
+    const offlinePlugin = getService(OfflinePlugin);
+    offlinePlugin.scheduleORM("mail.activity", "action_done", [[42]], {}, {
+        extras: { timeStamp: Date.now() },
+    });
+    offlinePlugin.scheduleORM("mail.activity", "action_done", [[55]], {}, {
+        extras: { timeStamp: Date.now() },
+    });
+    await animationFrame();
+    expect(".o_pending_activities").toHaveText(JSON.stringify(["done"])); // only 42, not 55
 });

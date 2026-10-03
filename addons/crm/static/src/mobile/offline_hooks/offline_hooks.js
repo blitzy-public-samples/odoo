@@ -16,6 +16,7 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
  *  isOffline: () => boolean,
  *  isRecordAvailableOffline: (actionId: number, resId: number|false) => boolean,
  *  queueCall: (model: string, method: string, args: any[], kwargs?: object, extras?: object) => string|number,
+ *  pendingActivities: (leadId: number, activityIds?: number[]) => Array<{key: string, kind: "create"|"log_call"|"done", value: object}>,
  * }}
  */
 export function useCrmOffline() {
@@ -53,6 +54,42 @@ export function useCrmOffline() {
             return offlinePlugin.scheduleORM(model, method, args, kwargs, {
                 extras: { timeStamp: Date.now(), ...extras },
             });
+        },
+
+        /**
+         * Queued activity-related calls for one lead (architecture.md
+         * §3.1 suggested API; first consumer is the offline activity
+         * panel, m3-activity-panel): `mail.activity` `create`s whose vals
+         * target this lead, `crm.lead` `action_log_call`s on this lead,
+         * and `mail.activity` `action_done`s on one of `activityIds`.
+         * `action_done([[id]])` carries no lead id of its own, so the
+         * caller must pass the set of activity ids it already knows
+         * belong to this lead (its already-loaded `activity_ids`); a
+         * `create`/`action_log_call` entry is matched directly, since its
+         * own args/vals name the lead. Returns `{key, kind, value}`
+         * entries, `kind` one of "create", "log_call" or "done".
+         */
+        pendingActivities(leadId, activityIds = []) {
+            const doneIds = new Set(activityIds);
+            const entries = [];
+            for (const { key, value } of Object.values(offlinePlugin._ormToSync())) {
+                const { model, method, args } = value;
+                if (model === "mail.activity" && method === "create") {
+                    const vals = args[0]?.[0];
+                    if (vals?.res_model === "crm.lead" && vals.res_id === leadId) {
+                        entries.push({ key, kind: "create", value });
+                    }
+                } else if (model === "crm.lead" && method === "action_log_call") {
+                    if (args[0]?.[0] === leadId) {
+                        entries.push({ key, kind: "log_call", value });
+                    }
+                } else if (model === "mail.activity" && method === "action_done") {
+                    if (doneIds.has(args[0]?.[0])) {
+                        entries.push({ key, kind: "done", value });
+                    }
+                }
+            }
+            return entries;
         },
     };
 }

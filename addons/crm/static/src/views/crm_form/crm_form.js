@@ -9,6 +9,9 @@ import { formView } from "@web/views/form/form_view";
 // the lead form arch (desktop and touch layouts), both as a plain `<a>`.
 const AI_SWITCH_SELECTOR = "a[name='action_set_automated_probability']";
 
+// m3-activity-panel (VAL-DATA-008): the Won button itself.
+const WON_BUTTON_SELECTOR = "button[name='action_set_won_rainbowman']";
+
 // B1/C6 (offline_inventory.md): the `stage_id` statusbar's inline and
 // dropdown buttons, see the comment at its usage below.
 const STATUSBAR_BUTTON_SELECTOR = ".o_statusbar_status button";
@@ -106,6 +109,22 @@ class CrmFormController extends formView.Controller {
             for (const el of rootEl.querySelectorAll(AI_SWITCH_SELECTOR)) {
                 el.classList.toggle("o_disabled_offline", offline);
             }
+            // VAL-DATA-008: the button carries a static
+            // `data-available-offline` in the arch (so it stays clickable
+            // offline on an *already-synced* lead -- the normal Won
+            // case), which also keeps `OfflinePlugin.SELECTORS_TO_DISABLE`
+            // from ever touching it. A lead created offline has no server
+            // id yet (`record.resId` stays falsy until the queued create
+            // syncs, `record.js`'s `_offlineSave`), and `action_set_won`
+            // has nothing to replay against in that case
+            // (`beforeExecuteActionButton` below already blocks queuing
+            // it); this reflects that in the DOM too, same technique as
+            // the AI-switch above, so the control reads as actually
+            // disabled rather than silently inert.
+            const resId = this.model.root.resId;
+            for (const el of rootEl.querySelectorAll(WON_BUTTON_SELECTOR)) {
+                el.disabled = offline && !resId;
+            }
         };
         let disposeAiSwitchEffect = () => {};
         onMounted(() => {
@@ -186,6 +205,16 @@ class CrmFormController extends formView.Controller {
                 clickParams.type === "object" &&
                 clickParams.name === "action_set_won_rainbowman"
             ) {
+                if (!this.model.root.resId) {
+                    // VAL-DATA-008: a lead created offline has no server
+                    // id yet; `action_set_won([[id]])` has nothing to
+                    // replay against, so block before even attempting
+                    // `record.save()` -- nothing is queued for this
+                    // click at all, not even the record's own pending
+                    // create (which is already queued separately, from
+                    // whichever save created it).
+                    return false;
+                }
                 // Same save-first reasoning as Restore just below: a dirty
                 // edit made before clicking Won must not be lost, and an
                 // invalid form must queue nothing, not even Won.

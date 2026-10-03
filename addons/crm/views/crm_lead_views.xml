@@ -304,6 +304,43 @@
             </field>
         </record>
 
+        <!-- m3-activity-panel (architecture.md §3.3, VAL-DATA-009): loads
+             `activity_ids` with the subfields the offline activity panel
+             needs, hidden with a CSS class rather than `invisible="1"`:
+             relational_model's `getFieldsSpec` (model/relational_model/utils.js)
+             skips a one2many's whole subview field spec once the field's
+             own `invisible` is the literal "1"/"True" ("always
+             invisible" is treated as "don't bother fetching it"), which
+             would leave every row's `activity_type_id`/`summary`/etc.
+             empty offline. `class="d-none"` hides the same DOM without
+             tripping that optimization, so the subfields load normally;
+             desktop online look is unchanged either way. The panel
+             itself renders as a widget right above the chatter; its own
+             template only produces DOM while offline
+             (`crmOffline.isOffline()`), so online this xpath has no
+             visible effect at all. -->
+        <record id="crm_lead_view_form_activity_panel" model="ir.ui.view">
+            <field name="name">crm.lead.form.activity.panel</field>
+            <field name="model">crm.lead</field>
+            <field name="inherit_id" ref="crm_lead_view_form"/>
+            <field name="arch" type="xml">
+                <xpath expr="//chatter" position="before">
+                    <div class="d-none">
+                        <field name="activity_ids">
+                            <list>
+                                <field name="activity_type_id"/>
+                                <field name="summary"/>
+                                <field name="date_deadline"/>
+                                <field name="user_id"/>
+                                <field name="state"/>
+                            </list>
+                        </field>
+                    </div>
+                    <widget name="crm_lead_activity_panel"/>
+                </xpath>
+            </field>
+        </record>
+
         <!--
             crm.lead (as Lead) views
         -->
