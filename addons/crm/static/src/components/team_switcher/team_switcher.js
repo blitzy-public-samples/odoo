@@ -1,6 +1,7 @@
 import { Dropdown } from "@web/core/dropdown/dropdown";
 import { DropdownItem } from "@web/core/dropdown/dropdown_item";
 import { _t } from "@web/core/l10n/translation";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { user } from "@web/core/user";
 import { useService } from "@web/core/utils/hooks";
 import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
@@ -42,9 +43,37 @@ export class TeamSwitcher extends Component {
                 this.isSaleManager = false;
                 return;
             }
-            user.hasGroup("sales_team.group_sale_manager").then((result) => {
-                this.isSaleManager = result;
-            });
+            // m5-fix-team-switcher-catch (research/m5-reconnect-stale-ui.md):
+            // `isOffline()` can briefly read `false` while the network is
+            // actually still down (a stray successful "RPC:RESPONSE" landing
+            // ahead of a parked request's own failure), so this probe can
+            // still reject with `ConnectionLostError` even though it is only
+            // ever issued once `offline` above is already `false`.
+            // `user.hasGroup`'s cache (`Cache.read()`, addons/web/static/src/
+            // core/utils/cache.js) never evicts a rejected promise, so an
+            // unhandled rejection here would stay cached for the rest of the
+            // page's life: every later re-run of this effect would re-raise
+            // the same `ConnectionLostError` unhandled, and
+            // `lostConnectionHandler` (addons/web/static/src/core/offline/
+            // offline_error.js) would call `setOffline(true)` again each
+            // time, looping the page back offline forever. A
+            // `ConnectionLostError` here is therefore treated the same as
+            // the architecture's offline SKIP decision -- the attempted
+            // request fails silently -- but, unlike the `offline` branch
+            // above, it must not overwrite an already-known value with
+            // `false`: keep whatever `isSaleManager` already held (the
+            // existing offline default if it was never known yet). Any
+            // other error is a genuine bug and must still surface.
+            user.hasGroup("sales_team.group_sale_manager").then(
+                (result) => {
+                    this.isSaleManager = result;
+                },
+                (error) => {
+                    if (!(error instanceof ConnectionLostError)) {
+                        throw error;
+                    }
+                }
+            );
         });
         onWillDestroy(disposeIsSaleManagerEffect);
 
