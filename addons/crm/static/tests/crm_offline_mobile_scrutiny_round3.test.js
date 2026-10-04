@@ -1,6 +1,6 @@
 import { defineMailModels, startServer } from "@mail/../tests/mail_test_helpers";
 import { expect, runAllTimers, test } from "@odoo/hoot";
-import { queryAllTexts } from "@odoo/hoot-dom";
+import { animationFrame, queryAllTexts } from "@odoo/hoot-dom";
 import {
     contains,
     defineActions,
@@ -266,6 +266,47 @@ test("VAL-MOBILE-006 matrix: offline, a folded stage shows the helper exactly wh
     expect(findGroup("AllLoaded").list.records.length).toBe(2);
     expect(findGroup("Partial").list.records.length).toBe(2);
     expect(findGroup("EmptyLoaded").list.records.length).toBe(0);
+
+    // Round 4 (synthesis.json, VAL-MOBILE-006): AllLoaded and Partial
+    // both have real records, so `_webReadGroup`'s `opening_info`
+    // (relational_model.js, built from each group's own *current*
+    // `isFolded` right before the request) reliably asks the server to
+    // keep them open across the reload above, and `isFolded` comes back
+    // `false`. EmptyLoaded has none -- it only survives this reload at
+    // all through the mock server's `group_expand` re-splice (module
+    // doc comment above), which does not reproduce that same
+    // opening_info handling for a group with no records of its own, so
+    // its `isFolded` here is not reliably `false` the way the other
+    // two's is. Force a deterministic cycle through the exact same
+    // `toggle()` a real re-open/re-fold would use -- fold first (a
+    // no-op if this reload already left it folded), then unfold again
+    // (which always calls `list.load()`, since it is now definitely
+    // folded going in) -- so EmptyLoaded reaches the shared flush/
+    // fold-back below in the same known-open, known-loaded state as
+    // AllLoaded and Partial, regardless of what this reload left it in.
+    if (!findGroup("EmptyLoaded").isFolded) {
+        await findGroup("EmptyLoaded").toggle();
+    }
+    await findGroup("EmptyLoaded").toggle();
+    expect(findGroup("EmptyLoaded").isFolded).toBe(false);
+    expect(findGroup("EmptyLoaded").list.records.length).toBe(0);
+
+    // Round 4 (synthesis.json, VAL-MOBILE-006): the reloads above handed
+    // AllLoaded, Partial and EmptyLoaded a brand-new `group.list` object
+    // each (every `Group` is rebuilt from scratch, per this file's own
+    // module doc comment) -- the renderer's fetched-state tracker is
+    // now keyed on that object's identity, not the stage id, so only
+    // the setup() effect's own `!group.isFolded` sweep re-marks these
+    // new lists as loaded (the explicit mark `_mobilePipelineGoTo` added
+    // before any of the reloads above pointed at the now-discarded old
+    // objects). Flush pending effects here, while all three are still
+    // unfolded, so that sweep runs before the fold-back below --
+    // otherwise the offline assertions for (a)/(b)/(c) would wrongly see
+    // their post-reload lists as never loaded. The effect is a reactive
+    // `effect()` (owl.js), batched via one `Promise.resolve().then()`
+    // hop (`batchProcessEffects`), not a timer, hence `animationFrame()`
+    // (every other flush in this suite) rather than `runAllTimers()`.
+    await animationFrame();
 
     // Now fold AllLoaded, Partial and EmptyLoaded back -- a pure local
     // flag flip, no RPC, no further `model.load()` -- so each one's
