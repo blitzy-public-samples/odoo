@@ -122,28 +122,32 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // inside the mobile-pipeline branch (`isMobilePipeline` below), so
         // there is no desktop case to branch on.
         this.quickCreatePopover = usePopover(CrmMobileQuickCreate, { useBottomSheet: true });
-        // VAL-MOBILE-018 / architecture.md §3.4: per-stage memory of how
-        // many queued creates `pendingLeadCreates` last saw there -- a
-        // plain field, not a signal/computed: it is never read during
-        // render (so it is not UI state, AGENTS.md §2's "signal/
-        // signal.Object/computed" rule governs *that*), it exists only so
-        // the effect below can tell "still has some" apart from "just lost
-        // its last one" for one particular stage, i.e. the one piece of
-        // own-state the feature's own wording allows ("no own state/store
-        // beyond what OWL needs to compare transitions within the
-        // component"). A count, not a boolean/Set membership: orchestrator-
-        // triage.md blocker 5 needs to know *how many* just synced, to add
-        // that number to the stage's exact pre-sync count instead of
-        // overwriting it with a capped one (see the effect below).
-        this._pendingLeadCreateCountByStage = new Map();
+        // VAL-MOBILE-003/018 / architecture.md §3.4, scrutiny round 2
+        // (orchestrator-triage.md): which stages currently have at least
+        // one queued create -- a plain Set, not a signal/computed: it is
+        // never read during render (AGENTS.md §2's "signal/signal.Object/
+        // computed" rule governs *rendered* state), it exists only so the
+        // effect below can spot one stage's queue draining between two
+        // runs. No per-stage *count* is kept any more: round 1's own
+        // Map<stageId, count> remembered only the last-seen non-zero
+        // count, so two creates in one stage replaying separately (the
+        // queue going 2->1->0, one `_syncORM` call at a time) credited
+        // the stage with just 1 sync instead of 2, and a create discarded
+        // from the systray while offline left its count sitting in the
+        // map to be wrongly credited as a sync on the next reconnect.
+        // Set membership is enough to know *that* a stage's queue just
+        // drained; the exact resulting count is asked from the server
+        // below instead of added up from how many replays crm thinks it
+        // saw.
+        this._stageIdsWithPendingLeadCreates = new Set();
         // VAL-MOBILE-018: the only trigger is the OfflinePlugin's own
         // queue signal, read here through `pendingLeadCreates` (never
         // polling, no online/offline listener of our own -- the queue
         // transition *is* the reconnection signal, since a failed replay
         // re-schedules the same entry under the same key with `extras.
         // error` set, offline_plugin.js's `_syncORM`, so it never leaves
-        // `pendingLeadCreates` non-empty). When one stage's count drops
-        // to zero after having been non-zero, that stage's own `web_save`
+        // `pendingLeadCreates` non-empty). When one stage's set of queued
+        // creates drains while online, that stage's own `web_save`
         // replay(s) all succeeded, so its list -- and only its list -- is
         // reloaded (`group.list.load()`, the same per-group fetch
         // `toggle()` already uses, architecture.md §2) so the real card
@@ -152,73 +156,63 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // stops rendering once the queue entry is gone, crm_kanban_
         // renderer.xml's `mobilePipelinePendingLeadCreatesFor`).
         //
-        // m4-fix-header-after-sync (VAL-MOBILE-003/018): `group.list.
-        // load()` alone only refreshes that stage's own card list
-        // (dynamic_record_list.js's `_setData`/`_updateCount` already
-        // sets `group.list.count` to the fresh row count) -- it never
-        // touches the `Group` datapoint's own `count`/`aggregates`
-        // fields, which is what `CrmMobilePipeline`'s header actually
-        // reads (`t-out="group.count"`, `ProgressBarState.
-        // getAggregateValue` for the revenue sum via `group.aggregates`
-        // cached in `_aggregateValues`), so the header kept showing the
-        // pre-replay numbers until the next full navigation. Fixed the
-        // same way desktop's own kanban keeps a group's header in sync
-        // after its own quick create (`KanbanRenderer.validateQuickCreate`,
-        // `KanbanController.onRecordSaved`): copy the just-reloaded
-        // `group.list.count` onto `group.count` (no RPC, the count the
-        // per-group reload above already fetched) -- UNLESS that reload's
-        // own count is itself capped (orchestrator-triage.md blocker 5:
-        // `web_search_read`'s `count_limit` makes `list.count` top out at
-        // `RelationalModel.DEFAULT_COUNT_LIMIT`, `dynamic_record_list.js`'s
-        // `_updateCount`/`hasLimitedCount`, while the `web_read_group`
-        // count already on `group.count` is exact, group.js:128-136); past
-        // that cap, add the number of creates that just synced to the
-        // exact count the stage already had instead, with no extra RPC.
-        // Then call the public `progressBarState.updateCounts(group)` so
-        // the revenue aggregate is current too. `updateCounts` issues two
-        // framework RPCs -- `read_progress_bar` (bar-segment counts) and,
-        // since the pipeline's `<progressbar sum_field="expected_revenue"
-        // .../>` gives it an aggregate field, `formattedReadGroup` (the
-        // revenue sums) -- both scoped to counts/aggregates only: neither
-        // ever calls any group's `list.load()`, so no other stage's card
-        // list is fetched (VAL-MOBILE-018 stays satisfied); their domain
-        // is the whole board's (same as desktop's identical call), so
-        // other stages' header numbers get refreshed too as a side effect
-        // of that one combined response, but no stage's cards are
-        // re-fetched.
+        // orchestrator-triage.md round 2 (VAL-MOBILE-003/018): a stage's
+        // queue draining while *offline* is a systray discard, not a sync
+        // (`_syncORM` never runs offline) -- it is dropped from tracking
+        // below with no reload, so a later reconnect finds nothing
+        // tracked for that stage and leaves its count untouched, instead
+        // of round 1's carried-forward count wrongly crediting the
+        // discard as a sync once online.
+        //
+        // Draining while *online* reloads the list, then takes the exact
+        // count from the server instead of computing one: `list.load()`'s
+        // own fresh `list.count` is already exact unless it hit
+        // `RelationalModel.DEFAULT_COUNT_LIMIT` (`hasLimitedCount`,
+        // dynamic_record_list.js's `_updateCount`), in which case
+        // `list.fetchCount()` -- the same public "the count is capped,
+        // fetch the real one" method the list/kanban pagers already call
+        // for their own "see all" link (list_controller.js,
+        // kanban_controller.js) -- issues one `search_count` for this
+        // group's own domain and clears the cap on this list's config.
+        // Either way `group.count` ends up a plain copy of that now-exact
+        // `group.list.count`: never the capped number, never crm's own
+        // arithmetic on top of it. Then the public `progressBarState.
+        // updateCounts(group)` refreshes the revenue aggregate the same
+        // way as before (its own two RPCs, `read_progress_bar` and
+        // `formattedReadGroup`, never call any group's `list.load()`, so
+        // no other stage's card list is fetched).
         useEffect(() => {
             if (!this.isMobilePipeline) {
                 return;
             }
-            const pendingLeadCreateCountByStage = new Map();
+            const stageIdsWithPendingLeadCreates = new Set();
             for (const group of this.mobilePipelineGroups) {
                 const stageId = group.value;
-                const pendingCount = this.crmOffline.pendingLeadCreates(stageId).length;
-                if (pendingCount) {
-                    pendingLeadCreateCountByStage.set(stageId, pendingCount);
-                } else if (this._pendingLeadCreateCountByStage.has(stageId)) {
-                    const syncedCount = this._pendingLeadCreateCountByStage.get(stageId);
-                    if (this.crmOffline.isOffline()) {
-                        // Emptied by a discard, not a sync (`_syncORM`
-                        // never runs while offline): skip the reload --
-                        // `isOffline()` checked before loading, never
-                        // caught from the load itself, same as every
-                        // other offline probe in this addon (AGENTS.md
-                        // §2) -- and carry the count forward so a later
-                        // run, once back online, still reloads this stage
-                        // if it is still the one that needs it then.
-                        pendingLeadCreateCountByStage.set(stageId, syncedCount);
-                        continue;
-                    }
-                    group.list.load().then(() => {
-                        group.count = group.list.hasLimitedCount
-                            ? group.count + syncedCount
-                            : group.list.count;
+                const hasPendingLeadCreates =
+                    this.crmOffline.pendingLeadCreates(stageId).length > 0;
+                if (hasPendingLeadCreates) {
+                    stageIdsWithPendingLeadCreates.add(stageId);
+                } else if (
+                    this._stageIdsWithPendingLeadCreates.has(stageId) &&
+                    !this.crmOffline.isOffline()
+                ) {
+                    group.list.load().then(async () => {
+                        if (group.list.hasLimitedCount) {
+                            await group.list.fetchCount();
+                        }
+                        group.count = group.list.count;
                         this.props.progressBarState?.updateCounts(group);
                     });
                 }
+                // Still offline here means this stage's queue drained via
+                // a discard, not a replay (`isOffline()` checked before
+                // acting, never caught from the reload itself, the same
+                // "skip, don't catch" rule as every other offline probe
+                // in this addon, architecture.md §2): leave it out of
+                // `stageIdsWithPendingLeadCreates` so nothing is reloaded
+                // now or carried forward to a later reconnect.
             }
-            this._pendingLeadCreateCountByStage = pendingLeadCreateCountByStage;
+            this._stageIdsWithPendingLeadCreates = stageIdsWithPendingLeadCreates;
         });
     }
 
@@ -294,12 +288,26 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
      * (group.js:95-101) never clears `list.records` on folding, so a
      * group folded again (or synced into while still folded, see the
      * sync-refresh effect above) keeps whatever it already loaded.
-     * orchestrator-triage.md blockers 2 and 4: treating every folded
-     * group as uncached hid cards the pipeline had already fetched; only
-     * a stage with no loaded records at all still needs the helper.
+     * orchestrator-triage.md round-1 blockers 2 and 4: treating every
+     * folded group as uncached hid cards the pipeline had already
+     * fetched; only a stage with records it hasn't loaded yet still
+     * needs the helper.
+     *
+     * orchestrator-triage.md round 2: `!group.list.records.length` alone
+     * can't tell a stage that was fetched online and is genuinely empty
+     * apart from one never fetched at all -- both have zero records in
+     * memory. `group.count` is the one way to tell them apart without a
+     * crm-owned "have I fetched this" cache: it comes from the pipeline's
+     * one board-wide `web_read_group`, which reports every stage's exact
+     * total up front regardless of fold state (architecture.md §3.4), so
+     * it is already 0 for a stage with nothing to show and > 0 for one
+     * whose leads this device just hasn't loaded. Comparing it against
+     * the records actually in memory, rather than testing either number
+     * in isolation, keeps a partially-loaded stage (fewer records loaded
+     * than its count) correctly "uncached" too.
      */
     mobilePipelineIsUncached(group) {
-        return group.isFolded && !group.list.records.length;
+        return group.isFolded && group.list.records.length < group.count;
     }
 
     /**
