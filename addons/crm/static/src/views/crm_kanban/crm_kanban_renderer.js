@@ -140,6 +140,38 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // below instead of added up from how many replays crm thinks it
         // saw.
         this._stageIdsWithPendingLeadCreates = new Set();
+        // VAL-MOBILE-006, scrutiny round 3 (synthesis.json): which stages'
+        // lists have been loaded at least once in this pipeline instance.
+        // `mobilePipelineIsUncached` below needs this to tell a folded
+        // stage that already has its (possibly partial, possibly empty)
+        // data from one that was never loaded at all -- `group.isFolded`
+        // and `group.count`/`group.list.records.length` cannot do this on
+        // their own (see that getter's own comment). Checked first for a
+        // framework equivalent: neither `Group`
+        // (addons/web/static/src/model/relational_model/group.js) nor
+        // `DynamicList`/`DynamicRecordList`/`DynamicGroupList`
+        // (.../dynamic_list.js, dynamic_record_list.js,
+        // dynamic_group_list.js) expose an `isLoaded`/load-promise/offset
+        // signal; `DynamicList.load()` is fire-and-forget and leaves no
+        // trace of having run. So this is a plain, component-level `Set`
+        // (not a `signal`/`computed`, same reasoning as
+        // `_stageIdsWithPendingLeadCreates` above: AGENTS.md §2's
+        // "signal/computed" rule governs *rendered* state read during
+        // `render()`, and `mobilePipelineIsUncached` is only ever called
+        // from the template, which already re-renders on every fold/
+        // offline/navigation change that could affect this Set's answer,
+        // same timing argument as that field), reset on remount, storing
+        // only ids, never the records themselves (not a second cache of
+        // lead data -- the framework's own `group.list.records` remains
+        // the only copy). Entries are added when a stage's list is loaded
+        // (the sync-refresh reload below) or when its group is unfolded
+        // online (`_mobilePipelineGoTo`), and -- defensively, so a group
+        // unfolded by any other path (a future control, or a test driving
+        // the model directly) is still recognized -- whenever this effect
+        // observes a group currently unfolded. Entries are never removed:
+        // once a stage's list has been fetched this session, re-folding
+        // it never un-fetches it.
+        this._stageIdsWithLoadedList = new Set();
         // VAL-MOBILE-018: the only trigger is the OfflinePlugin's own
         // queue signal, read here through `pendingLeadCreates` (never
         // polling, no online/offline listener of our own -- the queue
@@ -188,6 +220,18 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
             const stageIdsWithPendingLeadCreates = new Set();
             for (const group of this.mobilePipelineGroups) {
                 const stageId = group.value;
+                // VAL-MOBILE-006, scrutiny round 3: a group currently
+                // unfolded has, by construction, already had its list
+                // loaded (either inline in the pipeline's initial
+                // `web_read_group`, for a stage not folded by default, or
+                // by `group.toggle()`'s own `list.load()` the moment it
+                // was unfolded) -- recognize that unconditionally, not
+                // only for stages this effect also happens to be
+                // reloading below, so any unfold path (including one
+                // this file doesn't itself drive) is still picked up.
+                if (!group.isFolded) {
+                    this._stageIdsWithLoadedList.add(stageId);
+                }
                 const hasPendingLeadCreates =
                     this.crmOffline.pendingLeadCreates(stageId).length > 0;
                 if (hasPendingLeadCreates) {
@@ -197,6 +241,14 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
                     !this.crmOffline.isOffline()
                 ) {
                     group.list.load().then(async () => {
+                        // VAL-MOBILE-006: this reload can run while
+                        // `group` stays folded (a create synced into a
+                        // folded stage the user never unfolded, e.g. the
+                        // "blockers 2/4" regression test) -- the group
+                        // is loaded now regardless, so a later offline
+                        // visit must not show the helper beside its own
+                        // just-synced cards.
+                        this._stageIdsWithLoadedList.add(stageId);
                         if (group.list.hasLimitedCount) {
                             await group.list.fetchCount();
                         }
@@ -278,36 +330,44 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
     /**
      * VAL-MOBILE-006/018 / architecture.md §3.4 "Offline: cached stage
      * renders; uncached stage shows OfflineActionHelper": a stage's
-     * records are "cached" once they have actually been fetched, which is
-     * not the same thing as "unfolded" -- a folded group's records come
-     * from their own, separately disk-cached `list.load()` call, unlike
-     * the rest of the pipeline, whose columns (count and `expected_revenue`
-     * aggregate included) all come from the one `web_read_group` that
-     * loaded the whole board (research/design_options.md "per-stage
-     * offline behaviour"), and upstream's `Group.toggle()`
-     * (group.js:95-101) never clears `list.records` on folding, so a
-     * group folded again (or synced into while still folded, see the
-     * sync-refresh effect above) keeps whatever it already loaded.
-     * orchestrator-triage.md round-1 blockers 2 and 4: treating every
-     * folded group as uncached hid cards the pipeline had already
-     * fetched; only a stage with records it hasn't loaded yet still
-     * needs the helper.
+     * records are "cached" once its list has actually been loaded, which
+     * is not the same thing as "unfolded" -- a folded group's records
+     * come from their own, separately disk-cached `list.load()` call,
+     * unlike the rest of the pipeline, whose columns (count and
+     * `expected_revenue` aggregate included) all come from the one
+     * `web_read_group` that loaded the whole board (research/
+     * design_options.md "per-stage offline behaviour"), and upstream's
+     * `Group.toggle()` (group.js:95-101) never clears `list.records` on
+     * folding, so a group folded again (or synced into while still
+     * folded, see the sync-refresh effect above) keeps whatever it
+     * already loaded. orchestrator-triage.md round-1 blockers 2 and 4:
+     * treating every folded group as uncached hid cards the pipeline had
+     * already fetched; only a stage whose list has never been loaded
+     * still needs the helper.
      *
-     * orchestrator-triage.md round 2: `!group.list.records.length` alone
-     * can't tell a stage that was fetched online and is genuinely empty
-     * apart from one never fetched at all -- both have zero records in
-     * memory. `group.count` is the one way to tell them apart without a
-     * crm-owned "have I fetched this" cache: it comes from the pipeline's
-     * one board-wide `web_read_group`, which reports every stage's exact
-     * total up front regardless of fold state (architecture.md §3.4), so
-     * it is already 0 for a stage with nothing to show and > 0 for one
-     * whose leads this device just hasn't loaded. Comparing it against
-     * the records actually in memory, rather than testing either number
-     * in isolation, keeps a partially-loaded stage (fewer records loaded
-     * than its count) correctly "uncached" too.
+     * Scrutiny round 2's own fix compared `group.list.records.length`
+     * against `group.count` to tell a loaded-but-empty stage apart from
+     * one never fetched at all. Scrutiny round 3 (synthesis.json)
+     * disproved that: a *partly* loaded stage (fewer records loaded than
+     * its count, e.g. 80 of 81 leads, exactly how a folded stage with
+     * more leads than the kanban page size looks after being unfolded
+     * once) satisfies `records.length < count` just as much as a never-
+     * loaded one, so the helper was wrongly shown next to 80 perfectly
+     * good cards; and a never-loaded stage with `count === 0` satisfied
+     * neither side of that comparison, so the helper was wrongly
+     * withheld from it. Neither `group.count` nor `group.list.records`
+     * can answer "was this stage's list ever loaded" by itself -- that is
+     * a fact about the *list*, not about how many rows it happens to
+     * hold -- so this now reads `_stageIdsWithLoadedList` (this
+     * component's own fetched-state tracker, set up in `setup()` above;
+     * no framework signal for it exists, see that field's own comment)
+     * instead of comparing either number: a folded stage's cards (full,
+     * partial, or empty) always render once loaded, and the helper shows
+     * only for a stage whose list this pipeline instance has never
+     * loaded, regardless of its count.
      */
     mobilePipelineIsUncached(group) {
-        return group.isFolded && group.list.records.length < group.count;
+        return group.isFolded && !this._stageIdsWithLoadedList.has(group.value);
     }
 
     /**
@@ -326,6 +386,14 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         this.mobilePipelineIndex.set(index);
         if (group.isFolded && !this.crmOffline.isOffline()) {
             await group.toggle();
+            // VAL-MOBILE-006: the explicit "unfolded online" half of
+            // `_stageIdsWithLoadedList`'s rule (setup() above); the
+            // effect's own `!group.isFolded` sweep would also catch this
+            // on its next run, but marking it here, right as the load
+            // that just happened resolves, keeps the fetched-state
+            // tracker in sync with this stage's own navigation step
+            // instead of waiting for the next unrelated render.
+            this._stageIdsWithLoadedList.add(group.value);
         }
     }
 
