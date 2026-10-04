@@ -11,7 +11,7 @@ import {
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 import { ResPartner } from "@mail/../tests/mock_server/mock_models/res_partner";
 
 // The small-screen picker (`SelectCreateDialog`) renders `resModel` as a

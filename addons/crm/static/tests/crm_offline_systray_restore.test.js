@@ -15,7 +15,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * VAL-QUEUE-004 (architecture.md §3.2 item 11 / offline_inventory.md

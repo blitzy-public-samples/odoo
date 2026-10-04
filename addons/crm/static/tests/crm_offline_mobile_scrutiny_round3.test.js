@@ -14,7 +14,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { WebClient } from "@web/webclient/webclient";
 import { CrmKanbanModel } from "@crm/views/crm_kanban/crm_kanban_model";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * validation/mobile-ui/scrutiny/synthesis.json (M4 scrutiny round 3),

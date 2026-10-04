@@ -9,7 +9,7 @@ import {
     models,
     onRpc,
 } from "@web/../tests/web_test_helpers";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * Defect 7 (architecture.md §3.2 item 7 / offline_inventory.md rows A1/A2):

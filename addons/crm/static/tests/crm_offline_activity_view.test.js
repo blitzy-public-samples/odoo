@@ -14,7 +14,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { serializeDate, today } from "@web/core/l10n/dates";
 import { WebClient } from "@web/webclient/webclient";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * VAL-DIS-007 (B81): the `crm_activity` view's empty cell, "Schedule

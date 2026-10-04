@@ -15,7 +15,7 @@ import {
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * m3-mark-won (architecture.md §3.3, offline_inventory.md rows B1/C6,

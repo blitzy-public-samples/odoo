@@ -16,7 +16,7 @@ import {
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { WebClient } from "@web/webclient/webclient";
 import { CrmColumnProgress } from "@crm/views/crm_kanban/crm_column_progress";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * Defect 5 (architecture.md §3.2 item 5 / offline_inventory.md row A7):

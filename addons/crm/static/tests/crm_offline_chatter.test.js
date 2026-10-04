@@ -22,7 +22,7 @@ import {
     models,
     serverState,
 } from "@web/../tests/web_test_helpers";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * Defect 8 (architecture.md §3.2 item 8 / offline_inventory.md row B14):

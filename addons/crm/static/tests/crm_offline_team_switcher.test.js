@@ -21,7 +21,7 @@ import { WebClient } from "@web/webclient/webclient";
 import { getDefaultConfig } from "@web/views/view";
 import { TeamSwitcher } from "@crm/components/team_switcher/team_switcher";
 import { CrmSearchModel } from "@crm/views/crm_search_model";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * Defect 3 (architecture.md §3.2 item 3 / offline_inventory.md rows

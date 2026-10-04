@@ -17,7 +17,7 @@ import { rpcBus } from "@web/core/network/rpc";
 import { today } from "@web/core/l10n/dates";
 import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * m3-activity-panel (architecture.md §3.3, offline_inventory.md rows

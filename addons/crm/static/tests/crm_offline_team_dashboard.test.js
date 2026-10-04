@@ -12,7 +12,7 @@ import {
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * VAL-DIS-026 (B32-B39, B76, B77, C19, C21): the team dashboard kanban's own

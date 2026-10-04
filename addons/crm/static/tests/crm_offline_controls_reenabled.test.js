@@ -24,7 +24,7 @@ import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { LeadGenerationDropdown } from "@crm/components/lead_generation_dropdown/lead_generation_dropdown";
 import { TeamSwitcher } from "@crm/components/team_switcher/team_switcher";
 import { CrmColumnProgress } from "@crm/views/crm_kanban/crm_column_progress";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * VAL-FIX-013: a single offline → online cycle re-enables every M2-disabled

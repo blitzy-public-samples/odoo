@@ -13,7 +13,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { rpcBus } from "@web/core/network/rpc";
 import { WebClient } from "@web/webclient/webclient";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * m3-offline-cold-start (VAL-COLD-001, amended VAL-SKIP-001/VAL-FIX-007,

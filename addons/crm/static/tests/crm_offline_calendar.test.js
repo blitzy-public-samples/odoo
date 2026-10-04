@@ -13,7 +13,7 @@ import {
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { WebClient } from "@web/webclient/webclient";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * VAL-DIS-008 (B82): every click path that opens a calendar event (single

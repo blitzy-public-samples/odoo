@@ -19,7 +19,7 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
 import { CrmStage } from "@crm/../tests/mock_server/mock_models/crm_stage";
 import { CrmTeam } from "@crm/../tests/mock_server/mock_models/crm_team";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * m2-queue-semantics-tests (VAL-QUEUE-001/002/003/007/008). AGENTS.md

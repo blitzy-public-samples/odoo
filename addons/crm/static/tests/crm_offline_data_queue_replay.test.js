@@ -15,7 +15,7 @@ import {
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
 import { CrmKanbanModel } from "@crm/views/crm_kanban/crm_kanban_model";
-import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
+import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * m3-framework-data-coverage (VAL-DATA-001/002/003, architecture.md §3.3
