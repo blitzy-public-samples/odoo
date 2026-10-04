@@ -194,8 +194,34 @@ test("offline, Schedule queues one client-resolved mail.activity.create and show
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1); // online visit: warms the activity-type disk cache
 
+    // VAL-DATA-010: `data-available-offline` is required on every usable
+    // Schedule control, not just the Schedule button -- `OfflinePlugin`
+    // only ever disables untagged `<button>`s (`SELECTORS_TO_DISABLE`), so
+    // tagging the type/summary/deadline inputs and selects has no runtime
+    // effect; this is a markup requirement, checked here directly, not
+    // proof of a disabled-state toggle. `rpcBus`'s "RPC:REQUEST" (not a
+    // model/method `onRpc()` listener, which never fires once offline --
+    // see crm_offline_team_switcher.test.js:272-281) confirms Schedule
+    // issues no onchange, no name_create and no mail.activity.schedule
+    // wizard call, only the one create queued below.
+    const requests = [];
+    const onRequest = ({ detail }) => requests.push(detail.data.params);
+    rpcBus.addEventListener("RPC:REQUEST", onRequest);
+    after(() => rpcBus.removeEventListener("RPC:REQUEST", onRequest));
+
     const setOffline = mockCrmOffline();
     await setOffline(true);
+
+    for (const selector of [
+        ".o_crm_activity_schedule_type",
+        ".o_crm_activity_schedule_user",
+        ".o_crm_activity_schedule_summary",
+        ".o_crm_activity_schedule_deadline",
+        ".o_crm_activity_schedule_button",
+    ]) {
+        expect(selector).toHaveAttribute("data-available-offline");
+        expect(selector).not.toHaveAttribute("disabled");
+    }
 
     expect(".o_crm_activity_schedule_type").toHaveValue(String(callId));
     await contains(".o_crm_activity_schedule_summary").edit("Call back next week");
@@ -231,6 +257,9 @@ test("offline, Schedule queues one client-resolved mail.activity.create and show
         ],
     ]);
     expect(typeof value.extras.timeStamp).toBe("number");
+    expect(requests.some((params) => params.method === "onchange")).toBe(false);
+    expect(requests.some((params) => params.method === "name_create")).toBe(false);
+    expect(requests.some((params) => params.model === "mail.activity.schedule")).toBe(false);
 
     expect(".o_crm_activity_panel_row").toHaveCount(1);
     expect(".o_crm_activity_panel_row .o_crm_activity_pending_sync").toHaveCount(1);
@@ -576,6 +605,18 @@ test("offline, Log a call queues exactly one crm.lead.action_log_call, nothing e
 
     const setOffline = mockCrmOffline();
     await setOffline(true);
+
+    // VAL-DATA-010: Log a call's fields are also "usable Schedule/Log-a-call
+    // controls" under the panel's "each usable control" wording.
+    for (const selector of [
+        ".o_crm_activity_log_call_type",
+        ".o_crm_activity_log_call_summary",
+        ".o_crm_activity_log_call_note",
+        ".o_crm_activity_log_call_button",
+    ]) {
+        expect(selector).toHaveAttribute("data-available-offline");
+        expect(selector).not.toHaveAttribute("disabled");
+    }
 
     await contains(".o_crm_activity_log_call_summary").edit("Called the lead");
     await contains(".o_crm_activity_log_call_note").edit("Interested, call back later");

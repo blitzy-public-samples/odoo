@@ -28,6 +28,7 @@
                 <div class="o_crm_activity_panel_schedule mb-2">
                     <div class="fw-bold mb-1">Schedule</div>
                     <select class="form-select form-select-sm mb-1 o_crm_activity_schedule_type"
+                        data-available-offline=""
                         t-model.number="this.scheduleTypeId"
                         t-att-disabled="!this.canSchedule">
                         <option t-foreach="this.types()" t-as="type" t-key="type.id" t-att-value="type.id" t-esc="type.name"/>
@@ -39,8 +40,10 @@
                         <option t-foreach="this.assignableUsers()" t-as="assignee" t-key="assignee.id" t-att-value="assignee.id" t-esc="assignee.display_name"/>
                     </select>
                     <input type="text" placeholder="Summary" class="form-control form-control-sm mb-1 o_crm_activity_schedule_summary"
+                        data-available-offline=""
                         t-model="this.scheduleSummary" t-att-disabled="!this.canSchedule"/>
                     <input type="date" class="form-control form-control-sm mb-1 o_crm_activity_schedule_deadline"
+                        data-available-offline=""
                         t-model="this.scheduleDeadline" t-att-disabled="!this.canSchedule"/>
                     <button class="btn btn-sm btn-primary o_crm_activity_schedule_button"
                         data-available-offline=""
@@ -51,13 +54,16 @@
                 <div class="o_crm_activity_panel_log_call">
                     <div class="fw-bold mb-1">Log a call</div>
                     <select class="form-select form-select-sm mb-1 o_crm_activity_log_call_type"
+                        data-available-offline=""
                         t-model.number="this.logCallTypeId"
                         t-att-disabled="!this.canLogCall">
                         <option t-foreach="this.callTypes" t-as="type" t-key="type.id" t-att-value="type.id" t-esc="type.name"/>
                     </select>
                     <input type="text" placeholder="Summary" class="form-control form-control-sm mb-1 o_crm_activity_log_call_summary"
+                        data-available-offline=""
                         t-model="this.logCallSummary" t-att-disabled="!this.canLogCall"/>
                     <textarea placeholder="Note" class="form-control form-control-sm mb-1 o_crm_activity_log_call_note"
+                        data-available-offline=""
                         t-model="this.logCallNote" t-att-disabled="!this.canLogCall"></textarea>
                     <button class="btn btn-sm btn-secondary o_crm_activity_log_call_button"
                         data-available-offline=""

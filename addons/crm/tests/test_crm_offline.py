@@ -317,6 +317,14 @@ class TestCrmOffline(TestCrmCommon):
         do), must leave the chatter with one done note and the lead with
         no open (active) activity -- the same result logging a call
         online leaves.
+
+        VAL-DATA-020 (orchestrator-triage.md): also checks that the
+        summary (not just the note) is in the message, that the message
+        is tied to a Call activity type and to mail's activity subtype,
+        and compares the result field-by-field with logging the same call
+        online -- there is no other online "log a call" method, so "online"
+        here means `activity_schedule()` + `action_feedback()`, the two
+        calls crm's own `action_log_call` combines into one.
         """
         lead = self.env['crm.lead'].create({
             'name': 'Lead For Logged Call',
@@ -325,25 +333,65 @@ class TestCrmOffline(TestCrmCommon):
             'user_id': self.user_sales_salesman.id,
             'stage_id': self.stage_team1_1.id,
         })
+        online_lead = self.env['crm.lead'].create({
+            'name': 'Lead For Logged Call (online)',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        })
         call_type = self.env.ref('mail.mail_activity_data_call')
         salesman_lead = self.env['crm.lead'].with_user(self.user_sales_salesman).browse(lead.id)
+        salesman_online_lead = self.env['crm.lead'].with_user(self.user_sales_salesman).browse(online_lead.id)
+        summary = 'Called the prospect'
+        note = 'Interested, will follow up next week'
+
+        # Online comparator, done first so both messages exist to compare:
+        # the two calls crm's own action_log_call combines into one.
+        online_activity = salesman_online_lead.activity_schedule(
+            'mail.mail_activity_data_call', summary=summary, user_id=self.user_sales_salesman.id,
+        )
+        online_message_id = online_activity.action_feedback(feedback=note)
 
         # Replay exactly as `_syncORM` replays the queued call: same
         # model, method, args -- no sudo.
         message_id = salesman_lead.action_log_call(
-            call_type.id, 'Called the prospect', 'Interested, will follow up next week',
-            self.user_sales_salesman.id,
+            call_type.id, summary, note, self.user_sales_salesman.id,
         )
         lead.invalidate_recordset()
+        online_lead.invalidate_recordset()
 
         self.assertTrue(message_id, 'action_log_call must leave a done message in the chatter')
         message = self.env['mail.message'].browse(message_id)
+        online_message = self.env['mail.message'].browse(online_message_id)
         self.assertEqual(message.model, 'crm.lead')
         self.assertEqual(message.res_id, lead.id)
-        self.assertIn('Interested, will follow up next week', message.body)
+        self.assertIn(summary, message.body)
+        self.assertIn(note, message.body)
+        self.assertEqual(
+            message.mail_activity_type_id, call_type,
+            'The done message must be tied to the Call activity type it closed'
+        )
+        self.assertEqual(
+            message.subtype_id, self.env.ref('mail.mt_activities'),
+            "A logged call's done note must use mail's activity subtype"
+        )
         self.assertFalse(
             lead.activity_ids,
             'action_log_call must leave no open activity on the lead'
+        )
+
+        # Field-by-field parity with logging the same call online: the
+        # queue replays action_log_call verbatim, so its result must not
+        # differ from the two online calls it stands in for.
+        self.assertEqual(message.body, online_message.body)
+        self.assertEqual(message.message_type, online_message.message_type)
+        self.assertEqual(message.subtype_id, online_message.subtype_id)
+        self.assertEqual(message.mail_activity_type_id, online_message.mail_activity_type_id)
+        self.assertEqual(message.author_id, online_message.author_id)
+        self.assertFalse(
+            online_lead.activity_ids,
+            'Logging a call online must likewise leave no open activity on the lead'
         )
 
         logged_activity = self.env['mail.activity'].with_context(active_test=False).search([
