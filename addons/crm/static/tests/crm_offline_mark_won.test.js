@@ -232,6 +232,75 @@ test("online, Won still calls action_set_won_rainbowman and shows the rainbowman
 });
 
 // ---------------------------------------------------------------------------
+// m5-fix-online-guards (VAL-REPO-013 clause (b)): CrmFormController's
+// onPatched/effect handler used to recompute the Won button's `disabled` on
+// every patch *and* on every `isOffline()` change, unconditionally
+// (`el.disabled = offline && !resId`), which is always `false` once online.
+// web's own `executeButtonCallback`
+// (addons/web/static/src/views/view_button/view_button_hook.js) disables
+// every enabled button in the view *before* calling the button's action, to
+// close exactly this double-submit window, and only re-enables them once the
+// action settles. Anything that re-runs CRM's own sync logic while that
+// action is still in flight (here, a brief connectivity blip -- `effect()`
+// re-runs on every `isOffline()` change "independently of whether anything
+// else causes this controller to re-render", per the comment above) must not
+// clear that in-flight disable. The fix marks the button with a dataset flag
+// only when CRM itself disabled it (offline, unsaved lead); the sync logic
+// then only ever touches `disabled` when that flag is present, so a stray
+// run during a pending action leaves web's own disable alone.
+// ---------------------------------------------------------------------------
+
+test.tags("desktop");
+test("online, Won stays disabled by a brief offline blip while action_set_won_rainbowman is pending (desktop)", async () => {
+    const wonDeferred = Promise.withResolvers();
+    onRpc("crm.lead", "action_set_won_rainbowman", function ({ args }) {
+        expect.step("action_set_won_rainbowman");
+        return wonDeferred.promise.then(() => {
+            this.env["crm.lead"].write(args[0], { won_status: "won" });
+            return {
+                type: "ir.actions.act_window_close",
+                effect: { type: "rainbow_man", message: "Yeah!" },
+            };
+        });
+    });
+    onRpc("crm.lead", "action_set_won", () => expect.step("action_set_won"));
+    const setOffline = mockCrmOffline();
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    const wonButton = "button[name='action_set_won_rainbowman']";
+    const nameInput = ".o_field_widget[name='name'] input";
+
+    // "on a dirty lead form": the Won click's own save-first step
+    // (FormController.beforeExecuteActionButton) must save this edit.
+    await contains(nameInput).edit("Dirty lead");
+    expect(wonButton).not.toHaveAttribute("disabled");
+
+    await contains(wonButton).click();
+    // web's executeButtonCallback disabled every enabled button in the
+    // view before awaiting the (still-pending) action_set_won_rainbowman
+    // call -- this is the in-flight disable the fix must not clobber.
+    expect(wonButton).toHaveAttribute("disabled");
+
+    // A brief connectivity blip while action_set_won_rainbowman is still
+    // pending: this lead is already saved (has a server id), so CRM's own
+    // sync logic would -- correctly -- leave the button enabled were it
+    // actually offline; what matters here is that going back online runs
+    // that same shared logic again (`effect(syncAiSwitchOfflineState)`)
+    // while the Won action is still in flight.
+    await setOffline(true);
+    await setOffline(false);
+    expect(wonButton).toHaveAttribute("disabled"); // must still be disabled: not cleared by CRM's own sync logic
+
+    wonDeferred.resolve();
+    await animationFrame();
+    expect.verifySteps(["action_set_won_rainbowman"]); // called exactly once: no double submit
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(1);
+    expect(wonButton).toHaveCount(0); // won now: the button's own invisible condition hides it
+});
+
+// ---------------------------------------------------------------------------
 // Same save-first ordering VAL-QUEUE-005 established for Restore applies to
 // Won: a dirty edit made before clicking "Won" must not be lost, and an
 // invalid form must queue nothing, not even Won.

@@ -673,9 +673,10 @@ test("offline-queued create, action_done and action_log_call all replay verbatim
     // OfflinePlugin schedules a startup sync 3s after mount (offline_plugin.js's
     // constructor). Flush it now, while the queue is empty and it's a no-op: left
     // pending, it would fire during the runAllTimers() below and race the real
-    // sync triggered by setOffline(false) (hoot's MockLockManager doesn't actually
-    // serialize navigator.locks.request, so two concurrent _syncORM() runs can
-    // interleave and replay an entry twice while skipping another).
+    // sync triggered by setOffline(false) (hoot's mocked cross-tab lock manager
+    // doesn't actually serialize the two tabs' sync requests the way a real
+    // browser's does, so two concurrent _syncORM() runs can interleave and
+    // replay an entry twice while skipping another).
     await runAllTimers();
 
     const setOffline = mockCrmOffline();

@@ -121,9 +121,30 @@ class CrmFormController extends formView.Controller {
             // it); this reflects that in the DOM too, same technique as
             // the AI-switch above, so the control reads as actually
             // disabled rather than silently inert.
+            //
+            // m5-fix-online-guards (VAL-REPO-013 clause (b)): this runs on
+            // every patch *and* on every `isOffline()` change, online
+            // included, so it must never unconditionally assign
+            // `el.disabled`: web's `executeButtonCallback`
+            // (addons/web/static/src/views/view_button/view_button_hook.js)
+            // disables every enabled button in the view while this same
+            // button's own action (action_set_won_rainbowman) is in flight,
+            // to close a double-submit window, and only re-enables them
+            // once it settles. Overwriting `disabled` here regardless would
+            // clear that in-flight disable on any stray run during the
+            // action (a patch, or a connectivity blip) and reopen the
+            // window. The `crmDisabledOffline` dataset flag records that
+            // *this* code set the disable, so it only ever clears a
+            // disable it put there itself.
             const resId = this.model.root.resId;
             for (const el of rootEl.querySelectorAll(WON_BUTTON_SELECTOR)) {
-                el.disabled = offline && !resId;
+                if (offline && !resId) {
+                    el.disabled = true;
+                    el.dataset.crmDisabledOffline = "1";
+                } else if (el.dataset.crmDisabledOffline) {
+                    el.disabled = false;
+                    delete el.dataset.crmDisabledOffline;
+                }
             }
         };
         let disposeAiSwitchEffect = () => {};

@@ -304,6 +304,80 @@ class TestCrmOffline(TestCrmCommon):
         })
         self.assertEqual(explicit_activity.res_model, 'crm.lead')
 
+    def test_mail_activity_create_without_res_id_behaves_as_on_eval_base(self):
+        """ m5-fix-online-guards (VAL-REPO-013 clause (b)): the override
+        above must only step in for the one input shape that actually
+        raised on `eval/base` -- a queued Schedule create with both
+        `res_model` and `res_id` set but no `res_model_id`. Without a
+        `res_id`, the override must leave `create()` exactly as it is on
+        `eval/base` (no crm override at all).
+
+        Verified directly in an `odoo shell` savepoint probe against this
+        same database: calling `mail.activity`'s own `create()` (resolved
+        from the MRO past crm's override class, i.e. literally what
+        `eval/base` runs, since that branch never had
+        `addons/crm/models/mail_activity.py`) with
+        `{'res_model': 'crm.lead', ...}` and no `res_id`/`res_model_id`
+        succeeds and returns `res_model=False, res_model_id=False,
+        res_id=0` -- an orphan activity, not a `CheckViolation`. Reasoned
+        from the field definitions: `res_model` is declared
+        `precompute=True, readonly=True`
+        (`addons/mail/models/mail_activity.py`), so
+        `BaseModel._prepare_create_values` discards whatever value a
+        caller puts in `vals['res_model']` before `create()` ever sees it
+        (it only keeps precomputed *readonly* fields out of vals "to force
+        their computation"), and `_add_precomputed_values` recomputes it
+        from `res_model_id` on the new record. With no `res_model_id`
+        given, the recomputed `res_model` is False, which is consistent
+        with mail's SQL constraint `_check_res_id_is_set_if_model` (both
+        res_model and res_id empty) -- so the create succeeds as an
+        orphan. The current (buggy, pre-fix) crm override instead sets
+        `res_model_id` from the bare `res_model` check alone, so
+        `res_model` gets recomputed to 'crm.lead' while `res_id` stays
+        unset -- violating that same constraint and raising a
+        `CheckViolation` that never happens on eval/base. The fix adds
+        `vals.get('res_id')` to the override's guard so it only maps
+        `res_model_id` for the one shape that needs it (an explicit
+        `res_id`, VAL-DATA-019's Schedule-queue shape, still covered by
+        the test right above this one).
+        """
+        lead = self.env['crm.lead'].create({
+            'name': 'Lead Never Referenced By The Create Below',
+            'type': 'opportunity',
+            'team_id': self.sales_team_1.id,
+            'user_id': self.user_sales_salesman.id,
+            'stage_id': self.stage_team1_1.id,
+        })
+        call_type = self.env.ref('mail.mail_activity_data_call')
+        salesman_activities = self.env['mail.activity'].with_user(self.user_sales_salesman)
+
+        activity = salesman_activities.create({
+            'res_model': 'crm.lead',
+            'activity_type_id': call_type.id,
+            'summary': 'No res_id supplied',
+            'user_id': self.user_sales_salesman.id,
+            'date_deadline': fields.Date.context_today(lead),
+        })
+        # Force the DB write (and its CHECK constraint) now rather than at
+        # some later, unrelated flush: this is the exact point eval/base
+        # does -- or doesn't -- raise.
+        self.env.flush_all()
+
+        self.assertFalse(
+            activity.res_model,
+            "With no res_id, res_model must end up False (recomputed from "
+            "an unset res_model_id) -- the same orphan eval/base produces "
+            "-- not 'crm.lead' paired with a null res_id, which violates "
+            "mail's own _check_res_id_is_set_if_model SQL constraint."
+        )
+        self.assertFalse(activity.res_model_id)
+        self.assertFalse(activity.res_id)
+        self.assertNotIn(
+            activity, lead.activity_ids,
+            "An activity created with no res_id must not end up linked to "
+            "any lead."
+        )
+
     def test_action_log_call_leaves_done_note_and_no_open_activity(self):
         """ VAL-DATA-020 / expectedBehavior "action_log_call leaves a done
         note and no open activity" (architecture.md §3.3 "Log a call"):
