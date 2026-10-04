@@ -1,6 +1,6 @@
-import { defineMailModels } from "@mail/../tests/mail_test_helpers";
+import { defineMailModels, startServer } from "@mail/../tests/mail_test_helpers";
 import { expect, runAllTimers, test } from "@odoo/hoot";
-import { animationFrame, queryAllTexts } from "@odoo/hoot-dom";
+import { animationFrame, queryAllTexts, queryOne, queryRect } from "@odoo/hoot-dom";
 import {
     contains,
     defineActions,
@@ -48,7 +48,22 @@ class Lead extends models.Model {
             ["blocked", "Blocked"],
         ],
     });
-    expected_revenue = fields.Float();
+    // m4-fix-ut-evidence (VAL-MOBILE-015): `aggregator: "sum"` +
+    // `currency_field` is what makes `CrmMobilePipeline.
+    // _cachedAggregateValue`'s monetary branches (crm_mobile_pipeline.js)
+    // reachable at all -- `getAggregateSpecifications` (relational_model/
+    // utils.js) only ever requests the `currency_id:array_agg_distinct`
+    // aggregate this needs for a field declared this way. `default: 1`
+    // keeps every record already in `_records` below, and every one
+    // seeded ad hoc by the other tests in this file (none of which pass
+    // `currency_id`), on the one same currency -- the single-currency
+    // branch, not a change to any of their own existing aggregate
+    // assertions. `CrmMobileCard.expectedRevenueText` (crm_mobile_card.js)
+    // formats this through its own hardcoded "company_currency" field
+    // name, never this one, so the cards' own exact-text assertions
+    // below ("Lead 1\n100.00", ...) are unaffected either way.
+    expected_revenue = fields.Monetary({ aggregator: "sum", currency_field: "currency_id" });
+    currency_id = fields.Many2one({ relation: "res.currency", default: 1 });
 
     _records = [
         { id: 1, name: "Lead 1", stage_id: 1, kanban_state: "normal", expected_revenue: 100 },
@@ -61,6 +76,7 @@ class Lead extends models.Model {
         kanban: `
             <kanban js_class="crm_kanban" default_group_by="stage_id">
                 <field name="stage_id"/>
+                <field name="currency_id"/>
                 <progressbar field="kanban_state" colors='{"done": "success", "blocked": "danger", "normal": "muted"}' sum_field="expected_revenue"/>
                 <templates>
                     <t t-name="card">
@@ -68,6 +84,31 @@ class Lead extends models.Model {
                     </t>
                 </templates>
             </kanban>`,
+        // m4-fix-ut-evidence (VAL-MOBILE-015): a second kanban view
+        // (`"kanban,2"`, resolved via `views: [[2, "kanban"]]` on action
+        // id 2 below -- the mock server's own view-key convention,
+        // `getViewKey`/`findView` in mock_model.js), whose `<progressbar>`
+        // has no `sum_field` at all -- the one arch shape that reaches
+        // `CrmMobilePipeline.groupAggregate`'s `!sumField` early return
+        // (crm_mobile_pipeline.js), since every other action in this
+        // milestone's own test suite always declares one.
+        "kanban,2": `
+            <kanban js_class="crm_kanban" default_group_by="stage_id">
+                <field name="stage_id"/>
+                <progressbar field="kanban_state" colors='{"done": "success", "blocked": "danger", "normal": "muted"}'/>
+                <templates>
+                    <t t-name="card">
+                        <field name="name"/>
+                    </t>
+                </templates>
+            </kanban>`,
+        // VAL-MOBILE-006 (m4-fix-ut-evidence): a form view, used only by
+        // the "uncached lead" test below to genuinely visit one lead's
+        // form online (the same real-navigation idiom
+        // crm_offline_uncached_lead.test.js uses) before going offline --
+        // none of the other tests in this file open a record, so adding
+        // it changes nothing for them.
+        form: `<form><field name="name"/></form>`,
         search: `<search/>`,
     };
 }
@@ -98,7 +139,20 @@ defineActions([
         name: "Pipeline",
         res_model: "crm.lead",
         type: "ir.actions.act_window",
-        views: [[false, "kanban"]],
+        views: [
+            [false, "kanban"],
+            [false, "form"],
+        ],
+    },
+    {
+        id: 2,
+        name: "Pipeline (no progressbar sum_field)",
+        res_model: "crm.lead",
+        type: "ir.actions.act_window",
+        // m4-fix-ut-evidence (VAL-MOBILE-015): the `"kanban,2"` arch
+        // above, via the explicit view id -- action id 1 keeps its own
+        // `sum_field`-bearing kanban for every other test in this file.
+        views: [[2, "kanban"]],
     },
 ]);
 
@@ -274,4 +328,190 @@ test("VAL-MOBILE-002/010: the header's own pending-create count comes from the o
 
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(".o_crm_mobile_pipeline_pending_count").toHaveCount(0);
+});
+
+test.tags("mobile");
+test("VAL-MOBILE-003 (m4-fix-ut-evidence): the single visible stage fills the view's own width, and its fixed header stays in place (position-sticky) while the stage's cards scroll", async () => {
+    const pyEnv = await startServer();
+    // Enough cards in "New" for the view's own scroll container
+    // (`.o_content`) to actually overflow the mobile viewport: this is
+    // what proves `position-sticky` (crm_mobile_pipeline.xml) really
+    // keeps the header pinned while scrolling, not merely present and
+    // untested in the markup.
+    pyEnv["crm.lead"].create(
+        Array.from({ length: 20 }, (_, i) => ({
+            name: `Scroll Lead ${i}`,
+            stage_id: 1,
+            kanban_state: "normal",
+            expected_revenue: 10,
+        }))
+    );
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    // VAL-MOBILE-003: a real bounding-rect comparison, not only the
+    // visibility check the module doc above calls out as insufficient on
+    // its own -- the one visible stage column is exactly as wide as the
+    // view's own content area, not web's default 90%-peek-of-next-column
+    // width.
+    const contentRect = queryRect(".o_content");
+    const activeGroupRect = queryRect(".o_crm_mobile_pipeline_active");
+    expect(activeGroupRect.width).toBeCloseTo(contentRect.width, { digits: 0 });
+
+    const headerRectBeforeScroll = queryRect(".o_crm_mobile_pipeline_header");
+
+    // kanban_controller.scss's own narrow-breakpoint rules: `.o_kanban_
+    // renderer.o_kanban_grouped` hides vertical overflow at that level
+    // (`overflow: scroll hidden`, horizontal column-snap only) and pushes
+    // vertical scrolling down to each `.o_kanban_group` itself
+    // (`overflow-y: scroll`) -- the active group, not `.o_content`, is
+    // the real scrolling ancestor for this stage's cards. The header
+    // above is a sibling of the groups loop (crm_kanban_renderer.xml),
+    // outside that scrolling element entirely, which is what actually
+    // keeps it in place -- `position-sticky` in crm_mobile_pipeline.xml
+    // is a second, redundant guarantee for whichever ancestor the header
+    // does end up scrolling with.
+    const scroller = queryOne(".o_crm_mobile_pipeline_active");
+    expect(scroller.scrollHeight).toBeGreaterThan(scroller.clientHeight); // there is something to scroll
+    scroller.scrollTop = scroller.scrollHeight;
+    await animationFrame();
+    expect(scroller.scrollTop).toBeGreaterThan(0); // the scroll actually moved
+
+    // VAL-MOBILE-003: the header stays fully visible and pinned at
+    // exactly the same spot while the stage's cards scroll underneath
+    // it -- position-sticky effective, not merely present in the markup.
+    expect(".o_crm_mobile_pipeline_header").toBeVisible();
+    const headerRectAfterScroll = queryRect(".o_crm_mobile_pipeline_header");
+    expect(headerRectAfterScroll.top).toBeCloseTo(headerRectBeforeScroll.top, { digits: 0 });
+    expect(headerRectAfterScroll.top).toBeWithin(0, headerRectBeforeScroll.bottom);
+});
+
+test.tags("mobile");
+test("VAL-MOBILE-006 (m4-fix-ut-evidence): offline, tapping an uncached lead's grouped CrmMobileCard shows the offline helper; prev/next stay usable", async () => {
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    // Genuinely visit "Lead 1"'s form online (same real-navigation idiom
+    // as crm_offline_uncached_lead.test.js) so its data lands in the real
+    // RPC disk cache, then come back to the pipeline before going
+    // offline. "Lead 2" (same unfolded "New" stage, so its card already
+    // renders through this grouped mobile pipeline's own `CrmMobileCard`,
+    // not the legacy ungrouped `KanbanRecord`
+    // crm_offline_uncached_lead.test.js exercises) is deliberately left
+    // unvisited.
+    await contains(".o_crm_mobile_card:contains('Lead 1')").click();
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_field_widget[name=name] input").toHaveValue("Lead 1");
+    await contains(".o_breadcrumb .o_back_button").click();
+    expect(".o_crm_mobile_pipeline_header").toHaveCount(1);
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // VAL-MOBILE-006: prev/next stay usable offline, including right
+    // before and after the uncached-lead tap below -- the same
+    // navigation the folded-stage test above already covers, re-asserted
+    // here in the one scenario that also opens a card.
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(".o_crm_mobile_pipeline_title").toHaveText("Qualified");
+    await contains(".o_crm_mobile_pipeline_prev").click();
+    expect(".o_crm_mobile_pipeline_title").toHaveText("New");
+
+    // VAL-MOBILE-006/VAL-UNCACHED behavior kept: tapping "Lead 2"'s own
+    // `CrmMobileCard` (not the legacy card) offline shows the helper
+    // instead of an empty form or a silent no-op; `CrmKanbanController.
+    // openRecord`'s uncached-lead guard (crm_kanban_view.js) short-
+    // circuits before any RPC, exactly like the ungrouped case
+    // crm_offline_uncached_lead.test.js already proves, so no RPC is
+    // declared here either.
+    await contains(".o_crm_mobile_card:contains('Lead 2')").click();
+    expect(".o_form_view").toHaveCount(0);
+    expect(`.o_view_nocontent:contains('${HELPER_TEXT}')`).toHaveCount(1);
+    // The whole small-screen branch (header included) is replaced by the
+    // helper while it is showing (crm_kanban_view.xml) -- there is no
+    // in-view "back" control (architecture.md §3.8), only reconnecting.
+    expect(".o_crm_mobile_pipeline_header").toHaveCount(0);
+
+    // Reconnecting is the documented recovery (architecture.md §3.8): the
+    // helper is replaced by the pipeline again, prev/next included, and
+    // they still work.
+    await setOffline(false);
+    expect(".o_crm_mobile_pipeline_header").toHaveCount(1);
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(".o_crm_mobile_pipeline_title").toHaveText("Qualified");
+});
+
+test.tags("mobile");
+test("VAL-MOBILE-015 (m4-fix-ut-evidence): the header shows no aggregate at all when the arch's progressbar has no sum_field", async () => {
+    await mountWithCleanup(WebClient);
+    // Action id 2: the "kanban,2" arch above, whose `<progressbar>` has
+    // no `sum_field` attribute -- `CrmMobilePipeline.groupAggregate`'s
+    // `const { sumField } = progressBarState.progressAttributes; if
+    // (!sumField) { return null; }` (crm_mobile_pipeline.js) is otherwise
+    // unreachable in this milestone's whole test suite, every other arch
+    // always declares one.
+    await getService("action").doAction(2);
+
+    expect(".o_crm_mobile_pipeline_header").toHaveCount(1);
+    expect(".o_crm_mobile_pipeline_title").toHaveText("New");
+    expect(".o_crm_mobile_pipeline_count").toHaveText("2");
+    // No crash, and no stray `AnimatedNumber` -- `groupAggregate` really
+    // returned `null`, same as the "no progressBarState at all" case this
+    // suite already covers elsewhere, not a leftover from the sum_field
+    // arch this action deliberately doesn't use.
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveCount(0);
+
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(".o_crm_mobile_pipeline_title").toHaveText("Qualified");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveCount(0);
+});
+
+test.tags("mobile");
+test("VAL-MOBILE-015 (m4-fix-ut-evidence): the cached-aggregate fallback covers both the single- and the multi-currency monetary branches", async () => {
+    // Same "progress bar never becomes ready" trigger as blocker 3
+    // (crm_offline_mobile_scrutiny_fixes.test.js): a genuine
+    // ConnectionLostError from `read_progress_bar` keeps `isReady` false
+    // for every group for the life of this mount, forcing `groupAggregate`
+    // into `_cachedAggregateValue` for all of them -- unlike that test's
+    // own float `sum_field`, this file's `expected_revenue` is now a real
+    // `monetary` field with a `currency_field`, so this is the one
+    // scenario in the whole suite that reaches that method's own
+    // `sumField.type === "monetary"` branch at all.
+    onRpc("read_progress_bar", () => new Response("", { status: 502 }));
+
+    const pyEnv = await startServer();
+    // A stage of its own, deliberately not in `Stage._records` above, so
+    // none of the other tests in this file are affected: two leads, two
+    // different currencies -- `aggregates.currency_id` (`array_agg_
+    // distinct`) ends up with more than one entry for this group, lines
+    // 125-129 (`currencies?.length > 1`) in crm_mobile_pipeline.js.
+    const [multiCurrencyStageId] = pyEnv["crm.stage"].create([
+        { name: "Multi Currency", sequence: 4 },
+    ]);
+    pyEnv["crm.lead"].create([
+        { name: "EUR Lead", stage_id: multiCurrencyStageId, expected_revenue: 40, currency_id: 2 },
+        { name: "USD Lead", stage_id: multiCurrencyStageId, expected_revenue: 60, currency_id: 1 },
+    ]);
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+
+    // "New": both its leads default to the same `currency_id` (the
+    // field's own `default: 1`, untouched by this test) -- the
+    // single-currency branch, lines 130-132
+    // (`currencies?.[0]` truthy, exactly one entry).
+    expect(".o_crm_mobile_pipeline_title").toHaveText("New");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText(/300/); // 100 + 200
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveCount(1);
+
+    // Step onto "Multi Currency" (New -> Qualified -> Won -> Multi
+    // Currency): the multi-currency branch above -- still renders an
+    // aggregate (not null, not a crash), from `group.aggregates` instead
+    // of the never-ready progress bar.
+    await contains(".o_crm_mobile_pipeline_next").click();
+    await contains(".o_crm_mobile_pipeline_next").click();
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(".o_crm_mobile_pipeline_title").toHaveText("Multi Currency");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveCount(1);
 });

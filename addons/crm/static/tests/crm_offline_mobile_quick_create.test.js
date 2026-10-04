@@ -47,6 +47,11 @@ class Lead extends models.Model {
     email_from = fields.Char();
     expected_revenue = fields.Float();
     stage_id = fields.Many2one({ string: "Stage", relation: "crm.stage" });
+    // m4-fix-ut-evidence (VAL-MOBILE-010): only used by the team-context
+    // test below, to let the real switcher's `switcher_domain` match
+    // team-less seeded leads too (every `_records` lead here is
+    // team-less, deliberately, so selecting a team never hides them).
+    team_id = fields.Many2one({ string: "Sales Team", relation: "crm.team" });
 
     _views = {
         kanban: `
@@ -78,7 +83,39 @@ class Stage extends models.Model {
     ];
 }
 
-defineModels([Lead, Stage]);
+/**
+ * m4-fix-ut-evidence (VAL-MOBILE-010): a real `crm.team` mock, so a team
+ * selected through the actual switcher UI (action id 2 below) becomes
+ * `default_team_id` in the search context the same way it would online --
+ * `CrmSearchModel._getContext()`'s own doc comment ("Update the search
+ * context so the selected team is used as the default when creating
+ * crm.lead records via quick create...").
+ */
+class Team extends models.Model {
+    _name = "crm.team";
+
+    name = fields.Char();
+    use_opportunities = fields.Boolean({ default: true });
+
+    _records = [
+        { id: 1, name: "Direct Sales" },
+        { id: 2, name: "Online Sales" },
+    ];
+
+    get_team_switcher_data() {
+        const teams = this._filter([["use_opportunities", "=", true]]);
+        return {
+            available: teams.length > 1,
+            teams: teams.map((team) => ({
+                id: team.id,
+                name: team.name,
+                switcher_domain: ["|", ["team_id", "=", team.id], ["team_id", "=", false]],
+            })),
+        };
+    }
+}
+
+defineModels([Lead, Stage, Team]);
 defineMailModels();
 defineActions([
     {
@@ -94,6 +131,21 @@ defineActions([
         // equal-to-the-board's-own-context assertion below meaningful,
         // not vacuous.
         context: { default_type: "opportunity" },
+        views: [
+            [false, "kanban"],
+            [false, "form"],
+        ],
+    },
+    {
+        id: 2,
+        name: "Pipeline (team switcher)",
+        res_model: "crm.lead",
+        type: "ir.actions.act_window",
+        // m4-fix-ut-evidence (VAL-MOBILE-010): a second action, same
+        // `default_type`, plus `show_team_switcher` -- action id 1 above
+        // stays untouched (no switcher) so every other test in this file
+        // keeps mounting the exact same board it always has.
+        context: { default_type: "opportunity", show_team_switcher: true },
         views: [
             [false, "kanban"],
             [false, "form"],
@@ -289,6 +341,102 @@ test("VAL-MOBILE-010: offline, saving queues one crm.lead web_save([], vals) wit
     // (500 from the synced "New Lead") -- with no page reload.
     expect(".o_crm_mobile_pipeline_count").toHaveText("2");
     expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("600");
+});
+
+/**
+ * m4-fix-ut-evidence (VAL-MOBILE-010 round-1 evidence gaps): the test
+ * above already proves `kwargs.context` equals the board's own context
+ * plus `default_stage_id` -- but with no team ever selected, that context
+ * never carries `default_team_id`, so the equality never actually proved
+ * a team default survives into the queued call. This test selects a team
+ * through the real switcher UI first (action id 2, `show_team_switcher`),
+ * then additionally proves: (1) `default_type` and `default_team_id` are
+ * both present on the queued context, not just "whatever the board had";
+ * (2) not a single RPC of any kind (onchange, name_create, or otherwise)
+ * is issued while the save stays queued offline, not only that `web_save`
+ * specifically never fires; (3) after reconnecting, all six fields match
+ * on the mock server's own record, read back independently of the vals
+ * already asserted on the queued call.
+ */
+test.tags("mobile");
+test("VAL-MOBILE-010 (m4-fix-ut-evidence): offline quick-create context includes default_type and the selected team, issues zero RPCs while queued, and the synced record matches all six entered values on the server", async () => {
+    await seedLeads();
+    let boardContext;
+    onRpc("web_read_group", ({ kwargs }) => {
+        boardContext = kwargs.context;
+    });
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(2);
+    await runAllTimers();
+
+    // Select "Online Sales" (id 2) through the real switcher toggler +
+    // dropdown item, not by injecting state -- the contract requires the
+    // team to come from an actual selection.
+    await contains(".o_cp_team_switcher").click();
+    await contains(".dropdown-item:contains('Online Sales')").click();
+    expect(".o_cp_team_switcher").toHaveText("Online Sales");
+    await animationFrame();
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    // Every RPC from here on, model/method, whatever it is -- registered
+    // only now so it can't also count the online switcher-selection
+    // reload above, which is expected to issue RPCs of its own.
+    const rpcCalls = [];
+    onRpc(({ model, method }) => {
+        rpcCalls.push(`${model}/${method}`);
+    });
+
+    await contains(".o_crm_mobile_pipeline_add").click();
+    await contains(".o_crm_mobile_quick_create_name").edit("Team Lead", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_contact_name").edit("Jane Doe", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_phone").edit("123456", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_email").edit("jane@example.com", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_expected_revenue").edit("750", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_save").click();
+    await animationFrame();
+
+    expect(".o_bottom_sheet").toHaveCount(0);
+    // VAL-MOBILE-010: zero RPCs of any kind while queued offline.
+    expect(rpcCalls).toEqual([]);
+
+    const queue = Object.values(getService(OfflinePlugin)._ormToSync());
+    const leadCreates = queue.filter(
+        ({ value }) => value.model === "crm.lead" && value.method === "web_save"
+    );
+    expect(leadCreates.length).toBe(1);
+    const { kwargs } = leadCreates[0].value;
+    // Same shape as the test above: the board's own list context plus
+    // `default_stage_id`, bin_size/read_group_expand stripped -- except
+    // this board's own context now also carries the selected team.
+    const { bin_size, read_group_expand, ...listContext } = boardContext;
+    expect(kwargs.context).toEqual({ ...listContext, default_stage_id: 1 });
+    // The two keys the contract calls out by name.
+    expect(kwargs.context.default_type).toBe("opportunity");
+    expect(kwargs.context.default_team_id).toBe(2);
+
+    await setOffline(false);
+    await runAllTimers();
+    await animationFrame();
+    await runAllTimers();
+    await animationFrame();
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+
+    // All six fields, read back from the mock server's own record --
+    // independent proof, not a second assertion of the same queued vals.
+    const [record] = await getService("orm").searchRead(
+        "crm.lead",
+        [["name", "=", "Team Lead"]],
+        ["name", "contact_name", "phone", "email_from", "expected_revenue", "stage_id"]
+    );
+    expect(record.name).toBe("Team Lead");
+    expect(record.contact_name).toBe("Jane Doe");
+    expect(record.phone).toBe("123456");
+    expect(record.email_from).toBe("jane@example.com");
+    expect(record.expected_revenue).toBe(750);
+    expect(record.stage_id[0]).toBe(1);
 });
 
 test.tags("mobile");
