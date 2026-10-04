@@ -1,6 +1,6 @@
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
-import { expect, test } from "@odoo/hoot";
-import { queryAllTexts } from "@odoo/hoot-dom";
+import { expect, runAllTimers, test } from "@odoo/hoot";
+import { animationFrame, queryAllTexts } from "@odoo/hoot-dom";
 import {
     contains,
     defineActions,
@@ -12,6 +12,7 @@ import {
     mountWithCleanup,
     onRpc,
 } from "@web/../tests/web_test_helpers";
+import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { WebClient } from "@web/webclient/webclient";
 import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
@@ -224,4 +225,53 @@ test("offline, an already-cached stage still renders; the folded stage prev/next
     ]);
     expect(".o_view_nocontent").toHaveCount(0);
     expect(loadCount).toBeGreaterThan(0);
+});
+
+test.tags("mobile");
+test("VAL-MOBILE-002/010: the header's own pending-create count comes from the offline queue via the hooks module, per stage", async () => {
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    // Flush the plugin's harmless startup sync now, while the queue is
+    // empty (crm_offline_mobile_card.test.js's own note on why).
+    await runAllTimers();
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+
+    expect(".o_crm_mobile_pipeline_title").toHaveText("New");
+    expect(".o_crm_mobile_pipeline_pending_count").toHaveCount(0);
+
+    // A queued create for stage 1 ("New"), the same `web_save([], vals)`
+    // shape the mobile quick-create sheet's own producer uses
+    // (crm_offline_mobile_quick_create.test.js's VAL-MOBILE-010 test).
+    getService(OfflinePlugin).scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[], { name: "Pending Lead", stage_id: 1 }],
+        { context: {}, specification: {} },
+        { extras: { timeStamp: Date.now() } }
+    );
+    await animationFrame();
+
+    expect(".o_crm_mobile_pipeline_pending_count").toHaveText("1 pending");
+
+    // "Qualified" (stage 2) has no queued create of its own: no badge.
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(".o_crm_mobile_pipeline_title").toHaveText("Qualified");
+    expect(".o_crm_mobile_pipeline_pending_count").toHaveCount(0);
+
+    await contains(".o_crm_mobile_pipeline_prev").click();
+    expect(".o_crm_mobile_pipeline_title").toHaveText("New");
+    expect(".o_crm_mobile_pipeline_pending_count").toHaveText("1 pending");
+
+    await setOffline(false);
+    await runAllTimers();
+    await animationFrame();
+    // Belt-and-suspenders second flush, like other files in this
+    // milestone's own replay assertions.
+    await runAllTimers();
+    await animationFrame();
+
+    expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+    expect(".o_crm_mobile_pipeline_pending_count").toHaveCount(0);
 });

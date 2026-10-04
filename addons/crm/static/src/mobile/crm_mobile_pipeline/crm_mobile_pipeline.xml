@@ -31,6 +31,15 @@
                             currencies="this.groupAggregate.currencies"
                         />
                     </t>
+                    <!-- VAL-MOBILE-002/010: this stage's own queued,
+                         unsynced lead creates (see crm_mobile_pipeline.js's
+                         pendingCreateCount), read through the shared
+                         hooks module, hidden when 0, same as the
+                         revenue total above. -->
+                    <span t-if="this.pendingCreateCount"
+                        class="o_crm_mobile_pipeline_pending_count badge text-bg-warning"
+                        t-out="this.pendingCreateCount + ' pending'"
+                    />
                 </div>
             </div>
             <button type="button"

@@ -1,16 +1,25 @@
 import { Component, t, useProps } from "@odoo/owl";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
+import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
 
 /**
  * VAL-MOBILE-003 / architecture.md §3.4: the fixed header
  * `CrmKanbanRenderer`'s small-screen branch delegates to for whichever one
  * stage it currently shows -- stage name, lead count, the server-computed
- * `expected_revenue` group total, and the prev/next controls. Purely
+ * `expected_revenue` group total, and the prev/next controls. Mostly
  * presentational: `CrmKanbanRenderer` owns which stage is "current" and
  * whether to step to another one (`group`/`hasPrev`/`hasNext`/`onPrev`/
- * `onNext` are all it needs), so this component never touches the offline
- * hooks module itself (that lives on the renderer, next to the `isFolded`/
- * `group.toggle()` decision VAL-MOBILE-006 needs).
+ * `onNext` are all it needs for that, and it is the one that decides the
+ * `isFolded`/`group.toggle()` branch VAL-MOBILE-006 needs). This
+ * component does read the shared hooks module itself, though
+ * (VAL-MOBILE-002, architecture.md §3.1), for the one piece of offline
+ * state the header shows that isn't already in its props: how many of
+ * this stage's leads are still only a queued, unsynced `web_save` (the
+ * `pendingCreateCount` badge below) -- the same `pendingLeadCreates`
+ * `CrmKanbanRenderer.mobilePipelinePendingLeadCreatesFor` uses to render
+ * the per-lead pending cards underneath, so a user who has scrolled past
+ * those still sees, in the sticky header, that this stage has leads not
+ * yet on the server.
  *
  * The revenue total reuses `ProgressBarState.getGroupInfo`/
  * `getAggregateValue` -- exactly what desktop's `KanbanHeader.
@@ -43,6 +52,25 @@ export class CrmMobilePipeline extends Component {
         // button so the popover can anchor/scope to it.
         onQuickCreate: t.function(),
     });
+
+    setup() {
+        // VAL-MOBILE-002: reads the framework through the shared hooks
+        // module, never `usePlugin(OfflinePlugin)` directly.
+        this.crmOffline = useCrmOffline();
+    }
+
+    /**
+     * VAL-MOBILE-002/010: how many of this stage's leads exist only as a
+     * queued `crm.lead` `web_save([], vals)` create, not yet replayed --
+     * `0` (falsy) hides the header badge, matching `groupAggregate`'s own
+     * `null` guard just below. `group.value` is the real `crm.stage` id
+     * (`relational_model/utils.js`'s `getValueFromGroupData`), the same
+     * one `CrmKanbanRenderer.mobilePipelinePendingLeadCreatesFor` and the
+     * quick-create sheet's own `stage_id` compare against.
+     */
+    get pendingCreateCount() {
+        return this.crmOffline.pendingLeadCreates(this.props.group.value).length;
+    }
 
     /**
      * `{title, value}` or `{value, currencies}`/`{title, value,
