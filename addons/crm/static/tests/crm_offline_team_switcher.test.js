@@ -406,6 +406,88 @@ test("offline, a previously selected team stays a search facet across a view swi
 });
 
 // ---------------------------------------------------------------------------
+// VAL-FIX-007: the test above keeps a warm get_team_switcher_data cache
+// entry throughout, so it never actually hits the contract's own
+// precondition, "when crm.team get_team_switcher_data has no cached
+// value". This clears exactly that entry (not the whole RPC cache) before
+// going offline, so the facet-survives-a-view-switch path is proven on a
+// genuine disk-cache miss, matching VAL-SKIP-001/VAL-COLD-004's "a page
+// started offline whose team list was never loaded online".
+// ---------------------------------------------------------------------------
+
+test("offline, a previously selected team stays a search facet across a view switch even with no cached get_team_switcher_data value", async () => {
+    const switcherCalls = [];
+    const onRequest = ({ detail }) => {
+        const { params } = detail.data;
+        if (params.model === "crm.team" && params.method === "get_team_switcher_data") {
+            switcherCalls.push(params);
+        }
+    };
+    rpcBus.addEventListener("RPC:REQUEST", onRequest);
+    after(() => rpcBus.removeEventListener("RPC:REQUEST", onRequest));
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1);
+    expect(".o_cp_team_switcher:contains('All Teams')").toHaveCount(1);
+
+    await contains(".o_cp_team_switcher").click();
+    // No ".o_popover" ancestor: on the mobile preset the dropdown menu
+    // isn't wrapped in one (see component_test_helpers.js's getDropdownMenu).
+    await contains(".dropdown-item:contains('Hyrule')").click();
+    expect(".o_cp_team_switcher:contains('Hyrule')").toHaveCount(1);
+    expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2); // Lead 2 (Hyrule) + Lead 3 (unassigned)
+
+    // Clear ONLY the get_team_switcher_data disk/ram cache entry -- the
+    // real table name `rpc.js` keys the cache by is the RPC method name
+    // (`params?.method || url`) -- not the whole RPC cache: a genuine
+    // miss for this one call, nothing else disturbed in the generic RPC
+    // cache. `OfflinePlugin`'s own CLEAR-CACHES listener
+    // (offline_plugin.js) ignores the event's argument and unconditionally
+    // wipes its *own* `_visited` tracking (and the many2x tables) on
+    // every CLEAR-CACHES event, regardless of which table was asked for
+    // -- architecture.md §2's "On RPC:CLEAR-CACHES the visited-ui and
+    // many2x tables are invalidated." That side effect is re-warmed below
+    // by visiting the kanban and list once more online, the same thing a
+    // real session would do: a tab that is still open after another part
+    // of the app clears a cache entry keeps browsing online before ever
+    // going offline.
+    switcherCalls.length = 0;
+    rpcBus.trigger("CLEAR-CACHES", "get_team_switcher_data");
+
+    // Re-visit both views online: `config.state.teamSwitcherState`
+    // (plain component state, not stored in `_idb` and therefore
+    // untouched by the clear above) means `_initSwitcher()`'s early
+    // return still applies, so neither visit re-fetches
+    // get_team_switcher_data -- the resulting cache stays genuinely
+    // empty for it, while the kanban/list visited-ui is warm again.
+    await switchView("list");
+    expect("tr.o_data_row").toHaveCount(2);
+    await switchView("kanban");
+    expect(switcherCalls).toHaveLength(0); // confirms no re-fetch happened, online either
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+    // The list's own web_search_read refresh attempt, unrelated to the
+    // team switcher (same as the test above).
+    expect.errors(1);
+    await switchView("list");
+
+    // The team facet survived the view switch while offline, even though
+    // get_team_switcher_data now has no cached value at all:
+    // `_initSwitcher()`'s early return on `config.state?.teamSwitcherState`
+    // (restored by `_importState`) means this path never touches the
+    // network, cache or otherwise, regardless of what is or isn't cached.
+    expect(".o_cp_team_switcher:contains('Hyrule')").toHaveCount(1);
+    expect("tr.o_data_row").toHaveCount(2);
+    expect(switcherCalls).toHaveLength(0); // no switcher request at all, not even one
+    expect(".o_error_dialog").toHaveCount(0);
+    expect(".o_notification").toHaveCount(0);
+    expect.verifyErrors([
+        `Connection to "/web/dataset/call_kw/crm.lead/web_search_read" couldn't be established or was interrupted`,
+    ]);
+});
+
+// ---------------------------------------------------------------------------
 // VAL-DIS-010 / VAL-FIX-013: "Manage Teams" is reachable online, unreachable
 // offline (toggler disabled by the framework), reachable again online.
 // ---------------------------------------------------------------------------

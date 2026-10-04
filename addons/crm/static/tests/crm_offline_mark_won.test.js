@@ -13,6 +13,7 @@ import {
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
 import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
 
@@ -59,6 +60,7 @@ class Lead extends models.Model {
                     <field name="active" invisible="1"/>
                     <field name="won_status" invisible="1"/>
                 </header>
+                <widget name="web_ribbon" title="Won" invisible="won_status != 'won'"/>
                 <field name="name" required="1"/>
             </form>`,
         search: `<search/>`,
@@ -80,10 +82,12 @@ defineActions([
 
 test.tags("desktop");
 test("offline, Won queues action_set_won (not action_set_won_rainbowman), shows the won ribbon at once, and replays on reconnect (desktop)", async () => {
+    const replayedKwargs = [];
     onRpc("crm.lead", "action_set_won_rainbowman", () => expect.step("action_set_won_rainbowman"));
     onRpc("crm.lead", "get_rainbowman_message", () => expect.step("get_rainbowman_message"));
-    onRpc("crm.lead", "action_set_won", function ({ args }) {
+    onRpc("crm.lead", "action_set_won", function ({ args, kwargs }) {
         expect.step("action_set_won");
+        replayedKwargs.push(kwargs);
         this.env["crm.lead"].write(args[0], { won_status: "won" });
         return true;
     });
@@ -93,6 +97,7 @@ test("offline, Won queues action_set_won (not action_set_won_rainbowman), shows 
     // matches how a user would actually reach this screen.
     await getService("action").doAction(1);
     expect("button[name='action_set_won_rainbowman']").toHaveCount(1);
+    expect(".ribbon span").toHaveCount(0); // not won yet
 
     const setOffline = mockCrmOffline();
     await setOffline(true);
@@ -107,10 +112,18 @@ test("offline, Won queues action_set_won (not action_set_won_rainbowman), shows 
     expect(value.method).toBe("action_set_won");
     expect(value.args).toEqual([[1]]);
     expect(typeof value.extras.timeStamp).toBe("number");
+    // "the context in kwargs" (VAL-DATA-005): the record's own eval
+    // context, carrying the current user, not an empty kwargs object.
+    expect(Object.keys(value.kwargs)).toEqual(["context"]);
+    expect(value.kwargs.context.uid).toBe(user.userId);
 
     // Optimistic UI: won_status flips locally, so the button's own
-    // `invisible="won_status == 'won' or ..."` hides it without a round trip.
+    // `invisible="won_status == 'won' or ..."` hides it without a round trip,
+    // and the real Won ribbon ("the form shows the won state immediately")
+    // appears at once, before any replay.
     expect("button[name='action_set_won_rainbowman']").toHaveCount(0);
+    expect(".ribbon span").toHaveCount(1);
+    expect(".ribbon span").toHaveText(/^won$/i);
     expect(".o_notification").toHaveCount(0);
     expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0); // no rainbowman effect offline
 
@@ -123,20 +136,31 @@ test("offline, Won queues action_set_won (not action_set_won_rainbowman), shows 
     expect.verifySteps(["action_set_won"]); // replayed verbatim; still no rainbowman call
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(MockServer.env["crm.lead"].find((r) => r.id === 1).won_status).toBe("won");
+    expect(".ribbon span").toHaveText(/^won$/i); // still won after replay
+    // "context in kwargs" survives the replay unchanged (replayed
+    // verbatim). Compared on `.context` alone, not the whole kwargs
+    // object: the mock server's own call wrapper tags the kwargs object it
+    // hands to `onRpc` with an internal `is_kwargs` marker Symbol that the
+    // queue's own copy never had.
+    expect(replayedKwargs.length).toBe(1);
+    expect(replayedKwargs[0].context).toEqual(value.kwargs.context);
 });
 
 test.tags("mobile");
 test("offline, Won queues action_set_won (not action_set_won_rainbowman), shows the won ribbon at once, and replays on reconnect (mobile)", async () => {
+    const replayedKwargs = [];
     onRpc("crm.lead", "action_set_won_rainbowman", () => expect.step("action_set_won_rainbowman"));
     onRpc("crm.lead", "get_rainbowman_message", () => expect.step("get_rainbowman_message"));
-    onRpc("crm.lead", "action_set_won", function ({ args }) {
+    onRpc("crm.lead", "action_set_won", function ({ args, kwargs }) {
         expect.step("action_set_won");
+        replayedKwargs.push(kwargs);
         this.env["crm.lead"].write(args[0], { won_status: "won" });
         return true;
     });
     await mountWithCleanup(WebClient);
     await getService("action").doAction(1);
     expect("button[name='action_set_won_rainbowman']").toHaveCount(1);
+    expect(".ribbon span").toHaveCount(0); // not won yet
 
     const setOffline = mockCrmOffline();
     await setOffline(true);
@@ -150,8 +174,14 @@ test("offline, Won queues action_set_won (not action_set_won_rainbowman), shows 
     expect(value.model).toBe("crm.lead");
     expect(value.method).toBe("action_set_won");
     expect(value.args).toEqual([[1]]);
+    // "the context in kwargs" (VAL-DATA-005), same as the desktop case.
+    expect(Object.keys(value.kwargs)).toEqual(["context"]);
+    expect(value.kwargs.context.uid).toBe(user.userId);
 
     expect("button[name='action_set_won_rainbowman']").toHaveCount(0);
+    // "The form shows the won state (Won ribbon/status) immediately."
+    expect(".ribbon span").toHaveCount(1);
+    expect(".ribbon span").toHaveText(/^won$/i);
     expect(".o_notification").toHaveCount(0);
     expect(".o_reward svg.o_reward_rainbow_man").toHaveCount(0);
 
@@ -166,6 +196,12 @@ test("offline, Won queues action_set_won (not action_set_won_rainbowman), shows 
     expect.verifySteps(["action_set_won"]);
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(MockServer.env["crm.lead"].find((r) => r.id === 1).won_status).toBe("won");
+    expect(".ribbon span").toHaveText(/^won$/i); // still won after replay
+    // "context in kwargs" survives the replay unchanged (replayed
+    // verbatim), compared on `.context` alone for the same reason as the
+    // desktop case above.
+    expect(replayedKwargs.length).toBe(1);
+    expect(replayedKwargs[0].context).toEqual(value.kwargs.context);
 });
 
 test.tags("desktop");
@@ -236,8 +272,11 @@ test("offline, Won on a dirty valid form queues web_save then action_set_won, in
     expect(queued[0].value.extras.timeStamp < queued[1].value.extras.timeStamp).toBe(true);
 
     // Optimistic UI still applies: the record is no longer dirty (it was
-    // just saved) and shows as won.
+    // just saved) and shows as won. The ribbon appears at once too, before
+    // either queued call has replayed.
     expect("button[name='action_set_won_rainbowman']").toHaveCount(0);
+    expect(".ribbon span").toHaveCount(1);
+    expect(".ribbon span").toHaveText(/^won$/i);
     expect(".o_notification").toHaveCount(0);
 
     await setOffline(false);
@@ -269,8 +308,19 @@ test("offline, Won on a dirty valid form queues web_save then action_set_won, in
         (a, b) => a.value.extras.timeStamp - b.value.extras.timeStamp
     );
     expect(queued.length).toBe(2);
+    expect(queued[0].value.model).toBe("crm.lead");
     expect(queued[0].value.method).toBe("web_save");
+    expect(queued[0].value.args[1].name).toBe("Renamed before Won");
     expect(queued[1].value.method).toBe("action_set_won");
+    expect(queued[1].value.args).toEqual([[1]]);
+    // "in this order of extras.timeStamp" (VAL-DATA-005): strict, not
+    // merely equal, ordering between the two queued calls.
+    expect(queued[0].value.extras.timeStamp < queued[1].value.extras.timeStamp).toBe(true);
+
+    // The ribbon appears at once here too, before either queued call has
+    // replayed.
+    expect(".ribbon span").toHaveCount(1);
+    expect(".ribbon span").toHaveText(/^won$/i);
 
     await setOffline(false);
     await runAllTimers();

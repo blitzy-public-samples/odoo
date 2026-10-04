@@ -570,3 +570,87 @@ for (const { resModel, label, actionId } of SYSTRAY_CASES) {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// VAL-DATA-004: unlike FORM_SAVE_CASES/SYSTRAY_CASES above (whose form is
+// already mounted, online, before the test goes offline), this proves the
+// contract's own wording for crm.stage and crm.team: visited online, then,
+// while offline, a *fresh* navigation to the cached form (not the one still
+// mounted) and back to the cached list, around the queued save. Both the
+// form and the list must render from the disk cache alone, each losing the
+// genuine `web_read`/`web_search_read` race it attempts (the same idiom
+// `crm_offline_uncached_lead.test.js` uses for the identical two-error
+// shape). crm.lead's own form/list cold-navigation is already covered by
+// `crm_offline_data_queue_replay.test.js`'s VAL-DATA-001/002 and
+// `crm_offline_uncached_lead.test.js`; not duplicated here.
+// ---------------------------------------------------------------------------
+
+const COLD_FORM_SAVE_CASES = [
+    { resModel: "crm.stage", label: "a crm.stage", actionId: 2, before: "New" },
+    { resModel: "crm.team", label: "a crm.team", actionId: 3, before: "Sales Team" },
+];
+
+for (const { resModel, label, actionId, before } of COLD_FORM_SAVE_CASES) {
+    for (const preset of ["desktop", "mobile"]) {
+        test.tags(preset);
+        test(`offline, freshly reopening ${label}'s cached form from its cached list and returning to the list queues one web_save and replays it (${preset})`, async () => {
+            onRpc(resModel, "web_save", ({ parent }) => {
+                expect.step("web_save");
+                return parent();
+            });
+            await mountWithCleanup(WebClient);
+            await getService("action").doAction(actionId);
+            await contains(".o_data_row:eq(0) [name='name']").click();
+            expect(".o_form_view").toHaveCount(1);
+            await contains(".o_breadcrumb .o_back_button").click();
+            expect(".o_list_view").toHaveCount(1);
+
+            const setOffline = mockCrmOffline();
+            await setOffline(true);
+
+            // A fresh navigation to the record's form, not the one still
+            // mounted above: `web_read` is genuinely attempted and loses
+            // the race to the disk-cache hit, same idiom as
+            // crm_offline_uncached_lead.test.js and
+            // crm_offline_data_queue_replay.test.js's VAL-DATA-001/002.
+            expect.errors(1);
+            await contains(".o_data_row:eq(0) [name='name']").click();
+            expect(".o_form_view").toHaveCount(1);
+            expect(`.o_field_widget[name='name'] input`).toHaveValue(before);
+            expect.verifyErrors([
+                `Connection to "/web/dataset/call_kw/${resModel}/web_read" couldn't be established or was interrupted`,
+            ]);
+
+            const after = `Edited offline, fresh navigation (${resModel})`;
+            await contains(`.o_field_widget[name='name'] input`).edit(after);
+            await contains("button.o_form_button_save").click();
+            expect.verifySteps([]); // not sent while offline
+
+            const queued = Object.values(getService(OfflinePlugin)._ormToSync());
+            expect(queued.length).toBe(1);
+            expect(queued[0].value.model).toBe(resModel);
+            expect(queued[0].value.method).toBe("web_save");
+            expect(queued[0].value.args).toEqual([[1], { name: after }]);
+
+            // Back to the list through the breadcrumb: it re-fetches too
+            // and loses the same race, so the cached list still renders
+            // from the disk cache (the queued, not-yet-replayed, edit is
+            // not reflected in it -- only the row count is asserted here).
+            // `expect.errors()`'s count is cumulative for the whole test
+            // (crm_offline_uncached_lead.test.js's own idiom), hence 2
+            // here: the web_read error above plus this one.
+            expect.errors(2);
+            await contains(".o_breadcrumb .o_back_button").click();
+            expect(".o_list_view").toHaveCount(1);
+            expect(".o_data_row").toHaveCount(1);
+            expect.verifyErrors([
+                `Connection to "/web/dataset/call_kw/${resModel}/web_search_read" couldn't be established or was interrupted`,
+            ]);
+
+            await setOffline(false);
+            expect.verifySteps(["web_save"]);
+            expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
+            expect(MockServer.env[resModel].find((r) => r.id === 1).name).toBe(after);
+        });
+    }
+}

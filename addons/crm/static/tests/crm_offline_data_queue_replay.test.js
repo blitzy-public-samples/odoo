@@ -248,6 +248,8 @@ test("offline, creating a lead from the form (New, with the default values cache
     expect.verifyErrors([ONCHANGE_ERROR]);
 
     await contains(".o_field_widget[name='name'] input").edit("New Lead Created Offline");
+    await contains(".o_field_widget[name='description'] input").edit("Created offline description");
+    await contains(".o_field_widget[name='expected_revenue'] input").edit("777");
     await contains("button.o_form_button_save").click();
     expect.verifySteps([]); // not sent while offline
 
@@ -259,9 +261,19 @@ test("offline, creating a lead from the form (New, with the default values cache
     // A new record has no earlier server values to diff against, so the
     // queued vals carry every field the view renders (its "cached
     // defaults", here all blank since the onchange above was skipped), not
-    // just the one the user actually typed into.
+    // just the one the user actually typed into. Assert the full vals, not
+    // just the "name" key, so a regression that drops a field (e.g.
+    // "description" or "expected_revenue") is caught here.
     expect(value.args[0]).toEqual([]);
-    expect(value.args[1].name).toBe("New Lead Created Offline");
+    expect(value.args[1]).toEqual({
+        name: "New Lead Created Offline",
+        description: "Created offline description",
+        expected_revenue: 777,
+        // The statusbar's stage_id field is part of the view too (its
+        // widget just isn't an <input>), so a brand-new record's cached
+        // defaults carry it as well, blank, like every other field.
+        stage_id: false,
+    });
 
     await setOffline(false);
     await runAllTimers();
@@ -270,6 +282,13 @@ test("offline, creating a lead from the form (New, with the default values cache
 
     const created = MockServer.env["crm.lead"].find((lead) => lead.name === "New Lead Created Offline");
     expect(created).not.toBe(undefined);
+    // "A lead with those values exists on the mock server" (VAL-DATA-002):
+    // every queued key must equal the created lead's value, not just the
+    // name used to find it.
+    for (const [key, val] of Object.entries(value.args[1])) {
+        expect(created[key]).toBe(val);
+    }
+    expect(MockServer.env["crm.lead"].filter((lead) => lead.name === "New Lead Created Offline").length).toBe(1);
 });
 
 // ---------------------------------------------------------------------------
