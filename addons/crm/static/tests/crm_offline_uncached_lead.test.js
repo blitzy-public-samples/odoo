@@ -536,7 +536,7 @@ test("offline, an uncached lead's color picker is unreachable too (its toggler i
 });
 
 // ---------------------------------------------------------------------------
-// Online guard: `isRecordAvailableOffline` short-circuits to `true` while
+// Online guard: `isLeadAvailableOffline` short-circuits to `true` while
 // online, so a never-visited lead still opens normally -- the fix only
 // changes offline behavior.
 // ---------------------------------------------------------------------------

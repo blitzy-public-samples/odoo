@@ -24,7 +24,7 @@ export class CrmCalendarController extends CalendarController {
 
     async editRecord(record, context = {}) {
         if (record.id) {
-            if (!this.crmOffline.isRecordAvailableOffline(this.env.config.actionId, record.id)) {
+            if (!this.crmOffline.isLeadAvailableOffline(this.env.config.actionId, record.id)) {
                 return;
             }
             // The base non-dialog branch (crm's arch never sets
@@ -33,7 +33,7 @@ export class CrmCalendarController extends CalendarController {
             // it to `doAction` unawaited. That ad hoc action shares neither
             // the calendar action's `actionId` nor its own `get_views`
             // cache, so its `web_read` misses every offline cache even for
-            // a lead `isRecordAvailableOffline` just confirmed was visited.
+            // a lead `isLeadAvailableOffline` just confirmed was visited.
             // Routing through `switchView` instead keeps the calendar's own
             // action identity, so the form's cache keys match the earlier
             // visit (same idiom as the crm kanban/list `openRecord`

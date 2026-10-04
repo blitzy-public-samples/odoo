@@ -14,8 +14,10 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
  *
  * @returns {{
  *  isOffline: () => boolean,
- *  isRecordAvailableOffline: (actionId: number, resId: number|false) => boolean,
+ *  isLeadAvailableOffline: (actionId: number, resId: number|false) => boolean,
  *  queueCall: (model: string, method: string, args: any[], kwargs?: object, extras?: object) => string|number,
+ *  pendingForLead: (leadId: number) => Array<{key: string, value: object}>,
+ *  pendingLeadCreates: (stageId?: number) => Array<{key: string, value: object}>,
  *  pendingActivities: (leadId: number, activityIds?: number[]) => Array<{key: string, kind: "create"|"log_call"|"done", value: object}>,
  *  cachedMany2XRecords: (resModel: string) => Promise<Array<{id: number, display_name: string}>>,
  * }}
@@ -30,13 +32,14 @@ export function useCrmOffline() {
         },
 
         /**
-         * Whether a record is safe to open offline: either we are online
-         * (nothing is restricted), or the form was visited before going
-         * offline and is therefore cached. `OfflinePlugin.isAvailableOffline`
-         * is only meaningful while offline (architecture.md §2), so every
-         * caller must go through this guard rather than call it directly.
+         * Whether a lead's form is safe to open offline: either we are
+         * online (nothing is restricted), or the form was visited before
+         * going offline and is therefore cached. `OfflinePlugin.
+         * isAvailableOffline` is only meaningful while offline
+         * (architecture.md §2), so every caller must go through this guard
+         * rather than call it directly.
          */
-        isRecordAvailableOffline(actionId, resId) {
+        isLeadAvailableOffline(actionId, resId) {
             return (
                 !offlinePlugin.isOffline() ||
                 offlinePlugin.isAvailableOffline(actionId, "form", resId)
@@ -55,6 +58,66 @@ export function useCrmOffline() {
             return offlinePlugin.scheduleORM(model, method, args, kwargs, {
                 extras: { timeStamp: Date.now(), ...extras },
             });
+        },
+
+        /**
+         * Every queued entry that targets one *existing* lead (first
+         * consumer: the mobile card's pending-sync badge, architecture.md
+         * §3.4 / VAL-MOBILE-008). Every producer that writes to an id'd
+         * `crm.lead` -- `web_save`, `action_set_won`, `action_restore`,
+         * `web_unlink`, `action_archive`/`action_unarchive`,
+         * `action_log_call` -- puts that id in `args[0]` as an array
+         * (`[leadId]` or `[leadId, ...]`), so a plain `includes` check
+         * covers all of them without naming each method. A queued
+         * `mail.activity` `create` names the lead in its vals instead of
+         * `args[0]`, so it is matched the same way `pendingActivities`
+         * does. A queued `mail.activity` `action_done` carries only the
+         * activity id, not the lead id, so it is intentionally not
+         * reflected here: a caller that also needs that coverage uses
+         * `pendingActivities(leadId, activityIds)` with the lead's known
+         * activity ids.
+         */
+        pendingForLead(leadId) {
+            const entries = [];
+            for (const { key, value } of Object.values(offlinePlugin._ormToSync())) {
+                const { model, method, args } = value;
+                if (model === "crm.lead" && Array.isArray(args[0]) && args[0].includes(leadId)) {
+                    entries.push({ key, value });
+                } else if (model === "mail.activity" && method === "create") {
+                    const vals = args[0]?.[0];
+                    if (vals?.res_model === "crm.lead" && vals.res_id === leadId) {
+                        entries.push({ key, value });
+                    }
+                }
+            }
+            return entries;
+        },
+
+        /**
+         * Queued `crm.lead` `web_save` creates -- `args[0] = []`, the
+         * producer's shape for a brand-new record (`record.js`
+         * `_offlineSave`) -- optionally narrowed to those whose vals set
+         * `stage_id` to `stageId` (first consumer: the mobile pipeline's
+         * per-stage pending-create cards, architecture.md §3.4). Pass no
+         * `stageId` to get every queued lead create regardless of stage.
+         */
+        pendingLeadCreates(stageId) {
+            const entries = [];
+            for (const { key, value } of Object.values(offlinePlugin._ormToSync())) {
+                const { model, method, args } = value;
+                if (
+                    model === "crm.lead" &&
+                    method === "web_save" &&
+                    Array.isArray(args[0]) &&
+                    args[0].length === 0
+                ) {
+                    const vals = args[1] || {};
+                    if (stageId === undefined || vals.stage_id === stageId) {
+                        entries.push({ key, value });
+                    }
+                }
+            }
+            return entries;
         },
 
         /**

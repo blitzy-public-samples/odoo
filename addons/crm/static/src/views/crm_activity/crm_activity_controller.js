@@ -64,7 +64,7 @@ export class CrmActivityController extends ActivityController {
     }
 
     async openRecord(record, options = {}) {
-        if (!this.crmOffline.isRecordAvailableOffline(this.env.config.actionId, record.resId)) {
+        if (!this.crmOffline.isLeadAvailableOffline(this.env.config.actionId, record.resId)) {
             return;
         }
         return super.openRecord(record, options);

@@ -52,7 +52,7 @@ export const crmKanbanView = {
          */
         async openRecord(record, options) {
             if (
-                !this.crmOffline.isRecordAvailableOffline(this.env.config.actionId, record.resId)
+                !this.crmOffline.isLeadAvailableOffline(this.env.config.actionId, record.resId)
             ) {
                 this.offlineUncachedClick.set(true);
                 return;

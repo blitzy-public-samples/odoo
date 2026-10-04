@@ -347,7 +347,7 @@ test("a connection lost while loading the activity view's root shows the offline
 });
 
 // ---------------------------------------------------------------------------
-// Online guard: `isRecordAvailableOffline` short-circuits to `true` while
+// Online guard: `isLeadAvailableOffline` short-circuits to `true` while
 // online, so a never-visited lead's row still opens -- the fix only
 // changes offline behavior.
 // ---------------------------------------------------------------------------
