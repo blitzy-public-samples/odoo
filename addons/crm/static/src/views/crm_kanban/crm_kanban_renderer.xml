@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!-- VAL-MOBILE-003..006 (architecture.md §3.4): the small-screen
+         pipeline branch, spliced into "web.KanbanRenderer" instead of a
+         new view/js_class (VAL-MOBILE-005). Every addition below is
+         itself gated on `this.isMobilePipeline` (crm_kanban_renderer.js),
+         so with it false (desktop, or mobile grouped by anything other
+         than stage_id) this template produces the exact same markup as
+         the base one (VAL-MOBILE-004); only `getGroupClasses()`'s own
+         "mobile pipeline" branch and this file together change anything,
+         and both are no-ops when it's false. -->
+    <t t-name="crm.KanbanRenderer" t-inherit="web.KanbanRenderer" t-inherit-mode="primary">
+        <!-- Scopes crm_kanban_renderer.scss's layout rules: appended to
+             the format string rather than added as a second, separate
+             class-contributing attribute, so there is exactly one source
+             of truth for this node's `class` and no risk of owl's
+             attribute compiler disagreeing about how to merge two. -->
+        <xpath expr="//div[hasclass('o_kanban_renderer')]" position="attributes">
+            <attribute name="t-attf-class">{{ this.props.list.isGrouped ? 'o_kanban_grouped align-content-stretch' : 'o_kanban_ungrouped align-content-start flex-wrap justify-content-start' }}{{ this.isMobilePipeline ? ' o_crm_mobile_pipeline' : '' }}</attribute>
+        </xpath>
+        <!-- The fixed header (name, lead count, revenue sum, prev/next;
+             VAL-MOBILE-003): a `<t>` wrapper contributes no DOM node of
+             its own, so this renders as a direct sibling of the groups
+             below it, which crm_kanban_renderer.scss turns into "header
+             on top, one full-width stage under it" by switching the
+             renderer root to `flex-direction: column` only in this mode. -->
+        <xpath expr="//div[hasclass('o_kanban_renderer')]/t[@t-foreach='this.getGroupsOrRecords()']" position="before">
+            <t t-if="this.isMobilePipeline and this.mobilePipelineGroup">
+                <CrmMobilePipeline
+                    group="this.mobilePipelineGroup"
+                    hasPrev="this.mobilePipelineHasPrev"
+                    hasNext="this.mobilePipelineHasNext"
+                    onPrev.bind="this.mobilePipelineGoPrev"
+                    onNext.bind="this.mobilePipelineGoNext"
+                    progressBarState="this.props.progressBarState"
+                />
+            </t>
+        </xpath>
+        <!-- VAL-MOBILE-006: a folded (never-fetched) stage's own "Load
+             more" control would otherwise still render here (small
+             screens always take this branch for a folded group); replace
+             it with OfflineActionHelper for the one stage this branch is
+             currently showing, offline, instead of a dead "Load more"
+             click (`group.toggle()` then `list.load()` then an uncaught
+             `ConnectionLostError`, the risk `_mobilePipelineGoTo` in
+             crm_kanban_renderer.js already avoids for prev/next; this
+             covers the stage the pipeline *opens on* being folded too). -->
+        <xpath expr="//t[@t-elif='this.uiService.isSmall']" position="after">
+            <t t-if="this.isMobilePipeline and this.crmOffline.isOffline() and group.isFolded and group.id === this.mobilePipelineGroup?.id">
+                <OfflineActionHelper/>
+            </t>
+        </xpath>
+        <xpath expr="//t[@t-elif='this.uiService.isSmall']" position="attributes">
+            <attribute name="t-elif">this.uiService.isSmall and !(this.isMobilePipeline and this.crmOffline.isOffline() and group.isFolded)</attribute>
+        </xpath>
+    </t>
+
+</templates>

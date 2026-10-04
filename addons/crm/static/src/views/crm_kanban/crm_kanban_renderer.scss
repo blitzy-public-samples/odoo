@@ -1,0 +1,31 @@
+// VAL-MOBILE-003/004 (architecture.md §3.4): `.o_crm_mobile_pipeline` is
+// appended to the renderer root's own `t-attf-class` (crm_kanban_renderer.xml)
+// only when `CrmKanbanRenderer.isMobilePipeline` is true, so none of this
+// needs its own breakpoint guard: it would be redundant with the
+// `ui.isSmall()` check already gating the class itself, and risks drifting
+// from it if the two ever used different thresholds.
+.o_kanban_renderer.o_crm_mobile_pipeline {
+    // Stacks the fixed header (crm.CrmMobilePipeline, a plain sibling in
+    // the DOM -- `<t>` wrappers contribute no node of their own) above the
+    // one visible stage instead of beside it: both become flex items in a
+    // column, and the default `align-items: stretch` is what makes each of
+    // them -- header and the active `.o_kanban_group` alike -- span the
+    // renderer's full width with no extra width rule needed.
+    flex-direction: column;
+
+    // Every other stage is hidden by `getGroupClasses()` adding `d-none`
+    // (crm_kanban_renderer.js); the one left without it is marked
+    // `.o_crm_mobile_pipeline_active` instead and needs no width override
+    // of its own: with every sibling removed from the flex row, it already
+    // grows to fill all the space the removed siblings leave behind.
+    .o_kanban_group.o_crm_mobile_pipeline_active {
+        // The native per-column header (name + progress bar, no lead
+        // count -- kanban_header.xml hides the count whenever a
+        // progressbar is present) would otherwise double up on
+        // crm.CrmMobilePipeline's own name/revenue display; hide it, the
+        // fixed header above replaces it for this branch only.
+        > .o_kanban_header {
+            display: none;
+        }
+    }
+}
