@@ -10,4 +10,19 @@
     .o_crm_mobile_card_pending_sync {
         white-space: nowrap;
     }
+
+    // orchestrator-triage.md blocker 7 (VAL-MOBILE-017): each star is its
+    // own ≥44x44 CSS px touch target (the inline style on the button is
+    // what the test measures; this is the real, styled app's copy of it,
+    // same reasoning as the card root's own min-height/min-width above).
+    .o_crm_mobile_card_priority_star {
+        min-height: 44px;
+        min-width: 44px;
+        font-size: 1.25em;
+        color: $o-main-color-muted;
+
+        &.oi-filled {
+            color: $o-main-favorite-color;
+        }
+    }
 }

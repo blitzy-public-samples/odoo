@@ -22,6 +22,30 @@
             </div>
             <div t-if="this.partnerName" class="o_crm_mobile_card_partner d-block text-truncate text-muted" t-out="this.partnerName"/>
             <div t-if="this.expectedRevenueText" class="o_crm_mobile_card_revenue fw-semibold" t-out="this.expectedRevenueText"/>
+            <!-- orchestrator-triage.md blocker 7 (VAL-MOBILE-017): one
+                 star per priority option above "Low", each its own
+                 ≥44x44 CSS px button (inline size, belt-and-suspenders
+                 with crm_mobile_card.scss like the card root above) with
+                 `data-available-offline` on the button itself so the
+                 framework doesn't disable it offline, and
+                 `t-on-click.stop` so tapping a star updates the priority
+                 instead of triggering the card's own `onClick`. -->
+            <div t-if="this.hasPriority" class="o_crm_mobile_card_priority d-flex" role="radiogroup" aria-label="Priority">
+                <t t-foreach="this.priorityStars" t-as="star" t-key="star.value">
+                    <button type="button"
+                        class="o_crm_mobile_card_priority_star btn btn-link p-0 d-flex align-items-center justify-content-center oi"
+                        t-att-class="{'oi-filled': star.active}"
+                        style="min-height: 44px; min-width: 44px;"
+                        data-icon="star"
+                        data-available-offline=""
+                        role="radio"
+                        t-att-aria-checked="star.checked ? 'true' : 'false'"
+                        t-att-aria-label="star.label"
+                        t-att-data-tooltip="star.label"
+                        t-on-click.stop="() => this.onPriorityClick(star.value)"
+                    />
+                </t>
+            </div>
         </div>
     </t>
 
