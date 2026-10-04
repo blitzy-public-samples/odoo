@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!-- VAL-MOBILE-007: name, partner name, expected revenue, pending-sync
+         badge. The whole card is the single ≥44x44 CSS px touch target
+         (`min-height`/`min-width` set inline so the size holds regardless
+         of whether crm_mobile_card.scss has loaded yet; that file repeats
+         the same rule for the real, styled card). `o_kanban_record` is
+         kept on the root so this card keeps the framework's generic
+         kanban-card styling (background, spacing) and its keyboard
+         navigation (`kanban_renderer.js`'s arrow/Enter hotkeys look for
+         that class, not for the `KanbanRecord` component specifically). -->
+    <t t-name="crm.CrmMobileCard">
+        <div class="o_kanban_record o_kanban_global_click o_crm_mobile_card d-flex flex-column justify-content-center gap-1 p-2"
+            style="min-height: 44px; min-width: 44px;"
+            tabindex="0"
+            t-on-click="this.onClick"
+        >
+            <div class="d-flex align-items-start justify-content-between gap-2">
+                <span class="o_crm_mobile_card_name fw-bold d-block text-truncate" t-out="this.record.data.name"/>
+                <span t-if="this.isPendingSync" class="o_crm_mobile_card_pending_sync badge text-bg-warning flex-shrink-0">Pending sync</span>
+            </div>
+            <div t-if="this.partnerName" class="o_crm_mobile_card_partner d-block text-truncate text-muted" t-out="this.partnerName"/>
+            <div t-if="this.expectedRevenueText" class="o_crm_mobile_card_revenue fw-semibold" t-out="this.expectedRevenueText"/>
+        </div>
+    </t>
+
+</templates>

@@ -1,0 +1,13 @@
+// VAL-MOBILE-007: belt-and-suspenders copy of the inline min-height/
+// min-width crm_mobile_card.xml already sets on the card's own root --
+// this rule is what a real, styled app relies on day to day; the inline
+// style is what keeps the ≥44x44 CSS px guarantee from depending on this
+// file having loaded (see that template's own doc).
+.o_crm_mobile_card {
+    min-height: 44px;
+    min-width: 44px;
+
+    .o_crm_mobile_card_pending_sync {
+        white-space: nowrap;
+    }
+}

@@ -2,6 +2,7 @@ import { signal, usePlugin } from "@odoo/owl";
 import { UIPlugin } from "@web/core/ui/ui_plugin";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
 import { CrmColumnProgress } from "./crm_column_progress";
+import { CrmMobileCard } from "@crm/mobile/crm_mobile_card/crm_mobile_card";
 import { CrmMobilePipeline } from "@crm/mobile/crm_mobile_pipeline/crm_mobile_pipeline";
 import { RottingKanbanHeader } from "@mail/js/rotting_mixin/rotting_kanban_header";
 import { RottingKanbanRenderer } from "@mail/js/rotting_mixin/rotting_kanban_renderer";
@@ -89,6 +90,7 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         ...RottingKanbanRenderer.components,
         KanbanHeader: CrmKanbanHeader,
         CrmMobilePipeline,
+        CrmMobileCard,
         OfflineActionHelper,
     };
 

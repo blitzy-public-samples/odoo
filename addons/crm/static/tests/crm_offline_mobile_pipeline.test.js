@@ -122,9 +122,13 @@ test("the pipeline action, under the mobile preset, renders the mobile layout: o
     expect(".o_crm_mobile_pipeline_title").toHaveText("New");
     expect(".o_crm_mobile_pipeline_count").toHaveText("2"); // Lead 1 + Lead 2
     expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText(/300/); // 100 + 200
+    // m4-card (VAL-MOBILE-007) made these `CrmMobileCard`, which always
+    // shows the revenue line regardless of the arch's own "card"
+    // template -- hence the second line on each, unlike the desktop
+    // assertion below which still goes through that bare arch template.
     expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_kanban_record")).toEqual([
-        "Lead 1",
-        "Lead 2",
+        "Lead 1\n100.00",
+        "Lead 2\n200.00",
     ]);
 
     // VAL-MOBILE-003: prev/next carry the offline-availability attribute
@@ -139,7 +143,9 @@ test("the pipeline action, under the mobile preset, renders the mobile layout: o
     expect(".o_crm_mobile_pipeline_title").toHaveText("Qualified");
     expect(".o_crm_mobile_pipeline_count").toHaveText("1");
     expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText(/50/);
-    expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_kanban_record")).toEqual(["Lead 3"]);
+    expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_kanban_record")).toEqual([
+        "Lead 3\n50.00",
+    ]);
     expect(".o_crm_mobile_pipeline_prev").not.toHaveProperty("disabled", true);
 
     await contains(".o_crm_mobile_pipeline_prev").click();
@@ -182,7 +188,9 @@ test("offline, an already-cached stage still renders; the folded stage prev/next
     loadCount = 0;
     await contains(".o_crm_mobile_pipeline_next").click();
     expect(".o_crm_mobile_pipeline_title").toHaveText("Qualified");
-    expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_kanban_record")).toEqual(["Lead 3"]);
+    expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_kanban_record")).toEqual([
+        "Lead 3\n50.00",
+    ]);
     expect(".o_view_nocontent").toHaveCount(0);
     expect(loadCount).toBe(0);
 
@@ -211,7 +219,9 @@ test("offline, an already-cached stage still renders; the folded stage prev/next
     loadCount = 0;
     await contains(".o_crm_mobile_pipeline_next").click();
     expect(".o_crm_mobile_pipeline_title").toHaveText("Won");
-    expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_kanban_record")).toEqual(["Lead 4"]);
+    expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_kanban_record")).toEqual([
+        "Lead 4\n10.00",
+    ]);
     expect(".o_view_nocontent").toHaveCount(0);
     expect(loadCount).toBeGreaterThan(0);
 });

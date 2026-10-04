@@ -51,6 +51,25 @@
                 <OfflineActionHelper/>
             </t>
         </xpath>
+        <!-- VAL-MOBILE-007: in the mobile pipeline, each record is the crm
+             mobile card (fixed name/partner/revenue/pending-sync content)
+             instead of the base `KanbanRecord` + the kanban arch's own
+             "card" template; every other group-by keeps the exact
+             `<KanbanRecord>` the base template already renders
+             (VAL-MOBILE-004/005). A sibling swapped in by `t-if`/`t-if`
+             rather than a `position="replace"` so the untouched
+             `<KanbanRecord>`'s own long prop list needs no duplicating
+             here. -->
+        <xpath expr="//t[@t-foreach='group.list.records']/KanbanRecord" position="attributes">
+            <attribute name="t-if">!this.isMobilePipeline</attribute>
+        </xpath>
+        <xpath expr="//t[@t-foreach='group.list.records']/KanbanRecord" position="after">
+            <CrmMobileCard
+                t-if="this.isMobilePipeline"
+                record="record"
+                openRecord="this.props.openRecord"
+            />
+        </xpath>
         <xpath expr="//t[@t-elif='this.uiService.isSmall']" position="attributes">
             <attribute name="t-elif">this.uiService.isSmall and !(this.isMobilePipeline and this.crmOffline.isOffline() and group.isFolded)</attribute>
         </xpath>
