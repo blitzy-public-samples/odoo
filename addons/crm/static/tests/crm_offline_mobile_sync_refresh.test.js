@@ -35,6 +35,16 @@ import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
  * stage issues no further RPC). So the *only* `web_search_read` this file
  * expects, ever, is the one the fix issues after replay for the one stage
  * whose queue just emptied.
+ *
+ * m4-fix-header-after-sync (VAL-MOBILE-003/018): the kanban arch below now
+ * also declares a `<progressbar sum_field="expected_revenue">`, the same
+ * shape the real pipeline arch uses, so `CrmMobilePipeline`'s header
+ * actually renders a revenue total (`<AnimatedNumber>`, `.o_animated_
+ * number`) to assert on -- without it `progressBarState` is `undefined`
+ * and the revenue half of the header's bug (stale count *and* stale sum)
+ * can't be exercised at all. `colors="{}"`: this file never clicks a
+ * progress-bar segment, so the bar-color mapping itself is irrelevant,
+ * only the `sum_field` aggregate is.
  */
 
 class Lead extends models.Model {
@@ -52,6 +62,7 @@ class Lead extends models.Model {
             <kanban js_class="crm_kanban" default_group_by="stage_id">
                 <field name="stage_id"/>
                 <field name="expected_revenue"/>
+                <progressbar field="name" colors="{}" sum_field="expected_revenue"/>
                 <templates>
                     <t t-name="card">
                         <field name="name"/>
@@ -115,14 +126,39 @@ test("VAL-MOBILE-018: after an offline quick-create replays, only its own stage 
         searchReadDomains.push(kwargs.domain);
         return parent();
     });
+    // m4-fix-header-after-sync: the two RPCs `progressBarState.
+    // updateCounts(group)` issues to refresh a stage's header after its
+    // own per-group reload -- counted from here on so the initial
+    // mount's own `read_progress_bar` (issued once for every stage by
+    // the progress bar's own `loadProgressBar`, architecture.md §3.4)
+    // isn't mistaken for one of them. Neither is a stage-list reload
+    // (that is `web_search_read`, tracked separately above): documents
+    // exactly which RPCs the fix adds, and that they fire exactly once.
+    let readProgressBarCalls = 0;
+    let formattedReadGroupCalls = 0;
+    onRpc("read_progress_bar", ({ parent }) => {
+        readProgressBarCalls++;
+        return parent();
+    });
+    onRpc("formatted_read_group", ({ parent }) => {
+        formattedReadGroupCalls++;
+        return parent();
+    });
 
     const setOffline = mockCrmOffline();
     await setOffline(true);
 
-    // Still on "New" (stage 1, the default active stage).
+    // Still on "New" (stage 1, the default active stage). Before anything
+    // is queued, the header matches the one seeded lead.
     expect(".o_crm_mobile_pipeline_title").toHaveText("New");
+    expect(".o_crm_mobile_pipeline_count").toHaveText("1");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("100");
+
     await contains(".o_crm_mobile_pipeline_add").click();
     await contains(".o_crm_mobile_quick_create_name").edit("Offline Lead", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_expected_revenue").edit("200", {
+        confirm: false,
+    });
     await contains(".o_crm_mobile_quick_create_save").click();
     await animationFrame();
 
@@ -140,6 +176,11 @@ test("VAL-MOBILE-018: after an offline quick-create replays, only its own stage 
     // replayed, and the pending card above came from the queue, not a
     // reload.
     expect(searchReadDomains.length).toBe(0);
+    // VAL-MOBILE-003/018 (m4-fix-header-after-sync): the header still
+    // shows the pre-sync numbers -- a queued, unsynced create is not
+    // reflected there (only the pending-sync card above is).
+    expect(".o_crm_mobile_pipeline_count").toHaveText("1");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("100");
 
     await setOffline(false);
     await runAllTimers();
@@ -163,6 +204,15 @@ test("VAL-MOBILE-018: after an offline quick-create replays, only its own stage 
     expect(domainJSON.includes(JSON.stringify(["stage_id", "=", 1]))).toBe(true);
     expect(domainJSON.includes(JSON.stringify(["stage_id", "=", 2]))).toBe(false);
 
+    // m4-fix-header-after-sync (VAL-MOBILE-003/018): the header now
+    // includes the synced lead -- count and revenue sum both current --
+    // with no page reload, and the two aggregate RPCs that refreshed it
+    // fired exactly once each.
+    expect(".o_crm_mobile_pipeline_count").toHaveText("2");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("300");
+    expect(readProgressBarCalls).toBe(1);
+    expect(formattedReadGroupCalls).toBe(1);
+
     // The pending card is gone, replaced by exactly one real card for the
     // synced lead -- no duplicate, and the pre-existing "Lead New" card is
     // still there untouched.
@@ -173,9 +223,14 @@ test("VAL-MOBILE-018: after an offline quick-create replays, only its own stage 
     expect(new Set(cardNames)).toEqual(new Set(["Lead New", "Offline Lead"]));
 
     // "Qualified" (stage 2) is untouched: still its one original lead,
-    // no pending card, no second reload triggered by stepping onto it.
+    // no pending card, no second reload triggered by stepping onto it --
+    // and its own header numbers are unaffected (never recomputed from a
+    // list reload of its own, only from the one combined aggregate
+    // response above).
     await contains(".o_crm_mobile_pipeline_next").click();
     expect(".o_crm_mobile_pipeline_title").toHaveText("Qualified");
+    expect(".o_crm_mobile_pipeline_count").toHaveText("1");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("50");
     expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_crm_mobile_card_name")).toEqual([
         "Lead Qualified",
     ]);

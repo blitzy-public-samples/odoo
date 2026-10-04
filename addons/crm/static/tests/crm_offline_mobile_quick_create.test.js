@@ -31,6 +31,12 @@ import { mockCrmOffline } from "@crm/../tests/crm_test_helpers";
  * "Qualified" (also unfolded, to keep the exact-context assertion below
  * independent of the fold/offline-helper branch `crm_offline_mobile_pipeline
  * .test.js` already covers).
+ *
+ * m4-fix-header-after-sync (VAL-MOBILE-003/010/011/018): the kanban arch
+ * declares a `<progressbar sum_field="expected_revenue">` (the real
+ * pipeline arch's own shape) so the header's revenue total
+ * (`.o_animated_number`) renders at all; VAL-MOBILE-010/011 below assert
+ * it alongside the lead count, before and after the create.
  */
 class Lead extends models.Model {
     _name = "crm.lead";
@@ -47,6 +53,7 @@ class Lead extends models.Model {
             <kanban js_class="crm_kanban" default_group_by="stage_id">
                 <field name="stage_id"/>
                 <field name="expected_revenue"/>
+                <progressbar field="name" colors="{}" sum_field="expected_revenue"/>
                 <templates>
                     <t t-name="card">
                         <field name="name"/>
@@ -165,6 +172,11 @@ test("VAL-MOBILE-010: offline, saving queues one crm.lead web_save([], vals) wit
     const setOffline = mockCrmOffline();
     await setOffline(true);
 
+    // m4-fix-header-after-sync (VAL-MOBILE-003): before anything is
+    // queued, the header matches the one seeded lead in "New".
+    expect(".o_crm_mobile_pipeline_count").toHaveText("1");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("100");
+
     await contains(".o_crm_mobile_pipeline_add").click();
     await contains(".o_crm_mobile_quick_create_name").edit("New Lead", { confirm: false });
     await contains(".o_crm_mobile_quick_create_contact_name").edit("Jane Doe", { confirm: false });
@@ -232,6 +244,13 @@ test("VAL-MOBILE-010: offline, saving queues one crm.lead web_save([], vals) wit
     expect(".o_crm_mobile_pipeline_active .o_crm_mobile_pending_lead_create_badge").toHaveText("Pending sync");
     expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_crm_mobile_card")).toEqual(["Lead 1\n100.00"]);
 
+    // m4-fix-header-after-sync (VAL-MOBILE-003/018): the header still
+    // shows the pre-sync numbers -- a queued, unsynced create only shows
+    // up in the pending-sync card above, not in the fixed header, until
+    // it replays.
+    expect(".o_crm_mobile_pipeline_count").toHaveText("1");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("100");
+
     // Stepping to "Qualified" (its own lead, Lead 2, but no pending
     // creates targeted there) hides it again -- it is a per-stage card,
     // not a global one.
@@ -265,6 +284,11 @@ test("VAL-MOBILE-010: offline, saving queues one crm.lead web_save([], vals) wit
         "Lead 1",
         "New Lead",
     ]);
+    // m4-fix-header-after-sync (VAL-MOBILE-003/018): the header now
+    // includes the synced lead -- count 1 -> 2, revenue 100 -> 600
+    // (500 from the synced "New Lead") -- with no page reload.
+    expect(".o_crm_mobile_pipeline_count").toHaveText("2");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("600");
 });
 
 test.tags("mobile");
@@ -279,9 +303,21 @@ test("VAL-MOBILE-011: online, saving creates the lead immediately with no queuei
         webSaveArgs = args;
     });
 
+    // m4-fix-header-after-sync (VAL-MOBILE-003): before the create, the
+    // header matches the one seeded lead in "New".
+    expect(".o_crm_mobile_pipeline_count").toHaveText("1");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("100");
+
     await contains(".o_crm_mobile_pipeline_add").click();
     await contains(".o_crm_mobile_quick_create_name").edit("Online Lead", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_expected_revenue").edit("50", { confirm: false });
     await contains(".o_crm_mobile_quick_create_save").click();
+    await animationFrame();
+    // The online create's own `progressBarState.updateCounts(group)`
+    // call (m4-fix-header-after-sync, same as `onMobileLeadCreated`'s
+    // sync-refresh-effect counterpart) issues its two aggregate RPCs
+    // without being awaited by the save flow itself; flush them before
+    // reading the header below.
     await animationFrame();
 
     expect(".o_bottom_sheet").toHaveCount(0);
@@ -298,6 +334,11 @@ test("VAL-MOBILE-011: online, saving creates the lead immediately with no queuei
         "Lead 1",
     ]);
     expect(".o_crm_mobile_card_pending_sync").toHaveCount(0);
+    // m4-fix-header-after-sync (VAL-MOBILE-011): the header updates
+    // immediately after an online create too -- count 1 -> 2, revenue
+    // 100 -> 150 (50 from "Online Lead").
+    expect(".o_crm_mobile_pipeline_count").toHaveText("2");
+    expect(".o_crm_mobile_pipeline_header .o_animated_number").toHaveText("150");
 });
 
 test.tags("desktop");

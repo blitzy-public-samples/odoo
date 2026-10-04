@@ -150,6 +150,33 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // page reload and no duplicate (the stale pending card simply
         // stops rendering once the queue entry is gone, crm_kanban_
         // renderer.xml's `mobilePipelinePendingLeadCreatesFor`).
+        //
+        // m4-fix-header-after-sync (VAL-MOBILE-003/018): `group.list.
+        // load()` alone only refreshes that stage's own card list
+        // (dynamic_record_list.js's `_setData`/`_updateCount` already
+        // sets `group.list.count` to the fresh row count) -- it never
+        // touches the `Group` datapoint's own `count`/`aggregates`
+        // fields, which is what `CrmMobilePipeline`'s header actually
+        // reads (`t-out="group.count"`, `ProgressBarState.
+        // getAggregateValue` for the revenue sum via `group.aggregates`
+        // cached in `_aggregateValues`), so the header kept showing the
+        // pre-replay numbers until the next full navigation. Fixed the
+        // same way desktop's own kanban keeps a group's header in sync
+        // after its own quick create (`KanbanRenderer.validateQuickCreate`,
+        // `KanbanController.onRecordSaved`): copy the just-reloaded
+        // `group.list.count` onto `group.count` (no RPC, the count the
+        // per-group reload above already fetched), then call the public
+        // `progressBarState.updateCounts(group)` so the revenue aggregate
+        // is current too. `updateCounts` issues two framework RPCs --
+        // `read_progress_bar` (bar-segment counts) and, since the
+        // pipeline's `<progressbar sum_field="expected_revenue" .../>`
+        // gives it an aggregate field, `formattedReadGroup` (the revenue
+        // sums) -- both scoped to counts/aggregates only: neither ever
+        // calls any group's `list.load()`, so no other stage's card list
+        // is fetched (VAL-MOBILE-018 stays satisfied); their domain is
+        // the whole board's (same as desktop's identical call), so other
+        // stages' header numbers get refreshed too as a side effect of
+        // that one combined response, but no stage's cards are re-fetched.
         useEffect(() => {
             if (!this.isMobilePipeline) {
                 return;
@@ -160,7 +187,10 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
                 if (this.crmOffline.pendingLeadCreates(stageId).length) {
                     stageIdsWithPendingLeadCreate.add(stageId);
                 } else if (this._stageIdsWithPendingLeadCreate.has(stageId)) {
-                    group.list.load();
+                    group.list.load().then(() => {
+                        group.count = group.list.count;
+                        this.props.progressBarState?.updateCounts(group);
+                    });
                 }
             }
             this._stageIdsWithPendingLeadCreate = stageIdsWithPendingLeadCreate;
@@ -299,6 +329,16 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
      * `leadId` null): nothing to add here, the pending-sync card
      * (`mobilePipelinePendingLeadCreatesFor`) already renders from the
      * queue reactively.
+     *
+     * m4-fix-header-after-sync (VAL-MOBILE-011): `addExistingRecord`
+     * increments `group.count` itself, so the header's lead count was
+     * already right after an online create -- but
+     * `KanbanRenderer.validateQuickCreate` also calls `progressBarState.
+     * updateCounts(group)` right after its own `addExistingRecord`, and
+     * this method didn't, so the header's revenue sum (sourced from
+     * `ProgressBarState.getAggregateValue`, not from `group.count`) kept
+     * showing the pre-create total. Added here for parity, same RPCs as
+     * documented on the sync-refresh effect above.
      */
     async onMobileLeadCreated(leadId, stageId) {
         if (!leadId) {
@@ -307,6 +347,7 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         const group = this.mobilePipelineGroups.find((g) => g.value === stageId);
         if (group) {
             await group.addExistingRecord(leadId, true);
+            this.props.progressBarState?.updateCounts(group);
         }
     }
 
