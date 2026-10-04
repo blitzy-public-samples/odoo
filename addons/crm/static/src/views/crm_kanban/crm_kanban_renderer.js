@@ -1,9 +1,14 @@
 import { signal, usePlugin } from "@odoo/owl";
+import { usePopover } from "@web/core/popover/popover_hook";
 import { UIPlugin } from "@web/core/ui/ui_plugin";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
 import { CrmColumnProgress } from "./crm_column_progress";
 import { CrmMobileCard } from "@crm/mobile/crm_mobile_card/crm_mobile_card";
 import { CrmMobilePipeline } from "@crm/mobile/crm_mobile_pipeline/crm_mobile_pipeline";
+import {
+    CrmMobilePendingLeadCreate,
+    CrmMobileQuickCreate,
+} from "@crm/mobile/crm_mobile_quick_create/crm_mobile_quick_create";
 import { RottingKanbanHeader } from "@mail/js/rotting_mixin/rotting_kanban_header";
 import { RottingKanbanRenderer } from "@mail/js/rotting_mixin/rotting_kanban_renderer";
 import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
@@ -91,6 +96,7 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         KanbanHeader: CrmKanbanHeader,
         CrmMobilePipeline,
         CrmMobileCard,
+        CrmMobilePendingLeadCreate,
         OfflineActionHelper,
     };
 
@@ -110,6 +116,14 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // queue, hence a plain signal rather than the shared hooks module
         // (AGENTS.md §2 "state lives in signal/signal.Object/computed").
         this.mobilePipelineIndex = signal(0);
+        // VAL-MOBILE-009: the mobile pipeline's own quick-create sheet,
+        // literally `{ useBottomSheet: true }` (architecture.md §3.4) --
+        // unlike the PLS tooltip's own popover (`crm_pls_tooltip_button.js`),
+        // which also opens on desktop and so picks bottom-sheet-vs-popover
+        // from the current screen size, this control is only ever rendered
+        // inside the mobile-pipeline branch (`isMobilePipeline` below), so
+        // there is no desktop case to branch on.
+        this.quickCreatePopover = usePopover(CrmMobileQuickCreate, { useBottomSheet: true });
     }
 
     /**
@@ -195,6 +209,77 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         if (group.isFolded && !this.crmOffline.isOffline()) {
             await group.toggle();
         }
+    }
+
+    /**
+     * VAL-MOBILE-009/010: every stage the pipeline's one `web_read_group`
+     * already knows about -- `group.value` is the real `crm.stage` id
+     * (`relational_model/utils.js`'s `getValueFromGroupData`, not the
+     * `Group` datapoint's own internal `.id`), the same id
+     * `pendingLeadCreates`/`vals.stage_id` compare against. Folded stages
+     * are included (their count/aggregates come from that same call,
+     * architecture.md §3.4), so picking one here never needs to unfold or
+     * load anything.
+     */
+    get mobilePipelineQuickCreateStages() {
+        return this.mobilePipelineGroups.map((group) => ({
+            id: group.value,
+            displayName: group.displayName,
+        }));
+    }
+
+    /**
+     * VAL-MOBILE-009: opens the quick-create bottom sheet with the exact
+     * `group.context` desktop's own kanban quick create uses for this
+     * same stage (`kanban_renderer.xml`'s `context="group.context"`), so
+     * the queued/created lead gets the same `default_type`/team context
+     * either way.
+     */
+    onMobileQuickCreate(ev) {
+        const group = this.mobilePipelineGroup;
+        if (!group) {
+            return;
+        }
+        this.quickCreatePopover.open(ev.currentTarget, {
+            resModel: group.resModel,
+            context: group.context,
+            stages: this.mobilePipelineQuickCreateStages,
+            defaultStageId: group.value,
+            onCreated: ({ leadId, stageId }) => this.onMobileLeadCreated(leadId, stageId),
+        });
+    }
+
+    /**
+     * VAL-MOBILE-011: online, the sheet already created the lead on the
+     * server (its own `onSave`) -- this is only the "show it without a
+     * reload" half, the same `group.addExistingRecord(id, true)` desktop's
+     * `KanbanController.validateQuickCreate` uses for its own quick create
+     * (`kanban_renderer.js`). Offline, `onCreated` is still called (with
+     * `leadId` null): nothing to add here, the pending-sync card
+     * (`mobilePipelinePendingLeadCreatesFor`) already renders from the
+     * queue reactively.
+     */
+    async onMobileLeadCreated(leadId, stageId) {
+        if (!leadId) {
+            return;
+        }
+        const group = this.mobilePipelineGroups.find((g) => g.value === stageId);
+        if (group) {
+            await group.addExistingRecord(leadId, true);
+        }
+    }
+
+    /**
+     * VAL-MOBILE-010: the pending-sync cards for one stage's own queued
+     * lead creates -- a queued create has no id yet, so it can't be one of
+     * `group.list.records` and needs its own presentational card
+     * (`CrmMobilePendingLeadCreate`) instead of `CrmMobileCard`.
+     */
+    mobilePipelinePendingLeadCreatesFor(group) {
+        if (!this.isMobilePipeline) {
+            return [];
+        }
+        return this.crmOffline.pendingLeadCreates(group.value);
     }
 
     /**

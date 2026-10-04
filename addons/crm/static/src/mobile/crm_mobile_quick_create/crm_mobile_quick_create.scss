@@ -1,0 +1,20 @@
+// VAL-MOBILE-009: the sheet's own padding/spacing. BottomSheet
+// (addons/web/static/src/core/bottom_sheet/bottom_sheet.scss) already
+// handles the sheet chrome (handle, backdrop, snap/drag behavior); this
+// only styles the six-field form `CrmMobileQuickCreate` renders inside
+// its body.
+.o_crm_mobile_quick_create {
+    padding: 0.5rem 0.25rem 1rem;
+}
+
+// VAL-MOBILE-010: belt-and-suspenders copy of the inline min-height
+// crm_mobile_quick_create.xml already sets on the pending-create card's
+// own root, same reasoning as crm_mobile_card.scss's own copy of its
+// card's inline size.
+.o_crm_mobile_pending_lead_create {
+    min-height: 44px;
+
+    .o_crm_mobile_pending_lead_create_badge {
+        white-space: nowrap;
+    }
+}

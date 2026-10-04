@@ -34,6 +34,14 @@ export class CrmMobilePipeline extends Component {
         onPrev: t.function(),
         onNext: t.function(),
         progressBarState: t.any().optional(),
+        // VAL-MOBILE-009 (architecture.md §3.4): the mobile pipeline's own
+        // quick-create control -- `CrmKanbanRenderer` owns the actual
+        // `usePopover(..., { useBottomSheet: true })` state (same split
+        // as `onPrev`/`onNext`: this component stays purely
+        // presentational, see the module doc above), this prop is just
+        // the click handler it opens through, given the triggering
+        // button so the popover can anchor/scope to it.
+        onQuickCreate: t.function(),
     });
 
     /**

@@ -41,6 +41,19 @@
             >
                 <i class="oi" data-icon="arrow_right" role="img" aria-label="Next stage" title="Next stage"/>
             </button>
+            <!-- VAL-MOBILE-009: the mobile pipeline's quick-create control.
+                 A plain button without `data-available-offline` would be
+                 disabled offline by the framework's own
+                 `SELECTORS_TO_DISABLE` (AGENTS.md §2 "Offline-availability
+                 attribute"), tagged here because the sheet it opens must
+                 stay reachable offline (VAL-MOBILE-010). -->
+            <button type="button"
+                class="o_crm_mobile_pipeline_add btn btn-primary p-2"
+                data-available-offline=""
+                t-on-click="(ev) => this.props.onQuickCreate(ev)"
+            >
+                <i class="oi" data-icon="add" role="img" aria-label="New Lead" title="New Lead"/>
+            </button>
         </div>
     </t>
 
