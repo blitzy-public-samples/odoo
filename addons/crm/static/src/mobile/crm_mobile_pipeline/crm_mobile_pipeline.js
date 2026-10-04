@@ -75,14 +75,27 @@ export class CrmMobilePipeline extends Component {
     /**
      * `{title, value}` or `{value, currencies}`/`{title, value,
      * currencies}` (`ProgressBarState.getAggregateValue`'s own shapes,
-     * see progress_bar_hook.js) for `AnimatedNumber`, or `null` before the
-     * progress bar's own `loadProgressBar` resolves (`isReady` false --
-     * only possible for a frame right after mount, never once the
-     * surrounding kanban controller's `onWillLoadRoot` has settled).
+     * see progress_bar_hook.js) for `AnimatedNumber`.
+     *
+     * orchestrator-triage.md blocker 3 (VAL-MOBILE-003): `isReady` is
+     * false whenever `_pbCounts` is null (progress_bar_hook.js's own
+     * `getGroupInfo`), which is not only "a frame right after mount" --
+     * `loadProgressBar` sets it back to null on a `ConnectionLostError`
+     * too (e.g. an offline remount/reload), and it then stays null for
+     * every group until the next successful `read_progress_bar`. The
+     * stage's own `expected_revenue` total came from the one
+     * `web_read_group` that loaded the board though (disk-cached,
+     * architecture.md §2), already sitting in `group.aggregates` --
+     * `_cachedAggregateValue` reads it directly in that same not-ready
+     * case, instead of leaving the header blank.
      */
     get groupAggregate() {
         const { progressBarState, group } = this.props;
         if (!progressBarState) {
+            return null;
+        }
+        const { sumField } = progressBarState.progressAttributes;
+        if (!sumField) {
             return null;
         }
         // Warms `ProgressBarState`'s own `_aggregateValues`/`_groupsInfo`
@@ -94,9 +107,30 @@ export class CrmMobilePipeline extends Component {
         // only warms for *unfolded* groups).
         const info = progressBarState.getGroupInfo(group);
         if (!info.isReady) {
-            return null;
+            return this._cachedAggregateValue(group, sumField);
         }
-        const { sumField } = progressBarState.progressAttributes;
         return progressBarState.getAggregateValue(group, sumField);
+    }
+
+    /**
+     * The same `{title, value}`/`{value, currencies}` shape
+     * `ProgressBarState.getAggregateValue` builds (progress_bar_hook.js),
+     * read straight from `group.aggregates` instead of through that
+     * method's own `activeBars`/`_aggregateValues` bookkeeping, which
+     * `getGroupInfo` never populates while `isReady` is false.
+     */
+    _cachedAggregateValue(group, sumField) {
+        const title = sumField.string;
+        const value = group.aggregates?.[sumField.name] || 0;
+        if (sumField.type === "monetary" && sumField.currency_field) {
+            const currencies = group.aggregates?.[sumField.currency_field];
+            if (currencies?.length > 1) {
+                return { value, currencies };
+            }
+            if (currencies?.[0]) {
+                return { title, value, currencies: [currencies[0]] };
+            }
+        }
+        return { title, value };
     }
 }

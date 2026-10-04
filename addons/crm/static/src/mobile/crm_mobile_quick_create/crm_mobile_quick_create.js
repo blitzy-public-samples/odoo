@@ -34,6 +34,15 @@ export class CrmMobileQuickCreate extends Component {
         context: t.object(),
         stages: t.array(t.object()),
         defaultStageId: t.number().optional(),
+        // orchestrator-triage.md blocker 1 (VAL-MOBILE-001): `actionId`/
+        // `actionName`/`viewType`, built by `CrmKanbanRenderer` from its own
+        // `env.config` -- the same three fields `getScheduleORMExtras`
+        // (relational_model/utils.js) puts on every *other* producer's
+        // queued extras. Without them the offline systray's `groupEntries`
+        // computed throws on this entry the moment its dropdown opens
+        // (`offline_systray.js` dereferences `extras.changes`, below, for
+        // every `web_save`; `isClickable` also reads `extras.viewType`).
+        queueExtras: t.object(),
         onCreated: t.function().optional(),
     });
 
@@ -92,8 +101,22 @@ export class CrmMobileQuickCreate extends Component {
                 if (!(e instanceof ConnectionLostError)) {
                     throw e;
                 }
+                // orchestrator-triage.md blocker 1: the extras shape
+                // `record.js`'s own `_offlineSave` builds for every other
+                // offline create -- `changes` (many2one as `{id,
+                // display_name}`, the systray tooltip's own
+                // `v?.display_name ?? v` read) and `originalValues: {}`
+                // (there is no "before" for a create) -- plus the
+                // `queueExtras` the renderer supplies above.
+                const stage = this.props.stages.find((s) => s.id === vals.stage_id);
                 this.crmOffline.queueCall(this.props.resModel, "web_save", [[], vals], kwargs, {
+                    ...this.props.queueExtras,
                     displayName: vals.name,
+                    changes: {
+                        ...vals,
+                        stage_id: stage ? { id: stage.id, display_name: stage.displayName } : false,
+                    },
+                    originalValues: {},
                 });
             }
             this.props.onCreated?.({ leadId, stageId: vals.stage_id });
@@ -106,20 +129,4 @@ export class CrmMobileQuickCreate extends Component {
     onCancel() {
         this.props.close();
     }
-}
-
-/**
- * VAL-MOBILE-010: the visual counterpart of a queued lead create, read
- * straight from the offline queue (`useCrmOffline().pendingLeadCreates`,
- * `CrmKanbanRenderer`'s mobile-pipeline branch). A queued create has no id
- * yet (the producer's own `args[0] = []` shape), so this is a plain
- * presentational card over the queued vals rather than `CrmMobileCard`
- * (whose `isPendingSync` logic needs a real `resId`) -- never clickable,
- * since there is no record to open until the create replays.
- */
-export class CrmMobilePendingLeadCreate extends Component {
-    static template = "crm.CrmMobilePendingLeadCreate";
-    props = useProps({
-        name: t.string(),
-    });
 }

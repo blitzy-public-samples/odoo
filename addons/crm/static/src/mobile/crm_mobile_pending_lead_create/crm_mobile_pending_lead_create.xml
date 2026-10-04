@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!-- The pending-sync counterpart of a queued lead create
+         (`CrmKanbanRenderer`'s mobile-pipeline branch, VAL-MOBILE-010):
+         not a touch target, there is no record yet to open until the
+         queued create replays. Its name comes from `this.name`
+         (the component's own hooks-backed getter), not a prop. -->
+    <t t-name="crm.CrmMobilePendingLeadCreate">
+        <div class="o_kanban_record o_crm_mobile_pending_lead_create d-flex align-items-center justify-content-between gap-2 p-2"
+            style="min-height: 44px;"
+        >
+            <span class="o_crm_mobile_pending_lead_create_name fw-bold text-truncate" t-out="this.name"/>
+            <span class="o_crm_mobile_pending_lead_create_badge badge text-bg-warning flex-shrink-0">Pending sync</span>
+        </div>
+    </t>
+
+</templates>

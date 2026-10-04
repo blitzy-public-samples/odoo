@@ -4,11 +4,9 @@ import { UIPlugin } from "@web/core/ui/ui_plugin";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
 import { CrmColumnProgress } from "./crm_column_progress";
 import { CrmMobileCard } from "@crm/mobile/crm_mobile_card/crm_mobile_card";
+import { CrmMobilePendingLeadCreate } from "@crm/mobile/crm_mobile_pending_lead_create/crm_mobile_pending_lead_create";
 import { CrmMobilePipeline } from "@crm/mobile/crm_mobile_pipeline/crm_mobile_pipeline";
-import {
-    CrmMobilePendingLeadCreate,
-    CrmMobileQuickCreate,
-} from "@crm/mobile/crm_mobile_quick_create/crm_mobile_quick_create";
+import { CrmMobileQuickCreate } from "@crm/mobile/crm_mobile_quick_create/crm_mobile_quick_create";
 import { RottingKanbanHeader } from "@mail/js/rotting_mixin/rotting_kanban_header";
 import { RottingKanbanRenderer } from "@mail/js/rotting_mixin/rotting_kanban_renderer";
 import { useCrmOffline } from "@crm/mobile/offline_hooks/offline_hooks";
@@ -124,17 +122,20 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // inside the mobile-pipeline branch (`isMobilePipeline` below), so
         // there is no desktop case to branch on.
         this.quickCreatePopover = usePopover(CrmMobileQuickCreate, { useBottomSheet: true });
-        // VAL-MOBILE-018 / architecture.md §3.4: per-stage memory of
-        // whether `pendingLeadCreates` last saw a queued create there --
-        // a plain field, not a signal/computed: it is never read during
+        // VAL-MOBILE-018 / architecture.md §3.4: per-stage memory of how
+        // many queued creates `pendingLeadCreates` last saw there -- a
+        // plain field, not a signal/computed: it is never read during
         // render (so it is not UI state, AGENTS.md §2's "signal/
         // signal.Object/computed" rule governs *that*), it exists only so
-        // the effect below can tell "still has one" apart from "just lost
+        // the effect below can tell "still has some" apart from "just lost
         // its last one" for one particular stage, i.e. the one piece of
         // own-state the feature's own wording allows ("no own state/store
         // beyond what OWL needs to compare transitions within the
-        // component").
-        this._stageIdsWithPendingLeadCreate = new Set();
+        // component"). A count, not a boolean/Set membership: orchestrator-
+        // triage.md blocker 5 needs to know *how many* just synced, to add
+        // that number to the stage's exact pre-sync count instead of
+        // overwriting it with a capped one (see the effect below).
+        this._pendingLeadCreateCountByStage = new Map();
         // VAL-MOBILE-018: the only trigger is the OfflinePlugin's own
         // queue signal, read here through `pendingLeadCreates` (never
         // polling, no online/offline listener of our own -- the queue
@@ -165,35 +166,59 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // after its own quick create (`KanbanRenderer.validateQuickCreate`,
         // `KanbanController.onRecordSaved`): copy the just-reloaded
         // `group.list.count` onto `group.count` (no RPC, the count the
-        // per-group reload above already fetched), then call the public
-        // `progressBarState.updateCounts(group)` so the revenue aggregate
-        // is current too. `updateCounts` issues two framework RPCs --
-        // `read_progress_bar` (bar-segment counts) and, since the
-        // pipeline's `<progressbar sum_field="expected_revenue" .../>`
-        // gives it an aggregate field, `formattedReadGroup` (the revenue
-        // sums) -- both scoped to counts/aggregates only: neither ever
-        // calls any group's `list.load()`, so no other stage's card list
-        // is fetched (VAL-MOBILE-018 stays satisfied); their domain is
-        // the whole board's (same as desktop's identical call), so other
-        // stages' header numbers get refreshed too as a side effect of
-        // that one combined response, but no stage's cards are re-fetched.
+        // per-group reload above already fetched) -- UNLESS that reload's
+        // own count is itself capped (orchestrator-triage.md blocker 5:
+        // `web_search_read`'s `count_limit` makes `list.count` top out at
+        // `RelationalModel.DEFAULT_COUNT_LIMIT`, `dynamic_record_list.js`'s
+        // `_updateCount`/`hasLimitedCount`, while the `web_read_group`
+        // count already on `group.count` is exact, group.js:128-136); past
+        // that cap, add the number of creates that just synced to the
+        // exact count the stage already had instead, with no extra RPC.
+        // Then call the public `progressBarState.updateCounts(group)` so
+        // the revenue aggregate is current too. `updateCounts` issues two
+        // framework RPCs -- `read_progress_bar` (bar-segment counts) and,
+        // since the pipeline's `<progressbar sum_field="expected_revenue"
+        // .../>` gives it an aggregate field, `formattedReadGroup` (the
+        // revenue sums) -- both scoped to counts/aggregates only: neither
+        // ever calls any group's `list.load()`, so no other stage's card
+        // list is fetched (VAL-MOBILE-018 stays satisfied); their domain
+        // is the whole board's (same as desktop's identical call), so
+        // other stages' header numbers get refreshed too as a side effect
+        // of that one combined response, but no stage's cards are
+        // re-fetched.
         useEffect(() => {
             if (!this.isMobilePipeline) {
                 return;
             }
-            const stageIdsWithPendingLeadCreate = new Set();
+            const pendingLeadCreateCountByStage = new Map();
             for (const group of this.mobilePipelineGroups) {
                 const stageId = group.value;
-                if (this.crmOffline.pendingLeadCreates(stageId).length) {
-                    stageIdsWithPendingLeadCreate.add(stageId);
-                } else if (this._stageIdsWithPendingLeadCreate.has(stageId)) {
+                const pendingCount = this.crmOffline.pendingLeadCreates(stageId).length;
+                if (pendingCount) {
+                    pendingLeadCreateCountByStage.set(stageId, pendingCount);
+                } else if (this._pendingLeadCreateCountByStage.has(stageId)) {
+                    const syncedCount = this._pendingLeadCreateCountByStage.get(stageId);
+                    if (this.crmOffline.isOffline()) {
+                        // Emptied by a discard, not a sync (`_syncORM`
+                        // never runs while offline): skip the reload --
+                        // `isOffline()` checked before loading, never
+                        // caught from the load itself, same as every
+                        // other offline probe in this addon (AGENTS.md
+                        // §2) -- and carry the count forward so a later
+                        // run, once back online, still reloads this stage
+                        // if it is still the one that needs it then.
+                        pendingLeadCreateCountByStage.set(stageId, syncedCount);
+                        continue;
+                    }
                     group.list.load().then(() => {
-                        group.count = group.list.count;
+                        group.count = group.list.hasLimitedCount
+                            ? group.count + syncedCount
+                            : group.list.count;
                         this.props.progressBarState?.updateCounts(group);
                     });
                 }
             }
-            this._stageIdsWithPendingLeadCreate = stageIdsWithPendingLeadCreate;
+            this._pendingLeadCreateCountByStage = pendingLeadCreateCountByStage;
         });
     }
 
@@ -257,18 +282,32 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
     }
 
     /**
-     * VAL-MOBILE-006 / architecture.md §3.4 "Offline: cached stage
+     * VAL-MOBILE-006/018 / architecture.md §3.4 "Offline: cached stage
      * renders; uncached stage shows OfflineActionHelper": a stage's
-     * records are only "cached" once they have actually been fetched -- a
-     * folded group's records come from their own, separately disk-cached
-     * `list.load()` call, unlike the rest of the pipeline, whose columns
-     * (count and `expected_revenue` aggregate included) all come from the
-     * one `web_read_group` that loaded the whole board (research/
-     * design_options.md "per-stage offline behaviour"). `isOffline()` is
-     * checked *before* loading, never caught from the load itself (the
-     * "skip, don't catch" rule this addon applies to every offline probe,
-     * architecture.md §2): an uncached stage never issues a doomed RPC,
-     * crm_kanban_renderer.xml's small-screen branch shows
+     * records are "cached" once they have actually been fetched, which is
+     * not the same thing as "unfolded" -- a folded group's records come
+     * from their own, separately disk-cached `list.load()` call, unlike
+     * the rest of the pipeline, whose columns (count and `expected_revenue`
+     * aggregate included) all come from the one `web_read_group` that
+     * loaded the whole board (research/design_options.md "per-stage
+     * offline behaviour"), and upstream's `Group.toggle()`
+     * (group.js:95-101) never clears `list.records` on folding, so a
+     * group folded again (or synced into while still folded, see the
+     * sync-refresh effect above) keeps whatever it already loaded.
+     * orchestrator-triage.md blockers 2 and 4: treating every folded
+     * group as uncached hid cards the pipeline had already fetched; only
+     * a stage with no loaded records at all still needs the helper.
+     */
+    mobilePipelineIsUncached(group) {
+        return group.isFolded && !group.list.records.length;
+    }
+
+    /**
+     * VAL-MOBILE-006: `isOffline()` is checked *before* loading, never
+     * caught from the load itself (the "skip, don't catch" rule this
+     * addon applies to every offline probe, architecture.md §2): an
+     * uncached stage (`mobilePipelineIsUncached`, above) never issues a
+     * doomed RPC, crm_kanban_renderer.xml's small-screen branch shows
      * `OfflineActionHelper` for it instead of attempting to toggle it.
      */
     async _mobilePipelineGoTo(index) {
@@ -305,6 +344,11 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
      * same stage (`kanban_renderer.xml`'s `context="group.context"`), so
      * the queued/created lead gets the same `default_type`/team context
      * either way.
+     *
+     * orchestrator-triage.md blocker 1: `queueExtras` is this renderer's
+     * own `env.config` (`actionId`/`actionName`/`viewType`), the one piece
+     * of `getScheduleORMExtras`-shaped data the sheet itself has no way to
+     * get at (it is never mounted inside the action's own component tree).
      */
     onMobileQuickCreate(ev) {
         const group = this.mobilePipelineGroup;
@@ -316,6 +360,11 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
             context: group.context,
             stages: this.mobilePipelineQuickCreateStages,
             defaultStageId: group.value,
+            queueExtras: {
+                actionId: this.env.config.actionId,
+                actionName: this.env.config.actionName,
+                viewType: this.env.config.viewType,
+            },
             onCreated: ({ leadId, stageId }) => this.onMobileLeadCreated(leadId, stageId),
         });
     }

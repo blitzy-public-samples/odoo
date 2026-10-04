@@ -38,19 +38,34 @@
                 />
             </t>
         </xpath>
-        <!-- VAL-MOBILE-006: a folded (never-fetched) stage's own "Load
-             more" control would otherwise still render here (small
-             screens always take this branch for a folded group); replace
-             it with OfflineActionHelper for the one stage this branch is
+        <!-- orchestrator-triage.md blockers 2/4 (VAL-MOBILE-006): a
+             *never-fetched* folded stage's own "Load more" control would
+             otherwise still render here (small screens always take this
+             branch for a folded group); replace it with
+             OfflineActionHelper for the one stage this branch is
              currently showing, offline, instead of a dead "Load more"
              click (`group.toggle()` then `list.load()` then an uncaught
              `ConnectionLostError`, the risk `_mobilePipelineGoTo` in
              crm_kanban_renderer.js already avoids for prev/next; this
-             covers the stage the pipeline *opens on* being folded too). -->
+             covers the stage the pipeline *opens on* being folded too).
+             `mobilePipelineIsUncached` (not plain `group.isFolded`) so a
+             folded stage whose records are already loaded (e.g. one the
+             sync-refresh effect just reloaded while it stayed folded)
+             keeps rendering its cards (see the xpath below) instead of
+             this helper. -->
         <xpath expr="//t[@t-elif='this.uiService.isSmall']" position="after">
-            <t t-if="this.isMobilePipeline and this.crmOffline.isOffline() and group.isFolded and group.id === this.mobilePipelineGroup?.id">
+            <t t-if="this.isMobilePipeline and this.crmOffline.isOffline() and this.mobilePipelineIsUncached(group) and group.id === this.mobilePipelineGroup?.id">
                 <OfflineActionHelper/>
             </t>
+        </xpath>
+        <!-- orchestrator-triage.md blockers 2/4: the base template only
+             renders `group.list.records` while `!group.isFolded`; widen it
+             so the mobile pipeline also renders them for a folded group
+             that already has loaded records (`mobilePipelineIsUncached`
+             above is false for it): the fold state alone no longer
+             decides whether this stage's cards are shown. -->
+        <xpath expr="//t[@t-if='!group.isFolded']" position="attributes">
+            <attribute name="t-if">!group.isFolded or (this.isMobilePipeline and group.list.records.length)</attribute>
         </xpath>
         <!-- VAL-MOBILE-007: in the mobile pipeline, each record is the crm
              mobile card (fixed name/partner/revenue/pending-sync content)
@@ -83,12 +98,12 @@
         <xpath expr="//t[@t-elif='this.uiService.isSmall']" position="after">
             <t t-if="this.isMobilePipeline">
                 <t t-foreach="this.mobilePipelinePendingLeadCreatesFor(group)" t-as="pendingCreate" t-key="pendingCreate.key">
-                    <CrmMobilePendingLeadCreate name="pendingCreate.value.args[1].name"/>
+                    <CrmMobilePendingLeadCreate entryKey="pendingCreate.key"/>
                 </t>
             </t>
         </xpath>
         <xpath expr="//t[@t-elif='this.uiService.isSmall']" position="attributes">
-            <attribute name="t-elif">this.uiService.isSmall and !(this.isMobilePipeline and this.crmOffline.isOffline() and group.isFolded)</attribute>
+            <attribute name="t-elif">this.uiService.isSmall and !(this.isMobilePipeline and this.crmOffline.isOffline() and this.mobilePipelineIsUncached(group))</attribute>
         </xpath>
     </t>
 
