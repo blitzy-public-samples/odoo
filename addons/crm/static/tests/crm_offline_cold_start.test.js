@@ -13,7 +13,7 @@ import {
 } from "@web/../tests/web_test_helpers";
 import { rpcBus } from "@web/core/network/rpc";
 import { WebClient } from "@web/webclient/webclient";
-import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpers";
+import { mockCrmOffline, waitForMailStoreReady } from "@crm/../tests/mock_server/crm_offline_test_helpers";
 
 /**
  * m3-offline-cold-start (VAL-COLD-001, amended VAL-SKIP-001/VAL-FIX-007,
@@ -32,15 +32,21 @@ import { mockCrmOffline } from "@crm/../tests/mock_server/crm_offline_test_helpe
  * also misses (its key is the whole request) and `OfflineActionHelper`
  * renders instead of the cached pipeline (the defect this feature fixes).
  *
- * Each test mounts a `WebClient`, visits the pipeline online, destroys
- * that `WebClient` (`destroyApp()` -- a real unmount, so the next mount is
- * a genuinely fresh `CrmSearchModel`/kanban controller, not a revisit of a
- * live one), goes offline, mounts a *second*, fresh `WebClient` and opens
- * the same action: a cold start with no `config.state`, offline from
- * before the first RPC. The mock server's `RPCCache`
- * (`mock_server.js:541`) is installed once per test and survives both
- * `WebClient`s, exactly like the browser's real disk-backed `IndexedDB`
- * surviving a reload.
+ * Each test mounts a `WebClient`, visits the pipeline online, flushes that
+ * `WebClient`'s own background `mail.store` fetch with
+ * `waitForMailStoreReady()` (`mock_server/crm_offline_test_helpers.js` --
+ * started at mount time like any other `WebClient`, and not cancelled by
+ * destroying the app; left unflushed it can still reject with an uncaught
+ * `ConnectionLostError` once the *second* `WebClient` below goes offline,
+ * surfacing in whatever test happens to be running when that late
+ * rejection lands rather than in this one), destroys that `WebClient`
+ * (`destroyApp()` -- a real unmount, so the next mount is a genuinely
+ * fresh `CrmSearchModel`/kanban controller, not a revisit of a live one),
+ * goes offline, mounts a *second*, fresh `WebClient` and opens the same
+ * action: a cold start with no `config.state`, offline from before the
+ * first RPC. The mock server's `RPCCache` (`mock_server.js:541`) is
+ * installed once per test and survives both `WebClient`s, exactly like
+ * the browser's real disk-backed `IndexedDB` surviving a reload.
  *
  * Capturing what was actually sent uses `rpcBus`'s "RPC:REQUEST" event
  * (`addons/web/static/src/core/network/rpc.js`), not a model/method
@@ -196,6 +202,10 @@ test("offline cold start of the pipeline with no team selected renders the cache
     expect(".o_cp_team_switcher:contains('All Teams')").toHaveCount(1);
     expect(readGroupCalls).toHaveLength(1);
 
+    // Flush this `WebClient`'s own background `mail.store` fetch while
+    // still online, before tearing it down -- see the module docstring.
+    await waitForMailStoreReady();
+
     // Cold start: destroy this `WebClient` entirely (a real unmount, not a
     // revisit of a live controller), then mount a brand new one with no
     // `config.state`, and go offline before the action even starts
@@ -267,6 +277,10 @@ test("offline cold start of the pipeline with a team selected renders the cached
     // selected team's own `switcher_domain`.
     expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(3);
     expect(readGroupCalls).toHaveLength(2); // the initial load + the team-filtered reload
+
+    // Flush this `WebClient`'s own background `mail.store` fetch while
+    // still online, before tearing it down -- see the module docstring.
+    await waitForMailStoreReady();
 
     // Cold start, with "Hyrule" persisted in `browser.localStorage`
     // (`crm.switcher_team_id`, untouched by destroying/remounting the
@@ -342,6 +356,10 @@ test("offline cold start when the team list was never loaded online falls back t
     // online mount (A4); consumed here so the final `verifySteps` below is
     // only about the offline portion of this test.
     expect.verifySteps(["has_group"]);
+
+    // Flush this `WebClient`'s own background `mail.store` fetch while
+    // still online, before tearing it down -- see the module docstring.
+    await waitForMailStoreReady();
 
     // Cold start: destroy this `WebClient` (a real unmount, not a revisit
     // of a live controller), mount a brand new one with no `config.state`,

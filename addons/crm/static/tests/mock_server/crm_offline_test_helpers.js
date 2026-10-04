@@ -41,14 +41,33 @@ import { getService, mockOffline } from "@web/../tests/web_test_helpers";
  * another real-wall-clock wait that would just reopen the same race one
  * level down.
  */
+/**
+ * The wait sequence `mockCrmOffline()` runs before flipping offline,
+ * factored out so a test can also run it on demand -- e.g. right before
+ * `destroyApp()`ing a `WebClient` it mounted while online, so that
+ * `WebClient`'s own debounced `mail.store` fetch (started at mount time,
+ * same as any other) resolves successfully before the app is torn down
+ * instead of possibly still being in flight. An app's background fetch
+ * does not get cancelled by destroying the app: left unflushed, it can
+ * still reject with the same uncaught `ConnectionLostError` once a later
+ * `mockCrmOffline()` call (for a second, unrelated `WebClient`) flips the
+ * connection offline, surfacing in whatever test happens to be running
+ * when that late rejection lands (see `mockCrmOffline()`'s own doc, and
+ * `crm_offline_cold_start.test.js`, which destroys and remounts a fresh
+ * `WebClient` per test).
+ */
+export async function waitForMailStoreReady() {
+    await getService("mail.store").isReadyPromise;
+    await advanceTime(5);
+    await animationFrame();
+    await advanceTime(5);
+}
+
 export function mockCrmOffline() {
     const setOffline = mockOffline();
     return async (offline) => {
         if (offline) {
-            await getService("mail.store").isReadyPromise;
-            await advanceTime(5);
-            await animationFrame();
-            await advanceTime(5);
+            await waitForMailStoreReady();
         }
         return setOffline(offline);
     };
