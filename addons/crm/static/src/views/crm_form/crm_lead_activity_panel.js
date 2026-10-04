@@ -1,4 +1,4 @@
-import { Component, onWillStart, signal, useProps } from "@odoo/owl";
+import { Component, onWillStart, signal, useOnChange, useProps } from "@odoo/owl";
 import { registry } from "@web/core/registry";
 import { useService } from "@web/core/utils/hooks";
 import { standardWidgetProps } from "@web/views/widgets/standard_widget_props";
@@ -43,7 +43,10 @@ const CALL_ACTIVITY_TYPE_CATEGORY = "phonecall";
  *    lead's own cached salesperson (`record.data.user_id`, loaded by the
  *    inheriting view like any other field), and whatever `res.users` rows
  *    the framework's many2x cache already holds (`useCrmOffline()
- *    .cachedMany2XRecords`) -- never a fresh RPC, and no new cache.
+ *    .cachedMany2XRecords`) -- never a fresh RPC, and no new cache. That
+ *    choice is recomputed on every offline/online transition (not just
+ *    once at mount), so a colleague an online search cached after the
+ *    form was already open still shows up once the form goes offline.
  *  - Done (on a server activity only): queues `action_done([[id]])` and
  *    nothing else -- no feedback dialog, no "Done & Schedule Next".
  *  - Log a call: queues one `crm.lead.action_log_call` call, always with
@@ -81,6 +84,29 @@ export class CrmLeadActivityPanel extends Component {
 
         onWillStart(() =>
             Promise.all([this._loadActivityTypes(), this._loadAssignableUsers()])
+        );
+
+        // VAL-DATA-010 (M3 scrutiny round 2): `_loadAssignableUsers` was
+        // only ever called once, from `onWillStart` -- a colleague an
+        // online `res.users` autocomplete search caches *after* the form
+        // has mounted never reached `assignableUsers` once the form later
+        // went offline. Offline `Many2XAutocomplete` searches only *read*
+        // the many2x cache, never write it (architecture.md §2), so the
+        // instant this form goes offline is the last point that cache can
+        // still change for the running session: recompute right then, from
+        // the `OfflinePlugin` `isOffline()` signal `useCrmOffline()`
+        // exposes. `useOnChange` tracks only the dependency array
+        // (`isOffline()`) in a computation of its own and runs the
+        // callback through `untrack()` (owl.js's `useOnChange`), so the
+        // recompute's own reads (the current selection, the lead's
+        // salesperson, the many2x cache) never themselves become
+        // dependencies of this effect -- only going offline (or back
+        // online) retriggers it. `initialRun: false` leaves the one
+        // `onWillStart` call above as the sole initial load.
+        useOnChange(
+            () => [this.crmOffline.isOffline()],
+            () => this._loadAssignableUsers(),
+            { initialRun: false }
         );
     }
 
@@ -136,9 +162,14 @@ export class CrmLeadActivityPanel extends Component {
      * `res.users` rows an earlier online many2one search already cached
      * through the framework's many2x cache. No RPC either way, and no
      * new cache: `cachedMany2XRecords` is a pure read of the existing one
-     * (`useCrmOffline`).
+     * (`useCrmOffline`). Called again (not just once in `onWillStart`)
+     * every time the form goes offline or back online -- see the
+     * `useOnChange` in `setup()` -- so a colleague cached by an online
+     * search that happened after mount is still picked up without a
+     * remount.
      */
     async _loadAssignableUsers() {
+        const previousSelection = this.scheduleUserId();
         const candidates = new Map();
         const addCandidate = (id, displayName) => {
             if (id != null && !candidates.has(id)) {
@@ -154,7 +185,15 @@ export class CrmLeadActivityPanel extends Component {
             addCandidate(cachedUser.id, cachedUser.display_name);
         }
         this.assignableUsers.set([...candidates.values()]);
-        this.scheduleUserId.set(this.user.userId);
+        // Keep the current default (current user) and the selected value
+        // if still present: a recompute (e.g. triggered by going offline)
+        // must not silently reset an in-progress Schedule choice just
+        // because the many2x cache grew.
+        this.scheduleUserId.set(
+            previousSelection != null && candidates.has(previousSelection)
+                ? previousSelection
+                : this.user.userId
+        );
     }
 
     get record() {

@@ -1,5 +1,5 @@
 import { defineMailModels, startServer } from "@mail/../tests/mail_test_helpers";
-import { expect, runAllTimers, test } from "@odoo/hoot";
+import { after, expect, runAllTimers, test } from "@odoo/hoot";
 import { animationFrame, queryAllTexts, queryOne } from "@odoo/hoot-dom";
 import {
     contains,
@@ -13,6 +13,7 @@ import {
     onRpc,
 } from "@web/../tests/web_test_helpers";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { rpcBus } from "@web/core/network/rpc";
 import { today } from "@web/core/l10n/dates";
 import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
@@ -304,6 +305,80 @@ test("offline, Schedule's assignee choice lists the current user, the lead's cac
     });
 
     expect(".o_crm_activity_panel_row .o_crm_activity_user").toHaveText("Office Colleague");
+});
+
+// ---------------------------------------------------------------------------
+// VAL-DATA-010 regression (M3 scrutiny round 2, m3-fix-assignee-refresh):
+// `_loadAssignableUsers` used to run only once, in `onWillStart`, so a
+// colleague the many2x cache picked up *after* the form had already
+// mounted online was missing from Schedule's assignee list once that same
+// form later went offline (no remount in between). The fix recomputes the
+// choice on every offline/online transition.
+// ---------------------------------------------------------------------------
+
+test("offline, a colleague cached by an online res.users search after the form mounted still appears in Schedule's assignee list, with no remount and no RPC", async () => {
+    const { pyEnv, callId } = await seedActivityTypes();
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1); // form mounts online: the panel resolves its first assignee list here
+
+    // A colleague cached *after* the form already mounted -- e.g. by an
+    // online `res.users` many2one autocomplete search elsewhere on this
+    // same form (`Many2XAutocomplete.search()` ->
+    // `OfflinePlugin.cacheMany2XSearch`, architecture.md §2
+    // "Relational-field cache"). This is strictly later than the
+    // `onWillStart` call above, which is exactly the defect this test
+    // guards against.
+    const colleagueId = pyEnv["res.users"].create({
+        partner_id: pyEnv["res.partner"].create({ name: "Late Colleague" }),
+    });
+    await getService(OfflinePlugin).cacheMany2XSearch("res.users", [
+        { id: colleagueId, display_name: "Late Colleague" },
+    ]);
+
+    // No model/method `onRpc()` listener below: once offline,
+    // `mockCrmOffline()`'s network-wide route handler always wins route
+    // dispatch over a model/method listener (see
+    // crm_offline_cold_start.test.js / crm_offline_team_switcher.test.js),
+    // so only `rpcBus`'s "RPC:REQUEST" event lets a "no RPC at all for
+    // res.users" assertion hold for what follows.
+    const resUsersCalls = [];
+    const onRequest = ({ detail }) => {
+        const { params } = detail.data;
+        if (params.model === "res.users") {
+            resUsersCalls.push(params.method);
+        }
+    };
+    rpcBus.addEventListener("RPC:REQUEST", onRequest);
+    after(() => rpcBus.removeEventListener("RPC:REQUEST", onRequest));
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true); // same form instance, same panel: no remount
+
+    const assigneeOptions = queryAllTexts(".o_crm_activity_schedule_user option");
+    expect([...assigneeOptions].sort()).toEqual([user.name, "Late Colleague"].sort());
+    expect(".o_crm_activity_schedule_user").toHaveValue(String(user.userId)); // default unchanged
+    expect(".o_crm_activity_schedule_user").toHaveAttribute("data-available-offline");
+
+    await contains(".o_crm_activity_schedule_summary").edit("Call the colleague back");
+    await contains(".o_crm_activity_schedule_user").select(String(colleagueId));
+    await contains(".o_crm_activity_schedule_button").click();
+
+    expect(resUsersCalls).toEqual([]); // the recompute is a pure many2x-cache read, no RPC
+
+    const queued = Object.values(getService(OfflinePlugin)._ormToSync());
+    expect(queued.length).toBe(1); // exactly one call queued
+    const [{ value }] = queued;
+    expect(value.model).toBe("mail.activity");
+    expect(value.method).toBe("create");
+    expect(value.args[0][0]).toEqual({
+        res_model: "crm.lead",
+        res_id: 1,
+        activity_type_id: callId,
+        summary: "Call the colleague back",
+        date_deadline: today().toISODate(),
+        user_id: colleagueId, // the colleague cached after mount, not the default current user
+    });
 });
 
 // ---------------------------------------------------------------------------
