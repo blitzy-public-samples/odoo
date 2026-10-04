@@ -1,4 +1,4 @@
-import { signal, usePlugin } from "@odoo/owl";
+import { signal, useEffect, usePlugin } from "@odoo/owl";
 import { usePopover } from "@web/core/popover/popover_hook";
 import { UIPlugin } from "@web/core/ui/ui_plugin";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
@@ -124,6 +124,47 @@ export class CrmKanbanRenderer extends RottingKanbanRenderer {
         // inside the mobile-pipeline branch (`isMobilePipeline` below), so
         // there is no desktop case to branch on.
         this.quickCreatePopover = usePopover(CrmMobileQuickCreate, { useBottomSheet: true });
+        // VAL-MOBILE-018 / architecture.md §3.4: per-stage memory of
+        // whether `pendingLeadCreates` last saw a queued create there --
+        // a plain field, not a signal/computed: it is never read during
+        // render (so it is not UI state, AGENTS.md §2's "signal/
+        // signal.Object/computed" rule governs *that*), it exists only so
+        // the effect below can tell "still has one" apart from "just lost
+        // its last one" for one particular stage, i.e. the one piece of
+        // own-state the feature's own wording allows ("no own state/store
+        // beyond what OWL needs to compare transitions within the
+        // component").
+        this._stageIdsWithPendingLeadCreate = new Set();
+        // VAL-MOBILE-018: the only trigger is the OfflinePlugin's own
+        // queue signal, read here through `pendingLeadCreates` (never
+        // polling, no online/offline listener of our own -- the queue
+        // transition *is* the reconnection signal, since a failed replay
+        // re-schedules the same entry under the same key with `extras.
+        // error` set, offline_plugin.js's `_syncORM`, so it never leaves
+        // `pendingLeadCreates` non-empty). When one stage's count drops
+        // to zero after having been non-zero, that stage's own `web_save`
+        // replay(s) all succeeded, so its list -- and only its list -- is
+        // reloaded (`group.list.load()`, the same per-group fetch
+        // `toggle()` already uses, architecture.md §2) so the real card
+        // the replay just created replaces the pending-sync card with no
+        // page reload and no duplicate (the stale pending card simply
+        // stops rendering once the queue entry is gone, crm_kanban_
+        // renderer.xml's `mobilePipelinePendingLeadCreatesFor`).
+        useEffect(() => {
+            if (!this.isMobilePipeline) {
+                return;
+            }
+            const stageIdsWithPendingLeadCreate = new Set();
+            for (const group of this.mobilePipelineGroups) {
+                const stageId = group.value;
+                if (this.crmOffline.pendingLeadCreates(stageId).length) {
+                    stageIdsWithPendingLeadCreate.add(stageId);
+                } else if (this._stageIdsWithPendingLeadCreate.has(stageId)) {
+                    group.list.load();
+                }
+            }
+            this._stageIdsWithPendingLeadCreate = stageIdsWithPendingLeadCreate;
+        });
     }
 
     /**

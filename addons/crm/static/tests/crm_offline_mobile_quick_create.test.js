@@ -251,15 +251,20 @@ test("VAL-MOBILE-010: offline, saving queues one crm.lead web_save([], vals) wit
     await runAllTimers();
     await animationFrame();
 
-    // KNOWN-LIMIT (architecture.md's "no conflict detection... no server
-    // push" applies here too): the replay dequeues the entry and the
-    // pending card disappears, but nothing in this addon automatically
-    // inserts the now-real record into the already-mounted group's list
-    // afterward -- the same gap as any other offline-queued create in
-    // this fork, not something this sheet is expected to paper over. A
-    // real reload (view switch, fold/unfold, F5) would show it.
+    // m4-sync-refresh (VAL-MOBILE-018): the replay dequeues the entry and
+    // the pending card disappears, and -- the former KNOWN-LIMIT this
+    // comment used to describe -- `CrmKanbanRenderer`'s own sync-refresh
+    // effect now reloads "New"'s list (and only "New"'s) once its last
+    // queued create clears, so the real "New Lead" card is there too, no
+    // page reload, no duplicate; `crm_offline_mobile_sync_refresh.test.js`
+    // covers this in detail (including that "Qualified" issues no RPC of
+    // its own), this file only confirms its own scenario ends the same way.
     expect(Object.values(getService(OfflinePlugin)._ormToSync()).length).toBe(0);
     expect(".o_crm_mobile_pipeline_active .o_crm_mobile_pending_lead_create").toHaveCount(0);
+    expect(queryAllTexts(".o_crm_mobile_pipeline_active .o_crm_mobile_card_name")).toEqual([
+        "Lead 1",
+        "New Lead",
+    ]);
 });
 
 test.tags("mobile");
