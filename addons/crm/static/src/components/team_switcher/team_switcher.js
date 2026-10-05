@@ -18,8 +18,65 @@ export class TeamSwitcher extends Component {
     setup() {
         super.setup();
         this.actionService = useService("action");
+        this.orm = useService("orm");
         this.crmOffline = useCrmOffline();
         this.isSaleManager = false;
+
+        // m5-fix-team-switcher-recovery (VAL-FIX-006/VAL-FIX-013 recovery,
+        // round 3): `user.hasGroup`'s cache (`Cache.read()`, addons/web/
+        // static/src/core/utils/cache.js) never evicts a rejected promise.
+        // If the FIRST ever probe for this group in the page's life (either
+        // this one, or the `onWillStart` one below) lands during a brief
+        // false-online moment and rejects with `ConnectionLostError`, every
+        // later call to `user.hasGroup("sales_team.group_sale_manager")`
+        // returns that exact same rejected promise forever -- a genuine
+        // reconnect never issues a new RPC through it again.
+        // `hasGroupCachePoisoned` records that for this component once it
+        // happens, so a later probe can route around the dead cache entry
+        // with a fresh, uncached read of the same server method
+        // (`res.users.has_group`) instead of repeating a call that can
+        // never succeed. `orm.silent.call` (not `user.hasGroup`) is used for
+        // that bypass precisely because it does NOT go through `user.js`'s
+        // `groupCache` at all -- a plain RPC, uncached on the client, never
+        // stuck the way that cache can be.
+        let hasGroupCachePoisoned = false;
+        const probeSaleManager = () => {
+            const probe = hasGroupCachePoisoned
+                ? this.orm.silent.call(
+                      "res.users",
+                      "has_group",
+                      [user.userId, "sales_team.group_sale_manager"],
+                      { context: user.context }
+                  )
+                : user.hasGroup("sales_team.group_sale_manager");
+            return probe.then(
+                (result) => {
+                    this.isSaleManager = result;
+                },
+                (error) => {
+                    if (!(error instanceof ConnectionLostError)) {
+                        throw error;
+                    }
+                    // m5-fix-team-switcher-catch (research/
+                    // m5-reconnect-stale-ui.md): `isOffline()` can briefly
+                    // read `false` while the network is actually still down
+                    // (a stray successful "RPC:RESPONSE" landing ahead of a
+                    // parked request's own failure), so this probe can
+                    // still reject even though it is only ever issued once
+                    // the caller already sees `isOffline() === false`. A
+                    // `ConnectionLostError` here is treated the same as the
+                    // architecture's offline SKIP decision -- the attempted
+                    // request fails silently, `isSaleManager` keeps
+                    // whatever it already held -- but it also permanently
+                    // poisons `user.hasGroup`'s cache entry for this group,
+                    // so every later probe (from either call site) must use
+                    // the bypass above to have any chance of recovering.
+                    // Any other error is a genuine bug and must still
+                    // surface.
+                    hasGroupCachePoisoned = true;
+                }
+            );
+        };
 
         // Scrutiny finding 4 (VAL-FIX-006/VAL-FIX-013): `onWillStart` below
         // only runs once, at mount time, so a manager whose switcher first
@@ -43,37 +100,7 @@ export class TeamSwitcher extends Component {
                 this.isSaleManager = false;
                 return;
             }
-            // m5-fix-team-switcher-catch (research/m5-reconnect-stale-ui.md):
-            // `isOffline()` can briefly read `false` while the network is
-            // actually still down (a stray successful "RPC:RESPONSE" landing
-            // ahead of a parked request's own failure), so this probe can
-            // still reject with `ConnectionLostError` even though it is only
-            // ever issued once `offline` above is already `false`.
-            // `user.hasGroup`'s cache (`Cache.read()`, addons/web/static/src/
-            // core/utils/cache.js) never evicts a rejected promise, so an
-            // unhandled rejection here would stay cached for the rest of the
-            // page's life: every later re-run of this effect would re-raise
-            // the same `ConnectionLostError` unhandled, and
-            // `lostConnectionHandler` (addons/web/static/src/core/offline/
-            // offline_error.js) would call `setOffline(true)` again each
-            // time, looping the page back offline forever. A
-            // `ConnectionLostError` here is therefore treated the same as
-            // the architecture's offline SKIP decision -- the attempted
-            // request fails silently -- but, unlike the `offline` branch
-            // above, it must not overwrite an already-known value with
-            // `false`: keep whatever `isSaleManager` already held (the
-            // existing offline default if it was never known yet). Any
-            // other error is a genuine bug and must still surface.
-            user.hasGroup("sales_team.group_sale_manager").then(
-                (result) => {
-                    this.isSaleManager = result;
-                },
-                (error) => {
-                    if (!(error instanceof ConnectionLostError)) {
-                        throw error;
-                    }
-                }
-            );
+            probeSaleManager();
         });
         onWillDestroy(disposeIsSaleManagerEffect);
 
@@ -88,9 +115,17 @@ export class TeamSwitcher extends Component {
             // the toggler below is a plain `<button>` without
             // `data-available-offline`, so the framework's
             // `SELECTORS_TO_DISABLE` already disables it.
-            this.isSaleManager = this.crmOffline.isOffline()
-                ? false
-                : await user.hasGroup("sales_team.group_sale_manager");
+            if (this.crmOffline.isOffline()) {
+                this.isSaleManager = false;
+            } else {
+                // A false-online moment can land exactly at mount time too
+                // (`onWillStart` runs only once): `probeSaleManager()`
+                // already swallows a `ConnectionLostError` and poisons the
+                // cache instead of rejecting, so this `await` cannot break
+                // the mount -- the effect above recovers it on the next
+                // online flip.
+                await probeSaleManager();
+            }
             initialProbeDone = true;
         });
     }

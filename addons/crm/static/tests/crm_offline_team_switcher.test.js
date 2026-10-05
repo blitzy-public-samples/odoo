@@ -15,7 +15,7 @@ import {
     patchWithCleanup,
     switchView,
 } from "@web/../tests/web_test_helpers";
-import { ConnectionLostError, rpcBus } from "@web/core/network/rpc";
+import { rpcBus } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { user } from "@web/core/user";
 import { WebClient } from "@web/webclient/webclient";
@@ -684,41 +684,46 @@ test("a sales manager whose switcher first mounts offline sees Manage Teams afte
 // reads `false` while the network is actually still down (the framework
 // can read a stray successful "RPC:RESPONSE" before a parked request's own
 // failure lands, see the research note), the probe fires and rejects with
-// `ConnectionLostError`. `user.hasGroup` is backed by `Cache.read()`
-// (addons/web/static/src/core/utils/cache.js), which never evicts a
-// rejected promise -- but that cache miss is not this test's concern
-// (`user.hasGroup` is patched directly below so the test controls each
-// call's outcome instead of depending on that cache's real behavior).
-// What matters here is purely this effect's own `.then()`: an unhandled
-// rejection reaches the global `UncaughtPromiseError` handler, which
-// `lostConnectionHandler` (addons/web/static/src/core/offline/
-// offline_error.js) turns right back into `setOffline(true)` -- a reload
-// loop with no network traffic, matching the research note's repro. The
-// fix must swallow a `ConnectionLostError` from this probe without
-// altering `isSaleManager` (keep whatever was already known -- the
-// existing offline default here, since this component mounts offline and
-// never had a chance to learn a real value) and must still recover once a
-// later probe genuinely succeeds.
+// `ConnectionLostError`, which must not reach the global
+// `UncaughtPromiseError` handler (`lostConnectionHandler` -- addons/web/
+// static/src/core/offline/offline_error.js -- would turn it right back
+// into `setOffline(true)`, a reload loop with no network traffic).
+//
+// Round 3 (VAL-FIX-006/VAL-FIX-013 recovery, m5-fix-team-switcher-recovery):
+// catching that rejection is not enough on its own. `user.hasGroup` is
+// backed by `Cache.read()` (addons/web/static/src/core/utils/cache.js),
+// which never evicts a rejected promise -- once this group's FIRST ever
+// `user.hasGroup(...)` call in the page's life rejects, every later call to
+// `user.hasGroup("sales_team.group_sale_manager")` returns that exact same
+// rejected promise forever, with no new RPC, even once the connection is
+// genuinely back. Unlike the round-2 fix's own test (which fully replaced
+// `user.hasGroup` with a counter-driven stub, so each call was a fresh,
+// independent decision with no real cache involved), this test uses the
+// REAL cache via `onRpc` on the server method it calls
+// (`res.users.has_group`), so the permanent-rejection behavior is the
+// genuine one, not a stand-in. The fix must still swallow the
+// `ConnectionLostError` without altering `isSaleManager` (keep whatever was
+// already known), and it must still recover on a later, genuine reconnect
+// -- which, because the cache is now poisoned, requires bypassing
+// `user.hasGroup` with a fresh, uncached read of the same server method.
 // ---------------------------------------------------------------------------
 
-test("a brief online flip while the connection is still down doesn't leave an unhandled ConnectionLostError, and the known manager state is kept", async () => {
+test("a sales-manager probe poisoned by a brief false-online flip at cold start still recovers on a genuine reconnect, using the real hasGroup cache", async () => {
     let hasGroupCalls = 0;
-    patchWithCleanup(user, {
-        hasGroup: (group) => {
-            if (group !== "sales_team.group_sale_manager") {
-                return Promise.resolve(false);
-            }
-            hasGroupCalls++;
-            if (hasGroupCalls === 1) {
-                // The brief flip: `isOffline()` reads `false` for a moment
-                // while the network is actually still down, so this first
-                // probe attempt still fails.
-                return Promise.reject(
-                    new ConnectionLostError("/web/dataset/call_kw/res.users/has_group")
-                );
-            }
-            return Promise.resolve(true); // the real reconnect, later
-        },
+    onRpc("res.users", "has_group", ({ args }) => {
+        if (args[1] !== "sales_team.group_sale_manager") {
+            return false;
+        }
+        hasGroupCalls++;
+        if (hasGroupCalls === 1) {
+            // The brief flip: `isOffline()` reads `false` for a moment
+            // while the network is actually still down, so this first
+            // probe attempt still fails -- and poisons the real
+            // `user.hasGroup` cache entry for this group for the rest of
+            // this test's page life.
+            return new Response("", { status: 502 });
+        }
+        return true; // the real reconnect, later
     });
 
     const setOffline = mockCrmOffline();
@@ -728,7 +733,7 @@ test("a brief online flip while the connection is still down doesn't leave an un
     const comp = await mountWithCleanup(TeamSwitcher, {
         componentEnv: {
             searchModel: {
-                state: { switcherTeamId: null, switcherTeams: [] },
+                state: { switcherTeamId: null, switcherTeams: [{ id: 2, name: "Hyrule" }] },
                 isTeamSwitcherEnabled: true,
                 _updateSwitcherSelection: () => {},
             },
@@ -740,31 +745,88 @@ test("a brief online flip while the connection is still down doesn't leave an un
     expect(hasGroupCalls).toBe(0);
 
     // The brief flip: the effect's non-offline branch fires and issues the
-    // probe, which rejects.
+    // probe, which rejects and poisons the real cache entry.
     await setOffline(false);
+    await animationFrame();
 
     expect(hasGroupCalls).toBe(1);
-    // No unhandled rejection reached `lostConnectionHandler`: the plugin
-    // was not flipped back offline on its own, and no error dialog opened.
-    expect(getService(OfflinePlugin).isOffline()).toBe(false);
+    // No unhandled rejection reached `lostConnectionHandler` on top of the
+    // framework's own, correct "RPC:RESPONSE" detection (the failed probe's
+    // own response genuinely re-flips the plugin offline on its own, since
+    // the network really is still down) -- no error dialog opened either
+    // way.
     expect(".o_error_dialog").toHaveCount(0);
     // The failed probe did not corrupt the already-known (default) value.
     expect(comp.isSaleManager).toBe(false);
 
-    // The network really is still down: a later ping (or any other RPC)
-    // catches it and the plugin goes offline again, independent of this
-    // defect.
+    // Settle explicitly offline (idempotent: the "RPC:RESPONSE" handler
+    // above already re-flipped the plugin) before the genuine reconnect.
     await setOffline(true);
     expect(comp.isSaleManager).toBe(false); // unaffected: same SKIP as always
 
-    // The real reconnect: this time the probe succeeds.
+    // The real reconnect: `user.hasGroup`'s cache entry for this group is
+    // now permanently rejected, so recovering here requires the fix's
+    // uncached bypass read, not a second call through `user.hasGroup`.
     await setOffline(false);
-    await animationFrame(); // flush the effect's `user.hasGroup()` promise
+    await animationFrame(); // flush the effect's probe promise
 
     expect(hasGroupCalls).toBe(2);
     expect(comp.isSaleManager).toBe(true); // recovers; not stuck on the earlier rejection
     expect(getService(OfflinePlugin).isOffline()).toBe(false);
     expect(".o_error_dialog").toHaveCount(0);
+    await contains(".o_cp_team_switcher").click();
+    expect(".dropdown-item:contains('Manage Teams')").toHaveCount(1);
+});
+
+// ---------------------------------------------------------------------------
+// Round 3 add-on (m5-fix-team-switcher-recovery): the same permanent-
+// rejection hazard, but for `onWillStart`'s own, first-mount probe instead
+// of the reactive effect's re-probe -- a false-online moment can land
+// exactly at mount time too (the switcher's very first, online mount, with
+// the network only looking up for that one request). `onWillStart` must not
+// let that rejection break the mount (the component must still render,
+// `isSaleManager` falling back to `false`), and the effect above must still
+// recover it on the next online flip -- the same uncached bypass, triggered
+// from the other call site.
+// ---------------------------------------------------------------------------
+
+test("a first-mount online probe that rejects with a false-online ConnectionLostError does not break the mount, and recovers on the next online flip", async () => {
+    let hasGroupCalls = 0;
+    onRpc("res.users", "has_group", ({ args }) => {
+        if (args[1] !== "sales_team.group_sale_manager") {
+            return false;
+        }
+        hasGroupCalls++;
+        if (hasGroupCalls === 1) {
+            // False-online at mount: `onWillStart` runs while `isOffline()`
+            // already reads `false`, but this one request still fails.
+            return new Response("", { status: 502 });
+        }
+        return true; // the genuine reconnect, later
+    });
+
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(1); // onWillStart's own probe runs here, online, and rejects
+
+    expect(hasGroupCalls).toBe(1);
+    // The rejection did not break the mount: the view and the switcher are
+    // both there, with no error dialog.
+    expect(".o_error_dialog").toHaveCount(0);
+    expect(".o_cp_team_switcher").toHaveCount(1);
+    await contains(".o_cp_team_switcher").click();
+    expect(".dropdown-item:contains('Manage Teams')").toHaveCount(0); // fell back to false
+    await contains(".o_cp_team_switcher").click(); // close before going offline
+
+    const setOffline = mockCrmOffline();
+    await setOffline(true);
+    await setOffline(false); // the genuine reconnect
+    await animationFrame();
+
+    expect(hasGroupCalls).toBe(2);
+    expect(getService(OfflinePlugin).isOffline()).toBe(false);
+    expect(".o_error_dialog").toHaveCount(0);
+    await contains(".o_cp_team_switcher").click();
+    expect(".dropdown-item:contains('Manage Teams')").toHaveCount(1); // recovered
 });
 
 // ---------------------------------------------------------------------------
