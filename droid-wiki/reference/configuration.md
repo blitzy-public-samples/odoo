@@ -1,172 +1,302 @@
 # Configuration
-Active contributors: Odoo SA (upstream)
 
 ## Purpose
 
-Odoo combines command-line flags, environment variables, an INI-style config
-file, and built-in defaults into one process-wide configuration object. The
-same option can therefore be set at startup with `--http-port`, in
-`[options]` in `odoo.conf`, or through the option's environment mapping.
+Every knob that changes how the server runs, in one place: process options
+(CLI flags, environment variables, the `odoo.conf` file, defaults), the
+`odoo-bin` subcommands, the fork's `scripts/dev/` environment overrides
+including the `--https` TLS mode, per-database Odoo system parameters, and
+the config the browser receives with the web client. For how secrets are
+protected, read [Security](../security.md); this page never needs real secret
+values and does not print any.
 
-## Directory layout
+## Precedence: how one option can be set four ways
 
-```text
-odoo/tools/config.py          option declarations, parsing, and precedence
-odoo/cli/server.py            server command that consumes the options
-scripts/dev/_common.sh        fork development environment defaults
-scripts/dev/start.sh          passes the selected database and HTTP port
+`odoo/tools/config.py` builds a single `configmanager` whose `options` is a
+`collections.ChainMap` resolved at read time in this order
+(`odoo/tools/config.py:187-198`):
+
+1. **Runtime values** (`_runtime_options`) — derived checks, not user input.
+2. **CLI flags** (`_cli_options`) — parsed from the command line.
+3. **Environment variables** (`_env_options`) — per-option `env_name` (see below).
+4. **Config file** (`_file_options`) — the `[options]` section of `odoo.conf`.
+5. **Defaults** (`_default_options`) — each option's `my_default`.
+
+An option can also be file-only (no CLI flag, e.g. `admin_passwd`) or
+CLI-only (`file_loadable=False`, e.g. `--init`, `--update`, `--test-tags`,
+`--dev`). Environment names are auto-generated as `ODOO_<DEST>` for
+file-loadable options unless the option sets an explicit `env_name`
+(`odoo/tools/config.py:133-136`) — database options use libpq's names
+(`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`,
+`PGAPPNAME`, ...).
+
+## The config file
+
+```ini
+[options]
+admin_passwd = <database manager master password>
+addons_path = /home/factory-user/repos/odoo/addons
+data_dir = ~/.local/share/Odoo
+db_host = /var/run/postgresql
+db_port = 5432
+workers = 0
 ```
 
-## Key abstractions
+- Section is always `[options]`; keys are option destinations (`addons_path`,
+  not `--addons-path`). Unknown keys are kept as strings with a warning.
+- Search order for the default path (`odoo/tools/config.py:556-575`): the
+  user config dir (`.../odoo/odoo.conf`), then `~/.odoorc`, then
+  `~/.openerp_serverrc` (deprecated), then the user config path again.
+  Override with `-c <file>` or the `ODOO_RC` environment variable
+  (`OPENERP_SERVER` still works but is deprecated).
+- `odoo-bin --save` writes the current, exportable options back to that file.
+- An optional `[colors]` section tunes per-output coloring
+  (`pid`, `loglevel`, `session_id`, `http_request_line`,
+  `http_response_body`, `perf`, `cursor_mode`, `sql`); each accepts
+  `never` / `auto` / `always`.
+- File-only options (no CLI flag): `admin_passwd` (default `admin`),
+  `bin_path`, `csv_internal_sep`, `websocket_keep_alive_timeout` (3600),
+  `websocket_rate_limit_burst` (10), `websocket_rate_limit_delay` (0.2),
+  `reportgz`, `publisher_warranty_url`, `proxy_access_token`,
+  `import_file_maxbytes` (10 MiB), `import_file_timeout` (3),
+  `import_url_regex`, `default_productivity_apps`.
 
-| Name | File | Description |
-|---|---|---|
-| `configmanager` | `odoo/tools/config.py` | Owns defaults, file, environment, CLI, and runtime option maps. |
-| `options` | `odoo/tools/config.py` | A `collections.ChainMap` with runtime values taking precedence. |
-| `_OdooOption` | `odoo/tools/config.py` | Defines type checking, file loading, export, and environment mapping. |
-| `[options]` | `odoo/tools/config.py` | Config-file section for option destinations. |
-| `[colors]` | `odoo/tools/config.py` | Optional per-output color settings. |
+## `odoo-bin` CLI
 
-## How it works
+`odoo-bin <command> [options]` — commands are discovered from
+`odoo/cli/*.py` and any addon's `cli/` directory (`odoo/cli/command.py`).
+Core commands: `server`, `start` (quick start with dev defaults), `shell`
+(interactive REPL), `db` (create/dump/restore), `deploy`, `duplicate`,
+`scaffold`, `i18n`, `module`, `neutralize`, `obfuscate`, `upgrade_code`,
+`cloc`, `help`. `odoo-bin server` accepts all the options below; the dev
+scripts in `scripts/dev/` wrap it.
 
-```mermaid
-graph LR
-    D[Built-in defaults] --> M[ChainMap]
-    F[odoo.conf options] --> M
-    E[Environment variables] --> M
-    C[CLI flags] --> M
-    M --> P[Post-processing]
-    P --> S[Server and ORM]
-```
+### Common and startup options
 
-The `configmanager` constructs `ChainMap` in this order:
-`_runtime_options`, `_cli_options`, `_env_options`, `_file_options`, then
-`_default_options` (`odoo/tools/config.py:179-198`). Runtime values are
-derived checks, not a separate user-facing source. `_OdooOption` generates
-`ODOO_<DEST>` for file-loadable options unless an explicit `env_name` is
-provided. Database options use PostgreSQL names such as `PGHOST`, `PGPORT`,
-`PGUSER`, and `PGPASSWORD` (`odoo/tools/config.py:404-425`).
+| Option | Default | Effect |
+| --- | --- | --- |
+| `-c`, `--config` | searched path (see above); env `ODOO_RC` | Config file to read. |
+| `--save` | off | Write the effective options to the config file. |
+| `-i`, `--init` / `-u`, `--update` / `--reinit` | empty | Install / update / reinitialize modules; requires `-d`. CLI-only. |
+| `--with-demo` / `--without-demo` | no demo | Install demo data in new databases. |
+| `--skip-auto-install` | off | Skip modules marked `auto_install`. |
+| `--addons-path` | empty | Extra addon directories (comma-separated). |
+| `--upgrade-path`, `--pre-upgrade-scripts` | empty | Extra upgrade script locations for `-u` runs. |
+| `--load` | `base,rpc,web` | Server-wide modules loaded before any database. |
+| `-D`, `--data-dir` | platform data dir (e.g. `~/.local/share/Odoo`) | Filestore and sessions directory. |
+| `-P`, `--import-partial` | empty | State file to resume interrupted large imports. |
+| `--pidfile` | empty | Where the server writes its pid. |
+| `--unsafe-policy` | `log` | Policy on unsafe objects in safe_eval: `disable`, `log`, `raise`, `terminate`. |
 
-The default config path is selected from the user config directory as
-`odoo.conf`, with fallbacks to `~/.odoorc`, `~/.openerp_serverrc`, or a
-platform-specific path (`odoo/tools/config.py:540-575`). Odoo reads options
-from `[options]`; unknown options are retained as strings with a warning.
-`--dev`, `--test-tags`, and several install/test controls are intentionally
-CLI-only or non-exportable.
+### HTTP and web
 
-### Common options
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--http-interface` | `127.0.0.1` | Listen address for HTTP. |
+| `-p`, `--http-port` | `8069` | Main HTTP port. |
+| `--gevent-port` | `8072` | Port of the gevent worker (longpolling/bus). |
+| `--no-http` | off | Disable HTTP and longpolling entirely. |
+| `--proxy-mode` | off | Trust reverse-proxy headers (`X-Forwarded-*`). Only behind a trusted proxy. |
+| `--x-sendfile` | off | Delegate big file delivery to the web server (`X-Sendfile` / `X-Accel-Redirect`). |
+| `--db-filter` | empty | Regex filtering which databases the web UI offers; `%d` and `%h` placeholders. |
 
-| Option | Default or mapping | Meaning |
-|---|---|---|
-| `config` / `--config` | Selected config path; `ODOO_RC` | Selects the config file. |
-| `addons_path` / `--addons-path` | Empty list | Adds comma-separated addon directories. |
-| `data_dir` / `--data-dir` | Platform data directory | Stores filestore and runtime data. |
-| `server_wide_modules` / `--load` | `base,rpc,web` | Loads modules before a database is selected. |
-| `init` / `--init` | Empty | Installs modules, requiring `-d`. |
-| `update` / `--update` | Empty | Updates modules, requiring `-d`. |
-| `with_demo` / `--with-demo` | `False` | Installs demo data for new databases. |
+### Database
 
-### HTTP, web, and database options
+| Option | Default | Effect |
+| --- | --- | --- |
+| `-d`, `--database` | empty; env `PGDATABASE` | Database(s) to act on. |
+| `-r`, `--db_user` / `-w`, `--db_password` | empty; env `PGUSER` / `PGPASSWORD` | PostgreSQL credentials. |
+| `--db_host` / `--db_port` | socket / 5432; env `PGHOST` / `PGPORT` | PostgreSQL endpoint (`PGHOST` may be a socket directory). |
+| `--db_sslmode` | `prefer`; env `PGSSLMODE` | `disable` ... `verify-full`. |
+| `--db_maxconn` | `64` | Max physical connections per process. |
+| `--db_maxconn_gevent` | unset | Separate pool size for the gevent worker. |
+| `--db-template` | `template0`; env `PGDATABASE_TEMPLATE` | Template for new databases. |
+| `--db_app_name` | `odoo-{pid}`; env `PGAPPNAME` | Application name in PostgreSQL. |
+| `--db_replica_host` / `--db_replica_port` | unset; env `PGHOST_REPLICA` / `PGPORT_REPLICA` | Read replica endpoint (see `--dev=replica`). |
+| `--db-system` | `postgres`; env `PGDATABASE_SYSTEM` | Shared database for bus and maintenance. |
+| `--pg_path` | empty; env `PGPATH` | Directory holding `psql` and friends. |
+| `--no-database-list` | off | Hide the database list and the database manager. |
 
-| Option | Default or mapping | Meaning |
-|---|---|---|
-| `http_interface` / `--http-interface` | `127.0.0.1` | Address for HTTP services. |
-| `http_port` / `--http-port` | `8069` | Main HTTP service port. |
-| `gevent_port` / `--gevent-port` | `8072` | Gevent worker port. |
-| `http_enable` / `--no-http` | `True` | Enables HTTP and long-polling services. |
-| `proxy_mode` / `--proxy-mode` | `False` | Trusts reverse-proxy header rewriting. |
-| `dbfilter` / `--db-filter` | Empty | Regex filters databases exposed by the web UI. |
-| `db_name` / `-d` | Empty; `PGDATABASE` | Database name(s) for operations. |
-| `db_user` / `--db_user` | Empty; `PGUSER` | PostgreSQL user. |
-| `db_password` / `--db_password` | Empty; `PGPASSWORD` | PostgreSQL password. |
-| `db_host` / `--db_host` | Empty; `PGHOST` | PostgreSQL host or socket directory. |
-| `db_port` / `--db_port` | Empty; `PGPORT` | PostgreSQL port. |
-| `db_sslmode` / `--db_sslmode` | `prefer`; `PGSSLMODE` | PostgreSQL SSL mode. |
-| `db_maxconn` / `--db_maxconn` | `64` | Maximum physical PostgreSQL connections. |
+### Workers and limits (multiprocessing)
 
-### Runtime, limits, and tests
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--workers` | `0` | `0` = threaded mode; positive = prefork workers. |
+| `--gevent-workers` | `1` | Gevent workers in prefork mode (needs `SO_REUSEPORT`). |
+| `--limit-memory-soft` | 2048 MiB | Worker recycled after the request that crosses it. |
+| `--limit-memory-hard` | 2560 MiB | Allocations above it fail. |
+| `--limit-memory-soft-gevent` / `--limit-memory-hard-gevent` | unset | Per-gevent-worker overrides. |
+| `--limit-time-cpu` | `60` | CPU seconds per request. |
+| `--limit-time-real` | `120` | Wall-clock seconds per request. |
+| `--limit-time-real-cron` | `-1` | Wall-clock per cron job (`-1` follows `--limit-time-real`, `0` = no limit). |
+| `--limit-request` | `65536` | Requests per worker before recycling. |
+| `--max-cron-threads` | `2` | Concurrent cron threads. |
+| `--limit-time-worker-cron` | `0` | Cron thread/worker lifetime; `0` disables the check. |
+| `--osv-memory-count-limit` | `0` | Max records in TransientModel tables (`0` = no limit). |
+| `--transient-age-limit` | `1.0` | Hours a TransientModel record is kept. |
 
-| Option | Default | Meaning |
-|---|---:|---|
-| `workers` / `--workers` | `0` | Uses threaded mode at zero, or prefork workers when positive. |
-| `gevent_workers` / `--gevent-workers` | `1` | Gevent workers in prefork mode. |
-| `limit_memory_soft` | `2048 MiB` | Restarts a worker after a request over the soft virtual-memory limit. |
-| `limit_memory_hard` | `2560 MiB` | Rejects allocations over the hard worker limit. |
-| `limit_time_cpu` | `60` | CPU seconds allowed per request. |
-| `limit_time_real` | `120` | Wall-clock seconds allowed per request. |
-| `limit_request` | `65,536` | Requests handled before a worker is recycled. |
-| `dev` / `--dev` | Empty; `ODOO_DEV` | Enables `access`, `qweb`, `reload`, `replica`, or `xml` development features. |
-| `test_tags` / `--test-tags` | Empty | Selects tests by tag, module, class, or method and implies test mode. |
-| `test_enable` / `--test-enable` | `False` | Enables standard test execution; it is CLI-only. |
-| `logfile` / `--logfile` | Empty | Writes server logs to a file instead of only the console. |
+### Testing, logging, SMTP, i18n, advanced
 
-### Database parameters
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--test-enable` | off | Run tests; implies `--stop-after-init`. CLI-only. |
+| `-t`, `--test-tags` | empty | Tag/module/class/method filter, e.g. `/crm:TestCrmOffline`; implies test mode. CLI-only. |
+| `--test-file` | empty | Run a single Python test file. |
+| `--screenshots` / `--screencasts` | `$TMPDIR/odoo_tests` | Where browser-test captures land. |
+| `--logfile`, `--log-level` | empty / `info` | Log sink and verbosity (`debug`, `test`, `runbot`, ...). |
+| `--log-handler` | `:INFO` | Per-module log levels, repeatable (`odoo.orm:DEBUG`); `--log-web` and `--log-sql` are shortcuts. |
+| `--log-db`, `--log-db-level` | empty / `warning` | Log into a database. |
+| `--log-config` | empty | JSON dictConfig logging file. |
+| `--smtp`, `--smtp-port`, `--smtp-user`, `--smtp-password`, `--smtp-ssl` | `localhost`, `25`, empty, empty, off | Outgoing mail server. |
+| `--email-from`, `--from-filter` | empty | From address and which address may use the SMTP config. |
+| `--load-language`, `--i18n-overwrite` | — | Load translations at init; overwrite existing terms on update. |
+| `--dev` | empty; env `ODOO_DEV` | Dev features: `access`, `qweb`, `reload`, `replica`, `xml`; `all` enables `access`, `qweb`, `reload`, `xml`. CLI-only. |
+| `--stop`, `--stop-after-init` | off | Exit after initialization. CLI-only. |
+| `--unaccent` | off | Enable the PostgreSQL `unaccent` extension on new databases. |
+| `--geoip-city-db`, `--geoip-country-db` | `/usr/share/GeoIP/GeoLite2-*.mmdb` | MaxMind database paths. |
 
-`ir.config_parameter` is separate from process startup configuration. Its
-defaults are initialized in `odoo/addons/base/models/ir_config_parameter.py`:
-`database.secret` (a UUID), `database.uuid`, `database.create_date`,
-`web.base.url` using the configured HTTP port,
-`base.login_cooldown_after` (10), and `base.login_cooldown_duration` (60).
-Other shipped defaults include `base.default_max_email_size` set to 20 in
-`odoo/addons/base/data/ir_config_parameter_data.xml` and
-`base.template_portal_user_id` in `odoo/addons/base/security/base_groups.xml`.
+The `scripts/dev/` wrappers pass the relevant subset of these themselves —
+see [CLI and maintenance](../systems/cli-and-maintenance.md) for the exact
+commands each wrapper runs.
 
-The web setting `web.web_app_name` is declared by
-`addons/web/models/res_config_settings.py:7-10` and read by the manifest
-controller for the PWA name. The browser cache secret is not an
-`ir.config_parameter` key. `addons/web/controllers/home.py:72-78` derives
-`session_info['browser_cache_secret']` with the HMAC scope
-`"browser_cache_key"` over the user's session-token values. The HMAC key
-falls back to the `database.secret` parameter in
-`odoo/tools/misc.py:1792-1806`; password or 2FA changes therefore change the
-browser cache key.
+## The `scripts/dev/` environment overrides
 
-### Fork overrides
+The fork's dev environment layers its own variables on top
+(`scripts/dev/_common.sh:10-20`). These belong to the scripts, not to
+`configmanager`:
 
-The development scripts add a second, script-level configuration layer in
-`scripts/dev/_common.sh:10-20`: `ODOO_DB` defaults to `crm_offline`,
-`ODOO_PORT` to `8069`, `ODOO_HTTPS_BACKEND_PORT` to `8070`, and login/password
-to `admin`/`admin`. `PGHOST` defaults to `/var/run/postgresql` and `PGPORT` to
-`5432`. `scripts/dev/start.sh:98-105` passes the selected database and backend
-port as `-d` and `--http-port`; these `ODOO_PORT` names are not the same as
-the auto-generated `ODOO_HTTP_PORT` environment name in `config.py`.
+| Variable | Default | Used for |
+| --- | --- | --- |
+| `ODOO_DB` | `crm_offline` | Dev/test database everywhere. |
+| `ODOO_PORT` | `8069` | Public port: plain HTTP, or HTTPS with `start.sh --https`. |
+| `ODOO_HTTPS_BACKEND_PORT` | `8070` | Loopback port Odoo binds in `--https` mode. |
+| `ODOO_ADMIN_LOGIN` / `ODOO_ADMIN_PASSWORD` | `admin` / `admin` | Dev login (printed by `start.sh`). |
+| `PGHOST` | `/var/run/postgresql` | Socket dir so plain `./odoo-bin -d <db>` needs no DB flags. |
+| `PGPORT` | `5432` | PostgreSQL port. |
+| `ODOO_RC` | (from config.py) | If set, points the server at a config file. |
 
-## Integration points
+Everything the scripts produce lands in the gitignored `logs/`
+(`logs/odoo.log`, `logs/test-*.log`, `logs/measure-*.txt`) and `var/`
+(`var/tls/`). See [Getting started](../overview/getting-started.md).
 
-The server command consumes the parsed options, the runtime uses worker and
-limit values, and the ORM uses database connection settings. `ir.config_parameter`
-is a database model consumed by addons, including web's manifest and bootstrap
-controllers. Development wrappers use their own environment variables before
-calling `odoo-bin`.
+### The `--https` TLS mode
 
-## Entry points for modification
+`./scripts/dev/start.sh --https` exists because offline features need a
+[secure context](../features/offline-and-pwa/index.md): a plain `http://`
+origin that is not `localhost` disables service workers, IndexedDB crypto,
+and the whole offline layer. What the mode does (`scripts/dev/start.sh`):
 
-Add a new server option in the appropriate group in
-`odoo/tools/config.py`, including its type and file/environment behavior.
-For fork-only behavior, prefer a variable or wrapper change in
-`scripts/dev/_common.sh` or `scripts/dev/start.sh`; do not alter upstream
-configuration semantics from `addons/crm/`.
+- generates a self-signed certificate on first run in `var/tls/`
+  (`odoo-dev.crt` / `odoo-dev.key`, CN `localhost`, SAN
+  `DNS:localhost,IP:127.0.0.1`, RSA 2048, valid 10 years);
+- starts Odoo itself on the loopback-only port `8070`
+  (`--http-interface=127.0.0.1`);
+- runs `socat OPENSSL-LISTEN:8069,fork,reuseaddr,verify=0,cert=...,key=...`
+  as a TLS proxy from port `8069` (any interface) to `127.0.0.1:8070`;
+- the browser shows a certificate warning that must be accepted once.
+
+Use it whenever the page is opened through a port forward or from another
+machine. On plain `localhost`, the default mode is already a secure
+context. The default `start.sh` mode binds `127.0.0.1` only; the TLS port
+accepts connections from any interface — do not expose it past the dev
+machine.
+
+## Odoo system parameters (`ir.config_parameter`)
+
+Process options configure the server; system parameters configure the
+database. They are key/value rows in the `ir_config_parameter` table with
+typed accessors (`get_bool`, `get_int`, `get_float`, `get_str` /
+`set_*`), readable through Settings > Technical > System Parameters.
+Defaults initialized at database creation
+(`odoo/addons/base/models/ir_config_parameter.py:33-41`):
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `database.secret` | random UUID | HMAC key for session tokens and derived secrets; protected from rename/delete. |
+| `database.uuid` / `database.create_date` | random / now | Database identity and birth date. |
+| `web.base.url` | `http://localhost:<http_port>` | Base URL for links and assets. |
+| `base.login_cooldown_after` / `base.login_cooldown_duration` | `10` / `60` | Login rate limiting. |
+
+Other parameters read by the code paths this wiki covers:
+
+| Key | Where it is read | Effect |
+| --- | --- | --- |
+| `web.web_app_name` | `addons/web/controllers/webmanifest.py:43` | Name in the PWA manifest; falls back to `Odoo`. Declared as a setting in `addons/web/models/res_config_settings.py`. |
+| `web.max_file_upload_size` | `addons/web/models/ir_http.py` | Upload size cap in session info. |
+| `web.quick_login` | `addons/web/models/ir_http.py` | Quick-login signal in session info. |
+| `web.active_ids_limit` | `addons/web/models/ir_http.py` | Cap on active ids sent to the client (default 20000). |
+| `base.session_check_device` | `addons/web/models/ir_http.py` | Enables the per-device salt for session security. |
+| `base.default_max_email_size` | `odoo/addons/base/data/ir_config_parameter_data.xml` | Max email size (MB), default 20. |
+| `report.pdf_engine_default` | `odoo/addons/base/models/ir_actions_report.py:799` | Default PDF engine for reports; `html` means no binary engine. |
+| `iap.endpoint` | `addons/iap/tools/iap_tools.py` | Base URL for IAP calls, default `https://iap.odoo.com`. |
+
+### CRM settings and parameters
+
+`addons/crm/models/res_config_settings.py` writes these parameters from the
+CRM settings panel:
+
+| Key / setting | Effect |
+| --- | --- |
+| `crm.lead.auto.assignment` | Enables rule-based lead assignment; the settings form also syncs the `crm.ir_cron_crm_lead_assign` cron (active, interval, next run). |
+| `crm.iap.lead.enrich.setting` | `manual` or `auto` — when IAP lead enrichment runs. |
+| `crm.lead_mining_in_pipeline` | Shows lead-mining requests directly in the pipeline. |
+| `crm.pls_start_date` | Start date for predictive lead scoring (stored as a string; malformed values fall back to "8 days ago"). |
+| `crm.pls_fields` | Comma-separated `crm.lead` field names used by lead scoring. |
+| `sales_team.membership_multi` | Multi-team membership. |
+| Groups `crm.group_use_lead`, `crm.group_use_recurring_revenues` | Toggle leads vs opportunities-only, and recurring revenues UI. |
+
+The same panel toggles optional modules (`module_crm_iap_mine`,
+`module_crm_iap_enrich`, `module_website_crm_iap_reveal`, ...) which pull in
+the IAP-dependent addons described in [Dependencies](dependencies.md).
+
+## Browser-side config: session info and the cache secret
+
+The web client page (`/odoo`) carries a JSON `session_info` object built by
+`addons/web/models/ir_http.py` (`session_info()`) and extended by
+`addons/web/controllers/home.py`. The client reads configuration from it:
+user context and identity flags, `db`, `server_version`,
+`web.base.url`, `currencies`, user settings, tour flags — and two values
+the offline stack depends on:
+
+- **`registry_hash`** — an HMAC (scope `webclient-cache`) over the asset
+  registry sequence. The offline IndexedDB stores a version record keyed on
+  `registry_hash + CRYPTO_ALGO` and wipes the whole database when the
+  registry changes (`addons/web/static/src/core/utils/indexed_db.js`).
+- **`browser_cache_secret`** — an HMAC with scope `browser_cache_key` over
+  the user's session-token values, keyed by the `database.secret` system
+  parameter (`addons/web/controllers/home.py:72-78`, helper in
+  `odoo/tools/misc.py`). It is added only to the webclient page, which is
+  served with `Cache-Control: no-store`, so it never lands in a shared HTTP
+  cache. A password or 2FA change rotates it, which re-keys the offline
+  encrypted store (`addons/web/static/src/core/crypto.js` derives AES-GCM
+  keys from it).
+
+Never print, log, or commit real values of `admin_passwd`,
+`db_password`, `smtp_password`, `proxy_access_token`, or
+`browser_cache_secret` — see [Security](../security.md).
 
 ## Key source files
 
 | File | Purpose |
-|---|---|
-| `odoo/tools/config.py` | Option declarations, ChainMap precedence, file and environment loading. |
-| `odoo/cli/server.py` | Server CLI entry point. |
-| `odoo/addons/base/models/ir_config_parameter.py` | Database parameter defaults and typed accessors. |
-| `odoo/tools/misc.py` | HMAC helper keyed by `database.secret`. |
-| `odoo/addons/base/data/ir_config_parameter_data.xml` | Base email-size default. |
-| `odoo/addons/base/security/base_groups.xml` | Portal-user template parameter. |
-| `addons/web/models/res_config_settings.py` | `web.web_app_name` setting declaration. |
-| `addons/web/controllers/home.py` | Browser cache secret derivation. |
-| `addons/web/controllers/webmanifest.py` | Web app name and manifest routes. |
-| `scripts/dev/_common.sh` | Fork database, port, credentials, and PostgreSQL defaults. |
-| `scripts/dev/start.sh` | Fork server startup and optional TLS proxy. |
+| --- | --- |
+| `odoo/tools/config.py` | Option declarations, precedence, file and environment loading. |
+| `odoo/cli/command.py` | Subcommand discovery for `odoo-bin`. |
+| `odoo/addons/base/models/ir_config_parameter.py` | System parameter storage, typed accessors, protected defaults. |
+| `odoo/addons/base/data/ir_config_parameter_data.xml` | `base.default_max_email_size` default. |
+| `addons/web/models/res_config_settings.py` | `web.web_app_name` setting. |
+| `addons/web/controllers/webmanifest.py` | PWA manifest built from `web.web_app_name`. |
+| `addons/web/models/ir_http.py` | `session_info()` contents. |
+| `addons/web/controllers/home.py` | `browser_cache_secret` derivation, no-store caching. |
+| `addons/crm/models/res_config_settings.py` | CRM settings and `crm.*` parameters. |
+| `scripts/dev/_common.sh` | Dev environment variable defaults. |
+| `scripts/dev/start.sh` | Plain and `--https` server startup, TLS proxy. |
 
 ## Related pages
 
 - [Reference](index.md)
 - [Server runtime](../systems/server-runtime.md)
-- [Module system](../systems/module-system.md)
-- [Tooling](../how-to-contribute/tooling.md)
+- [HTTP server](../systems/http-server.md)
+- [CLI and maintenance](../systems/cli-and-maintenance.md)
 - [Offline and PWA](../features/offline-and-pwa/index.md)
+- [Security](../security.md)
+- [Deployment](../deployment.md)

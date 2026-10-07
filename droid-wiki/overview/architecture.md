@@ -1,78 +1,71 @@
 # Architecture
 
-The system has four layers: a PostgreSQL database, a Python application server (the `odoo/` package) that hosts every module and exposes HTTP/RPC, an OWL-based single-page web client (`addons/web`) that talks to the server over JSON, and, specific to this fork, a browser-side offline stack (service worker, encrypted IndexedDB, ORM-call queue) that lets the web client keep working without a connection. Business functionality is delivered as 642 addon modules that plug into the server and extend the client.
+Odoo is a client-server application. A single Python process serves both HTTP requests and JSON-RPC calls, reads and writes PostgreSQL, and ships the compiled front-end as asset bundles. The browser runs an OWL application that talks to the server almost exclusively through `orm` calls and a few controllers.
 
-By language the codebase is roughly 1.36M lines of Python (server, ORM, module logic), ~1.2M lines of first-party JavaScript (web client, plus vendored libraries such as OWL, Bootstrap 5 and Chart.js in each addon's `static/lib/`), 573k lines of XML (views, data, security), and 80k lines of SCSS.
+By language, the codebase is roughly 1.51 million lines of JavaScript in 6,775 files, 1.36 million lines of Python in 9,400 files, 573,000 lines of XML in 6,052 files (data records and view archs), about 110,000 lines of SCSS/CSS, and 147,000 lines of CSV (mostly translations and demo data).
 
-## Server core
-
-```mermaid
-graph TD
-    CLI["odoo-bin / odoo/cli"] --> SRV["odoo/service/server.py<br/>(Threaded / Prefork / Gevent)"]
-    SRV --> REG["Registry (odoo/orm/registry.py)<br/>one per database"]
-    REG --> LOAD["odoo/modules/loading.py<br/>manifest graph → import → XML/CSV data"]
-    SRV --> HTTP["odoo/http/router.py (WSGI)"]
-    HTTP --> DISP["Dispatchers (odoo/http/dispatcher.py)<br/>Http / JsonRPC / Json2"]
-    DISP --> CTRL["Controllers (@route methods)"]
-    CTRL --> ORM["ORM (odoo/orm/models.py)<br/>recordsets + ir.access checks"]
-    ORM --> PG[("PostgreSQL<br/>odoo/sql_db.py pool")]
-```
-
-- The server boots via `odoo-bin` → `odoo/cli/server.py` → `odoo/service/server.py`, which picks one of three server models: `ThreadedServer` (dev, one process), `PreforkServer` (production, forked HTTP and cron workers with memory/request/time limits), or `GeventServer` (longpolling and websockets).
-- Each database gets a `Registry` that loads the module graph: manifests declare `depends`, data files, and assets; Python model classes are built and set up in `odoo/orm/model_classes.py`.
-- Requests enter a WSGI application (`odoo/http/router.py`), which resolves the session and database, matches a route on the per-database routing map, and dispatches through `HttpDispatcher`, `JsonRPCDispatcher`, or `Json2Dispatcher`. Read-only routes run on read-only cursors and retry on a writable cursor if needed.
-- The ORM (`odoo/orm/`) is the heart: recordsets, fields, domains (a real AST with optimization passes, `odoo/orm/domains.py`), computed fields, onchange, and access control unified in the `ir.access` model (`odoo/addons/base/models/ir_access.py`).
-
-## Web client
+## The server
 
 ```mermaid
 graph LR
-    B[Browser] --> SW["Service worker<br/>(/web/service-worker.js)"]
-    B --> WC["OWL web client<br/>(addons/web/static/src)"]
-    WC --> CORE["core/: services + plugins<br/>rpc, orm, ui, errors, registries"]
-    WC --> MODEL["model/relational_model/<br/>record.js, dynamic_list.js"]
-    WC --> VIEWS["views/: form, list, kanban,<br/>calendar, graph, pivot"]
-    CORE -->|JSON| HTTP["odoo/http controllers"]
-    MODEL -->|ConnectionLostError| QUEUE["scheduleORM<br/>(offline queue)"]
+    Browser -->|HTTP / JSON-RPC| odoohttp["odoo.http dispatcher"]
+    odoohttp --> Registry["odoo.registry (per database)"]
+    Registry --> Model["Model classes (odoo.orm)"]
+    Model --> Fields["Fields (odoo.fields)"]
+    Model --> PG[(PostgreSQL)]
+    Model --> Assets["ir.asset / ir.qweb assets"]
+    Assets --> Browser
 ```
 
-- The client boots `addons/web/static/src/main.js` → `start.js` → `webclient/webclient.js` and registers the shared service worker with scope `/odoo`.
-- The vendored framework is OWL 3 (`addons/web/static/lib/owl/owl.js`) behind an Owl-2 compatibility layer (`addons/web/static/src/owl2/owl3_compatibility_layer.js`), imported everywhere as `@odoo/owl`.
-- New code uses the plugin API: classes extending OWL `Plugin` registered through `services.add(...)` (`addons/web/static/src/core/services.js`) and consumed with `usePlugin(...)`. Legacy service bridges (`"offline"`, `"ui"`, `"bottom_sheet"`) are temporary, marked for the OWL 3 migration.
-- Views are registered in `registry.category("views")`; an XML arch attribute `js_class` binds a view to a custom view object. CRM uses this heavily (see [CRM views](../apps/crm/crm-views.md)).
+- `odoo-bin` (`odoo-bin`) is the entry point. It parses configuration, sets up the database registry, and starts the threaded HTTP server (`odoo/http/`).
+- The registry loads installed addons from `addons/`. An addon is a directory with a `__manifest__.py`, Python `models/`, XML data (views, security rules, demo data), `controllers/` for HTTP routes, and `static/` for front-end assets. See [Module system](../systems/module-system.md).
+- Models extend `odoo.models.Model` and are composed with `_inherit`/`_inherits`. Fields, constraints, computed methods, and the query builder live in `odoo/orm/` and `odoo/fields/`. See [ORM](../systems/orm.md).
+- Views are XML archs (`<form>`, `<list>`, `<kanban>`, ...) stored as `ir.ui.view` records. The client receives parsed archs and renders them with registered view components.
+- Assets are gathered per bundle (`web.assets_backend`, `web.assets_tests`, ...) and served to the browser. See [Assets](../systems/assets.md).
 
-## The offline stack (this fork)
+## The web client
+
+The front-end in `addons/web/static/src/` is an OWL 2 application (`addons/web/static/src/owl2/`):
+
+- `addons/web/static/src/main.js` boots the web client from the session info embedded in the page.
+- `addons/web/static/src/webclient/` holds the shell: action manager, navbar, breadcrumbs, user menu, systray (including the offline systray).
+- `addons/web/static/src/views/` holds the view framework: a `RelationalModel` that loads and edits records (`addons/web/static/src/model/relational_model/`), and one controller/renderer/parser per view type (form, list, kanban, calendar, ...).
+- `addons/web/static/src/core/` holds services and plugins: RPC/ORM services, `UIPlugin` (the small-screen signal), `OfflinePlugin`, the PWA service, dialogs, popovers, and the bottom sheet.
+
+## The offline stack
+
+Offline support is entirely in `addons/web`; the CRM only consumes it. See [Offline and PWA](../features/offline-and-pwa/index.md) for the full story.
 
 ```mermaid
-sequenceDiagram
-    participant U as User (offline)
-    participant V as View (form/list/kanban)
-    participant Q as OfflinePlugin queue
-    participant DB as IndexedDB (encrypted)
-    participant S as Server
-
-    U->>V: edit a lead, save
-    V->>S: web_save RPC
-    S--xV: ConnectionLostError
-    V->>Q: scheduleORM("crm.lead", "web_save", ...)
-    Q->>DB: persist {model, method, args, kwargs, extras}
-    Note over Q: entry shown in offline systray
-    ... connection returns ...
-    Q->>S: orm.silent.call replay, timestamp order
-    S-->>Q: success → dequeue / other error → park with extras.error
+graph TD
+    Record["Form/list edit (record.js, dynamic_list.js)"] -->|ConnectionLostError| Q["scheduleORM()"]
+    Q --> DB[("IndexedDB (encrypted, per-tab mutex)")]
+    UI["Offline systray"] --> DB
+    SW["Service worker"] --> Cache[("Cached /odoo homepage")]
+    SW --> Offline["/odoo/offline fallback page"]
+    Reconn["Reconnect probe"] --> Replay["_syncORM() replay, timestamp order"]
+    Replay --> DB
+    Replay -->|orm.silent.call| Server["Server"]
 ```
 
-While online, every visited view and successful relational search is cached (encrypted with AES-GCM keyed from `session.browser_cache_secret`). When the connection drops, three detectors agree (`offline_error.js` handlers, `ConnectionLostError` on RPC, browser online/offline events), buttons without the `data-available-offline` attribute are disabled, and any form save, list edit, delete, or archive is queued verbatim. On reconnection, entries replay in timestamp order under a cross-tab Web Lock, last write wins, and failures are parked for the user to handle in the offline systray. The details are in [offline and PWA](../features/offline-and-pwa/index.md).
+- `OfflinePlugin` (`addons/web/static/src/core/offline/offline_plugin.js`) detects connectivity (browser events plus `ConnectionLostError` on any RPC), queues writes into the encrypted `orm-to-sync` IndexedDB table, and replays them on reconnection in timestamp order, last write wins.
+- The local store (`addons/web/static/src/core/utils/indexed_db.js`) encrypts values with AES-GCM (`addons/web/static/src/core/crypto.js`) and serializes access with a per-tab mutex plus Web Locks across tabs.
+- The service worker (`addons/web/static/src/service_worker.js`) serves the cached homepage when the network fails, and `/odoo/offline` (`addons/web/views/webclient_templates.xml`) is the last-resort page.
+- Buttons without the `data-available-offline` attribute are disabled while offline; the availability of actions, views, and records is tracked from what was visited while online.
+- The many2x cache (`addons/web/static/src/views/fields/relational_utils.js`) stores `web_name_search` results so partner and tag lookups can still answer offline.
 
-## How the pieces fit together
+## The fork's CRM work
 
-| Layer | Code | What it owns |
-| --- | --- | --- |
-| Server kernel | `odoo/` | ORM, HTTP, module loading, workers, cron, CLI, test framework |
-| Base module | `odoo/addons/base` | `ir.*`/`res.*` system models, access control, menus, assets |
-| Web client | `addons/web/static/src` | OWL app framework, views, model layer, offline/PWA stack |
-| CRM | `addons/crm` | Lead pipeline, custom views, PWA share target, offline consumer |
-| Business apps | `addons/*` | Sales, accounting, inventory, HR, website, POS, marketing, 229 localizations |
-| Dev environment | `scripts/dev/` | Setup, servers, test runners with anti-false-green guards |
+The 75 fork commits (Sep 30 - Oct 7, 2026) all live in `addons/crm`. The design rule: queue every offline write that is a bare, client-resolvable write on `crm.lead`, `crm.stage`, `crm.team`, or a lead's `mail.activity`; silently skip decorative server reads; disable everything else offline. Every crm entry point that needs a server is classified in `addons/crm/static/src/mobile/offline_inventory.md` (150 rows).
 
-The [module system](../systems/module-system.md) glues these together: addons depend on each other, inherit each other's models and views, and contribute assets to shared bundles. The [testing](../how-to-contribute/testing.md) story wraps the whole stack, from Python unit tests to headless-Chrome JS suites.
+- Offline writes: lead form saves, lead creates (including a mobile quick create), kanban stage moves, mark won, archive/unarchive/delete, activity schedule/done, and "log a call" (`action_log_call` in `addons/crm/models/crm_lead.py`, built so one queued server call does all the work).
+- Offline guards: patches in `addons/crm/static/src/views/view_components/` disable or block controls that cannot be queued (wizards, server reports, module installs, group edits, and navigation to uncached records).
+- Mobile UI: a small-screen branch in the pipeline kanban renderer shows one stage at a time (`addons/crm/static/src/mobile/crm_mobile_pipeline/`), with a mobile card, a bottom-sheet quick create, and cards for queued lead creates. All of it is gated on `UIPlugin.isSmall()`.
+- PWA: the manifest gains "My Pipeline" and "New Lead" shortcuts (`addons/crm/controllers/webmanifest.py`), and the share target creates leads from shared text.
+
+## Reading paths
+
+- Server internals: start in `odoo/orm/` (models, fields, query building) and `odoo/http/` (routing and dispatch).
+- A specific business app: the [Apps index](../apps/index.md) groups the 642 addons into families.
+- The offline framework in depth: [Offline and PWA](../features/offline-and-pwa/index.md).
+- How the CRM consumes it: [Offline CRM](../apps/crm/offline-crm.md) and [Mobile CRM](../apps/crm/mobile-crm.md).

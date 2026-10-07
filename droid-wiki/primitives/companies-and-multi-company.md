@@ -1,6 +1,6 @@
 # Companies and multi-company
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Krzysztof, William, Yannick
 
 ## Purpose
 
@@ -89,6 +89,12 @@ A field declared `company_dependent=True` stores one value per company. `odoo/or
 
 `ir.default` itself stores `company_id` (nullable for "all companies") and `user_id`, and `_get` orders candidates by `user_id, company_id, id` so the most specific default wins.
 
+There is no `ir.property` model and no `res.company.property` model in 20.0: both are gone. A value that varies per company is either a `company_dependent` field (stored inline as jsonb) or an `ir.default` row, so "make it a company property" means "mark the existing field `company_dependent`".
+
+### Inter-company flows
+
+Sharing one database between legal entities does not by itself let one company's documents touch another's. The cross-company pattern is `with_company()` plus deliberate `sudo()`, because `env.companies` and the access domain both narrow to the active set. `addons/account_payment_interco` ("Intercompany Payment - Account") is the in-tree example. It adds three account fields to `res.company` — `account_interco_clearing_journal_id` (declared `check_company=True`), `account_interco_payable_id`, and `account_interco_receivable_id` — and, in `AccountMove._post`, looks for payments posted by a *different* company and creates a balancing entry with `self.env['account.move'].with_company(payment.company_id)` in that company's clearing journal (`addons/account_payment_interco/models/account_move.py`). The pattern to copy is: read across companies, then write inside the target company's own environment.
+
 ### Sequences
 
 `ir.sequence` carries a `company_id`. `next_by_code` searches `[('code', '=', sequence_code), ('company_id', 'in', [company_id, False])]` ordered by `company_id`, so a company-specific series takes precedence over a shared one, and `company_id` comes from `self.env.company`. The `standard` implementation uses a native PostgreSQL sequence (fast, gaps allowed); `no_gap` serializes through the row itself.
@@ -97,6 +103,7 @@ A field declared `company_dependent=True` stores one value per company. `odoo/or
 
 - Every RPC carries the context, so the client's active companies reach `env.companies` and therefore the access domain and every `company_dependent` read.
 - The offline share target in `addons/web/static/src/webclient/share_target/share_target_item.js` pins `allowed_company_ids` to the current company when creating a record from a share.
+- Cross-company writes run through `with_company()`, as `addons/account_payment_interco` does when it posts a clearing entry in the paying company.
 - CRM models scope by `company_id` and rely on the standard restriction row; see [CRM](../apps/crm/index.md).
 
 ## Entry points for modification
@@ -119,6 +126,8 @@ To make a value company-specific, prefer `company_dependent=True` on the existin
 | `addons/web/static/src/webclient/switch_company_menu/switch_company_menu.js` | Desktop switcher and `CompanySelector`. |
 | `addons/web/static/src/webclient/burger_menu/mobile_switch_company_menu/mobile_switch_company_menu.js` | Small-screen switcher. |
 | `addons/crm/security/ir.access.csv` | Worked example of the company restriction rows. |
+| `addons/account_payment_interco/models/res_company.py` | Per-company intercompany clearing accounts. |
+| `addons/account_payment_interco/models/account_move.py` | `_post` creating a clearing entry in the paying company. |
 
 ## Related pages
 

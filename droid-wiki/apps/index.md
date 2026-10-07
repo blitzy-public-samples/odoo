@@ -1,6 +1,6 @@
 # Apps
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Thibault Delavallée, Fabien Pinckaers, Christophe Simonis (upstream, by commit count on `addons/`); bobbyabbott421-glitch (fork, `addons/crm/`)
 
 ## Purpose
 
@@ -20,11 +20,11 @@ addons/                     # 642 business addon modules
 │   ├── security/           # crm_security.xml + ir.access.csv
 │   ├── data/               # records loaded at install (XML)
 │   ├── report/             # report models and print layouts
-│   ├── i18n/               # 63 .po translation files
+│   ├── i18n/               # 62 .po translation files
 │   ├── static/             # src/ (JS, SCSS), tests/, tours/
 │   └── tests/              # Python tests, imported in tests/__init__.py
 ├── mail/                   # messaging backbone
-├── web/                    # OWL web client + the fork's offline/PWA stack
+├── web/                    # OWL web client + the offline/PWA stack
 └── ...
 odoo/addons/base/           # the base module, inside the core package
 ```
@@ -82,36 +82,33 @@ graph TD
 
 ## The 642-module inventory
 
-Counts verified against `ls addons/` on this tree. Wikilinked families have their own page.
+Each row is a family with its own page. The count is the number of directories whose name matches the listed prefixes, so it is reproducible with `ls -d addons/<prefix>*`; a bridge addon such as `website_crm` falls in one row only (the website one), and the last row collects the singletons. Counts were verified against `ls addons/` on this tree.
 
-| Family | Directories | What they add |
-| --- | --- | --- |
-| `l10n_*` | 229 | Country localizations: charts of accounts, taxes, legal reports, e-invoicing. See [localizations and integrations](localizations-and-integrations.md). |
-| `website*` | 52 | Website builder, ecommerce, blog, forum, slides, livechat, and bridges into CRM and events. See [website suite](website-suite.md). |
-| `pos_*` + `point_of_sale` | 46 | Point of sale: front end, restaurant, self-order, terminals, loyalty. See [point of sale](point-of-sale.md). |
-| `sale*` + `sales_team` | 30 | Quotations and orders, plus bridges into stock, mrp, project, timesheets. See [sales suite](sales-suite.md). |
-| `payment_*` | 24 | Payment providers (stripe, adyen, paypal, mollie, ...). See [accounting](accounting.md). |
-| `hr*` | 24 | Employees, holidays, expenses, recruitment, attendance, skills. See [hr suite](hr-suite.md). |
-| `test_*` | 20 | Test-support modules for the framework suite (`test_mail`, `test_website`, `test_populate`, ...). See [other business apps](other-business-apps.md). |
-| `project*` | 18 | Tasks, the `project_todo` app, and bridges to helpdesk-style flows and timesheets. See [project and services](project-and-services.md). |
-| `account*` | 16 | Journals, moves, reconciliation, taxes, EDI, Peppol. See [accounting](accounting.md). |
-| `spreadsheet*` | 15 | Spreadsheet engine plus one dashboard module per app. See [spreadsheets and dashboards](spreadsheet-and-dashboards.md). |
-| `mrp*` | 12 | BOMs, work orders, subcontracting, repair. See [inventory and manufacturing](inventory-and-manufacturing.md). |
-| `mass_mailing*` | 12 | Email and SMS campaigns. See [marketing suite](marketing-suite.md). |
-| `auth_*` | 12 | Login providers and policies: LDAP, OAuth, signup, TOTP, password policy. See [localizations and integrations](localizations-and-integrations.md). |
-| `purchase*` | 11 | RFQs, vendor bills, requisitions. See [inventory and manufacturing](inventory-and-manufacturing.md). |
-| `base_*` | 10 | Core extensions: import, automation, geolocalize, report engines, sparse fields. See [base module](base.md). |
-| `stock*` | 8 | Moves, lots, routes, landed costs. See [inventory and manufacturing](inventory-and-manufacturing.md). |
-| `mail*` | 8 | Discuss core, bots, tracking, plugins. See [mail](mail.md). |
-| `event*` | 8 | Events, booths, tracks, SMS. See [marketing suite](marketing-suite.md). |
-| `crm*` | 7 | `crm`, iap enrich/mine, livechat, mail plugin, sms, sale project. See [crm](crm/index.md). |
-| everything else | 80 | Singletons and small groups: `product`, `google_*` and `microsoft_*` connectors, `iap`, `calendar`, `survey`, `fleet`, `lunch`, `maintenance`, `loyalty`, `resource`, `sms`, `snailmail`, `utm`, `web*`, `portal`, `digest`, `contacts`, `bus`, `delivery`, `analytic`, `uom`, `repair`, and more. See [other business apps](other-business-apps.md). |
+| Family | Directories | Prefixes | What they add |
+| --- | --- | --- | --- |
+| [Web client](web/index.md) | 4 | `web`, `web_hierarchy`, `web_tour`, `web_unsplash` | The OWL client, the views framework, and the offline/PWA stack the fork's CRM work consumes. |
+| [Base and core system addons](base.md) | 10 (+ `base` in the core package) | `base_*` | Core extensions: import, automation, geolocalize, report engines, sparse fields, tours. |
+| [Mail and messaging](mail.md) | 8 (+ `bus`, `portal*`, `digest`, `im_livechat`) | `mail*` | Discuss core, bots, tracking, plugins: the chatter and activity layer every business app uses. |
+| [CRM](crm/index.md) | 7 | `crm*` | The pipeline (`crm`), iap enrich/mine, livechat, mail plugin, sms, sale project, plus the fork's offline and mobile additions ([offline CRM](crm/offline-crm.md), [mobile CRM](crm/mobile-crm.md)). |
+| [Accounting](accounting.md) | 41 | `account*` (16), `analytic`, `payment*` (24) | Journals, moves, reconciliation, taxes, EDI, Peppol, payment providers. |
+| [Sales suite](sales-suite.md) | 30 | `sale*` (29), `sales_team` | Quotations and orders, plus bridges into stock, mrp, project, timesheets. |
+| [Inventory and manufacturing](inventory-and-manufacturing.md) | 35 | `stock*` (8), `mrp*` (12), `purchase*` (11), `delivery`, `barcodes*` (2), `repair` | Warehouse moves, BOMs, purchasing, valuation, shipping. |
+| [Website suite](website-suite.md) | 52 (+ `html_editor`, `html_builder`, `theme_default`) | `website*` | Website builder, ecommerce, blog, forum, slides, livechat, and bridges into CRM and events. |
+| [HR suite](hr-suite.md) | 24 | `hr*` | Employees, holidays, expenses, recruitment, attendance, skills, timesheets. |
+| [Point of sale](point-of-sale.md) | 46 | `point_of_sale`, `pos*` (45) | The cashier terminal, restaurant, self-order, payment terminals, loyalty. |
+| [Marketing suite](marketing-suite.md) | 20 | `mass_mailing*` (12), `event*` (8) | Email and SMS campaigns, events and booths; `utm`, `survey*`, `snailmail*` and `social_media` live in the [other business apps](other-business-apps.md) roundup. |
+| [Project and services](project-and-services.md) | 18 | `project*` | Tasks, the `project_todo` app, and bridges to timesheets and stock. |
+| [Spreadsheet and dashboards](spreadsheet-and-dashboards.md) | 16 | `spreadsheet*` (15), `board` | Spreadsheet engine, one dashboard module per app, and `board`, the per-user My Dashboard. |
+| [Localizations and integrations](localizations-and-integrations.md) | 258 | `l10n*` (229), `auth*` (12), `google*` (5), `microsoft*` (3), `cloud_storage*` (4), `iap*` (3), `iot*` (2) | Country charts and e-invoicing formats, login providers, external APIs, Odoo's own paid services. |
+| [Other business apps](other-business-apps.md) | 73 | the remainder: `product*`, `portal*`, `bus`, `digest`, `calendar*`, `resource*`, `uom`, `fleet*`, `lunch`, `loyalty`, `survey*`, `sms*`, `snailmail`, `utm`, `test_*` (20), ... | Shared infrastructure and single-app addons: 20 `test_*` framework modules, the realtime bus, the portal, UTM tracking, test-population tooling. |
 
-Besides these, the core package holds its own test-support modules: `odoo/addons/` contains `base` plus 15 `test_*` modules that exercise inheritance, linting, translation, and uninstall behavior.
+The 20 `test_*` modules under `addons/` exist to exercise the framework (`test_mail`, `test_website`, `test_populate`, ...) and are listed in the [other business apps](other-business-apps.md) page. The core package holds test-support modules of its own: `odoo/addons/` contains `base` plus 15 `test_*` modules that exercise inheritance, linting, translation, HTTP dispatch, and uninstall behavior.
 
 ## Upstream Odoo and this fork
 
-Everything under `addons/` and `odoo/addons/base/` is upstream Odoo 20.0 code. In this repository the `20.0` branch is a single squashed commit containing the whole upstream tree with the offline/PWA framework fused into `addons/web`; `eval/base` adds only the dev environment under `scripts/dev/`. Per-file history is therefore not usable for attribution.
+Everything under `addons/` is upstream Odoo 20.0 code, and upstream history is intact: `origin/20.0` carries 211,574 commits, its tip is `ee8c13eaa57` ("[FIX] mail: duplicate notifications", 2026-08-13). The fork branch `eval/factory-crm-offline` branches off that tip and adds 76 commits of its own, 74 of which touch `addons/crm/`; the rest of its changes are tooling and documentation, never another addon: `scripts/dev/` (the dev environment), `AGENTS.md`, `.gitignore`, the `.factory/skills/odoo-offline-qa/` skill, and this wiki. No addon outside `addons/crm/` differs from upstream on this branch, so per-file history remains usable for attribution.
+
+The offline/PWA framework itself is upstream 20.0 code: `addons/web/static/src/core/offline/`, `addons/web/static/src/core/pwa/` and `addons/web/static/src/service_worker.js` all exist on `origin/20.0`. The fork consumes that stack from `addons/crm`; it does not ship it.
 
 The fork's active target is `addons/crm`: the rules in `AGENTS.md` restrict changes to that directory so the fork stays rebasable onto upstream 20.0. Behavior owned by another addon is extended from inside `addons/crm/` with Python `_inherit`, controller subclassing, JS `patch()`, or XML view inheritance; the manifest globs (`crm/static/src/**`) already cover new files. Conventions are detailed in [patterns and conventions](../how-to-contribute/patterns-and-conventions.md).
 
@@ -136,8 +133,8 @@ Start from the manifest of the module and the model file that owns the behavior.
 
 ## Related pages
 
-- [Base module](base.md)
-- [Mail](mail.md)
+- [Base and core system addons](base.md)
+- [Mail and messaging](mail.md)
 - [CRM](crm/index.md)
 - [Web client](web/index.md)
 - [Module system](../systems/module-system.md)

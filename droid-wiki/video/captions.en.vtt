@@ -1,534 +1,697 @@
 WEBVTT
 
 1
-00:00:00.000 --> 00:00:02.465
-This repository is Odoo 20, narrowed
+00:00:00.450 --> 00:00:03.095
+Picture a salesperson in an underground
 
 2
-00:00:02.465 --> 00:00:04.931
-to a practical problem: keeping a
+00:00:03.095 --> 00:00:05.675
+parking garage, with no signal at all.
 
 3
-00:00:04.931 --> 00:00:07.396
-CRM pipeline useful when the network
+00:00:06.095 --> 00:00:07.481
+This repository is
 
 4
-00:00:07.396 --> 00:00:09.861
-disappears. The desktop pipeline shows leads
+00:00:07.481 --> 00:00:09.145
+built for that moment.
 
 5
-00:00:09.861 --> 00:00:12.327
-moving through New, Qualified, Proposition, and
+00:00:09.565 --> 00:00:11.804
+It is Odoo 20, forked so the
 
 6
-00:00:12.327 --> 00:00:14.792
-Won. The mobile capture shows the
+00:00:11.804 --> 00:00:14.565
+CRM pipeline keeps working offline.
 
 7
-00:00:14.792 --> 00:00:17.257
-same work continuing offline. That path
+00:00:14.985 --> 00:00:16.807
+You can still save a lead,
 
 8
-00:00:17.257 --> 00:00:19.723
-is the fork's center: CRM consumes
+00:00:16.807 --> 00:00:18.760
+move a stage, or log a call.
 
 9
-00:00:19.723 --> 00:00:22.188
-an offline framework owned by the
+00:00:19.180 --> 00:00:21.200
+Each write waits safely, then
 
 10
-00:00:22.188 --> 00:00:24.653
-web client, instead of inventing a
+00:00:21.200 --> 00:00:23.480
+replays when the network returns.
 
 11
-00:00:24.653 --> 00:00:25.475
-second one.
+00:00:23.900 --> 00:00:25.644
+On screen is the desktop
 
 12
-00:00:26.275 --> 00:00:29.182
-The repository is a large Python
+00:00:25.644 --> 00:00:27.925
+pipeline this work started from.
 
 13
-00:00:29.182 --> 00:00:32.090
-application server surrounded by 642 addon
+00:00:29.125 --> 00:00:31.525
+First, the shape of the codebase.
 
 14
-00:00:32.090 --> 00:00:34.997
-modules. The core reports version 20.0,
+00:00:31.945 --> 00:00:35.159
+Upstream Odoo is one Python server
 
 15
-00:00:34.998 --> 00:00:37.905
-Python 3.12 through 3.14, and PostgreSQL
+00:00:35.159 --> 00:00:38.195
+surrounded by 642 addon modules.
 
 16
-00:00:37.905 --> 00:00:40.812
-16 or newer. The tree includes
+00:00:38.615 --> 00:00:40.890
+That adds up to about 1.36
 
 17
-00:00:40.812 --> 00:00:42.266
-accounting, sales, inventory,
+00:00:40.890 --> 00:00:43.653
+million lines of Python and 1.51
 
 18
-00:00:42.266 --> 00:00:43.720
-websites, human resources,
+00:00:43.653 --> 00:00:46.090
+million lines of JavaScript.
 
 19
-00:00:43.720 --> 00:00:46.628
-point of sale, marketing, and 229
+00:00:46.510 --> 00:00:48.736
+Its history starts in December
 
 20
-00:00:46.628 --> 00:00:49.535
-country localizations. The useful mental model
+00:00:48.736 --> 00:00:50.545
+2006, with more than two
 
 21
-00:00:49.535 --> 00:00:52.442
-is one server, one module graph,
+00:00:50.545 --> 00:00:52.910
+hundred eleven thousand commits.
 
 22
-00:00:52.442 --> 00:00:55.350
-and many applications extending shared models.
+00:00:53.330 --> 00:00:55.730
+The fork is small by comparison.
 
 23
-00:00:56.150 --> 00:00:58.636
-Start at odoo-bin. The CLI selects
+00:00:56.150 --> 00:00:59.257
+It adds seventy-six commits, from
 
 24
-00:00:58.636 --> 00:01:01.123
-a command, then the server chooses
+00:00:59.257 --> 00:01:02.275
+September 30 to October 5, 2026.
 
 25
-00:01:01.123 --> 00:01:03.609
-a threaded, prefork, or gevent runtime.
+00:01:02.695 --> 00:01:04.808
+Every product change lives
 
 26
-00:01:03.609 --> 00:01:06.095
-A database gets a registry. The
+00:01:04.808 --> 00:01:06.770
+inside addons slash crm.
 
 27
-00:01:06.095 --> 00:01:08.582
-module loader imports Python models and
+00:01:07.970 --> 00:01:09.272
+Next, how a request
 
 28
-00:01:08.582 --> 00:01:11.068
-loads XML and CSV data in
+00:01:09.272 --> 00:01:10.945
+moves through the server.
 
 29
-00:01:11.068 --> 00:01:13.555
-dependency order. An HTTP request resolves
+00:01:11.365 --> 00:01:13.353
+The odoo-bin command starts a
 
 30
-00:01:13.555 --> 00:01:16.041
-a session and database, matches a
+00:01:13.353 --> 00:01:15.790
+threaded, prefork, or gevent server.
 
 31
-00:01:16.041 --> 00:01:18.527
-route, selects a dispatcher, and reaches
+00:01:16.210 --> 00:01:18.160
+Each database gets its own
 
 32
-00:01:18.527 --> 00:01:21.014
-a controller or model. SQL runs
+00:01:18.160 --> 00:01:20.110
+registry of loaded models.
 
 33
-00:01:21.014 --> 00:01:23.500
-through the pooled PostgreSQL connection layer.
+00:01:20.530 --> 00:01:22.559
+The HTTP dispatcher routes
 
 34
-00:01:24.300 --> 00:01:26.865
-The ORM is extracted under odoo/orm.
+00:01:22.559 --> 00:01:24.805
+each request to a controller.
 
 35
-00:01:26.865 --> 00:01:29.430
-Models operate on recordsets, fields declare
+00:01:25.225 --> 00:01:27.782
+Controllers call the ORM, which
 
 36
-00:01:29.430 --> 00:01:31.995
-the schema, and domains form an
+00:01:27.782 --> 00:01:30.650
+batches its writes into PostgreSQL.
 
 37
-00:01:31.995 --> 00:01:34.560
-optimized search tree. A write first
+00:01:31.070 --> 00:01:32.720
+The offline work never
 
 38
-00:01:34.560 --> 00:01:37.125
-checks access and marks values in
+00:01:32.720 --> 00:01:34.095
+changes this path.
 
 39
-00:01:37.125 --> 00:01:39.690
-the transaction cache. SQL is flushed
+00:01:34.515 --> 00:01:36.515
+It only decides when a browser
 
 40
-00:01:39.690 --> 00:01:42.255
-later in batches. Odoo 20 also
+00:01:36.515 --> 00:01:38.390
+call is allowed to reach it.
 
 41
-00:01:42.255 --> 00:01:44.820
-unifies access rights and record rules
+00:01:39.590 --> 00:01:41.063
+The browser side is
 
 42
-00:01:44.820 --> 00:01:47.385
-in ir.access, so the same model
+00:01:41.063 --> 00:01:42.465
+an OWL web client.
 
 43
-00:01:47.385 --> 00:01:49.950
-layer handles business data and authorization.
+00:01:42.885 --> 00:01:45.003
+It is layered from core plugins,
 
 44
-00:01:50.750 --> 00:01:53.678
-crm.lead carries the pipeline. Its lifecycle
+00:01:45.003 --> 00:01:46.935
+up through views and actions.
 
 45
-00:01:53.678 --> 00:01:55.142
-covers leads and
+00:01:47.355 --> 00:01:49.028
+The key point is that the
 
 46
-00:01:55.142 --> 00:01:56.605
-opportunities, stages, probability,
+00:01:49.028 --> 00:01:51.072
+offline framework already lives
 
 47
-00:01:56.605 --> 00:01:59.533
-won and lost transitions, contacts, expected
+00:01:51.072 --> 00:01:53.055
+here, inside addons slash web.
 
 48
-00:01:59.533 --> 00:02:02.461
-revenue, and recurring revenue. Predictive Lead
+00:01:53.475 --> 00:01:54.967
+It owns the sync queue,
 
 49
-00:02:02.461 --> 00:02:05.388
-Scoring uses per-team won and lost
+00:01:54.967 --> 00:01:56.996
+the encrypted store, the service
 
 50
-00:02:05.388 --> 00:02:06.852
-frequencies to estimate
+00:01:56.996 --> 00:01:59.025
+worker, and the offline systray.
 
 51
-00:02:06.852 --> 00:02:08.316
-automated probability. Teams
+00:01:59.445 --> 00:02:02.395
+The CRM fork consumes that framework.
 
 52
-00:02:08.316 --> 00:02:11.244
-can allocate leads with member quotas.
+00:02:02.815 --> 00:02:05.190
+It never builds a second one.
 
 53
-00:02:11.244 --> 00:02:14.171
-Forecast views project prorated revenue, while
+00:02:06.390 --> 00:02:07.953
+Here is the lifecycle
 
 54
-00:02:14.171 --> 00:02:17.099
-merge and duplicate tools keep the
+00:02:07.953 --> 00:02:09.515
+of one offline write.
 
 55
-00:02:17.099 --> 00:02:18.075
-pipeline usable.
+00:02:09.935 --> 00:02:11.358
+A save fails with a
 
 56
-00:02:18.875 --> 00:02:21.670
-The browser client boots from main.js
+00:02:11.358 --> 00:02:12.985
+connection lost error.
 
 57
-00:02:21.670 --> 00:02:24.465
-into start.js and WebClient. OWL 3
+00:02:13.405 --> 00:02:16.070
+The offline plugin stores the exact
 
 58
-00:02:24.465 --> 00:02:27.260
-is vendored behind a compatibility layer
+00:02:16.070 --> 00:02:18.880
+call in an encrypted IndexedDB table.
 
 59
-00:02:27.260 --> 00:02:30.055
-in a directory still named owl2.
+00:02:19.300 --> 00:02:21.596
+On reconnect, entries replay in
 
 60
-00:02:30.055 --> 00:02:32.850
-Core plugins provide RPC, ORM, errors,
+00:02:21.596 --> 00:02:24.100
+timestamp order, one second apart.
 
 61
-00:02:32.850 --> 00:02:35.645
-UI, dialogs, popovers, and registries. The
+00:02:24.520 --> 00:02:26.458
+Last write wins, and there
 
 62
-00:02:35.645 --> 00:02:38.440
-relational model feeds form, list, kanban,
+00:02:26.458 --> 00:02:28.120
+is no conflict dialog.
 
 63
-00:02:38.440 --> 00:02:41.235
-calendar, graph, and pivot views. Addons
+00:02:28.540 --> 00:02:30.220
+A call that fails for any
 
 64
-00:02:41.235 --> 00:02:44.030
-customize those views through registry entries
+00:02:30.220 --> 00:02:32.086
+other reason is parked under
 
 65
-00:02:44.030 --> 00:02:46.825
-and the js_class attribute in XML.
+00:02:32.086 --> 00:02:33.890
+Sync issues in the systray.
 
 66
-00:02:47.625 --> 00:02:50.052
-When a form save or list
+00:02:35.090 --> 00:02:37.465
+So which controls may queue at all?
 
 67
-00:02:50.052 --> 00:02:52.478
-operation meets a lost connection, the
+00:02:37.885 --> 00:02:40.482
+The fork answered that with an inventory,
 
 68
-00:02:52.478 --> 00:02:54.905
-relational model schedules the ORM call.
+00:02:40.482 --> 00:02:42.535
+before writing any feature code.
 
 69
-00:02:54.905 --> 00:02:57.331
-The queue stores the model, method,
+00:02:42.955 --> 00:02:45.526
+Every entry point in the CRM addon
 
 70
-00:02:57.331 --> 00:02:58.545
-arguments, keyword arguments,
+00:02:45.526 --> 00:02:47.955
+got exactly one of three labels.
 
 71
-00:02:58.545 --> 00:02:59.758
-and display metadata
+00:02:48.375 --> 00:02:49.849
+Queue means a write the
 
 72
-00:02:59.758 --> 00:03:02.185
-in the orm-to-sync table. The offline
+00:02:49.849 --> 00:02:51.500
+client can fully describe.
 
 73
-00:03:02.185 --> 00:03:04.611
-systray shows the pending change. When
+00:02:51.920 --> 00:02:53.595
+Skip means a decorative
 
 74
-00:03:04.611 --> 00:03:07.038
-the connection returns, a Web Lock
+00:02:53.595 --> 00:02:55.270
+read, silently dropped.
 
 75
-00:03:07.038 --> 00:03:09.465
-serializes replay across tabs. Entries run
+00:02:55.690 --> 00:02:57.955
+Disable covers everything else,
 
 76
-00:03:09.465 --> 00:03:11.891
-in timestamp order, with a pause
+00:02:57.955 --> 00:03:00.015
+such as wizards and reports.
 
 77
-00:03:11.891 --> 00:03:12.700
-between calls.
+00:03:00.435 --> 00:03:02.758
+The final count is 150 rows,
 
 78
-00:03:13.500 --> 00:03:15.981
-The offline database is wrapped by
+00:03:02.758 --> 00:03:05.235
+and most of them are disabled.
 
 79
-00:03:15.981 --> 00:03:18.462
-a per-tab mutex and versioned with
+00:03:06.435 --> 00:03:09.060
+Disabling is mostly automatic.
 
 80
-00:03:18.462 --> 00:03:20.943
-the asset registry hash. When the
+00:03:09.480 --> 00:03:10.817
+The framework turns
 
 81
-00:03:20.943 --> 00:03:23.424
-registry changes, the store is invalidated
+00:03:10.817 --> 00:03:12.727
+off every button without the
 
 82
-00:03:23.424 --> 00:03:25.905
-rather than migrated. Values use AES-GCM
+00:03:12.727 --> 00:03:14.955
+data-available-offline attribute.
 
 83
-00:03:25.905 --> 00:03:28.386
-with a fresh initialization vector. The
+00:03:15.375 --> 00:03:18.248
+But links, menu items, and already-open
 
 84
-00:03:28.386 --> 00:03:30.867
-browser secret comes from the session
+00:03:18.248 --> 00:03:20.350
+dialogs slip past that pass.
 
 85
-00:03:30.867 --> 00:03:33.348
-bootstrap and is derived server-side from
+00:03:20.770 --> 00:03:22.447
+Guard patches in the view
 
 86
-00:03:33.348 --> 00:03:35.829
-session token fields, so changing a
+00:03:22.447 --> 00:03:24.745
+components folder close those gaps.
 
 87
-00:03:35.829 --> 00:03:38.310
-password or second factor rotates the
+00:03:25.165 --> 00:03:27.325
+Each one re-checks the connection
 
 88
-00:03:38.310 --> 00:03:39.550
-local encryption key.
+00:03:27.325 --> 00:03:29.115
+at the moment of the click.
 
 89
-00:03:40.350 --> 00:03:42.913
-One service worker serves the /odoo
+00:03:29.535 --> 00:03:32.165
+A view never visited online shows the
 
 90
-00:03:42.913 --> 00:03:45.476
-scope. It caches the homepage and
+00:03:32.165 --> 00:03:34.660
+framework's offline helper instead.
 
 91
-00:03:45.476 --> 00:03:48.039
-offline page, uses network-first navigation, and
+00:03:35.860 --> 00:03:37.933
+Some writes needed a server change
 
 92
-00:03:48.039 --> 00:03:50.602
-masks session information before storing HTML.
+00:03:37.933 --> 00:03:39.660
+before they could be queued.
 
 93
-00:03:50.602 --> 00:03:53.165
-The PWA service captures the install
+00:03:40.080 --> 00:03:41.639
+The queue replays calls
 
 94
-00:03:53.165 --> 00:03:55.728
-prompt and supports scoped app manifests.
+00:03:41.639 --> 00:03:43.572
+verbatim, and never passes an
 
 95
-00:03:55.728 --> 00:03:58.291
-CRM and account can enable the
+00:03:43.572 --> 00:03:45.505
+id from one call to the next.
 
 96
-00:03:58.291 --> 00:04:00.853
-share target. CRM adds a team
+00:03:45.925 --> 00:03:47.818
+So logging a call became a
 
 97
-00:04:00.853 --> 00:04:03.416
-picker so a shared item can
+00:03:47.818 --> 00:03:50.050
+single method, action log call.
 
 98
-00:04:03.416 --> 00:04:05.125
-become a new lead.
+00:03:50.470 --> 00:03:52.602
+It creates the call activity and
 
 99
-00:04:05.925 --> 00:04:08.677
-Small-screen behavior is driven by UIPlugin
+00:03:52.602 --> 00:03:54.545
+marks it done in one request.
 
 100
-00:04:08.677 --> 00:04:10.053
-signals and matchMedia
+00:03:54.965 --> 00:03:57.007
+In the same spirit, an activity
 
 101
-00:04:10.053 --> 00:04:11.428
-breakpoints. Bottom sheets
+00:03:57.007 --> 00:03:59.235
+create override fills in the model
 
 102
-00:04:11.428 --> 00:04:14.180
-replace floating popovers where the call
+00:03:59.235 --> 00:04:01.215
+id for queued lead activities.
 
 103
-00:04:14.180 --> 00:04:16.932
-site opts in. The CRM PLS
+00:04:02.415 --> 00:04:04.401
+On the client, every CRM
 
 104
-00:04:16.932 --> 00:04:19.684
-tooltip is one example. Offline action
+00:04:04.401 --> 00:04:06.768
+component reads offline state
 
 105
-00:04:19.684 --> 00:04:22.435
-helper screens let a user recover
+00:04:06.768 --> 00:04:09.365
+through one hook, useCrmOffline.
 
 106
-00:04:22.435 --> 00:04:25.187
-a view from remembered searches. The
+00:04:09.785 --> 00:04:11.735
+It wraps the framework plugin,
 
 107
-00:04:25.187 --> 00:04:27.939
-test wrapper runs the CRM JavaScript
+00:04:11.735 --> 00:04:13.685
+and keeps no state of its own.
 
 108
-00:04:27.939 --> 00:04:30.691
-suite under desktop and a 375
+00:04:14.105 --> 00:04:15.836
+It can queue a call, or list
 
 109
-00:04:30.691 --> 00:04:32.525
-by 667 mobile preset.
+00:04:15.836 --> 00:04:17.855
+what is still pending for a lead.
 
 110
-00:04:33.325 --> 00:04:36.035
-The development scripts exist because Odoo
+00:04:18.275 --> 00:04:19.857
+The team switcher shows
 
 111
-00:04:36.035 --> 00:04:38.746
-can report success while collecting zero
+00:04:19.857 --> 00:04:21.375
+why that care matters.
 
 112
-00:04:38.746 --> 00:04:41.456
-tests or silently skipping browser tests.
+00:04:21.795 --> 00:04:23.309
+Its data comes from the
 
 113
-00:04:41.456 --> 00:04:44.166
-The wrappers choose install versus update
+00:04:23.309 --> 00:04:25.006
+disk cache, and falls back
 
 114
-00:04:44.166 --> 00:04:46.877
-correctly, update crm and web for
+00:04:25.006 --> 00:04:26.520
+to All Teams on a miss.
 
 115
-00:04:46.877 --> 00:04:49.587
-JavaScript collection, and fail on empty
+00:04:26.940 --> 00:04:28.701
+A rejected group check would
 
 116
-00:04:49.587 --> 00:04:50.942
-selections. Frontend changes
+00:04:28.701 --> 00:04:30.520
+poison its cache for good, so
 
 117
-00:04:50.942 --> 00:04:52.297
-require asset regeneration.
+00:04:30.520 --> 00:04:32.340
+it is re-probed on reconnect.
 
 118
-00:04:52.297 --> 00:04:55.008
-The normal check is Python, desktop
+00:04:33.540 --> 00:04:35.190
+Now, the phone.
 
 119
-00:04:55.008 --> 00:04:57.718
-JavaScript, mobile JavaScript, and the forbidden
+00:04:35.610 --> 00:04:37.783
+On small screens, the pipeline
 
 120
-00:04:57.718 --> 00:04:59.525
-only or debug guard.
+00:04:37.783 --> 00:04:39.685
+shows one stage at a time.
 
 121
-00:05:00.325 --> 00:05:02.573
-To change this fork, start in
+00:04:40.105 --> 00:04:42.166
+That branch is gated on the UI
 
 122
-00:05:02.573 --> 00:05:04.821
-addons/crm and follow the project rules
+00:04:42.166 --> 00:04:44.355
+plugin's small-screen signal, so
 
 123
-00:05:04.821 --> 00:05:07.069
-in AGENTS.md. Use the web client
+00:04:44.355 --> 00:04:46.480
+desktop rendering is unchanged.
 
 124
-00:05:07.069 --> 00:05:09.317
-as the extension point, not a
+00:04:46.900 --> 00:04:49.270
+A sticky header shows the stage name,
 
 125
-00:05:09.317 --> 00:05:11.565
-parallel offline engine. Run the scripted
+00:04:49.270 --> 00:04:51.700
+the lead count, and the revenue total.
 
 126
-00:05:11.565 --> 00:05:13.813
-tests in both viewport presets and
+00:04:52.120 --> 00:04:54.735
+Previous and next buttons step between
 
 127
-00:05:13.813 --> 00:05:16.062
-report the results. The shortest route
+00:04:54.735 --> 00:04:57.220
+stages without a network round trip.
 
 128
-00:05:16.062 --> 00:05:18.310
-through the code is CRM models,
+00:04:57.640 --> 00:05:00.162
+Each card is a forty-four pixel touch
 
 129
-00:05:18.310 --> 00:05:20.558
-CRM views, the relational model, and
+00:05:00.162 --> 00:05:02.490
+target, with a pending sync badge.
 
 130
-00:05:20.558 --> 00:05:22.806
-OfflinePlugin. That is the shape of
+00:05:03.690 --> 00:05:05.211
+The plus button opens a
 
 131
-00:05:22.806 --> 00:05:25.054
-Odoo here: a broad ERP core,
+00:05:05.211 --> 00:05:06.915
+quick create bottom sheet.
 
 132
-00:05:25.054 --> 00:05:27.302
-focused CRM work, and offline behavior
+00:05:07.335 --> 00:05:09.635
+It has exactly six fields, with a
 
 133
-00:05:27.302 --> 00:05:29.550
-owned by the shared web layer.
+00:05:09.635 --> 00:05:12.460
+plain stage selector instead of a search.
 
+134
+00:05:12.880 --> 00:05:14.687
+Saving issues one web
+
+135
+00:05:14.687 --> 00:05:16.730
+save, online or offline.
+
+136
+00:05:17.150 --> 00:05:18.742
+Offline, that same call
+
+137
+00:05:18.742 --> 00:05:20.525
+simply lands in the queue.
+
+138
+00:05:20.945 --> 00:05:23.168
+Until it replays, a pending card
+
+139
+00:05:23.168 --> 00:05:25.195
+holds its place in the stage.
+
+140
+00:05:25.615 --> 00:05:28.036
+When the queue drains, the real card
+
+141
+00:05:28.036 --> 00:05:30.265
+replaces it, with no page reload.
+
+142
+00:05:31.465 --> 00:05:33.222
+Installing the web app is
+
+143
+00:05:33.222 --> 00:05:35.240
+the native mobile story here.
+
+144
+00:05:35.660 --> 00:05:38.610
+There is no separate native app project.
+
+145
+00:05:39.030 --> 00:05:41.667
+The CRM controller adds two manifest
+
+146
+00:05:41.667 --> 00:05:44.305
+shortcuts, My Pipeline and New Lead.
+
+147
+00:05:44.725 --> 00:05:46.541
+It also enables the share
+
+148
+00:05:46.541 --> 00:05:48.492
+target, so a file shared on
+
+149
+00:05:48.492 --> 00:05:50.375
+the phone can open in CRM.
+
+150
+00:05:50.795 --> 00:05:52.816
+All of it runs through the one
+
+151
+00:05:52.816 --> 00:05:55.595
+service worker that web already registers.
+
+152
+00:05:56.795 --> 00:05:58.697
+Testing gets special care,
+
+153
+00:05:58.697 --> 00:06:00.395
+because there is no CI.
+
+154
+00:06:00.815 --> 00:06:03.123
+The raw test runner has three ways
+
+155
+00:06:03.123 --> 00:06:05.815
+to report success while testing nothing.
+
+156
+00:06:06.235 --> 00:06:08.848
+The dev scripts detect all three, and
+
+157
+00:06:08.848 --> 00:06:11.260
+fail on skips or empty selections.
+
+158
+00:06:11.680 --> 00:06:13.762
+Forty-six offline test files
+
+159
+00:06:13.762 --> 00:06:15.567
+must pass under both the
+
+160
+00:06:15.567 --> 00:06:17.580
+desktop and mobile presets.
+
+161
+00:06:18.000 --> 00:06:19.546
+An end-to-end tour then
+
+162
+00:06:19.546 --> 00:06:21.586
+goes offline at phone size, and
+
+163
+00:06:21.586 --> 00:06:23.750
+checks every write on the server.
+
+164
+00:06:24.950 --> 00:06:26.487
+You can remember this
+
+165
+00:06:26.487 --> 00:06:28.425
+repository as three layers.
+
+166
+00:06:28.845 --> 00:06:30.695
+Upstream Odoo provides the
+
+167
+00:06:30.695 --> 00:06:32.545
+server and the web client.
+
+168
+00:06:32.965 --> 00:06:35.815
+The web addon owns the offline engine.
+
+169
+00:06:36.235 --> 00:06:38.338
+The CRM fork decides, row by
+
+170
+00:06:38.338 --> 00:06:40.512
+row, what queues, what skips,
+
+171
+00:06:40.512 --> 00:06:42.335
+and what stays disabled.
+
+172
+00:06:42.755 --> 00:06:44.566
+To start, read the inventory,
+
+173
+00:06:44.566 --> 00:06:46.144
+then follow the hook, the
+
+174
+00:06:46.144 --> 00:06:48.130
+guards, and the mobile pipeline.

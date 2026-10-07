@@ -1,142 +1,175 @@
 # Dependencies
-Active contributors: Odoo SA (upstream)
 
 ## Purpose
 
-The Python dependency file pins the server's supported runtime and test
-libraries, with version markers for the Python and distro combinations Odoo
-supports. Browser dependencies are committed under addon static trees and
-loaded through asset manifests; this repository intentionally has no npm or
-JavaScript bundler layer.
+What the codebase needs to run and what it may call: the pinned Python
+packages, the vendored JavaScript libraries, the PostgreSQL and PDF-engine
+requirements, the asset build chain, and the external services CRM can
+reach. Repository-wide counts (files, lines, translation mass) live in
+[By the numbers](../by-the-numbers.md); secret handling lives in
+[Security](../security.md).
 
-This is a map of the dependency boundary, not a freshness audit. Offline
-review cannot establish whether upstream pins are current, and upstream owns
-the main pins.
+## Python dependencies
 
-## Directory layout
+`requirements.txt` pins every package per Ubuntu/Debian release — the
+supported interpreter window is Python 3.12 to 3.14
+(`MIN_PY_VERSION`/`MAX_PY_VERSION` in `odoo/release.py`), and most pins are
+guarded with markers like `python_version >= '3.12' and python_version <
+'3.13'` for Ubuntu 24.04 "Noble", `python_version >= '3.13'` for Debian 13
+"Trixie", or `python_version >= '3.14'` for Ubuntu 26.04 "Resolute". The
+majors:
 
-```text
-requirements.txt                         server and test Python dependencies
-addons/populate/requirements.txt         addon-local Faker pins
-addons/web/static/lib/                   vendored web libraries
-addons/spreadsheet/static/src/o_spreadsheet/
-                                          generated spreadsheet distribution
-addons/web/__manifest__.py                asset inclusion declarations
-```
+| Package | Pin(s) | Role |
+| --- | --- | --- |
+| `psycopg2` | **2.9.9** (Noble), **2.9.10** (Trixie) | PostgreSQL driver (`odoo/sql_db.py`). |
+| `gevent` / `greenlet` | 24.2.1 / 3.0.3 (Noble); 24.11.1 / 3.1.1 (Trixie); greenlet 3.3.2 (Resolute) | Gevent worker: longpolling and the websocket bus. |
+| `Werkzeug` | 3.0.1 | WSGI machinery under `odoo/http/`. |
+| `lxml` | 5.2.1 (Noble), 5.4.0 (Trixie), 6.0.2 (Resolute) + `lxml-html-clean` | XML/QWeb parsing, views, XML-RPC. |
+| `Babel` | 2.10.3 (< 3.13), 2.17.0 (>= 3.13) | Translations and date/number formatting. |
+| `Jinja2` / `MarkupSafe` | 3.1.2 / 2.1.5 | Jinja2 renders the module skeletons of `odoo-bin scaffold` (`odoo/cli/scaffold.py`, the only in-tree import); MarkupSafe escapes markup in report rendering (`ir.actions.report`). |
+| `cryptography` / `pyopenssl` / `asn1crypto` | 42.0.8 / 24.1.0 / 1.5.1 | Crypto primitives, used for PDF digital signatures (`odoo/tools/pdf/signature.py`); also `passlib` 1.7.4 for password hashing. |
+| `requests` / `urllib3` / `idna` | 2.31.0 / 2.0.7 / 3.6 | Outbound HTTP (IAP calls, webhooks). |
+| `h11` | 0.16.0 | HTTP/1.1 protocol parsing inside the server itself (`odoo/http/server.py`, `odoo/http/server_log.py`). |
+| `Pillow` | 10.2.0 (Noble), 11.1.0 (Trixie), 12.1.1 (Resolute) | Image processing. |
+| `reportlab` / `PyPDF2` / `PyPDF` | 4.1.0 / 2.12.1 (< 3.13) / 5.4.0 (>= 3.13) | PDF generation and splitting/merging. |
+| `python-stdnum` / `zeep` | 1.19 (→2.2 on 3.14) / 4.2.1 (→4.3.1) | VAT number validation and SOAP (EU VIES). |
+| `libsass` / `rjsmin` | 0.22.0 / 1.2.0 | Asset pipeline: SCSS compilation and JS minification. |
+| Others | `num2words`, `polib`, `vobject`, `qrcode`, `geoip2`, `openpyxl`, `XlsxWriter`, `xlrd`, `python-dateutil`, `python-magic`, `python-ldap`, `pyserial`, `pyusb`, `psutil`, `freezegun`, `docutils`, `ofxparse`, `cbor2`, `chardet` | Spreadsheets, i18n file formats, calendar (ics), GeoIP, barcode/QR, hardware (serial/USB for POS), tests. |
 
-## Key abstractions
+Notes:
 
-| Dependency or boundary | File | Use |
-|---|---|---|
-| Python pins | `requirements.txt` | Main server, rendering, database, and test dependencies. |
-| Distro-aligned markers | `requirements.txt` | Selects versions for Python 3.11 through 3.14 and Noble/Trixie/Resolute comments. |
-| Faker extra | `addons/populate/requirements.txt` | Data population addon dependency, isolated from the main requirements. |
-| OWL | `addons/web/static/lib/owl/owl.js` | Vendored OWL 3 runtime imported as `@odoo/owl`. |
-| Bootstrap and Popper | `addons/web/static/lib/bootstrap/` and `addons/web/static/lib/popper/` | UI components, styles, and positioning. |
-| DOMPurify | `addons/web/static/lib/dompurify/DOMpurify.js` | HTML sanitization in web assets. |
-| Chart.js | `addons/web/static/lib/Chart/Chart.js` | Charts, with the Luxon adapter. |
-| Spreadsheet bundle | `addons/spreadsheet/static/src/o_spreadsheet/o_spreadsheet.js` | Generated browser spreadsheet engine. |
+- The dev environment adds two packages `requirements.txt` does not pin:
+  `websocket-client` (without it, every browser test skips silently while
+  the run stays green) and `phonenumbers` (without it, phone formatting
+  assertions fail). `scripts/dev/setup.sh` installs both into `.venv`.
+- Vendored Python instead of new pins: `odoo/tools/_vendor/`
+  (`send_file.py`, `useragents.py`), `odoo/tools/zeep/`, `odoo/tools/babel/`,
+  `odoo/tools/arabic_reshaper/`, `odoo/tools/safe_eval/`, `odoo/tools/pdf/`
+  are copies shipped in the tree, not external dependencies.
+- One addon ships its own requirements file: `addons/populate/requirements.txt`.
 
-## How it works
+## Vendored JavaScript
 
-```mermaid
-graph LR
-    R[requirements.txt] --> V[Python environment]
-    V --> S[Odoo server and addons]
-    L[static/lib libraries] --> A[Asset manifests]
-    A --> B[Browser bundles]
-    G[Generated spreadsheet bundle] --> B
-```
+There is no npm, bundler, or JS build tooling; browser libraries are
+committed under each addon's `static/lib/`. The web client ships them in
+`addons/web/static/lib/`:
 
-### Python
+| Library | Version (as shipped) | Used for |
+| --- | --- | --- |
+| `owl/` | Owl 3.0.0-alpha.49 (`owl.js`, plus the `owl2/` compat layer in `addons/web/static/src/owl2/`) | The component framework everything is written in. |
+| `hoot/`, `hoot-dom/` | — | The JS test framework (`@odoo/hoot`) and its DOM helpers. |
+| `bootstrap/`, `popper/` | — | CSS framework and positioned elements. |
+| `Chart/`, `chartjs-adapter-luxon/`, `luxon/` | Chart.js 4.5.0, Luxon 3.7.2 | Graph views. |
+| `fullcalendar/` | — | Calendar view (core, daygrid, timegrid, list, interaction, luxon3). |
+| `ace/` | 1.43.3 | The in-website HTML/JS editor. |
+| `dompurify/` | 3.2.7 | HTML sanitization. |
+| `diff_match_patch/` | — | Text diffing; shipped in the web bundle (`addons/web/__manifest__.py`) with no first-party importer left in `addons/web/static/src/`. |
+| `pdfjs/` | — | PDF preview in the browser. |
+| `prismjs/` | — | Syntax highlighting. |
+| `signature_pad/` | — | Signature capture. |
+| `stacktracejs/` | 3.x | Error reporting stack parsing. |
+| `zxing-library/` | 10.x | Barcode scanning in the browser (POS). |
+| `odoo_ui_icons/` | — | The Odoo icon font. |
 
-`requirements.txt` begins by stating that its officially supported versions
-are the `python3-*` equivalents distributed in Ubuntu 24.04 and Debian 12.
-Version markers select compatible pins across Python versions. Examples are
-Werkzeug 3.0.1 for WSGI and HTTP, `psycopg2` 2.9.9 for Python 3.12 and 2.9.10
-for Python 3.13+, and lxml 5.2.1, 5.4.0, or 6.0.2 for Python 3.12, 3.13,
-or 3.14. `lxml-html-clean` is separate and unpinned because the cleaner was
-removed from lxml.
+Other addons vendor their own copies: `addons/mail/static/lib/`,
+`addons/website/static/lib/`, `addons/spreadsheet/static/lib/`,
+`addons/html_editor/static/lib/`, `addons/point_of_sale/static/lib/`,
+`addons/partner_autocomplete/static/lib/`, `addons/auth_passkey/static/lib/`,
+`addons/pos_imin/static/lib/`, `addons/website_event_track/static/lib/`.
 
-| Package | Pin(s) in `requirements.txt` | Purpose |
-|---|---|---|
-| Werkzeug | `3.0.1` | WSGI server utilities, routing, and HTTP handling. |
-| psycopg2 | `2.9.9` / `2.9.10` | PostgreSQL driver for the ORM and connection pool. |
-| lxml | `5.2.1` / `5.4.0` / `6.0.2` | XML, QWeb, view, and document parsing. |
-| lxml-html-clean | unpinned | HTML cleaning split from lxml. |
-| Pillow | `10.2.0` / `11.1.0` / `12.1.1` | Image decoding, resizing, and report assets. |
-| gevent | `24.2.1` / `24.11.1` | Cooperative workers and long-polling support on non-Windows systems. |
-| Babel | `2.10.3` / `2.17.0` | Locale-aware dates, numbers, and translations. |
-| reportlab | `4.1.0` | PDF report generation. |
-| zeep | `4.2.1` / `4.3.1` | SOAP client support for integrations. |
-| cryptography | `42.0.8` | Cryptographic primitives and secure integrations. |
-| requests | `2.31.0` | Outbound HTTP integrations. |
-| freezegun | `1.2.1` / `1.5.1` | Test-time clock freezing. |
+`addons/web/static/src/libs/` holds thin wrappers rather than copies:
+`bootstrap.js` (extensions and fixes to Bootstrap applied in one place
+"to avoid patching in place"), `luxon.js`, and the `fontawesome/` and
+`materialsymbols/` icon adapters.
 
-The freezegun entries are test support, not a production web dependency.
-The only addon with its own requirements file is
-`addons/populate/requirements.txt`, which pins Faker to 22.0.0 for Python
-3.12, 33.3.1 for Python 3.13, and 39.0.0 for Python 3.14.
+## PostgreSQL
 
-### Browser libraries
+Minimum version **16** (`MIN_PG_VERSION = 16` in `odoo/release.py`).
+`odoo/sql_db.py` warns at connect when `server_version` is lower and the
+tree relies on features of newer engines (e.g. the
+`Constraint ... _not_null` warning about PostgreSQL 18 naming in
+`odoo/orm/table_objects.py`). The dev scripts target the distro cluster
+over the `/var/run/postgresql` socket (`scripts/dev/_common.sh`).
 
-`addons/web/__manifest__.py:188-219` includes OWL, the OWL 2 compatibility
-directory, Popper, and Bootstrap assets. Bootstrap 5 source and JavaScript
-live under `addons/web/static/lib/bootstrap/`; Popper is
-`addons/web/static/lib/popper/popper.js`. DOMPurify is included at
-`addons/web/__manifest__.py:94` from
-`addons/web/static/lib/dompurify/DOMpurify.js`. The chart bundle is declared
-as `web.chartjs_lib` at `addons/web/__manifest__.py:516-518`, using
-`addons/web/static/lib/Chart/Chart.js` and the Luxon adapter.
+## PDF engines (wkhtmltopdf status in 20.0)
 
-The OWL runtime is physically in
-`addons/web/static/lib/owl/owl.js`, while Odoo imports it as `@odoo/owl`.
-This matches the fork's OWL 3 plus compatibility-layer architecture. The
-spreadsheet engine is different: `addons/spreadsheet/static/src/o_spreadsheet/o_spreadsheet.js`
-is a generated AOT distribution, not a source tree to edit. Its header says
-it was generated by spreadsheet build tools and must not be edited.
+QWeb reports render to HTML first; converting HTML to PDF is a pluggable
+engine, and **base ships none**: `ir.actions.report._run_pdf_engine` raises
+`NotImplementedError` unless a module provides one
+(`odoo/addons/base/models/ir_actions_report.py`). Resolution order: the
+report's `report_type` (`qweb-pdf-<engine>`), else the
+`report.pdf_engine_default` system parameter, else `html` (no conversion).
 
-There is no `package.json`, npm lockfile, webpack/Vite/Rollup configuration,
-or `node_modules` workflow in the repository. Odoo builds and serves asset
-bundles from addon manifests and database attachments instead of invoking a
-JavaScript package manager. Adding an npm dependency would change that
-deliberate property and violates the fork's no-new-dependencies rule.
+- **wkhtmltopdf** is not hard-wired anymore. It is provided by
+  `addons/base_report_wkhtmltox` (`auto_install: True`), which shells out to
+  the external `wkhtmltopdf` binary, detects the patched-Qt build, and
+  degrades to state `install` ("you need Wkhtmltopdf to print a pdf") when
+  the binary is missing. Without the binary, PDF printing reports an engine
+  error rather than crashing the server.
+- **paper-muncher** is the second shipped engine
+  (`addons/base_report_paper_muncher`), an external headless-Chromium-based
+  binary it looks for at `/opt/paper-muncher/bin/paper-muncher`.
+- Neither binary is a Python dependency; both are deployment concerns (see
+  [Deployment](../deployment.md)).
 
-## Integration points
+## Asset build chain
 
-Python imports resolve from the environment prepared by the repository setup
-scripts. Web manifests include vendored libraries in backend, frontend, test,
-and chart bundles; [assets](../systems/assets.md) explains generation and
-cache invalidation. The no-new-dependencies rule is part of the fork's
-contribution [patterns](../how-to-contribute/patterns-and-conventions.md).
+No node, no npm, no webpack — the asset pipeline
+(`odoo/addons/base/models/assetsbundle.py`, details in
+[Assets](../systems/assets.md)) uses Python: SCSS compiles through
+`libsass` (falling back to an external `sass` binary with
+`-r bootstrap-sass --compass` if the module is missing), and JS minifies
+with `rjsmin`. `scripts/dev/rebuild-assets.sh` regenerates the bundles after
+front-end changes.
 
-## Entry points for modification
+## External services CRM can call
 
-Check `requirements.txt` and the supported Python marker before changing a
-server package. For browser code, inspect the owning addon manifest and
-`static/lib/` first; do not add npm tooling or replace a vendored library
-without an upstream-compatible plan.
+All optional and selected by settings; all credits go through
+`iap.account` records, and each endpoint is overridable by a system
+parameter (see [Configuration](configuration.md)):
+
+| Service | Default endpoint | Parameter | Entered through |
+| --- | --- | --- | --- |
+| IAP (generic, lead mining `crm_iap_mine`) | `https://iap.odoo.com` | `iap.endpoint` | `addons/iap/tools/iap_tools.py` |
+| Lead/company enrichment | `https://iap-services.odoo.com` | `enrich.endpoint` | `addons/iap/models/iap_enrich_api.py` |
+| Partner autocomplete | `https://partner-autocomplete.odoo.com` | `iap.partner_autocomplete.endpoint` | `addons/partner_autocomplete/models/iap_autocomplete_api.py` |
+| EU VAT validation (VIES SOAP) | EU VIES service (via `python-stdnum` + `zeep`) | — | `addons/partner_autocomplete/models/res_partner.py` (`stdnum.eu.vat.check_vies`) |
+
+The offline/mobile CRM itself has no server dependency beyond the fork's own
+Odoo: the service worker, IndexedDB store, and crypto use browser-native
+APIs only — see [Offline and PWA](../features/offline-and-pwa/index.md).
+
+## The fork's hard rule
+
+`AGENTS.md` (section "Security and dependencies") forbids adding
+dependencies to this fork: no new Python or JS package, no new addon in a
+manifest's `depends`, `requirements.txt` unchanged, no npm/bundler/JS build
+tooling, and no native mobile project (the "native mobile" target is the
+installable PWA the fork already ships). Anything new must be implemented in
+`addons/crm/` with the primitives already vendored or browser-native.
 
 ## Key source files
 
 | File | Purpose |
-|---|---|
-| `requirements.txt` | Main Python dependency pins and version markers. |
-| `addons/populate/requirements.txt` | Faker pins for the populate addon. |
-| `addons/web/__manifest__.py` | Web asset and library declarations. |
-| `addons/web/static/lib/owl/owl.js` | Vendored OWL runtime. |
-| `addons/web/static/src/owl2/owl3_compatibility_layer.js` | Compatibility layer around OWL 3. |
-| `addons/web/static/lib/bootstrap/` | Vendored Bootstrap 5 sources and JavaScript. |
-| `addons/web/static/lib/popper/popper.js` | Vendored Popper positioning library. |
-| `addons/web/static/lib/dompurify/DOMpurify.js` | Vendored HTML sanitizer. |
-| `addons/web/static/lib/Chart/Chart.js` | Vendored Chart.js library. |
-| `addons/web/static/lib/chartjs-adapter-luxon/chartjs-adapter-luxon.js` | Chart.js date adapter. |
-| `addons/spreadsheet/static/src/o_spreadsheet/o_spreadsheet.js` | Generated spreadsheet distribution. |
+| --- | --- |
+| `requirements.txt` | All pinned Python dependencies, per release markers. |
+| `odoo/release.py` | `MIN_PY_VERSION`, `MAX_PY_VERSION`, `MIN_PG_VERSION`. |
+| `odoo/sql_db.py` | PostgreSQL connection layer and version warning. |
+| `addons/web/static/lib/` | Vendored browser libraries. |
+| `addons/web/static/src/libs/` | Wrappers around vendored libraries. |
+| `odoo/addons/base/models/assetsbundle.py` | libsass/rjsmin asset compilation. |
+| `odoo/addons/base/models/ir_actions_report.py` | PDF engine resolution. |
+| `addons/base_report_wkhtmltox/models/ir_actions_report.py` | wkhtmltopdf engine. |
+| `addons/base_report_paper_muncher/paper_muncher.py` | paper-muncher engine. |
+| `addons/iap/tools/iap_tools.py` | IAP JSON-RPC client and default endpoint. |
+| `scripts/dev/setup.sh` | Installs requirements.txt plus `websocket-client` and `phonenumbers`. |
 
 ## Related pages
 
 - [Reference](index.md)
 - [Assets](../systems/assets.md)
-- [Web](../apps/web/index.md)
-- [Spreadsheet and dashboards](../apps/spreadsheet-and-dashboards.md)
-- [Contribution patterns](../how-to-contribute/patterns-and-conventions.md)
+- [Architecture](../overview/architecture.md)
+- [Offline and PWA](../features/offline-and-pwa/index.md)
+- [CRM](../apps/crm/index.md)
+- [Security](../security.md)
+- [By the numbers](../by-the-numbers.md)

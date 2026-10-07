@@ -1,6 +1,6 @@
 # Users, groups, and access
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Christophe, Krzysztof, Raphael
 
 ## Purpose
 
@@ -83,6 +83,19 @@ Access can be narrowed below the record. Any field may carry `groups`, a comma-s
 
 `sudo()` returns the same recordset in superuser mode: the user does not change, but access checks are skipped. Its docstring in `odoo/orm/models.py` warns that this crosses record-level boundaries, notably between companies. `with_user(user)` re-evaluates everything as another user in non-superuser mode. Models that must never be manipulated from a sudo-ed data command set `_allow_sudo_commands = False`; `ir.access`, `res.users`, `ir.ui.view`, `ir.cron`, and the action models all do.
 
+### Client-side group and access probes
+
+The web client re-asks the server instead of duplicating the rule. `addons/web/static/src/core/user.js` exposes two memoized probes on the user service:
+
+- `user.hasGroup(group)` reads through `groupCache` and posts `res.users.has_group` to `/web/dataset/call_kw/res.users/has_group` (`odoo/addons/base/models/res_users.py`). The cache is pre-seeded from `session.groups` for the groups the session already carries (`base.group_user`, `base.group_user_regular`, `base.group_system`, `base.group_erp_manager`, `base.group_public`), so those never cost a round trip.
+- `user.checkAccessRight(model, operation, ids)` reads through `accessRightCache` and posts to `/web/dataset/call_kw/<model>/has_access`, which resolves the same `_access_domain` the server enforces at read and write time.
+
+Both memoize the *promise*, and the cache never evicts a rejected entry. A probe that rejects with `ConnectionLostError` during a brief online flip therefore stays rejected for the life of the page. `addons/crm/static/src/components/team_switcher/team_switcher.js` works around that: once it records `hasGroupCachePoisoned`, a later `sales_team.group_sale_manager` probe goes around the dead cache entry with a plain, uncached `orm.silent.call("res.users", "has_group", ...)` instead of `user.hasGroup`. The same fork probes `crm.group_use_recurring_revenues` (`addons/crm/static/src/views/crm_kanban/crm_column_progress.js`) and `checkAccessRight(model, "create")` (`addons/crm/static/src/components/lead_generation_dropdown/lead_generation_dropdown.js`); every one of them is skipped while offline. See [Offline CRM](../apps/crm/offline-crm.md).
+
+### Portal and public users
+
+`res.users.share` is a computed, stored boolean: a user in no internal group is a share user, and the field is what the UI calls a "portal" user. `_is_portal()` returns `has_group('base.group_portal')` and `_is_public()` returns `has_group('base.group_public')`, both run with `sudo()` (`odoo/addons/base/models/res_users.py:1282-1287`). A public user is the anonymous visitor the website serves; a portal user is a share user with a `res.partner` behind it. Neither is matched by any internal `ir.access` permission, so they see exactly what their own group's rows and restrictions allow and nothing else — which is also why the offline cache, fed only by records the user already read online, cannot widen their view. Passwords, credential checks (`_check_credentials`, `_login`, `authenticate`, and the Passlib context at `odoo/addons/base/models/res_users.py:1306`), and the rest of the authentication surface are covered in [security](../security.md).
+
 ### Where access is declared
 
 Security rows are plain data files listed in the manifest. `addons/crm/__manifest__.py` loads `security/crm_security.xml` early (it creates groups other records reference) and `security/ir.access.csv` later. The CSV filename determines the target model: `convert_csv_import` in `odoo/tools/convert.py` derives it from the basename, so a file named `ir.access.csv` creates `ir.access` records. Columns are `id,name,model_id,group_id/id,operation,domain`.
@@ -103,6 +116,7 @@ The migration from the old pair of models is scripted: `odoo/upgrade_code/19.4-0
 - The ORM calls `_access_domain` from `check_access` and from search/read paths in `odoo/orm/models.py`; see [ORM](../systems/orm.md).
 - Views and menus filter on groups independently of `ir.access`: `ir.ui.view.group_ids` and `ir.ui.menu.group_ids` (see [actions, views, and menus](actions-views-menus.md)), plus `_postprocess_access_rights` on the arch.
 - The offline stack caches only records the user already read online, so it cannot widen access; see [offline and PWA](../features/offline-and-pwa/index.md).
+- The client's `hasGroup` / `checkAccessRight` probes are what gate group- and access-dependent UI, so a component that hides itself behind one of them is only as reliable as that cache; see [Offline CRM](../apps/crm/offline-crm.md).
 
 ## Entry points for modification
 
@@ -118,6 +132,8 @@ Add access by shipping rows in your addon's `security/ir.access.csv` and groups 
 | `odoo/addons/base/models/res_users.py` | `group_ids`, `all_group_ids`, company fields, user context. |
 | `odoo/addons/base/models/res_groups.py` | Implied-group closures, privileges, cache invalidation. |
 | `odoo/addons/base/models/res_groups_privilege.py` | Group scopes shown in the UI. |
+| `addons/web/static/src/core/user.js` | `hasGroup` / `checkAccessRight` probes and their promise caches. |
+| `addons/crm/static/src/components/team_switcher/team_switcher.js` | Worked example of routing a group probe around a poisoned cache on reconnect. |
 | `odoo/upgrade_code/19.4-00-ir-access.py` | Codemod that derived `ir.access` from `ir.model.access` and `ir.rule`. |
 | `odoo/tools/convert.py` | Data-file loader; `convert_csv_import` maps a CSV filename to its model. |
 | `addons/crm/security/crm_security.xml` | CRM group records (`group_use_lead`, `group_use_recurring_revenues`). |
@@ -130,6 +146,8 @@ Add access by shipping rows in your addon's `security/ir.access.csv` and groups 
 - [Companies and multi-company](companies-and-multi-company.md)
 - [Actions, views, and menus](actions-views-menus.md)
 - [Security](../security.md)
+- [Offline CRM](../apps/crm/offline-crm.md)
+- [Mobile CRM](../apps/crm/mobile-crm.md)
 - [base addon](../apps/base.md)
 - [Data models](../reference/data-models.md)
 - [Glossary](../overview/glossary.md)

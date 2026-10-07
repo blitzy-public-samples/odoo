@@ -1,135 +1,143 @@
-# Marketing
+# Marketing suite
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Christophe, Thibault, Martin (top authors of `addons/mass_mailing` on `origin/20.0`, bots and translation imports excluded)
 
 ## Purpose
 
-The marketing addons cover outbound communication and audience tracking: email and SMS campaigns, physical mail, events, surveys, short-link click tracking, periodic KPI digests, and gamified challenges. They matter to this fork because several of them feed `crm.lead` records into the pipeline, and because `addons/crm` inherits the UTM tracking fields they define.
+The marketing family covers outbound campaigns and the audience data behind them: email campaigns, SMS campaigns, printed postcards, the UTM campaign/source/medium taxonomy, short-link click tracking, events and their registrations, and gamified challenges. The family matters to this fork because `addons/crm` inherits the UTM tracking fields it defines, and because several bridge addons push campaign results back into the pipeline as `crm.lead` records.
 
-## Directory layout
+Two families that upstream ships as enterprise apps are absent from this repository and must not be assumed: `marketing_automation` (multi-step marketing flows) and `social` (social media posting). The community `social_media` addon is not a posting app — it only adds social account fields to `res.company` (`addons/social_media/models/res_company.py`) so email templates and the website can link to them. `mass_mailing` lists `social_media` as a dependency for that reason.
+
+## Family contents
+
+Real directories in `addons/`:
 
 ```text
-addons/
-  mass_mailing/            Email Marketing: mailing.mailing, lists, contacts, traces
-  mass_mailing_sms/        SMS mailings (mailing_type = 'sms')
-  mass_mailing_themes/     Email design themes
-  mass_mailing_crm/        Bridge: lead counts per mailing
-  mass_mailing_{event,event_track,sale,slides}[_sms]/   recipient-model bridges
-  sms/                     SMS gateway (sms.sms, sms.template, trackers)
-  sms_twilio/              Twilio provider for the gateway
-  snailmail/               Printed-letter delivery via IAP
-  event/                   Events, registrations, ticketing, mail schedulers
-  event_booth/             Booth reservation
-  event_crm/               Registration -> lead rules (auto_install)
-  event_{product,sale,crm_sale,sms,booth_sale}/         commercial bridges
-  website_event*/          Public event pages, tracks, exhibitors (12 modules)
-  survey/                  Surveys, questions, user inputs, live sessions
-  survey_crm/              Answers that generate leads (auto_install)
-  gamification/            Challenges, goals, badges, karma
-  gamification_sale_crm/   Sample CRM goal definitions (auto_install)
-  utm/                     utm.mixin + campaign/source/medium/tag/stage
-  link_tracker/            Short URLs and click statistics
-  digest/                  Periodic KPI email + tips
-  marketing_card/          Shareable generated cards
-  marketing_card_event/    Card campaigns for events
+mass_mailing/                 Email Marketing: mailing.mailing, lists, contacts, traces
+mass_mailing_sms/             SMS Marketing (adds mailing_type = 'sms')
+mass_mailing_themes/          Email design themes
+mass_mailing_crm/             Bridge: lead/opportunity counts per mailing
+mass_mailing_crm_sms/         Bridge: SMS mailings on leads
+mass_mailing_event/           Bridge: mass mailing on event attendees
+mass_mailing_event_sms/       Bridge: SMS on event attendees
+mass_mailing_event_track/     Bridge: mass mailing on track speakers
+mass_mailing_event_track_sms/ Bridge: SMS on track speakers
+mass_mailing_sale/            Bridge: mass mailing on sale orders
+mass_mailing_sale_sms/        Bridge: SMS on sale orders
+mass_mailing_slides/          Bridge: mass mailing on course members
+sms/                          SMS gateway: sms.sms, sms.template, sms.tracker
+sms_twilio/                   Twilio as the gateway API instead of IAP
+utm/                          UTM taxonomy: campaign, source, medium, stage, tag, mixin
+link_tracker/                 Short links and per-click tracking
+event/                        Events: event.event, registrations, tickets, questions, mailings
+event_booth/                  Booth sales and assignments for events
+event_booth_sale/             Bridge: booths <-> sale orders
+event_crm/                    Bridge: event registration <-> CRM lead
+event_crm_sale/               Bridge: event, CRM, and sale orders
+event_product/                Sell products at events
+event_sale/                   Bridge: event tickets <-> sale orders
+event_sms/                    SMS on events
+gamification/                 Badges, challenges, goals, karma
+social_media/                 Social account fields on res.company only
+marketing_card/               Printed postcard campaigns (link_tracker + mass_mailing)
+marketing_card_event/         Bridge: postcards for events
+snailmail/                    Printed-letter delivery through IAP
+digest/                       Periodic KPI emails (not a campaign tool, but the same sending layer)
 ```
 
-There is no `marketing_automation` module in this repository; the automation app is not part of the open-source tree. Twelve modules carry the `mass_mailing` prefix.
+## Key models
 
-## Key abstractions
-
-| Name | File | Description |
+| Model | Defined in | Role |
 | --- | --- | --- |
-| `utm.mixin` | `addons/utm/models/utm_mixin.py` | Abstract mixin adding `campaign_id`, `source_id`, `medium_id` and the `utm_reference` Reference field; `default_get` reads values back from tracking cookies. |
-| `mailing.mailing` | `addons/mass_mailing/models/mailing.py` | One campaign send: recipient model + domain or mailing lists, HTML body, A/B testing settings, aggregated statistics. |
-| `mailing.trace` | `addons/mass_mailing/models/mailing_trace.py` | Per-recipient delivery record with `trace_status` and `failure_type`, the source of every mailing statistic. |
-| `mailing.subscription` | `addons/mass_mailing/models/mailing_subscription.py` | Contact-to-list membership carrying `opt_out`, `opt_out_reason_id`, `opt_out_datetime`. |
-| `sms.sms` | `addons/sms/models/sms_sms.py` | Outgoing SMS with provider state mapping (`IAP_TO_SMS_STATE_SUCCESS`) and `_send`/`_send_with_api`. |
-| `snailmail.letter` | `addons/snailmail/models/snailmail_letter.py` | A report rendered to PDF and posted to the IAP print endpoint `/iap/snailmail/1/print`. |
-| `event.event` | `addons/event/models/event_event.py` | Event with stage, `kanban_state`, seat counters (`seats_max`/`seats_reserved`/`seats_available`) and slots. |
-| `event.mail` | `addons/event/models/event_mail.py` | Scheduler row: `interval_nbr`/`interval_unit`/`interval_type` relative to registration or event dates. |
-| `event.lead.rule` | `addons/event_crm/models/event_lead_rule.py` | Rule that turns registrations into leads, per attendee or per order, on creation, confirmation or attendance. |
-| `survey.survey` | `addons/survey/models/survey_survey.py` | Survey definition, sessions, scoring; `addons/survey_crm/models/survey_survey.py` adds `generate_lead` and `team_id`. |
-| `gamification.challenge` | `addons/gamification/models/gamification_challenge.py` | Periodic goal set (`daily`/`weekly`/`monthly`/`yearly`/`once`) with a badge `reward_id`. |
-| `link.tracker` | `addons/link_tracker/models/link_tracker.py` | Short URL (`link.tracker.code`) plus click log (`link.tracker.click`) and a stored `count`. |
-| `digest.digest` | `addons/digest/models/digest.py` | KPI email with `periodicity` and `next_run_date`; each KPI is a `kpi_*` boolean plus a computed `kpi_*_value`. |
-| `card.campaign` | `addons/marketing_card/models/card_campaign.py` | Generates per-record shareable cards (`card.card`) from a `card.template`. |
+| `mailing.mailing` | `addons/mass_mailing/models/mailing.py` | One campaign: subject, body, recipient model, lists, schedule, and statistics |
+| `mailing.list` | `addons/mass_mailing/models/mailing_list.py` | A named audience list |
+| `mailing.contact` | `addons/mass_mailing/models/mailing_contact.py` | One recipient with blacklist tracking and custom properties |
+| `mailing.subscription` | `addons/mass_mailing/models/mailing_subscription.py` | The contact-to-list link, with opt-out state |
+| `mailing.subscription.optout` | `addons/mass_mailing/models/mailing_subscription_optout.py` | Per-list opt-out reasons |
+| `mailing.filter` | `addons/mass_mailing/models/mailing_filter.py` | A saved domain that selects recipients from any model |
+| `mailing.trace` | `addons/mass_mailing/models/mailing_trace.py` | Per-recipient sent/opened/clicked/replied/bounced events that roll up into mailing stats |
+| `sms.sms` | `addons/sms/models/sms_sms.py` | One outbound SMS and its delivery state |
+| `sms.template` | `addons/sms/models/sms_template.py` | A rendered SMS body reusable from any model |
+| `sms.tracker` | `addons/sms/models/sms_tracker.py` | Delivery/click tracking for SMS, the counterpart of `mailing.trace` |
+| `utm.campaign` / `utm.source` / `utm.medium` | `addons/utm/models/` | The attribution taxonomy shared by CRM, sales, events, and mailings |
+| `utm.mixin` | `addons/utm/models/utm_mixin.py` | Abstract mixin giving any model `campaign_id`, `source_id`, `medium_id`, and `utm_reference` |
+| `utm.stage` / `utm.tag` | `addons/utm/models/` | Optional campaign stages and tags |
+| `link.tracker` | `addons/link_tracker/models/link_tracker.py` | A tracked short link, itself a `utm.mixin` record |
+| `link.tracker.code` | `addons/link_tracker/models/link_tracker.py` | The short code that resolves to a `link.tracker` |
+| `link.tracker.click` | `addons/link_tracker/models/link_tracker.py` | One recorded click with its request metadata |
+| `event.event` | `addons/event/models/event_event.py` | An event with tickets, questions, and dates |
+| `event.registration` | `addons/event/models/event_registration.py` | One attendee, linked to a partner and an optional lead |
+| `event.stage` | `addons/event/models/event_stage.py` | Kanban stages for events |
+| `event.event.ticket` | `addons/event/models/event_ticket.py` | Ticket types with prices and quotas |
+| `event.mail` / `event.mail.registration` | `addons/event/models/event_mail.py`, `.../event_mail_registration.py` | Scheduled communications and their per-registration state |
+| `event.question` / `event.registration.answer` | `addons/event/models/event_question.py`, `.../event_registration_answer.py` | Registration form questions and answers |
+| `gamification.badge` / `gamification.challenge` / `gamification.goal` | `addons/gamification/models/` | Badges, challenges, and the goals a challenge tracks |
+| `gamification.goal.definition` | `addons/gamification/models/gamification_goal_definition.py` | The field, computation mode, and target a goal measures |
+| `gamification.karma.rank` / `gamification.karma.tracking` | `addons/gamification/models/` | Karma ranks and the karma ledger |
+| `card.campaign` / `card.card` / `card.template` | `addons/marketing_card/models/` | Printed postcard campaigns and their cards |
 
 ## How it works
 
-A mailing names a recipient model (`mailing_model_id`) or a set of mailing lists, resolves recipients through `mailing_domain`, and writes one `mailing.trace` per recipient. Links in the body are rewritten to short URLs so clicks land on `/r/<code>` (`addons/link_tracker/controller/main.py`) or, for mailings, `/r/<code>/m/<trace_id>` (`addons/mass_mailing/controllers/main.py`), which attributes the click to a trace. Sending is driven by the `ir_cron_mass_mailing_queue` job in `addons/mass_mailing/data/ir_cron_data.xml`, with a second cron for A/B test winner selection.
+Email campaigns. `mailing.mailing` is a `mail.thread` + `mail.activity.mixin` + `mail.render.mixin` record (`addons/mass_mailing/models/mailing.py:38`). It carries its own `campaign_id`, `medium_id`, and `source_id` fields rather than inheriting `utm.mixin`, and defaults them to the standard `utm.utm_medium_email` and `utm.utm_source_mailing` records. The recipient set is either a list of `mailing.list` records or any model chosen through `mailing_model_id`, filtered by `mailing.filter` domains; `mailing.mailing._get_recipients()` resolves the final set. Sending renders the body per recipient through `mail.render.mixin`, mints a tracked link when the body contains one, and posts `mail.mail` rows. A `mailing.trace` row is written per recipient and updated as the recipient opens, clicks, replies, or bounces, which is what the campaign statistics and A/B tests read.
 
-```mermaid
-graph TD
-  M["mailing.mailing<br/>addons/mass_mailing/models/mailing.py"] -->|"one per recipient"| T["mailing.trace"]
-  M -->|"mailing_type = sms"| S["sms.sms<br/>addons/sms/models/sms_sms.py"]
-  S -->|"provider"| TW["sms_twilio"]
-  M -->|"body links rewritten"| L["link.tracker"]
-  L -->|"GET /r/code"| C["link.tracker.click"]
-  M -->|"campaign_id / utm_reference"| U["utm.campaign"]
-  U -->|"utm.mixin fields"| LEAD["crm.lead"]
-  E["event.registration"] -->|"event.lead.rule"| LEAD
-  SU["survey.user_input"] -->|"answers with generate_lead"| LEAD
-```
+SMS campaigns. `mass_mailing_sms` extends the `mailing_type` selection on `mailing.mailing` with `'sms'` and adds the SMS-specific fields and scheduling (`addons/mass_mailing_sms/models/mailing_mailing.py:26`). The gateway itself is `addons/sms`: `sms.sms` is an outbound message with a state machine, `sms.template` renders a body from a record, and `sms.tracker` records delivery. `sms.sms.send()` splits messages by API (`_split_by_api`) and sends through IAP by default (`addons/sms/__manifest__.py` depends on `iap_mail`); `sms_twilio` swaps in the Twilio API for companies that configure it.
 
-UTM attribution is what ties campaigns back to the pipeline. `addons/utm/models/ir_http.py` stores `utm_*` URL parameters in cookies for 31 days in `_post_dispatch`, and `utm.mixin.default_get` reads them back when a record is created from a public request. Because `crm.lead` inherits `utm.mixin` (`addons/crm/models/crm_lead.py`), a lead created from a tracked link arrives with its campaign, source and medium already set. Counting goes the other way: `addons/mass_mailing_crm/models/mailing_mailing.py` and `addons/survey_crm/models/survey_survey.py` both group `crm.lead` by `utm_reference` matching `<model>,<id>` to report how many leads a mailing or a survey produced.
+UTM. `utm.mixin` (`addons/utm/models/utm_mixin.py`) gives any model `campaign_id`, `source_id`, `medium_id`, and a generic `utm_reference`. Its `default_get()` reads tracking values from cookies that `ir.http` dispatch populates from URL parameters, creating the `utm.campaign`/`utm.source`/`utm.medium` record on demand. CRM leads inherit this mixin, which is how a mailing or a link click becomes attributed pipeline; see [CRM](crm/index.md).
 
-Lead creation from events is rule-driven rather than hardcoded. `event.lead.rule` filters a batch of registrations by domain, company, event and event category, then creates leads with the rule's `type`, `user_id` and `team_id` and contact data derived from the registrations. All matching rules apply, so one registration batch can produce several leads. The created lead keeps `event_lead_rule_id`, `event_id` and `registration_ids` (`addons/event_crm/models/crm_lead.py`), and those links survive a lead merge because the bridge extends `_merge_dependences` and `_merge_get_fields`.
+Link tracking. `link.tracker` inherits `utm.mixin` and stores a short URL; `link.tracker.code` holds the code, and `link.tracker.click` records each visit. Mailings and events mint trackers automatically when their content contains links, so clicks feed back into the same UTM fields.
 
-Surveys generate leads from individual answers: `generate_lead` on `survey.question.answer` propagates up to the question and the survey, and `action_end_session` calls `_create_leads_from_generative_answers()` on the inputs collected during a live session.
+Events. `event.event` holds the schedule, tickets (`event.event.ticket`), registration form questions (`event.question`), and scheduled communications (`event.mail`, whose `interval_type` covers before/after event and after registration). `event.registration` is one attendee; bridges connect it to sales (`event_sale` sells tickets through `sale.order`), CRM (`event_crm` creates a lead from a registration), booths (`event_booth`), and SMS (`event_sms`). An `ir.cron` (`addons/event/data/ir_cron_data.xml`) drives the scheduled communications.
 
-Digests are the reporting counterpart. `digest.digest` sends a periodic KPI mail; `addons/crm/models/digest.py` adds `kpi_crm_lead_created` and `kpi_crm_opportunities_won`, both guarded by `_raise_if_not_member_of('sales_team.group_sale_salesman')`, and registers their menu actions and sort sequence through `_get_kpi_custom_settings`. `digest.tip` records add short HTML hints scoped to a group; CRM ships several in `addons/crm/data/digest_data.xml`.
+Gamification. `gamification.challenge` groups `gamification.challenge.line` goals; each goal follows a `gamification.goal.definition` that names a model, a field, a computation mode, and a target. Two crons (`addons/gamification/data/ir_cron_data.xml`: `ir_cron_check_challenge` calling `_cron_update()` and `ir_cron_consolidate`) evaluate goals and consolidate karma. Badges are awarded manually or from goals. HR wires this to employees through the auto-installed `hr_gamification`.
 
 ## Integration points
 
-- `utm` is a dependency of `crm`, `mass_mailing`, `event` and `link_tracker`. Any model that inherits `utm.mixin` becomes a possible campaign destination.
-- `mass_mailing` depends on `html_builder` for the email designer and on `digest`, `link_tracker`, `social_media`, `web_tour`.
-- `sms` is `auto_install: True` and hooks into `mail` (notifications, followers, scheduled messages, server actions). `sms_twilio` plugs a provider into `sms.sms`; without it, sending goes through IAP.
-- `snailmail` and `sms` both consume IAP credits through `iap.account`; see [localizations and integrations](localizations-and-integrations.md).
-- The `*_crm` bridges (`event_crm`, `survey_crm`, `mass_mailing_crm`, `gamification_sale_crm`, `event_crm_sale`, `website_event_crm`) are `auto_install: True`, so installing CRM alongside the marketing app wires them up with no user action.
-- `gamification` also backs survey certifications (`survey` depends on it) and is reused by HR, see [HR](hr-suite.md).
+- CRM: `crm.lead` inherits `utm.mixin`, so every campaign, source, and medium defined here is available as a lead attribution field. `mass_mailing_crm` adds per-mailing lead counts, and `event_crm` converts registrations into leads. See [CRM](crm/index.md).
+- Mail: `mailing.mailing` and `sms.template` both build on `mail.render.mixin`; campaign sending goes through `mail.mail`. See [Mail](mail.md).
+- Sales: `mass_mailing_sale`, `event_sale`, `event_product`, `event_crm_sale`, and `event_booth_sale` bridge campaigns and events into orders. See [Sales suite](sales-suite.md).
+- Website and e-learning: `mass_mailing_slides` targets course members, `website` depends on `social_media`. See [Website suite](website-suite.md).
+- Automation: campaign sending, event communications, and gamification goals are all driven by scheduled actions; see [Cron and scheduled actions](../primitives/cron-and-scheduled-actions.md).
+- CRM/fork note: nothing in this family is modified by the fork. `addons/crm` consumes the UTM fields and the mailing bridges, and `addons/crm/controllers/webmanifest.py` is the only CRM-side touch point that shares infrastructure with the mail layer.
 
 ## Entry points for modification
 
-Adding a recipient model to email marketing means setting `_mailing_enabled = True` on it, exactly as `addons/mass_mailing_crm/models/crm_lead.py` does in three lines. To change how events produce leads, work on `event.lead.rule` rather than on `event.registration`; the rule model owns the filtering and the field mapping. New digest KPIs follow the `kpi_<name>` boolean plus `kpi_<name>_value` compute pattern and must be registered in `_get_kpi_custom_settings`.
-
-Note the fork rule before touching any of these files: work in this repository is confined to `addons/crm`, so behaviour owned by a marketing addon has to be extended from CRM with `_inherit`, a controller subclass, a JS `patch()` or view inheritance. See [patterns and conventions](../how-to-contribute/patterns-and-conventions.md).
+Start from `addons/mass_mailing/models/mailing.py` for campaign behavior, `addons/mass_mailing/models/mailing_trace.py` for statistics, and `addons/mass_mailing_sms/models/mailing_mailing.py` for the SMS variant of the same flow. To target a new recipient model, add a bridge module that depends on `mass_mailing` and the target addon and extends the mailing's recipient domain, following `addons/mass_mailing_sale` as the template. To change attribution, edit `addons/utm/models/utm_mixin.py`, but remember that CRM's behavior is owned by `addons/crm` and must be extended from there, not here. New models in a family addon must be imported in its `models/__init__.py`, and new XML data files must be added to the manifest `data` list in dependency order.
 
 ## Key source files
 
 | File | Purpose |
 | --- | --- |
-| `addons/mass_mailing/models/mailing.py` | The mailing model: recipients, body, A/B testing, statistics. |
-| `addons/mass_mailing/models/mailing_trace.py` | Per-recipient delivery and engagement record. |
-| `addons/mass_mailing/models/mailing_list.py` | Mailing lists with contact/opt-out/blacklist counters. |
-| `addons/mass_mailing/data/ir_cron_data.xml` | Queue-processing and A/B-testing crons. |
-| `addons/mass_mailing/controllers/main.py` | Tracking, unsubscribe and `/r/<code>/m/<trace>` click routes. |
-| `addons/mass_mailing_crm/models/mailing_mailing.py` | Lead counts per mailing, CRM mailing template action. |
-| `addons/sms/models/sms_sms.py` | Outgoing SMS, provider state mapping, sending. |
-| `addons/sms_twilio/models/sms_sms.py` | Twilio delivery path for the gateway. |
-| `addons/snailmail/models/snailmail_letter.py` | PDF rendering and IAP print submission. |
-| `addons/event/models/event_event.py` | Event definition, stages, seat accounting. |
-| `addons/event/models/event_mail.py` | Registration and event mail schedulers. |
-| `addons/event_crm/models/event_lead_rule.py` | Registration-to-lead rules. |
-| `addons/event_crm/models/crm_lead.py` | Event fields on the lead and merge handling. |
-| `addons/survey/models/survey_survey.py` | Survey definition, sessions, scoring. |
-| `addons/survey_crm/models/survey_survey.py` | `generate_lead`, target team, lead counting. |
-| `addons/gamification/models/gamification_challenge.py` | Periodic challenges and badge rewards. |
-| `addons/utm/models/utm_mixin.py` | Campaign/source/medium fields and cookie-based defaults. |
-| `addons/utm/models/ir_http.py` | Writes `utm_*` cookies during dispatch. |
-| `addons/link_tracker/controller/main.py` | The `/r/<code>` redirect. |
-| `addons/digest/models/digest.py` | KPI digest model, periodicity, sending. |
-| `addons/crm/models/digest.py` | CRM's two digest KPIs. |
-| `addons/crm/data/digest_data.xml` | CRM digest tips and default KPI activation. |
-| `addons/marketing_card/models/card_campaign.py` | Generated shareable card campaigns. |
+| `addons/mass_mailing/__manifest__.py` | Email Marketing manifest and data order |
+| `addons/mass_mailing/models/mailing.py` | `mailing.mailing`, the campaign model (1,566 lines) |
+| `addons/mass_mailing/models/mailing_list.py` | `mailing.list` |
+| `addons/mass_mailing/models/mailing_contact.py` | `mailing.contact` |
+| `addons/mass_mailing/models/mailing_subscription.py` | Contact-to-list subscriptions and opt-outs |
+| `addons/mass_mailing/models/mailing_filter.py` | Saved recipient domains |
+| `addons/mass_mailing/models/mailing_trace.py` | Per-recipient statistics |
+| `addons/mass_mailing_sms/models/mailing_mailing.py` | Adds `mailing_type = 'sms'` to campaigns |
+| `addons/sms/models/sms_sms.py` | `sms.sms` gateway record and send path |
+| `addons/sms/models/sms_template.py` | `sms.template` rendering |
+| `addons/sms_twilio/models/sms_sms.py` | Twilio API backend for the gateway |
+| `addons/utm/models/utm_mixin.py` | The `utm.mixin` attribution fields and cookie handling |
+| `addons/utm/models/utm_campaign.py` | `utm.campaign` |
+| `addons/link_tracker/models/link_tracker.py` | `link.tracker`, `link.tracker.code`, `link.tracker.click` |
+| `addons/event/models/event_event.py` | `event.event` |
+| `addons/event/models/event_registration.py` | `event.registration` |
+| `addons/event/models/event_mail.py` | Scheduled event communications |
+| `addons/event/data/ir_cron_data.xml` | Cron driving event communications |
+| `addons/gamification/models/gamification_challenge.py` | `gamification.challenge` |
+| `addons/gamification/models/gamification_goal.py` | `gamification.goal` |
+| `addons/gamification/data/ir_cron_data.xml` | Crons evaluating goals and karma |
+| `addons/marketing_card/models/card_campaign.py` | Printed postcard campaigns |
+| `addons/social_media/models/res_company.py` | Social account fields on `res.company` |
 
 ## Related pages
 
+- [Apps](index.md)
 - [CRM](crm/index.md)
-- [Sales](sales-suite.md)
-- [Website](website-suite.md)
-- [Messaging](mail.md)
-- [HR](hr-suite.md)
-- [Localizations and integrations](localizations-and-integrations.md)
+- [Mail](mail.md)
+- [Sales suite](sales-suite.md)
+- [Website suite](website-suite.md)
+- [HR suite](hr-suite.md)
 - [Cron and scheduled actions](../primitives/cron-and-scheduled-actions.md)
 - [Patterns and conventions](../how-to-contribute/patterns-and-conventions.md)

@@ -1,5 +1,5 @@
 # Module system
-Active contributors: Odoo SA (upstream)
+Active contributors: Christophe, Raphael, Xavier
 
 ## Purpose
 
@@ -17,6 +17,7 @@ odoo/modules/
 ├── neutralize.py    # neutralize a database (demo/production scrubbing)
 └── registry/        # shim re-exporting odoo.orm.registry.Registry
 odoo/orm/registry.py          # Registry, LRU, signaling
+odoo/tools/convert.py         # convert_file(): XML and CSV record loading
 odoo/cli/upgrade_code.py      # upgrade_code command (source codemods)
 odoo/upgrade_code/            # the codemod scripts
 ```
@@ -32,6 +33,7 @@ odoo/upgrade_code/            # the codemod scripts
 | `load_modules` | `odoo/modules/loading.py` | The whole install/upgrade sequence for a database. |
 | `MigrationManager` | `odoo/modules/migration.py` | Finds and runs pre/post/end migration scripts. |
 | `Registry` | `odoo/orm/registry.py` | Model registry per database, LRU-cached, with signaling. |
+| `convert_file` | `odoo/tools/convert.py` | Loads one XML or CSV data file into records. |
 | `UpgradeCode` | `odoo/cli/upgrade_code.py` | CLI command applying the scripts in `odoo/upgrade_code/` to source files. |
 
 ## How it works
@@ -40,7 +42,7 @@ odoo/upgrade_code/            # the codemod scripts
 
 `Manifest.for_addon(name)` in `odoo/modules/module.py` searches every directory on `odoo.addons.__path__` for `<name>/__manifest__.py` (the only accepted filename, `MANIFEST_NAMES`), parses it with `ast.literal_eval`, and caches the result (`lru_cache(10_000)`). `initialize_sys_path()` builds that path list: the core's own `odoo/addons` (`config.addons_base_dir`), the data dir (`config.addons_data_dir` under `data_dir/addons/20.0`), each `--addons-path` entry, and the repository's top-level `addons/` (`config.addons_community_dir`). `Manifest.all_addon_manifests()` is the full scan used by module listing; the first path that contains a module wins.
 
-`_load_manifest()` fills a `_DEFAULT_MANIFEST` template, defaults `license` to `LGPL-3`, forces `depends` to `['base']` for everything except `base` itself, converts `auto_install` to the set of dependencies that trigger it, and normalizes `version` with `adapt_version()`. `check_manifest_dependencies()` verifies `external_dependencies` (Python imports and binaries on PATH) and raises `MissingDependency`.
+`_load_manifest()` fills the `_DEFAULT_MANIFEST` template and validates the common keys: `name`, `version`, `depends`, `data`, `demo`, `assets`, `auto_install`, `installable`, `application`, `category`, `license`, `external_dependencies`, `post_load`, the `*_hook` callbacks and the website-theme keys. Missing `author` and `license` are defaulted with a warning, `depends` is forced to `['base']` for everything except `base` itself, `auto_install=True` becomes the set of dependencies that trigger it, and `version` is normalized by `adapt_version()`. `check_manifest_dependencies()` verifies `external_dependencies` (Python imports and binaries on PATH) and raises `MissingDependency`.
 
 ### Load ordering
 
@@ -51,7 +53,7 @@ odoo/upgrade_code/            # the codemod scripts
 `load_modules()` in `odoo/modules/loading.py` runs inside `Registry.new()`:
 
 1. STEP 1 loads `base` alone (`graph.extend(['base'])`), because nothing else can be resolved before it.
-2. `load_module_graph()` walks the graph. Per module with an install/upgrade/reinit operation it: runs `pre` migration scripts, imports the Python package (`load_openerp_module()`, which also calls the manifest's `post_load` hook), runs `pre_init_hook`, registers models via `registry.load(package)`, runs `registry._setup_models__()` and `init_models()`, loads `data` files with `load_data()` (`kind='data'`, `noupdate=False`), loads `demo` files with `load_demo()` inside a savepoint, runs `post` migrations, reflects field groups, and updates translations. Each file goes through `convert_file()` from `odoo/tools/convert.py`.
+2. `load_module_graph()` walks the graph. Per module with an install/upgrade/reinit operation it: runs `pre` migration scripts, imports the Python package (`load_openerp_module()`, which also calls the manifest's `post_load` hook), runs `pre_init_hook`, registers models via `registry.load(package)`, runs `registry._setup_models__()` and `init_models()`, loads `data` files with `load_data()` (`kind='data'`, `noupdate=False`), loads `demo` files with `load_demo()` inside a savepoint, runs `post` migrations, reflects field groups, and updates translations.
 3. STEP 2 marks modules: `ir.module.module.update_list()` discovers new addons, `button_install()`/`button_upgrade()` flip states, auto-install modules follow their triggers.
 4. STEP 3 loops `load_module_graph()` until no module changes state to `to install`/`to upgrade` anymore.
 5. STEP 3.5 runs `end` migration scripts; STEP 4 checks removed columns, cleans `ir.model.data`, and triggers the autovacuum cron; STEP 5 uninstalls modules `to remove`.
@@ -73,6 +75,14 @@ graph TD
     N -->|STEP 2-3| O["mark modules and re-loop until stable"]
     O -->|STEP 3.5| P["end-migration scripts"]
 ```
+
+### Data files: XML records and noupdate
+
+Each file in the manifest's `data` (and `demo`) list goes through `convert_file()` in `odoo/tools/convert.py`. XML files are parsed into record operations: `<record>` creates or updates a record through `model._load_records()`, `<menuitem>`, `<template>`, `<field>` and `<function>` map to the corresponding model calls, and the `id` of each element becomes an `ir.model.data` external identifier (`module.name`). CSV files are handled by `convert_csv_import()`, one row per record.
+
+`noupdate` decides whether an existing record is overwritten on a later module update. It is set globally in the file's `<odoo noupdate="1">` or `<data noupdate="1">` wrapper, or per `<record noupdate="1">`, and defaults to false for `data` files; `load_data()` therefore passes `noupdate=False` for data and `noupdate=True` for demo (`load_data` calls `convert_file(..., noupdate=kind == 'demo')`). During an update, a `noupdate` record that already exists is left alone unless the element carries `forcecreate="1"`, so user edits to that record survive upgrades. Demo files are always loaded as `noupdate`, which is also why they only run when demo data is enabled.
+
+`--with-demo`/`--without-demo` and the `demo` manifest list control demo loading; the per-database setting lives in `ir.module.module` state and the `base.demo` parameter. `scripts/dev/reset-db.sh` in this fork creates `crm_offline` with `-i crm,mail --with-demo`, so the development database always starts with demo data.
 
 ### Migrations
 
@@ -96,7 +106,7 @@ Migration scripts in `odoo/upgrade/` change database data at upgrade time. `upgr
 - The HTTP layer gets its routing map from the registry, see [HTTP server](http-server.md).
 - Asset bundle generation happens while modules load, see [assets](assets.md).
 - `base` itself is a module at `odoo/addons/base`; its `ir.module.module` model stores the states the graph reads.
-- The fork's `scripts/dev/` wrappers drive `-i`/`-u` through this machinery against the `crm_offline` database.
+- The fork's `scripts/dev/` wrappers drive `-i`/`-u` through this machinery against the `crm_offline` database, and `scripts/dev/rebuild-assets.sh` regenerates the bundles an update would otherwise leave stale.
 
 ## Entry points for modification
 
@@ -111,13 +121,14 @@ Addons are where work goes; the loader itself changes rarely. The two practical 
 | `odoo/modules/loading.py` | The install and upgrade sequence, step by step. |
 | `odoo/modules/migration.py` | Script discovery, version comparison, `exec_script()`. |
 | `odoo/modules/db.py` | Database create/drop/initialize/duplicate helpers. |
+| `odoo/tools/convert.py` | `convert_file()`, XML `<record>`/`<menuitem>`/`<template>` handling, `noupdate`. |
 | `odoo/orm/registry.py` | `Registry`, LRU, advisory locks, signaling tables, cache sizes. |
 | `odoo/orm/environments.py` | `_check_signaling()` that reacts to signaling rows. |
-| `odoo/tools/convert.py` | XML/CSV data file conversion used by `load_data()`. |
+| `odoo/addons/base/models/ir_module.py` | `ir.module.module` states, `button_install()`, `button_upgrade()`. |
 | `odoo/cli/upgrade_code.py` | Codemod command and `FileManager`. |
 | `odoo/upgrade_code/owl3-migration.py` | Example codemod, the OWL 2 to 3 source migration. |
-| `odoo/addons/base/models/ir_module.py` | `ir.module.module` states, `button_install()`, `button_upgrade()`. |
 | `addons/crm/__manifest__.py` | A manifest to read alongside `_load_manifest()`. |
+| `scripts/dev/reset-db.sh` | Recreates the dev database with demo data. |
 
 ## Related pages
 

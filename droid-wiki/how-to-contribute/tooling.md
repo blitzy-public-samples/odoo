@@ -1,105 +1,111 @@
 # Tooling
 
-Active contributors: bobbyabbott421-glitch (fork), Odoo SA (upstream)
+The dev toolchain of this fork: the `scripts/dev/` wrappers and what each one runs underneath, the shared harness that guards against false-green test runs, the TLS and asset machinery behind `--https` and `rebuild-assets.sh`, and the two agent-side tools — the offline QA skill and the `droid` CLI this wiki was generated with.
 
-## Purpose
+## `scripts/dev/` at a glance
 
-The tools that wrap this fork's development: the `scripts/dev/` wrappers that encode the dev database, the module-update flags, and the guards against a false-green test run; the `skills/` rule packs that state Odoo's house rules; ruff for Python linting; and the packaging tree, which exists but is not part of fork work. The absence of CI is a fact of this repository and shapes all of it.
+All scripts run from the repository root, source `scripts/dev/_common.sh`, and print the exact command they execute. Everything they produce lands in the gitignored `logs/` and `var/` directories.
 
-## scripts/dev
+| Script | What it wraps |
+| --- | --- |
+| `scripts/dev/setup.sh` | System packages, PostgreSQL, the `.venv`, headless Chrome, and the test-only Python deps. Idempotent; safe to re-run. |
+| `scripts/dev/start.sh` | Serves Odoo on <http://localhost:8069>, foreground, Ctrl+C stops it. Creates `crm_offline` (crm, mail, demo data) on first run. |
+| `scripts/dev/start.sh --https` | Same, with TLS on 8069 and Odoo on loopback 8070, for hosts other than `localhost`. |
+| `scripts/dev/stop.sh` | Stops a server started by `start.sh`, including its TLS proxy. |
+| `scripts/dev/test-py.sh` | `./odoo-bin -d crm_offline -u crm --test-enable --test-tags /crm --stop-after-init --log-level=test` (all crm Python tests), or the `-i crm` variant when crm is not installed yet. A class argument narrows to `--test-tags /crm:<class>`. |
+| `scripts/dev/test-js.sh desktop\|mobile [module]` | `./odoo-bin -d crm_offline -u crm,web --test-enable --test-tags /<module>:WebSuite.test_unit_desktop ...` (or `MobileWebSuite.test_unit_mobile`). Module defaults to `crm`; pass `web` for the whole web suite. |
+| `scripts/dev/test-guard.sh` | `./odoo-bin -d crm_offline -u crm,web --test-enable --test-tags /web:HootSuite.test_check_suite ...` — the forbidden-statement check. |
+| `scripts/dev/rebuild-assets.sh` | An `odoo-bin shell` run that deletes every generated asset attachment and pregenerates the bundles (below). |
+| `scripts/dev/reset-db.sh` | Drops and recreates `crm_offline` clean, including its filestore. |
 
-| Script | What it does | What it guards |
-| --- | --- | --- |
-| `scripts/dev/setup.sh` | Idempotent per-machine setup: apt packages, PostgreSQL cluster and a superuser role for the current user, `.venv` from `requirements.txt` plus `websocket-client` and `phonenumbers`, headless Chrome, then import and `odoo-bin --version` sanity checks. Refuses to run as root. | Missing `websocket-client` would make every browser test skip silently; missing `phonenumbers` fails 5 crm Python tests. |
-| `scripts/dev/start.sh [--https]` | Serves the dev database in the foreground, creating it first if absent (`-i crm,mail --with-demo`). Default: `http://localhost:8069`. `--https`: self-signed TLS on 8069 and Odoo on 8070, accepting connections from any interface. | Refuses to start if a server is already running or port 8069 is held; waits for `/web/login` to answer 200 before reporting success. |
-| `scripts/dev/stop.sh` | Stops a server started by `start.sh`, including the TLS proxy. | Leaves a server it did not start alone. |
-| `scripts/dev/test-py.sh [Class]` | All crm Python tests, or one class. | `assert_tests_selected`: fails on `of 0 tests when loading database`. Prints a note listing Python skips instead of failing, because some crm tests skip by design. |
-| `scripts/dev/test-js.sh desktop\|mobile [crm\|web]` | Hoot unit tests under the chosen preset, `crm` by default. | Requires Chrome and `websocket-client`; `assert_tests_selected` plus `assert_no_skips`. |
-| `scripts/dev/test-guard.sh` | Runs `HootSuite.test_check_suite` over the whole unit-test bundle. | Same two assertions; fails on any `only(` or `debug(` in a `.test.js`. |
-| `scripts/dev/rebuild-assets.sh` | Deletes generated asset attachments and regenerates the bundles through `odoo-bin shell`. | Stops a running dev server first, since it caches assets in memory. |
-| `scripts/dev/reset-db.sh` | Drops the database and its filestore, recreates it with crm, mail, and demo data. | Stops the dev server and refuses to proceed while port 8069 is held. |
-| `scripts/dev/_common.sh` | Sourced by all of the above; not meant to be run directly. Holds the config, PID helpers, port and database guards, `run_measured`, `assert_tests_selected`, `assert_no_skips`. | Both result guards live here. |
+Defaults are environment-overridable: `ODOO_DB`, `ODOO_PORT`, `ODOO_HTTPS_BACKEND_PORT`, `ODOO_ADMIN_LOGIN`, `ODOO_ADMIN_PASSWORD` (all set in `scripts/dev/_common.sh`).
 
-Environment overrides, all in `scripts/dev/_common.sh`: `ODOO_DB` (`crm_offline`), `ODOO_PORT` (`8069`), `ODOO_HTTPS_BACKEND_PORT` (`8070`), `ODOO_ADMIN_LOGIN` and `ODOO_ADMIN_PASSWORD` (`admin`), `PGHOST` (`/var/run/postgresql`), `PGPORT` (`5432`). So `ODOO_DB=other_db ./scripts/dev/test-py.sh` points a whole suite at another database, and `ODOO_PORT` is what the port guards check.
+## The shared harness: `scripts/dev/_common.sh`
 
-Outputs go to `logs/` (per-script logs, `odoo.log`, `measure-*.txt`) and `var/tls/` (certificates), both gitignored. Read them with [Logging](../how-to-monitor/logging.md) and [Debugging](debugging.md).
+`_common.sh` is why the wrappers are more than aliases. It holds:
 
-## Rule packs in skills/
+- **Configuration**: `ODOO_DB=crm_offline`, `ODOO_PORT=8069`, `ODOO_HTTPS_BACKEND_PORT=8070`, admin credentials `admin`/`admin`, and `PGHOST=/var/run/postgresql` so plain `odoo-bin` commands need no database flags. Paths: `LOG_DIR=logs`, `VAR_DIR=var`, `TLS_DIR=var/tls`, log/pid files under `logs/`.
+- **The result guards.** `assert_tests_selected` fails the run if the log shows `of 0 tests when loading database` (nothing matched the tags); `assert_no_skips` fails it on any `: skipped ` line, because Odoo exits 0 on both. These close the test runner's three silent-success modes (see [Testing](testing.md)).
+- **The measured runner.** `run_measured` tees each command's output to `logs/<name>.log` and, when GNU `time` is installed (setup.sh installs it), records wall time and peak RSS in `logs/measure-<name>.txt`.
+- **Port discipline.** Test runs bind port 8069 themselves, so `ensure_port_free` stops a dev server started by `start.sh` first — via the pid files in `logs/` — and the script refuses to run if some other process holds the port.
 
-`skills/` holds four packs written for agents working on Odoo code. They overlap with `AGENTS.md` but are more detailed, and `skills/README.md` notes that they must be installed together because they reference each other.
+## `setup.sh` — one-time machine preparation
 
-| Pack | Path | Covers |
-| --- | --- | --- |
-| Odoo addon guidelines | `skills/odoo-guidelines/SKILL.md` plus `skills/odoo-guidelines/guidelines/` | Every file in an addon outside `static/`: module structure and file naming, manifest, Python imports and model layout, translatable literals, recordsets/domains/context, computes and onchange, extension points, transactions, fields, controllers, views and data records, view inheritance anchored on names, QWeb PDF reports, access rights, batch ORM calls and performance, tests, ASCII punctuation, and changes on a stable branch. |
-| Odoo web guidelines | `skills/odoo-web-guidelines/SKILL.md` plus `skills/odoo-web-guidelines/guidelines/` | Anything under an addon's `static/src/` and `static/tests/`: organizing files by feature, avoiding getters, avoiding patching, SCSS, and assets. `static/lib/` is out of scope. |
-| Review | `skills/odoo-review/SKILL.md` | A two-pass review: map every changed file to the guideline sections that apply, then judge the change on its merits. It dispatches to the other three packs. |
-| Security | `skills/odoo-security/SKILL.md` | An audit sweep over the framework-specific failure modes: over-sudo, raw SQL and parameterization, domain injection, public methods, route auth and CSRF, XSS through `Markup`/`markup()`/`innerHTML`, field-level access on password and `related=` fields, `file_open`, and `eval`/`safe_eval`. |
+What it installs, and why each piece matters:
 
-The fork adds one skill of its own outside `skills/`: `.factory/skills/odoo-offline-qa/SKILL.md`, the browser QA procedure for offline behavior, covered on [Testing](testing.md).
+- apt packages: the C libraries matching `requirements.txt` source builds, fonts for headless Chrome rendering, GNU `time`, `socat` (the TLS proxy), PostgreSQL.
+- A running PostgreSQL cluster and a superuser role for the current user.
+- `.venv` from `requirements.txt`, then `websocket-client` and `phonenumbers` on top: without `websocket-client` every browser test raises `SkipTest` while the run still reports success, and without `phonenumbers` five crm Python tests fail on phone-formatting assertions. Both are deliberate additions to the venv, not to `requirements.txt`, which the fork does not touch.
+- Google Chrome, the headless browser the JS suites and tours drive through the DevTools API.
 
-These packs are guidelines, not enforcement. Nothing runs them automatically; the only automated check of this kind is the `only(` / `debug(` guard.
+It refuses to run as root and checks its own results at the end (Python imports, `odoo-bin --version`, Chrome version).
 
-## Ruff
+## `start.sh` and `start.sh --https`
 
-`ruff.toml` at the repo root configures Python linting. It is marked "automatically generated file by the runbot nightly ruff checks, do not modify", targets `py312`, assumes ruff 0.16.1 or newer, and enables a wide rule set (BLE, C, COM, E, EM, EXE, F, FA, FLY, G, I, ICN, INT, ISC, LOG, PGH, PIE, PLC, PLE, PLW, PYI, RET, RUF, SIM, SLOT, T, TC, TID, TRY, UP, W, YTT) with `E501` line length, `C901` complexity, and several style rules ignored. Import ordering is Odoo's documented order, with `odoo` as first party and `odoo.addons` as local folder.
+`start.sh` serves `http://localhost:8069` — browsers treat `localhost` as a secure context, which is what keeps offline features alive in the plain-HTTP dev case. It creates the database on first run (`-i crm,mail --with-demo`), tees everything to `logs/odoo.log` *and* the terminal, and waits for `/web/login` to answer before reporting success.
 
-Two practical notes: ruff is not in `requirements.txt`, and `setup.sh` does not install it, so it is not in `.venv` by default. Install it yourself (`pip install ruff`) if you want to lint before finishing; the config says the upstream runbot runs it nightly, and this repository has no equivalent.
+`start.sh --https` exists for the one case plain HTTP breaks: opening the page on a host other than `localhost` (a port forward, another machine), where a plain `http://` origin is not a secure context and offline storage is disabled. It:
 
-## No CI
+- generates a self-signed certificate in `var/tls/` (`odoo-dev.crt`, `odoo-dev.key`, CN=localhost, valid ~10 years; browsers warn once, accept it once),
+- runs Odoo itself on loopback `127.0.0.1:8070`,
+- and terminates TLS on port 8069 with a `socat OPENSSL-LISTEN` proxy — unlike local mode, the TLS port accepts connections from any interface.
 
-`.github/` contains only `ISSUE_TEMPLATE/` and `PULL_REQUEST_TEMPLATE.md`; there is no `workflows/` directory and no other CI configuration. Consequences:
+Both modes write pid files (`logs/odoo.pid`, `logs/tls-proxy.pid`) that `stop.sh` uses, so `stop.sh` cleanly ends the server and the proxy.
 
-- Every test command must be run by a person and its result reported, including the runs that were skipped and why.
-- The `scripts/dev/` guards are the only automated protection against a run that tested nothing.
-- Ruff, the `only(` / `debug(` guard, and the asset rebuild are all manual steps, driven by the definition of done on [How to contribute](index.md).
+## `rebuild-assets.sh` and bundle staleness
 
-## Packaging and maintenance commands
+Odoo compiles the front end into asset bundles stored as `ir.attachment` records, not committed build files (the full pipeline is on [Assets](../systems/assets.md)). `scripts/dev/rebuild-assets.sh` regenerates them in the dev database:
 
-The packaging tree is upstream Odoo's and is untouched by fork work:
+```python
+env['ir.attachment'].regenerate_assets_bundles()   # delete generated attachments
+env['ir.qweb']._pregenerate_assets_bundles()      # rebuild every referenced bundle
+env.cr.commit()
+```
 
-- `setup.py` builds the `odoo` package for PyPI, taking version and metadata from `odoo/release.py`, using `find_namespace_packages` and installing `setup/odoo` as a script.
-- `debian/` holds the Debian packaging: `control`, `rules`, `init`, `odoo.service`, `logrotate`, and the maintainer scripts.
-- `setup/` holds the other distribution targets: `docker/`, `rpm/`, `win32/`, `sandboxing/`, `package.py`, `requirements-check.py`, and `odoo-wsgi.example.py`.
-- `requirements.txt` pins the Python dependencies; fork rules forbid changing it.
+Run it after every front-end change (js/css/scss/xml) and before any test run that follows. It stops a running dev server first — the server caches bundles in memory and would keep serving stale ones — and logs to `logs/rebuild-assets.log`. One knock-on effect to expect: the browser's offline store is versioned on `session.registry_hash + CRYPTO_ALGO`, so a rebuild changes the registry hash and wipes the `offline` IndexedDB — re-visit views online before testing offline again.
 
-For the server's own administrative commands (`server`, `shell`, `db`, `module`, `i18n`, `cloc`, `neutralize`, `obfuscate`, `duplicate`, `scaffold`, `deploy`, `start`, `upgrade_code`), see [CLI and maintenance](../systems/cli-and-maintenance.md). For how the packaged tree is deployed, see [Deployment](../deployment.md). In this fork the only commands needed day to day are the `scripts/dev/` wrappers plus `odoo-bin shell --no-http` for asset regeneration.
+## `reset-db.sh`
 
-## Entry points for modification
+When database state is polluted: `scripts/dev/reset-db.sh` terminates the database connections, drops `crm_offline`, removes its filestore (`~/.local/share/Odoo/filestore/crm_offline`), and recreates it with `-i crm,mail --with-demo` — exactly the state a first `start.sh` produces. It does not start the server afterwards. Initialization logs land in `logs/db-init.log` (and are appended to `logs/odoo.log`), with timings in `logs/measure-db-init.txt`.
 
-Add a new wrapper under `scripts/dev/` rather than changing an existing one, and source `_common.sh` for configuration and the result guards. Change `_common.sh` itself only to add shared configuration or a new guard, then call it from the scripts that need it. Do not add a second way to run the tests: the guards only work if every run goes through the wrappers, and `scripts/dev/README.md` documents the commands they run in full.
+## The forbidden-statement guard
+
+`scripts/dev/test-guard.sh` exists because one `only(` or `debug()` in a `.test.js` file silently disables every other test in that run. It runs `/web:HootSuite.test_check_suite`, which scans the entire `web.assets_unit_tests` bundle — crm's test files included, since the manifest's globs put them there. Run it whenever a JS test is added or edited. The `-u crm,web` in its invocation is load-bearing: the check lives in `addons/web/tests/test_js.py`, and without `web` in the update list it is never collected.
+
+## The QA skill: `.factory/skills/odoo-offline-qa/`
+
+The agent-facing runbook for validating offline and PWA behavior in a real browser: the 375x667 mobile viewport, the secure-context preconditions, going offline with a genuine network toggle, inspecting the `orm-to-sync` queue, proving replayed writes landed in PostgreSQL, and the touch-emulation limits of browser automation. It is the browser-side complement to the suites — the suites prove logic, the skill's loop proves the parts only a real browser shows (service worker caching, the offline UI lock, queue draining). [Debugging](debugging.md) covers when to reach for it.
+
+## The `droid` CLI
+
+This wiki (`droid-wiki/`) was generated with `droid`, Factory's AI coding agent CLI (`/usr/local/bin/droid`). The commands that matter around this repository:
+
+```bash
+droid                 # interactive session in the current directory
+droid exec "<prompt>" # non-interactive run, for scripts and automation
+droid resume           # pick up a previous session
+droid search <query>   # search across local session history
+droid doctor           # diagnose configuration and connectivity
+```
+
+Agent skills live in `.factory/skills/` (the offline QA skill above is one); the repository-level rule packs for agents live in `skills/` at the repo root. `droid update` refreshes the CLI itself.
 
 ## Key source files
 
 | File | Purpose |
 | --- | --- |
-| `scripts/dev/README.md` | The wrapper inventory and the notes on the test runner's false-green modes. |
-| `scripts/dev/_common.sh` | Configuration, PID and port helpers, `run_measured`, and the result assertions. |
-| `scripts/dev/setup.sh` | One-shot machine setup, including the two test dependencies. |
-| `scripts/dev/start.sh` | Dev server, `--https` mode, database creation on first run. |
-| `scripts/dev/test-py.sh` | Python suite wrapper and the `-i crm` versus `-u crm` decision. |
-| `scripts/dev/test-js.sh` | Desktop and mobile Hoot presets with `-u crm,web`. |
-| `scripts/dev/test-guard.sh` | The `only(` / `debug(` check. |
-| `scripts/dev/rebuild-assets.sh` | Bundle regeneration through `odoo-bin shell`. |
-| `scripts/dev/reset-db.sh` | Clean database and filestore recreation. |
-| `skills/README.md` | What the rule packs are and how they are installed. |
-| `skills/odoo-guidelines/SKILL.md` | Index of the addon guideline sections. |
-| `skills/odoo-web-guidelines/SKILL.md` | Index of the JavaScript, Owl, and SCSS guideline sections. |
-| `skills/odoo-review/SKILL.md` | The two-pass review process. |
-| `skills/odoo-security/SKILL.md` | The security audit sweep. |
-| `.factory/skills/odoo-offline-qa/SKILL.md` | The fork's browser QA procedure for offline behavior. |
-| `ruff.toml` | Ruff configuration, target `py312`, generated by the upstream runbot checks. |
-| `requirements.txt` | Pinned Python dependencies, unchanged by fork rules. |
-| `setup.py` | PyPI packaging entry point. |
-| `debian/`, `setup/` | Distribution packaging trees, upstream and untouched. |
-| `CONTRIBUTING.md` | Upstream contribution pointers. |
+| `scripts/dev/README.md` | The canonical command documentation and the exact `odoo-bin` invocations. |
+| `scripts/dev/_common.sh` | Configuration, the result guards, the measured runner, port discipline. |
+| `scripts/dev/setup.sh` | Machine preparation, including the two test-only Python dependencies. |
+| `scripts/dev/start.sh` | The dev server, the `--https` TLS proxy, first-run database creation. |
+| `scripts/dev/rebuild-assets.sh` | Bundle regeneration (`regenerate_assets_bundles` + `_pregenerate_assets_bundles`). |
+| `addons/crm/__manifest__.py` | The asset declarations the bundles are built from. |
+| `.factory/skills/odoo-offline-qa/SKILL.md` | The manual offline QA runbook. |
 
 ## Related pages
 
-- [Development workflow](development-workflow.md)
-- [Testing](testing.md)
-- [Debugging](debugging.md)
-- [How to contribute](index.md)
-- [Getting started](../overview/getting-started.md)
-- [CLI and maintenance](../systems/cli-and-maintenance.md)
-- [Test framework](../systems/test-framework.md)
-- [Logging](../how-to-monitor/logging.md)
+- [How to contribute](index.md) — where the toolchain sits in the workflow
+- [Testing](testing.md) — what the test scripts guard against
+- [Debugging](debugging.md) — the log files and failure modes this tooling exposes
+- [Assets](../systems/assets.md) — the server-side bundle pipeline `rebuild-assets.sh` drives
+- [Getting started](../overview/getting-started.md) — setup and the quick command view

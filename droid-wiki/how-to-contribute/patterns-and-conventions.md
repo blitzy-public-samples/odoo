@@ -1,57 +1,44 @@
 # Patterns and conventions
 
-Active contributors: bobbyabbott421-glitch (fork), Odoo SA (upstream)
+How code is written in this repository, with the offline-specific rules the fork adds. `AGENTS.md` is the authoritative version of these rules; this page is the wiki's copy.
 
-How code is written in this repo, and the rules specific to this fork. The authoritative sources are `AGENTS.md` (project rules, untracked in git), `skills/odoo-guidelines/` and `skills/odoo-web-guidelines/` (rule packs), and the code itself.
+## Server side
 
-## Scope rules for fork work
+- **Extension over modification.** To change behavior owned by another addon, extend it from inside `addons/crm/`: Python `_inherit` on a model, subclassing a controller, JS `patch()`, or XML view/template inheritance. This keeps the fork rebasable on upstream 20.0.
+- **Minimal overrides.** A Python `_inherit` should call `super()` and amend the result, not replace it. `addons/crm/models/mail_activity.py` does exactly this for `action_create_calendar_event`.
+- **One method, one queued call.** Anything meant to run offline must be a single server call whose arguments are fully known on the client. `action_log_call` in `addons/crm/models/crm_lead.py` creates the activity and marks it done in one call, precisely so it can be queued.
+- **Every model or controller file is imported in its package `__init__.py`**, and every XML data file is in `__manifest__.py` in dependency order. Missing imports are the most common silent failure.
 
-- Changes go only under `addons/crm/`. The fork must stay rebasable onto upstream Odoo 20.0. To change behavior owned by another addon, extend it from inside `addons/crm/` with Python `_inherit`, controller subclassing, JS `patch()`, or XML view/template inheritance.
-- Make only the changes the task needs. No refactors of code the task does not touch.
-- No new dependencies: no Python or JS packages, no new addon in the manifest's `depends`, no npm or bundler tooling. No new fields on `crm.lead`, `crm.stage`, or `crm.team`. No changes to access rules, record rules, or groups.
+## Client side
 
-## The offline rules
+- **One directory per component.** Front-end source lives under `addons/crm/static/src/`, grouped by kind (`views/`, `components/`, `webclient/`, `mobile/`), then one directory per component, files named after the directory: `views/crm_kanban/` holds `crm_kanban_view.js`, `crm_kanban_model.js`, `crm_kanban_renderer.js`, ... Scss sits next to its js.
+- **JS patching.** `patch(ImportedComponent.prototype, { method() { if (my case) {...} else { return super.method(...arguments); } } })` with `patch` from `@odoo/core/utils/patch`. Keep the super path for everything outside your case. `addons/crm/static/src/activity_menu_patch.js` is the reference.
+- **Plugin API, not the legacy bridge.** New code uses `Plugin` classes, `usePlugin(PluginClass)`, and `signal` state. The legacy `"offline"` service bridge is temporary and deprecated. State is read by calling the signal: `const offline = usePlugin(OfflinePlugin); offline.isOffline()`.
+- **Mobile is a signal, not a device check.** Every small-screen behavior is gated on `usePlugin(UIPlugin)`'s `isSmall()`. Desktop behavior must not change. The mobile quick create, pipeline, and card all follow this.
+- **View objects and js_class.** A custom view is registered in `registry.category("views")` and selected from the arch with `js_class`, e.g. `js_class="crm_kanban"` on the lead kanban. Every new view must have both (the registration and the arch reference), or it is never reached.
 
-- Never build a second offline engine. No new sync queue, IndexedDB wrapper, service worker, cache layer, encryption helper, connectivity detector, or conflict resolver. A duplicate stack would not inherit the existing encryption, multi-tab locking, and error parking, and would diverge from the real one. Everything already exists in `addons/web/static/src/core/offline/`, `addons/web/static/src/core/utils/indexed_db.js`, and `addons/web/static/src/core/crypto.js`.
-- The queue replays `model, method, args, kwargs` verbatim with no id remapping. Anything needing a server onchange, a transient wizard, or an id produced by another call cannot be queued.
-- Do not change conflict semantics: timestamp-ordered replay, last write wins, failures parked in the offline systray. No conflict detection, `write_date` comparison, field merge, or conflict dialog.
-- A control stays usable offline only if it carries `data-available-offline` on the interactive element itself (the `<button>`), not on a wrapper.
-- The offline cache must never widen what a user can see.
-- New OWL code uses the plugin API (`Plugin`, `usePlugin`, `signal`), not the legacy `"offline"` service bridge.
+## Offline rules
 
-## Python conventions
-
-- A model file defines one model (or a small family); it must be imported in the addon's `models/__init__.py` or it silently never loads. The same applies to controllers and to test modules in `tests/__init__.py`.
-- Extend, don't copy: `_inherit = "mail.activity"` in `addons/crm/models/mail_activity.py` overrides `action_create_calendar_event`, calls `super()`, and amends the returned action. Keep the `super` path intact for everything outside your case.
-- Controller subclassing: `addons/crm/controllers/webmanifest.py` subclasses web's `WebManifest` and flips only `_has_share_target()`. That single override is what enables the PWA share target for CRM.
-- Data files load in manifest order; dependency order matters. Security CSVs are `security/ir.access.csv` in 20.0 (the old `ir.model.access.csv` and `ir.rule` are gone).
-- The ORM API surface: `search`, `browse`, `create`, `write`, `unlink`, `read_group`, computed fields with `@api.depends`, `@api.constrains`, `onchange` for form-time defaults. Record rules/access are enforced in `odoo/addons/base/models/ir_access.py`.
-- Ruff is the linter (`ruff.toml`, target py312, runbot-generated rule set). Run it before calling anything done.
-
-## JavaScript conventions
-
-- **Patch** to extend a method: `patch(ImportedComponent.prototype, { method() { if (my case) {...} else { return super.method(...arguments); } } })` with `patch` from `@web/core/utils/patch`; see `addons/crm/static/src/activity_menu_patch.js`. Always keep the `super` path.
-- **Subclass** to swap a whole class: `CrmFormModel extends formView.Model`, registered as `registry.category("views").add("crm_form", { ...formView, Model: CrmFormModel })`; see `addons/crm/static/src/views/crm_form/crm_form.js`.
-- **Directory per component**: `static/src/views/crm_kanban/` holds `crm_kanban_view.js`, `crm_kanban_model.js`, `crm_kanban_renderer.js`, `crm_kanban_arch_parser.js`, and co-located `.xml`/`.scss`. Files are named after the directory.
-- The manifest's `assets_backend` glob `crm/static/src/**` already covers new source files. Add an exclusion pair (`('remove', ...)` in `assets_backend` plus the same path in `assets_backend_lazy`) only to lazily load something, as crm does for `crm_activity`, `crm_graph`, `crm_pivot`, `forecast_graph`, `forecast_pivot`.
-- Plugin API for new services; registries for extensions; `signal`/`computed` for reactive state.
-- A component that exists but is never reached is the most common wiring failure. Every new view must be registered in the view registry *and* bound by a `js_class` in the addon's lead views; every new component must be reachable from a rendered parent, not only from its unit test.
-
-## XML views
-
-- `addons/crm/views/crm_lead_views.xml` binds custom views to archs with `js_class="crm_kanban"`, `"crm_form"`, `"crm_list"`, `"crm_activity"`, `"crm_calendar"`; forecast variants override the attribute in place.
-- Template inheritance (`<xpath expr="..." position="inside|after|replace">`) extends other addons' templates instead of copying them.
-
-## Mobile
-
-- Gate every mobile behavior on the small-screen signal: `const ui = usePlugin(UIPlugin); if (ui.isSmall()) {...}` (`addons/web/static/src/core/ui/ui_plugin.js`). Desktop behavior must not change.
-- The bottom sheet (`addons/web/static/src/core/bottom_sheet/`) is the mobile alternative to floating popovers: opt in with `usePopover(component, { useBottomSheet: true })`.
-- "Native mobile" means the installable PWA this fork already supports. Never introduce a native app project.
+- **No second offline stack.** Never add a new queue, store, worker, cache, encryption helper, connectivity detector, or conflict resolver in crm. Everything goes through `addons/web`'s framework; a parallel stack would lose its encryption, locking, and error parking.
+- **Queue semantics are fixed.** Timestamp-ordered replay, last write wins, failures parked in the systray. No conflict detection, no write_date comparison, no merge, no dialogs.
+- **The three dispositions.** Every crm entry point that needs a server is QUEUE (bare, client-resolvable write on `crm.lead`, `crm.stage`, `crm.team`, or a lead's `mail.activity`), SKIP (decorative read, silently dropped), or DISABLE (everything else). The classification lives in `addons/crm/static/src/mobile/offline_inventory.md`; new entry points get a row there.
+- **Chained ids and onchanges kill queueability.** Anything needing a server onchange, a transient-model wizard, or an id produced by another call is disabled offline, never queued.
+- **A control is usable offline only if its own DOM node** carries `data-available-offline`. Wrappers do not count; the framework disables buttons by selector.
+- **crm does not queue what the framework does not.** Where the framework has no producer (group delete, resequence, `_multiSave` cell edits), crm disables the control offline instead of writing a new producer.
 
 ## Testing conventions
 
-- Python: `tests/test_*.py` on the shared base `TestCrmCommon` (`addons/crm/tests/common.py`); UI tests extend `HttpCase`, are tagged `@tagged('post_install', '-at_install')`, and drive the browser with `self.start_tour("/odoo", "tour_name", login=...)`.
-- JS: `static/tests/*.test.js` with `test`/`expect` from `@odoo/hoot` and helpers from `@web/../tests/web_test_helpers`; every new JS test must pass under both the desktop and the mobile preset. Never `only()` or `debug()` in a `.test.js` (a guard suite fails the run).
-- Never delete, skip, retag, or weaken an existing test. The only existing test file that may change is `tests/__init__.py`.
+- New JS tests use `test`/`expect` from `@odoo/hoot`, view helpers from `@web/../tests/web_test_helpers`, and the shared fixtures in `addons/crm/static/tests/crm_test_helpers.js` and `addons/crm/static/tests/crm_mock_server.js`.
+- Every JS test passes under **both** presets (`./scripts/dev/test-js.sh desktop` and `... mobile`).
+- Never `only(` or `debug()` in a `.test.js` file; `./scripts/dev/test-guard.sh` fails the run on either.
+- Python test modules run only when imported in `addons/crm/tests/__init__.py`. UI tests extend `HttpCase`, are tagged `@tagged('post_install', '-at_install')`, and drive the browser with `self.start_tour(...)`.
+- Rebuild assets after any front-end change, before testing.
 
-Details on running everything: [testing](testing.md). The rules for where work happens: [development workflow](development-workflow.md).
+## Security and scope
+
+- No new access rules, record rules, or groups; the offline cache must not widen what a user can see.
+- No new dependencies: no Python or JS packages, no new addon in `depends`, no build tooling.
+- No fields added to `crm.lead`, `crm.stage`, or `crm.team`.
+- Never delete, skip, retag, or weaken an existing test.
+
+For the branch-and-PR cycle and the test commands, see [Development workflow](development-workflow.md) and [Testing](testing.md).

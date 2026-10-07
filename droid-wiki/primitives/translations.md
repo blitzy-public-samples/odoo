@@ -1,10 +1,10 @@
 # Translations
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Martin, Christophe, Chong
 
 ## Purpose
 
-Every addon ships its own translations as gettext `.po` files under `i18n/`. The working tree contains 20,257 `.po` files and 603 `.pot` templates; `addons/crm/i18n/` alone has 63 language files. Odoo 20.0 splits translated strings into two kinds with different storage: **code terms**, read straight from the `.po` files at runtime, and **model terms**, stored per language inside the record's own jsonb column. There is no `ir.translation` table in this version.
+Every addon ships its own translations as gettext `.po` files under `i18n/`. The working tree contains 20,257 `.po` files and 603 `.pot` templates; `addons/crm/i18n/` alone has 62 `.po` language files (plus its `crm.pot` template). Odoo 20.0 splits translated strings into two kinds with different storage: **code terms**, read straight from the `.po` files at runtime, and **model terms**, stored per language inside the record's own jsonb column. There is no `ir.translation` table in this version.
 
 ## Directory layout
 
@@ -38,6 +38,10 @@ A field marked `translate` gets a `jsonb` column instead of its native type (`od
 
 Code terms are never stored in the database. `CodeTranslations._get_code_translations` opens the module's `.po` files and keeps the entries whose PO comments carry a marker: `odoo-python` for Python terms, `odoo-javascript` for web terms. The result is memoized per `(module, lang)`. `_lt` (`LazyGettext`) covers strings defined at import time, before any environment exists; `odoo/addons/base/models/ir_access.py` uses it for its access-error templates.
 
+### Reading and writing a field's translations
+
+A field's translations go through methods on `Model` in `odoo/orm/models.py`: `get_field_translations(field_name, langs=None)` returns a `(translations, context)` pair, where `translations` is a list of `{"lang", "source", "value"}` dicts, and `update_field_translations(field_name, translations, source_lang="")` — with the private `_update_field_translations` doing the work — writes them back into the jsonb column. There is no `_get_field_translations` method in 20.0; those two are the current entry points.
+
 ### Loading
 
 `get_po_paths(module, lang)` yields candidates for each base language before the exact code, so `fr_BE` loads `fr` then `fr_BE`, and it looks in both `i18n/` and `i18n_extra/`. `get_base_langs` encodes two special chains: Latin-American Spanish variants also load `es_419`, and `zh_HK` also loads `zh_TW`.
@@ -46,7 +50,11 @@ At install or upgrade, `_load_module_terms` feeds every matching `.po` file plus
 
 ### Client side
 
-`/web/webclient/translations` (`addons/web/controllers/webclient.py`, `auth='public'`, `readonly=True`) calls `ir.http._get_translations_for_webclient`, which returns the web-marked terms per module plus the language parameters. In the browser, `_t(source, ...substitutions)` in `addons/web/static/src/core/l10n/translation.js` looks the source string up and then interpolates: iterables are rendered with `Intl`-based list formatting, and if any substitution is markup the whole result is escaped and returned as markup.
+`/web/webclient/translations` (`addons/web/controllers/webclient.py`, `type='http'`, `auth='public'`, `readonly=True`, `cors='*'`) calls `ir.http._get_translations_for_webclient`, which returns the web-marked terms per module plus the language parameters. Terms are fetched at runtime per module; they are not baked into the asset bundles.
+
+`addons/web/static/src/core/l10n/localization_plugin.js` fetches that route (or `session.translationURL`), fills `translatedTerms` keyed by module and `translatedTermsGlobal` as the fallback, then flips `translatedTerms[translationLoaded] = true`. In the browser, `_t(source, ...substitutions)` in `addons/web/static/src/core/l10n/translation.js` looks the source string up and interpolates: iterables are rendered with `Intl`-based list formatting, and if any substitution is markup the whole result is escaped and returned as markup. The transpiler rewrites each `_t(...)` call into `appTranslateFn(source, moduleName, ...)`, so a term resolves in its own module's namespace first and the same word can translate differently in `pos` and `spreadsheet`. A `LazyTranslatedString` created before loading throws if it is evaluated before `translatedTerms[translationLoaded]` is set. `ir.http._get_web_translations_hash` (`@api.ormcache`) keys the cached payload on the module list and the language.
+
+QWeb templates use `t-lang`, which the parser rewrites to `t-options-lang` and accepts only on the same node as `t-call` (`odoo/addons/base/models/ir_qweb.py:2746`) — it is an argument to a called template, not a general attribute.
 
 ### Tooling
 
@@ -57,6 +65,7 @@ Two support addons exercise this machinery: `odoo/addons/test_translation` for t
 ## Integration points
 
 - View archs are translated through `ir.ui.view.arch_db`, so translation interacts with view inheritance (see [actions, views, and menus](actions-views-menus.md)).
+- QWeb report templates accept `t-lang` to render a called template in another language, which is how a report or mail can be printed in the customer's language rather than the user's.
 - Menu and template caches are keyed on language; `ir.ui.menu.load_menus` is ormcached on `self.env.lang`.
 
 ## Entry points for modification
@@ -73,11 +82,13 @@ Wrap new user-facing Python strings in `self.env._(...)` and new client strings 
 | `odoo/addons/base/models/ir_module.py` | `_load_module_terms` at install and upgrade. |
 | `odoo/addons/base/models/res_lang.py` | Language records and activation. |
 | `odoo/addons/base/models/ir_ui_view.py` | `arch_db` with `translate=xml_translate`. |
+| `odoo/orm/models.py` | `get_field_translations` / `update_field_translations` for model terms. |
+| `addons/web/static/src/core/l10n/localization_plugin.js` | Fetches and installs the web terms; `translationLoaded` flag. |
 | `addons/web/controllers/webclient.py` | `/web/webclient/translations`. |
 | `addons/web/static/src/core/l10n/translation.js` | `_t()` and substitution handling. |
 | `odoo/addons/test_translation/` | Framework tests for translation import/export. |
 | `addons/test_translation_mode/` | Interactive in-context translation mode (not for production). |
-| `addons/crm/i18n/` | 63 language files, the shape every addon follows. |
+| `addons/crm/i18n/` | 62 `.po` language files (plus `crm.pot`), the shape every addon follows. |
 
 ## Related pages
 

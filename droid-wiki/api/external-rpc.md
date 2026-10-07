@@ -1,9 +1,9 @@
 # External RPC
-Active contributors: Odoo SA (upstream)
+Active contributors: Julien, Krzysztof, Thle
 
 ## Purpose
 
-External programs reach Odoo through the same HTTP application as the web client, but through a different set of routes. The `rpc` addon (`addons/rpc`) ships them: `/xmlrpc/<service>`, `/xmlrpc/2/<service>` and `/jsonrpc` are the historical entry points, and `/json/2/<model>/<method>` is the one the codebase points new clients at. This page documents what actually exists in this repository, including the deprecation state of the older endpoints, the authentication flows, and what method visibility and access rules apply to a remote call.
+External programs reach Odoo through the same HTTP application as the web client, but through different routes. The `rpc` addon ships them: `/xmlrpc/<service>`, `/xmlrpc/2/<service>` and `/jsonrpc` are the historical entry points, deprecated since Odoo 19 and scheduled for removal in Odoo 22, and `POST /json/2/<model>/<method>` is the endpoint the codebase points new clients at. `addons/web/controllers/json.py` adds a separate read-only JSON view route under `/json/1`. This page documents what exists in this repository, the authentication flows, what method visibility and access rules apply to a remote call, and the generated documentation in `addons/api_doc/`.
 
 ## Directory layout
 
@@ -11,16 +11,18 @@ External programs reach Odoo through the same HTTP application as the web client
 addons/rpc/
 ├── __manifest__.py           # auto_install, depends: ["base"]
 ├── controllers/
-│   ├── __init__.py           # RPC controller: /web/version, /json/version, deprecation notice
+│   ├── __init__.py           # RPC controller (/web/version, /json/version), deprecation notice
 │   ├── xmlrpc.py             # /xmlrpc/<service>, /xmlrpc/2/<service>, OdooMarshaller
 │   ├── jsonrpc.py            # /jsonrpc
 │   └── json2.py              # /json/2/<model>/<method>
 └── tests/test_xmlrpc.py      # TestExternalAPI, TestXMLRPC (HttpCase)
+addons/api_doc/               # /doc: dynamic API documentation (auto_install)
 odoo/service/
 ├── common.py                 # login / authenticate / version, exp_* functions
 └── model.py                  # dispatch(), execute_cr(), call_kw()
-odoo/orm/models.py            # get_public_method(), the visibility rule
-addons/web/controllers/json.py  # /json and /json/1/<subpath>, read-only view JSON
+odoo/orm/models.py            # get_public_method(), the method visibility rule
+odoo/addons/base/models/res_users.py   # res.users.apikeys, _check_uid_passwd
+addons/web/controllers/json.py         # /json and /json/1/<subpath>, read-only view JSON
 ```
 
 ## Key abstractions
@@ -28,24 +30,26 @@ addons/web/controllers/json.py  # /json and /json/1/<subpath>, read-only view JS
 | Name | File | Description |
 | --- | --- | --- |
 | `XMLRPC` | `addons/rpc/controllers/xmlrpc.py` | Controller with the two `/xmlrpc` services; marshals return values. |
-| `JSONRPC` | `addons/rpc/controllers/jsonrpc.py` | `/jsonrpc`, same dispatcher as the browser's JSON-RPC. |
+| `JSONRPC` | `addons/rpc/controllers/jsonrpc.py` | `/jsonrpc`, same JSON-RPC dispatcher as the browser. |
 | `WebJson2Controller` | `addons/rpc/controllers/json2.py` | `/json/2/<model>/<method>`, bearer-authenticated model calls. |
-| `dispatch_rpc()` | `odoo/http/router.py` | Maps a service name to `common` or `object` dispatch. |
+| `dispatch_rpc()` | `odoo/http/router.py` | Maps a service name to the `common` or `object` dispatch. |
 | `call_kw()` | `odoo/service/model.py` | Invokes one public model method with `args` and `kwargs`. |
-| `get_public_method()` | `odoo/orm/models.py` | Rejects private and unsafe method names. |
-| `_check_uid_passwd()` | `odoo/addons/base/models/res_users.py` | Validates the `(uid, passwd)` pair sent by `execute_kw`. |
+| `get_public_method()` | `odoo/orm/models.py` | Rejects private, unsafe and `@api.private` method names. |
+| `res.users.apikeys` | `odoo/addons/base/models/res_users.py` | Hashed API keys with scope and expiration; backs bearer auth. |
+| `_check_uid_passwd()` | `odoo/addons/base/models/res_users.py` | Validates the `(uid, password)` pair sent by `execute_kw`. |
+| `_auth_method_bearer()` | `odoo/addons/base/models/ir_http.py` | Bearer header parsing, session fallback with `Sec-Fetch-*` checks. |
 
 ## How it works
 
-`addons/rpc/controllers/xmlrpc.py` declares `/xmlrpc/<service>` (fault codes returned as strings) and `/xmlrpc/2/<service>` (fault codes as integers), both `auth='none'`, `methods=['POST']`, `csrf=False`, `save_session=False`. Each handler parses the XML body with `xmlrpc.client.loads(..., use_datetime=True)`, calls `dispatch_rpc(service, method, params)` and marshals the result through `OdooMarshaller`, which serializes `date`/`datetime` as ISO strings, `bytes` as decoded strings, `markupsafe.Markup` as `str`, `Command` as `int`, `Domain` as `list`, and strips XML-illegal control characters. `addons/rpc/controllers/__init__.py` also holds `_check_request()`, which closes the read-only cursor that `serve_db()` opened for the `auth='none'` route before the RPC opens its own.
+`addons/rpc/controllers/xmlrpc.py` declares `/xmlrpc/<service>` (fault codes returned as strings) and `/xmlrpc/2/<service>` (fault codes as integers), both `auth="none"`, `methods=["POST"]`, `csrf=False`, `save_session=False`. Each handler parses the XML body with `xmlrpc.client.loads(..., use_datetime=True)`, calls `dispatch_rpc(service, method, params)` and marshals the result through `OdooMarshaller`. Because `auth='none'` defaults the route to a read-only cursor, `_check_request()` in `addons/rpc/controllers/__init__.py` closes that cursor first; the service layer opens its own.
 
-`dispatch_rpc()` accepts only `common` and `object`; anything else raises `ValueError`, even though its docstring still lists a `db` service. `common` maps `login`, `authenticate` and `version` to the `exp_*` functions in `odoo/service/common.py`. `authenticate(db, login, password, user_agent_env)` returns the uid or `False` and marks the attempt `interactive: False`, which is what lets an API key be passed where a password is expected. `object` maps to `odoo/service/model.py:dispatch()`, which takes `(db, uid, passwd, model, method, *args)` for `execute` and `(args, kwargs)` for `execute_kw`, opens a cursor with `Registry(db).cursor()`, validates the pair with `res.users._check_uid_passwd()` (itself ormcached on `uid` and `passwd`), then calls `execute_cr()` with an `Environment(cr, uid, {})` built from the real uid, never from the arguments.
+`dispatch_rpc()` in `odoo/http/router.py` accepts only `common` and `object`; anything else raises `ValueError` even though the docstring still mentions a `db` service. It also resets the current `request` context before dispatching, so the call behaves like a background job rather than an HTTP request. The `common` service maps `login`, `authenticate` and `version` to the `exp_*` functions in `odoo/service/common.py`: `authenticate(db, login, password, user_agent_env)` returns the uid or `False`, and marks the attempt `interactive: False`, which is what lets an API key be passed where a password is expected. The `object` service maps to `dispatch()` in `odoo/service/model.py`, which takes `(db, uid, passwd, model, method, *args)` for `execute` and an `(args, kwargs)` pair for `execute_kw`, opens a cursor with `Registry(db).cursor()`, validates the pair with `res.users._check_uid_passwd()` (ormcached on `uid` and `passwd`), and calls `execute_cr()` with an `Environment(cr, uid, {})` built from the validated uid, never from the arguments.
 
-`call_kw()` resolves the method with `get_public_method()` from `odoo/orm/models.py`. Names starting with `_`, names in `_UNSAFE_ATTRIBUTES`, non-callables and unbound class or static methods raise `AccessError` or `AttributeError`, and methods decorated `@api.private` are refused as well, so `execute_kw` can only reach the public API. For `@api.model` methods the whole model is passed; otherwise `args[0]` is the id list and is browsed. A `context` key in `kwargs` replaces the environment context. The return value is adapted: `create` returns a single id when its argument was a mapping, other recordsets are returned as id lists. `execute_cr()` runs the call inside `retrying()` and forces lazy values to evaluate before the cursor closes.
+`call_kw()` resolves the method with `get_public_method()` from `odoo/orm/models.py`. Names starting with `_`, names in `_UNSAFE_ATTRIBUTES`, non-callables, class and static methods, and methods decorated `@api.private` raise `AccessError` or `AttributeError`, so `execute_kw` can only reach the public API. For `@api.model` methods the whole model is passed; otherwise `args[0]` is the id list and is browsed. A `context` key in `kwargs` replaces the environment context. The return value is adapted: `create` returns a single id when its argument was a mapping, other recordsets are returned as id lists, and lazy values are forced before the cursor closes. `execute_cr()` runs the call inside `retrying()`.
 
 ### Deprecation state
 
-`RPC_DEPRECATION_NOTICE` in `addons/rpc/controllers/__init__.py` states that `/xmlrpc`, `/xmlrpc/2` and `/jsonrpc` are deprecated as of Odoo 19 and scheduled for removal in Odoo 22, and points to the migration section of the external API documentation. Every request to those endpoints logs a warning; the message itself suggests muting it with `--log-handler odoo.addons.rpc.controllers.xmlrpc:ERROR`. `addons/rpc/tests/test_xmlrpc.py` still exercises them, so they work in this revision, but new integrations should use the JSON API below.
+`RPC_DEPRECATION_NOTICE` in `addons/rpc/controllers/__init__.py` states that `/xmlrpc`, `/xmlrpc/2` and `/jsonrpc` are deprecated as of Odoo 19 and scheduled for removal in Odoo 22. Every request to those endpoints logs a warning that suggests muting it with `--log-handler odoo.addons.rpc.controllers.xmlrpc:ERROR`. `addons/rpc/tests/test_xmlrpc.py` still exercises them, so they work in this revision, but new integrations should use the JSON API.
 
 ### The current JSON API
 
@@ -58,30 +62,77 @@ curl -X POST "https://odoo.example/json/2/crm.lead/search_read" \
   -d '{"domain": [["type", "=", "opportunity"]], "fields": ["name"], "limit": 5}'
 ```
 
-The method must be public (`get_public_method()` again), its signature is bound with `inspect.signature().bind(records, **kwargs)` and a mismatch returns `UnprocessableEntity`, an `@api.model` method cannot be called with ids, a model name that does not exist returns `NotFound`, and a returned recordset is reduced to its ids. A catch-all on `/json/2` answers 404 with "Did you mean POST /json/2/<model>/<method>?". `addons/web/controllers/json.py` adds a separate read-only route, `/json/1/<subpath>`, which returns the JSON a view would show; it also uses bearer scope `rpc`, requires `base.group_allow_export`, and is disabled unless the database is in demo mode or the `web.json.enabled` parameter is set.
+The method must be public (`get_public_method()` again), its signature is bound with `inspect.signature().bind(records, **kwargs)` and a mismatch returns `UnprocessableEntity`, an `@api.model` method called with ids returns `UnprocessableEntity`, a model name that does not exist returns `NotFound`, and a returned recordset is reduced to its ids. A catch-all on `/json/2` answers 404 with "Did you mean POST /json/2/<model>/<method>?". `addons/web/controllers/json.py` adds the separate read-only route `/json/1/<subpath>`, which returns the JSON a view would show; it uses bearer scope `rpc`, requires `base.group_allow_export`, and is disabled unless the database is in demo mode or the `web.json.enabled` parameter is set.
 
-Bearer authentication is implemented by `_auth_method_bearer()` in `odoo/addons/base/models/ir_http.py`. It reads the token from an `Authorization: bearer <key>` header and validates it with `res.users.apikeys._check_credentials(scope='rpc', key=token)`; keys are stored hashed (pbkdf2-sha512), the scope is fixed to `rpc` in the UI, and an unknown or expired key raises `Unauthorized` with a `WWW-Authenticate: bearer` header. If a session exists and its uid differs from the key's user, the request is rejected with `AccessDenied`. With no key, an existing interactive session is accepted only if the browser-style `Sec-Fetch-*` headers are present.
+The historical XML-RPC flow, for a client that still uses it:
 
-| Client | Authentication | Result |
-| --- | --- | --- |
-| XML-RPC | `common.authenticate(db, login, password)` then `execute_kw(db, uid, password, ...)` | uid, then the method result; `False` on bad credentials |
-| JSON-RPC (`/jsonrpc`) | none at the route level; the `service`/`method`/`args` triple decides | the service result |
-| `/json/2` | API key in a bearer header | the method result as JSON |
+```python
+import xmlrpc.client
+
+url = "https://odoo.example"
+db = "crm_offline"
+key = "<API key>"  # created in the user's Preferences, never a password
+
+common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
+uid = common.authenticate(db, "admin", key, {})
+models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+leads = models.execute_kw(
+    db, uid, key,
+    "crm.lead", "search_read",
+    [[["type", "=", "opportunity"]]],
+    {"fields": ["name"], "limit": 5},
+)
+```
+
+The `args` list carries the method's positional arguments (here the domain), and the trailing dict carries its keyword arguments, exactly as `dispatch()` splits them.
+
+### Authentication with API keys
+
+API keys are rows of `res.users.apikeys` (`odoo/addons/base/models/res_users.py`): the key itself is stored hashed with a `pbkdf2_sha512` context deliberately cheaper than passwords (random keys are not worth attacking by dictionary), alongside an 8-hex-character index for lookup, a scope, and an expiration date that non-system users must set within the duration allowed by their groups. The model sets `_allow_sudo_commands = False`, removal requires an identity check (`@check_identity`), and generating keys programmatically is gated by `base.enable_programmatic_api_keys` unless the caller is a system user.
+
+Bearer authentication is implemented by `_auth_method_bearer()` in `odoo/addons/base/models/ir_http.py`. It reads the token from an `Authorization: bearer <key>` header and validates it with `res.users.apikeys._check_credentials(scope='rpc', key=token)`; an unknown or expired key raises `Unauthorized` with a `WWW-Authenticate: bearer` header. If a session exists and its uid differs from the key's user, the request is rejected with `AccessDenied`. Without a key, an existing interactive session is accepted only when the browser-style `Sec-Fetch-*` headers prove a real navigation. The same key store backs non-interactive XML-RPC: `_check_credentials(credential, {'interactive': False})` falls back to `res.users.apikeys._check_credentials(scope='rpc', key=password)`, and `auth_totp` blocks password-based RPC entirely for 2FA users through `_rpc_api_keys_only()`.
+
+### Serialization and rate constraints
+
+`OdooMarshaller` in `addons/rpc/controllers/xmlrpc.py` decides what an XML-RPC client can receive: `datetime` and `date` are marshalled as ISO strings, `bytes` as decoded strings, `markupsafe.Markup` as `str`, `Command` as `int`, `Domain` as `list`, and characters illegal in XML (0-31 except tab, newline and carriage return) are stripped. The marshaller is created with `allow_none=False`, so a method returning `None` cannot be serialized; `execute_cr()` logs a warning for that case. Every request body is capped at 128 MiB by default (`DEFAULT_MAX_CONTENT_LENGTH` in `odoo/http/_facade.py`), adjustable database-wide with the `web.max_file_upload_size` parameter and per route with the `max_content_length` option. There is no request rate limiter in the codebase; the throttles that exist are the per-worker login cooldown (`base.login_cooldown_after` failures, `base.login_cooldown_duration` seconds, defaults 10 and 60) and the TOTP code-check limit in `auth_totp`.
+
+### The `api_doc` module
+
+`addons/api_doc/` is auto-installed (`auto_install: True`, `depends: ['web']`) and serves the dynamic documentation at `/doc`: a single-page, OpenAPI-like client generated from the registry's models, fields and methods. `DocController` in `addons/api_doc/controllers/api_doc.py` gates the page and its JSON documents behind `api_doc.group_allow_doc`, exposes `type='json2'` index and per-model JSON routes both with session auth (`/doc/index.json`, `/doc/<model_name>.json`) and with bearer auth (`/doc-bearer/index.json`, `/doc-bearer/<model_name>.json`, scope `rpc`), and includes a playground to run methods over HTTP with examples in several languages.
 
 ### `sudo()` and `with_user()` implications
 
-None of these paths elevate privileges. `dispatch()` builds its environment from `(cr, uid)` where `uid` comes from the `passwd`-validated arguments; `call_kw()` never calls `sudo()`, and `/json/2` uses `request.env[__model__]`, the environment of the key's user. Access rules therefore apply in full to a remote caller, and `with_user()` is the only way to narrow them further. A method that needs elevation must call `sudo()` itself, and models such as `ir.access`, `ir.config_parameter` and `res.users.apikeys` set `_allow_sudo_commands = False` so that even a sudoed caller cannot write them without an explicit choice. The practical consequence for integrations is that a public method exposed remotely is exactly as powerful as the user behind the API key makes it.
+None of these paths elevate privileges. `dispatch()` builds its environment from the `(cr, uid)` pair it just validated; `call_kw()` never calls `sudo()`, and `/json/2` uses `request.env[__model__]`, the environment of the key's user. Access rules therefore apply in full to a remote caller. A method that needs elevation must call `sudo()` itself, and models such as `ir.access`, `ir.config_parameter` and `res.users.apikeys` set `_allow_sudo_commands = False` so even a sudoed caller cannot write them without an explicit choice. The practical consequence for integrations is that a public method exposed remotely is exactly as powerful as the user behind the API key.
+
+```mermaid
+sequenceDiagram
+    participant C as External client
+    participant X as XMLRPC / Json2 controller
+    participant R as dispatch_rpc (router.py)
+    participant S as odoo/service layer
+    participant U as res.users checks
+    participant O as ORM
+    C->>X: POST /xmlrpc/2/object execute_kw(...)
+    X->>R: dispatch_rpc("object", "execute_kw", params)
+    R->>R: reset request context
+    R->>S: dispatch(method, params)
+    S->>U: _check_uid_passwd(uid, passwd)
+    U-->>S: valid (ormcached)
+    S->>O: execute_cr -> retrying(call_kw)
+    O->>O: get_public_method + ir.access check
+    O-->>C: result marshalled by OdooMarshaller
+```
 
 ## Integration points
 
-- `odoo/http/router.py:dispatch_rpc()` is shared by the XML-RPC and JSON-RPC controllers, so both services behave identically.
-- `odoo/service/model.py:call_kw()` is also what `/web/dataset/call_kw` calls, which is why the web client and external clients hit the same visibility rule.
-- The controllers are ordinary `@route` controllers: `addons/web/controllers/json.py` and `addons/rpc/controllers/json2.py` both use the same decorator options described in [Web controllers](web-controllers.md).
-- `addons/rpc/__manifest__.py` sets `auto_install: True` with `depends: ["base"]`, so the routes exist in every database without an explicit install.
+- `odoo/service/model.py:call_kw()` is also what `/web/dataset/call_kw` calls, which is why the web client and external clients hit the same visibility rule; see [Web controllers](web-controllers.md).
+- `_auth_method_bearer()` is shared by `/json/2`, `/json/1` and the `api_doc` bearer routes, so one key store serves every programmatic surface. The trust boundaries are described in [Security](../security.md).
+- `addons/rpc/__manifest__.py` sets `auto_install: True` with `depends: ["base"]`, so the routes exist in every database without an explicit install; `addons/api_doc/__manifest__.py` is auto-installed on top of `web`.
+- The tests that pin this behavior are `addons/rpc/tests/test_xmlrpc.py` (`TestExternalAPI`, `TestXMLRPC`).
 
 ## Entry points for modification
 
-Read `addons/rpc/controllers/json2.py` first: it is the smallest complete example of a model-call endpoint, and the pattern to copy when a fork needs a new programmatic route. For XML-RPC behaviour changes, the marshalling lives in `OdooMarshaller` in `addons/rpc/controllers/xmlrpc.py`, and the service semantics in `odoo/service/`. Keep new endpoints in `addons/crm/` as required by this fork's scope rules.
+Read `addons/rpc/controllers/json2.py` first: it is the smallest complete example of a model-call endpoint, and the pattern to copy when a fork needs a new programmatic route. For XML-RPC behavior changes, the marshalling lives in `OdooMarshaller` in `addons/rpc/controllers/xmlrpc.py`, and the service semantics in `odoo/service/`. Keep new endpoints in `addons/crm/` as required by this fork's scope rules.
 
 ## Key source files
 
@@ -93,17 +144,19 @@ Read `addons/rpc/controllers/json2.py` first: it is the smallest complete exampl
 | `addons/rpc/controllers/json2.py` | `/json/2/<model>/<method>` and its readonly resolver. |
 | `addons/rpc/__manifest__.py` | Auto-installed `rpc` addon. |
 | `addons/rpc/tests/test_xmlrpc.py` | `TestExternalAPI`, `TestXMLRPC`. |
-| `odoo/http/router.py` | `dispatch_rpc()` service selection. |
-| `odoo/service/common.py` | `login`, `authenticate`, `version`. |
+| `addons/api_doc/controllers/api_doc.py` | `/doc` page and its JSON document routes. |
+| `addons/api_doc/__manifest__.py` | Auto-installed documentation addon. |
+| `odoo/http/router.py` | `dispatch_rpc()` service selection and request-context reset. |
+| `odoo/service/common.py` | `login`, `authenticate`, `version` services. |
 | `odoo/service/model.py` | `dispatch()`, `execute_cr()`, `call_kw()`. |
 | `odoo/orm/models.py` | `get_public_method()`, `_UNSAFE_ATTRIBUTES`. |
-| `odoo/addons/base/models/res_users.py` | `_check_uid_passwd()`, `authenticate()`, `res.users.apikeys`. |
+| `odoo/addons/base/models/res_users.py` | `res.users.apikeys`, `_check_uid_passwd()`, `_check_credentials()`. |
 | `odoo/addons/base/models/ir_http.py` | `_auth_method_bearer()`. |
 | `addons/web/controllers/json.py` | `/json` and `/json/1/<subpath>` read-only view JSON. |
 
 ## Related pages
 
-- [APIs](index.md)
+- [API](index.md)
 - [Web controllers](web-controllers.md)
 - [Security](../security.md)
 - [Users, groups and access](../primitives/users-groups-and-access.md)

@@ -1,63 +1,61 @@
 # Getting started
 
-The dev environment lives in `scripts/dev/` and is fully scripted. Run everything from the repository root. The dev database is `crm_offline` (crm, mail, demo data); log in as `admin` / `admin` at `http://localhost:8069`.
-
 ## Prerequisites
 
-- Python 3.12–3.14 and PostgreSQL 16+ (the versions supported by `odoo/release.py`).
-- Headless Chrome for JS/browser tests: installed by the setup script.
-- Linux; the setup script uses apt. It refuses to run as root.
-- No node/npm anywhere: JavaScript has no build step. Vendored libraries live in each addon's `static/lib/` and assets are compiled by the server itself.
+- Python 3.11+ with `pip` and `venv`, and PostgreSQL (the setup script installs and configures both on Linux).
+- A browser with service-worker support: Chrome, Edge, or Firefox. Offline features additionally require a **secure context**, meaning `localhost` or HTTPS (see below).
+- Headless Chrome is installed by the setup script; the JS and tour test suites drive it.
 
-## First run
+## Setup
 
 ```bash
+git clone <this repository>
+cd odoo
 ./scripts/dev/setup.sh      # once per machine (idempotent, safe to re-run)
-./scripts/dev/start.sh      # creates crm_offline on first run, serves on :8069
+./scripts/dev/start.sh      # creates the crm_offline database on first run, then serves
 ```
 
-Open `http://localhost:8069`, log in with `admin` / `admin`. `start.sh` runs in the foreground; Ctrl+C stops it. `./scripts/dev/stop.sh` stops a server started this way, including the TLS proxy.
+Open <http://localhost:8069> and log in as `admin` / `admin`. The `crm_offline` database has crm, mail, and demo data.
 
-`setup.sh` installs system packages, sets up PostgreSQL (cluster plus a superuser role for your user), creates `.venv` from `requirements.txt` **plus** `websocket-client` and `phonenumbers`. Their absence makes tests skip or fail silently, which is exactly what the environment is built to prevent. It also installs headless Chrome and runs import sanity checks.
+The scripts and what they produce are documented in `scripts/dev/README.md`. Everything they output (logs, timings, TLS certificates) goes to the gitignored `logs/` and `var/` directories.
 
-## Secure context (offline features)
+## Running the server
 
-Offline features only work in a secure context (HTTPS, or plain HTTP on `localhost`). Outside one, the framework disables offline entirely: no storage, and any attempt to queue an ORM call throws `NonSecureContextError`. Verified in the browser:
+`./scripts/dev/start.sh` serves the web client at http://localhost:8069 in the foreground; Ctrl+C stops it. `./scripts/dev/stop.sh` stops a server started this way from another shell.
 
-```js
-window.isSecureContext            // true
-"serviceWorker" in navigator      // true
+**Offline features need a secure context.** `http://localhost:8069` qualifies. If you open the page on any other host (a port forward, another machine), plain HTTP disables offline storage entirely and queued writes raise `NonSecureContextError`. Use:
+
+```bash
+./scripts/dev/start.sh --https
 ```
 
-Use `./scripts/dev/start.sh --https` whenever the page is opened on any host other than `localhost` (port forwards, other machines). It terminates TLS on port 8069 with a self-signed certificate from `var/tls/` and proxies to Odoo on 8070, accepting connections from any interface. Browsers show a certificate warning you accept once.
+which terminates TLS on 8069 with a self-signed certificate in `var/tls/` (accept the browser warning once) and runs Odoo on 8070.
 
-## Running the tests
+## Testing
 
 | Command | What it runs |
 | --- | --- |
-| `./scripts/dev/test-py.sh` | all crm Python tests (pass a class name to narrow, e.g. `TestCRMLead`) |
-| `./scripts/dev/test-js.sh desktop` | crm JS unit tests, desktop preset |
-| `./scripts/dev/test-js.sh mobile` | same suite at 375x667 with touch (new JS tests must pass both presets) |
-| `./scripts/dev/test-guard.sh` | fails if any `.test.js` contains `only(` or `debug(` |
-| `./scripts/dev/rebuild-assets.sh` | regenerate front-end bundles (run after every js/css/scss/xml change, before re-testing) |
-| `./scripts/dev/reset-db.sh` | drop and recreate `crm_offline` clean |
+| `./scripts/dev/test-py.sh` | all crm Python tests |
+| `./scripts/dev/test-py.sh TestCrmOffline` | one test class |
+| `./scripts/dev/test-js.sh desktop` | crm JS unit tests at desktop size |
+| `./scripts/dev/test-js.sh mobile` | the same suite at 375x667 with touch |
+| `./scripts/dev/test-guard.sh` | fails if any `.test.js` uses `only(` or `debug()` |
+| `./scripts/dev/rebuild-assets.sh` | regenerate front-end asset bundles |
 
-Defaults can be overridden with environment variables, e.g. `ODOO_DB=other_db ./scripts/dev/test-py.sh`.
+After **any** front-end change (js/css/scss/xml), run `rebuild-assets.sh` before testing; a failure caused by a stale asset bundle is not a real result. New JS tests must pass under both the desktop and the mobile preset.
 
-The scripts wrap `./odoo-bin` and print the exact command they run. They exist because the raw test runner has three false-green modes (zero collected tests still exit 0; JS suites are only collected with `-u crm,web`; browser tests skip silently on missing dependencies). The wrappers fail on empty selections and skipped tests. Details in [testing](../how-to-contribute/testing.md).
+The test wrappers exist because raw `./odoo-bin` has three silent-success modes: it runs 0 tests when the module was not installed or updated in the run, JS suites are only collected with `-u crm,web`, and browser tests skip silently when a dependency is missing. The wrappers fail on skipped tests and empty selections. The full commands they run are printed by each script and listed in `scripts/dev/README.md`.
 
-## Where things land
+## Trying the offline CRM by hand
 
-- `logs/`: dev server log (`odoo.log`), per-script output (`test-py-all.log`, `test-js-desktop-crm.log`, ...), wall-time and peak-memory measurements (`measure-*.txt`).
-- `var/tls/`: self-signed certificates for `--https`.
-- Both are gitignored runtime output; nothing else in the repo should write to them.
+1. Run `rebuild-assets.sh`, then `start.sh`, and open the CRM pipeline.
+2. Visit a few views and leads while online (offline availability is built from what was visited).
+3. Go offline with the browser's real network toggle.
+4. Edit a lead, create one from the mobile quick create, mark one won, schedule an activity. Each write lands in the offline systray.
+5. Go back online, wait for the systray queue to drain, then confirm the writes on the server, for example `psql -d crm_offline -c "SELECT id, name, stage_id FROM crm_lead ORDER BY write_date DESC LIMIT 5"`.
 
-## Manual offline checking
+`.factory/skills/odoo-offline-qa/SKILL.md` is the full manual QA runbook for this, including the mobile viewport and the secure-context pitfalls.
 
-To try the offline behavior by hand: log in, browse the CRM pipeline (visiting a view online is what makes it available offline), switch the browser to offline (DevTools network tab or cut the connection), edit and save a lead. The entry appears in the offline systray with a Created/Edited/Deleted label. Go back online and watch the replay: entries leave the systray one by one, with a spinner while syncing. The `odoo-offline-qa` skill in this environment documents the full browser walkthrough.
+## Resetting
 
-## Next steps
-
-- Read [architecture](architecture.md) for how the pieces fit together.
-- Read [development workflow](../how-to-contribute/development-workflow.md) before making changes.
-- The [CRM app](../apps/crm/index.md) pages describe where fork development actually happens.
+`./scripts/dev/reset-db.sh` drops and recreates `crm_offline` with clean demo data.

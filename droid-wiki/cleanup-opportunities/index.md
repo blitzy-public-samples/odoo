@@ -1,73 +1,57 @@
 # Cleanup opportunities
-Active contributors: Odoo SA (upstream)
 
-## Purpose
+This section maps the maintenance debt in this repository: the deferred-work markers
+(TODO/FIXME/HACK) and the complexity hotspots (largest files, deepest dependency
+chain, biggest addons). It is a reading guide for maintainers, not a backlog of
+approved refactors — nothing listed here should be fixed as a side effect of another
+task, and `AGENTS.md` explicitly warns against refactoring code the current task does
+not need.
 
-This scan maps two kinds of maintenance signal: TODO/FIXME comments and files
-large enough that a small change can have a wide effect. It is a reading guide
-for maintainers, not a backlog of approved refactors.
+The census date is 2026-10-07, branch `eval/factory-crm-offline` at `30955b57688`.
 
-The scan deliberately excludes cleanup proposals for upstream Odoo code. The
-fork must stay rebasable onto upstream 20.0, so refactoring is safe only inside
-`addons/crm/`; changes to `odoo/`, `addons/web/`, or other upstream addons need
-an upstream change or an extension from CRM. See [patterns and
-conventions](../how-to-contribute/patterns-and-conventions.md) for that
-boundary.
+## The one constraint that shapes all of it
 
-## Directory layout
+The fork must stay rebasable onto upstream 20.0, so changes belong only inside
+`addons/crm/` (see [design decisions](../background/design-decisions.md)). That
+splits every finding below into two buckets:
 
-```text
-odoo/                         upstream server and base addon
-addons/                       upstream business addons
-addons/crm/                   fork's permitted cleanup scope
-droid-wiki/cleanup-opportunities/
-  index.md
-  todos-and-fixmes.md
-  complexity-hotspots.md
-```
+- **Upstream debt** — markers and hotspots in `odoo/`, `addons/web/`, and every other
+  addon. Read them for context; do not "clean them up" locally. Where a behavior
+  genuinely needs changing, extend it from `addons/crm/` (Python `_inherit`, JS
+  `patch()`, XML inheritance).
+- **Fork debt** — what the fork itself could act on inside `addons/crm/`. This is the
+  smaller bucket by marker count: the census found zero TODO/FIXME/HACK markers in any
+  file the fork added. The fork's real maintenance surface is the 22-item "Known
+  limits" list in `addons/crm/static/src/mobile/README.md`, which functions as a
+  maintained backlog, and the offline test suites the fork added (54 of its 118 changed
+  files are tests).
 
-## Key abstractions
+## Sub-pages
 
-| Signal | File or scope | Meaning |
-|---|---|---|
-| Marker density | `odoo/` and `addons/` source files | TODO/FIXME comments identify deferred compatibility, testing, and design work. |
-| Size hotspots | `addons/account/models/account_move.py` and other large files | Line count is a risk indicator, not proof that a file needs splitting. |
-| Rebasability boundary | `addons/crm/` | The fork's active implementation scope; upstream code is not a local cleanup target. |
+| Page | What it covers |
+| --- | --- |
+| [TODOs and FIXMEs](todos-and-fixmes.md) | The marker census: 2,246 occurrences in 1,468 files, the top files, the notable comments with sampled ages, and the upstream-vs-fork split |
+| [Complexity hotspots](complexity-hotspots.md) | The largest files, the deepest addon dependency chain, the biggest addons by lines, and the known-limits list as the fork's maintained backlog |
 
-## How it works
+## The biggest theme
 
-The two reports use repository scans rather than Git authorship. Marker counts
-use `rg` over Python and JavaScript files, while hotspot counts use `wc -l`.
-The repository history is shallow and squashed, so it cannot establish which
-comment was written first or assign cleanup ownership.
-
-## Integration points
-
-The reports connect to the [size and activity
-snapshot](../by-the-numbers.md), the [ORM](../systems/orm.md), and the
-[CRM application](../apps/crm/index.md). They also use the fork's contribution
-rule that extensions belong in `addons/crm/`, rather than modifying upstream
-modules.
-
-## Entry points for modification
-
-Start with the relevant sub-page, then confirm behavior with tests before
-touching code. For a permitted fork change, begin in `addons/crm/` and use the
-extension patterns documented in [how to contribute](../how-to-contribute/patterns-and-conventions.md).
-
-## Key source files
-
-| File | Purpose |
-|---|---|
-| `AGENTS.md` | Defines the rebasability and scope rules for this fork. |
-| `addons/crm/` | Only addon scope where local cleanup is normally permitted. |
-| `odoo/` | Upstream server code included in the scan but excluded from local refactors. |
-| `addons/web/` | Upstream web framework, including the offline/PWA framework. |
+Almost all measurable maintenance debt in this tree is upstream's, and the fork's
+design deliberately keeps it that way. The marker census is dominated by vendored
+libraries (Fullcalendar alone carries 105 marker lines) and long-lived upstream
+compatibility seams (the oldest sampled marker predates 2016); the complexity hotspots
+are generated bundles and framework files the scope rule puts out of reach. What the
+fork could act on is concentrated in three places: the known-limits list (several of
+whose items are actually owned by `addons/web` or `addons/mail` and cannot be closed
+inside `addons/crm/`), the CRM files upstream owns that the fork patches around rather
+than edits, and the fork's own density — 76% of its added lines are tests, which is a
+strength but also a surface that must keep passing under two presets.
 
 ## Related pages
 
-- [Size and activity](../by-the-numbers.md)
-- [Contribution patterns](../how-to-contribute/patterns-and-conventions.md)
-- [CRM](../apps/crm/index.md)
-- [TODOs and FIXMEs](todos-and-fixmes.md)
-- [Complexity hotspots](complexity-hotspots.md)
+- [By the numbers](../by-the-numbers.md) for the size, activity, and bot-attribution
+  snapshot this census extends
+- [Design decisions](../background/design-decisions.md) for why the scope rule exists
+- [Offline CRM](../apps/crm/offline-crm.md) and [mobile CRM](../apps/crm/mobile-crm.md)
+  for the code the fork's debt attaches to
+- [Patterns and conventions](../how-to-contribute/patterns-and-conventions.md) for the
+  extension patterns any fork-side cleanup must use

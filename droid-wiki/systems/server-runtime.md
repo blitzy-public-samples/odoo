@@ -1,22 +1,9 @@
 # Server runtime
-Active contributors: Odoo SA (upstream)
+Active contributors: Christophe, Xavier, Krzysztof
 
 ## Purpose
 
 `odoo/service/server.py` implements the three ways Odoo runs: `ThreadedServer` for development, `PreforkServer` (forked HTTP and cron workers) for production, and `GeventServer` for longpolling and websockets. It also owns the cron trigger, the memory/CPU/request limits that recycle workers, and the startup path that preloads registries. Connection pooling sits in `odoo/sql_db.py`, and every option that drives it is declared in `odoo/tools/config.py`.
-
-## Directory layout
-
-```text
-odoo/service/
-├── server.py     # start(), ThreadedServer, PreforkServer, GeventServer, Worker*
-├── model.py      # external RPC dispatch (execute / execute_kw)
-└── common.py     # /xmlrpc common service (login, version)
-odoo/sql_db.py              # ConnectionPool, PsycoConnection, Cursor, db_connect()
-odoo/tools/config.py        # configmanager and every odoo-bin option
-odoo/http/server.py         # HTTPSocket, the h11 layer all servers share
-odoo/_monkeypatches/site.py # sets odoo.evented for `odoo-bin gevent`
-```
 
 ## Key abstractions
 
@@ -30,13 +17,29 @@ odoo/_monkeypatches/site.py # sets odoo.evented for `odoo-bin gevent`
 | `Worker`, `WorkerHTTP`, `WorkerCron` | `odoo/service/server.py` | Forked workers with watchdogs and limit checks. |
 | `ConnectionPool` | `odoo/sql_db.py` | Bounded pool of psycopg2 connections, RW or read-only. |
 | `configmanager` | `odoo/tools/config.py` | Option registry read as `config['key']`. |
-| `preload_registries` | `odoo/service/server.py` | Loads every `-d` database, runs post-install tests. |
+| `preload_registries` | `odoo/service/server.py` | Loads every `-d` database, runs post-install tests, returns the exit code. |
 
 ## How it works
 
-### Server selection
+### Boot sequence
 
-`start()` in `odoo/service/server.py` chooses the runtime: `GeventServer` when `odoo.evented` is true, `PreforkServer` when `--workers` is non-zero (warning first if tests are enabled), otherwise `ThreadedServer`. On Linux 64-bit the threaded case also calls `mallopt` with `M_ARENA_MAX=2` unless `MALLOC_ARENA_MAX` is set, because glibc's per-core arenas inflate virtual memory enough to trip `--limit-memory-soft`. With `--dev=reload` a filesystem watcher (`FSWatcherInotify`, or `FSWatcherWatchdog` elsewhere) restarts the server on source changes. `odoo.evented` is set by `_monkeypatches/site.py:patch_evented()` when `sys.argv[1] == 'gevent'`: it calls `gevent.monkey.patch_all()` and installs a psycogreen wait callback so psycopg2 blocks cooperate with greenlets.
+`odoo-bin` imports `odoo.cli` and calls `main()` from `odoo/cli/command.py`, which picks a `Command` (default `server`) and runs it. The server command in `odoo/cli/server.py` then, in order: checks it is not running as root, parses configuration with logging (`config.parse_config`), checks it is not running as the `postgres` user, reports the effective configuration, creates any `-d` database that does not exist yet (setting `--init base` on it), writes the pid file, and calls `service.server.start(preload=config['db_name'], stop=config['stop_after_init'])`. `start()` loads the server-wide modules (`--load`, default `base,web`), builds the WSGI `root` from `odoo/http/router.py`, picks the server class, and runs it.
+
+```mermaid
+flowchart TD
+    B["odoo-bin"] -->|"odoo.cli.main()"| CMD["odoo/cli/command.py: pick Command"]
+    CMD -->|"default: server"| CS["odoo/cli/server.py: main()"]
+    CS -->|"config.parse_config"| CFG["odoo/tools/config.py"]
+    CS -->|"service.server.start()"| ST["odoo/service/server.py: start()"]
+    ST -->|"load_server_wide_modules()"| SW["base, web imports"]
+    ST -->|"workers = 0"| TS["ThreadedServer"]
+    ST -->|"workers > 0"| PS["PreforkServer"]
+    ST -->|"odoo.evented"| GS["GeventServer"]
+    TS -->|"preload = -d databases"| PR["preload_registries()"]
+    PS -->|"preload = -d databases"| PR
+    GS -->|"preload = -d databases"| PR
+    PR -->|"Registry.new"| RG["odoo/orm/registry.py"]
+```
 
 ### ThreadedServer
 
@@ -56,8 +59,7 @@ Each worker's `_runloop` calls `check_limits()` per iteration: it exits after `-
 
 ```mermaid
 graph TD
-    OB["odoo-bin"] -->|calls| ST["service/server.py: start()"]
-    ST -->|"workers = 0, not evented"| TS["ThreadedServer"]
+    ST["odoo/service/server.py: start()"] -->|"workers = 0, not evented"| TS["ThreadedServer"]
     ST -->|"workers > 0"| PS["PreforkServer (master)"]
     ST -->|"odoo.evented"| GS["GeventServer (odoo-bin gevent)"]
     TS -->|accepts into| T1["ThreadPoolExecutor: max_http_threads"]
@@ -67,12 +69,15 @@ graph TD
     PS -->|subprocesses| P3["gevent children: gevent_workers"]
     T1 -->|runs| HS["HTTPSocket.process_request()"]
     P1 -->|runs| HS
-    P3 -->|is| GS
     GS -->|serves| WS["websocket and longpolling on gevent_port"]
     T2 -->|calls| CR["ir.cron._process_jobs()"]
     P2 -->|calls| CR
     HS -->|WSGI call| ROOT["odoo/http/router.py: root()"]
 ```
+
+### --stop-after-init
+
+`config['stop_after_init']` is threaded from `odoo/cli/server.py` into `service.server.start(preload, stop=True)`. In `ThreadedServer.start()` the HTTP daemon is spawned only when `--test-enable` is on or when `stop` is false, so a plain `--stop-after-init` run never binds the port. Every server class then runs `preload_registries(preload)`, which loads (and, with `-i`/`-u`, updates) each `-d` database and, when `--test-enable` is set, collects the `post_install` suite for the updated modules, pregenerates the asset bundles if any `HttpCase` is present, runs it, and logs the assertion report. With `stop` true the runtime then calls `self.stop()` and returns the registry's return code instead of entering its serve loop; a failed registry load returns `-1`, failed tests increment the code. This is the mode every `scripts/dev/` test wrapper and `reset-db.sh` uses.
 
 ### Connection pooling
 
@@ -99,7 +104,7 @@ For behavior changes, extend from an addon rather than editing the runtime; the 
 
 | File | Purpose |
 | --- | --- |
-| `odoo/service/server.py` | `start()`, the three server classes, `Worker*`, cron threads, `_reexec()`. |
+| `odoo/service/server.py` | `start()`, the three server classes, `Worker*`, cron threads, `preload_registries()`, `_reexec()`. |
 | `odoo/sql_db.py` | `ConnectionPool`, `Connection`, `Cursor`, `db_connect()`, `close_all()`. |
 | `odoo/tools/config.py` | `configmanager`, option declaration, derived paths. |
 | `odoo/http/server.py` | `HTTPSocket`, the h11 layer used by every runtime. |
@@ -107,6 +112,7 @@ For behavior changes, extend from an addon rather than editing the runtime; the 
 | `odoo/addons/base/models/ir_cron.py` | `_process_jobs()`, the cron trigger consumers call. |
 | `odoo/orm/registry.py` | Registry LRU sizing and signaling. |
 | `odoo/cli/server.py` | The `odoo-bin` server command: checks, then `service.server.start()`. |
+| `odoo/cli/command.py` | Command selection; `server` is the default. |
 | `scripts/dev/start.sh` | Fork wrapper that starts the dev server (ports 8069/8070). |
 | `setup/odoo-wsgi.example.py` | Running the WSGI app under gunicorn/uwsgi. |
 

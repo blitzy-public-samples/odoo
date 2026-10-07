@@ -1,57 +1,54 @@
 # Glossary
 
-Project vocabulary for the Odoo core, the web client, and this fork's offline stack. Terms appear roughly in the order you meet them: platform, frontend, offline, CRM.
+Terms used across this wiki and in the codebase.
 
-## Platform
+## Core Odoo
 
-- **Addon (module)**: a self-contained package under `addons/` (or `odoo/addons/` for framework modules) that adds models, views, data, or assets to Odoo. 642 live in `addons/`.
-- **Manifest**: `__manifest__.py` at an addon root: name, `depends`, `data` (XML/CSV loaded in order), `demo`, `assets` (bundle declarations). Parsed by `odoo/modules/module.py`.
-- **ORM**: the record-oriented layer in `odoo/orm/`. `odoo/models.py` and `odoo/fields.py` are re-export shims over it.
-- **Recordset**: an ordered collection of records of one model; every ORM operation (`search`, `write`, `mapped`, `filtered`, ...) runs on recordsets.
-- **Domain**: a search filter expression like `[('stage_id.name', '=', 'New')]`. In 20.0 a real AST (`odoo/orm/domains.py`) with optimization passes.
-- **`_inherit` vs `_inherits`**: `_inherit` extends an existing model in place; `_inherits` is delegation, embedding a parent record per entry (like a composition with a shared id).
-- **Environment**: the per-request context (`env`) carrying the cursor, user, and context; created in `odoo/orm/environments.py`.
-- **Registry**: per-database map of model name → model class, built when the module graph loads (`odoo/orm/registry.py`). Invalidated across processes through PostgreSQL signaling.
-- **`ir.access`**: the unified access model in 20.0: what used to be separate access rights (`ir.model.access`) and record rules (`ir.rule`) is now one model with an operation (create/read/write/unlink) and an optional domain.
-- **`ir.cron`**: scheduled jobs, run by cron workers or cron threads.
-- **`ir.config_parameter`**: key/value system parameters (e.g. `web.web_app_name`, the browser cache secret).
-- **Savepoint**: a nested transaction point; tests run each method inside a savepoint of a shared transaction so they can roll back cheaply.
-- **Prefork / Gevent servers**: the two multi-worker server modes: `PreforkServer` forks HTTP and cron workers; `GeventServer` runs greenlets for longpolling/websockets. The default dev server is threaded.
-- **Test tags**: `--test-tags` selects tests, e.g. `/crm:WebSuite.test_unit_desktop` (module:Class.method). Python UI tests are tagged `post_install`/`-at_install`.
-- **False-green**: a test run that reports success while testing nothing: zero collected tests still exit 0; JS suites are never collected without `-u crm,web`; browser tests self-skip on missing dependencies. `scripts/dev/` wrappers exist to catch all three.
+- **Addon (module)** — a directory under `addons/` with a `__manifest__.py` declaring its dependencies, data files, and assets. Installed addons contribute models, views, routes, and assets to a database.
+- **Action** — a window action (`ir.actions.act_window`) or other action record; the client's action service opens views through actions.
+- **Arch** — the XML definition of a view (`<form>`, `<list>`, `<kanban>`, ...), stored in `ir.ui.view` and parsed by each view type's arch parser.
+- **js_class** — an attribute on a view arch that selects a custom view object from `registry.category("views")` instead of the default one, e.g. `js_class="crm_kanban"`.
+- **ORM** — Odoo's model layer in `odoo/orm/` and `odoo/fields/`; the client talks to it through `orm` service calls like `web_save`, `web_read_group`, `web_name_search`.
+- **OWL** — the component framework the web client is written in (bundled at `addons/web/static/src/owl2/`). Components, reactive state, plugins, and services.
+- **Plugin** — the current API for core state and services: classes extending `Plugin` from `@odoo/owl`, registered with `services.add(...)`, consumed with `usePlugin(PluginClass)`. Replaces the older service API for new code.
+- **Systray** — the navbar's right-hand item area (user menu, activities, and the offline queue indicator).
+- **Relational model** — the client-side model in `addons/web/static/src/model/relational_model/` that loads records and stages edits for form, list, and kanban views.
+- **PLS** — Predictive Lead Scoring: server-computed win probabilities for leads (`addons/crm/models/crm_lead_scoring_frequency.py`).
+- **Forecast views** — date-grouped kanban/list/graph/pivot variants using `fill_temporal`, registered as `forecast_kanban` etc.
+- **MRR** — Monthly Recurring Revenue, shown on kanban columns for teams with recurring plans.
+- **Rainbowman** — the congratulation animation after winning a lead (`check_rainbowman_message`).
 
-## Web client
+## Offline and PWA
 
-- **OWL**: Odoo's component framework, similar in spirit to Vue/React. The vendored library is OWL 3 with an Owl-2 compatibility layer; everything imports it as `@odoo/owl`.
-- **Plugin**: the new service API: classes extending OWL `Plugin`, registered with `services.add(...)`, exposing reactive `signal` state, consumed with `usePlugin(PluginClass)`. `OfflinePlugin` is the reference implementation.
-- **Legacy service bridge**: old-style named services (`"offline"`, `"ui"`, `"bottom_sheet"`) wrapped around plugins, kept until the OWL 3 migration finishes. New code must not build on them.
-- **Registry**: named global maps (`registry.category("views")`, `"systray"`, `"services"`) that the client reads to wire behavior.
-- **Action**: anything the client can open in its content area: a window view, a URL, a server report (`ir.actions.*`).
-- **View / arch**: a model UI (form, list, kanban, ...). The XML is the *arch*; `js_class` on the arch binds it to a custom view object from the view registry.
-- **Asset bundle**: a named set of JS/SCSS files declared in a manifest (e.g. `web.assets_backend`), compiled and served as attachments. `assets_backend_lazy` bundles load on demand.
-- **`registry_hash`**: fingerprint of the asset bundles; the client wipes its offline storage when it changes.
-- **Relational model**: `addons/web/static/src/model/relational_model/`, the JS data layer under the views (`record.js`, `dynamic_list.js`).
+- **Offline queue / sync queue** — the `orm-to-sync` IndexedDB table that `OfflinePlugin.scheduleORM()` writes queued server calls into, replayed on reconnection in timestamp order.
+- **Replay** — `_syncORM()`: queued calls re-issued verbatim with `orm.silent.call`, 1s apart, dequeued on success, parked with `extras.error` on other failures.
+- **Sync issues** — systray badge and parked-queue state for calls that failed replay; only the user can discard or retry them.
+- **Last write wins** — the queue's only conflict policy: no write_date comparison, no merge, no dialog.
+- **Secure context** — a browser condition (HTTPS or `localhost`) required for IndexedDB, crypto, and service workers. Outside it the framework disables offline entirely and raises `NonSecureContextError`.
+- **`data-available-offline`** — the attribute on a `<button>` that keeps it clickable while offline; everything without it is disabled by the framework.
+- **Available offline** — `OfflinePlugin.isAvailableOffline(actionId, viewType, resId)`: whether an action/view/record was visited while online, from the `_visited` set.
+- **OfflineActionHelper** — the component that replaces a view when it was never visited online (`addons/web/static/src/views/offline_action_helper.js`).
+- **Many2x cache** — `many2x_<model>` tables of `web_name_search` results kept by the framework so relational fields can suggest records offline.
+- **Service worker** — `addons/web/static/src/service_worker.js`, one worker for all of `/odoo`: caches the homepage, serves it network-first, masks and re-injects session info.
+- **Web manifest** — `/web/manifest.webmanifest`, served by `addons/web/controllers/webmanifest.py` and subclassed by crm for the share target and shortcuts.
+- **Share target** — a PWA capability that lets the installed app receive text shared from the phone's share sheet; crm creates leads from it.
+- **Bottom sheet** — the small-screen alternative to popovers and dialogs (`addons/web/static/src/core/bottom_sheet/`), used for the mobile quick create.
 
-## Offline stack (this fork)
+## The fork's CRM terms
 
-- **Secure context**: HTTPS or `localhost`. Offline storage, service workers, and crypto only exist inside one; outside it the stack degrades to no-ops and `scheduleORM` throws `NonSecureContextError`.
-- **Service worker**: `/web/service-worker.js`, one worker for scope `/odoo`: caches the homepage and offline page, masks session info in the cached copy, serves them when the network fails.
-- **Sync queue**: the `orm-to-sync` IndexedDB table holding queued `{model, method, args, kwargs, extras}` entries, replayed on reconnection in timestamp order.
-- **`extras`**: queue entry metadata for the systray: `timeStamp`, `actionName`, `displayName(s)`, `changes`/`originalValues`, `actionId`, `viewType`, and `error` when a replay fails.
-- **Visited-UI**: `visited-ui-items`, the record of actions/views/records seen online; `isAvailableOffline(actionId, viewType, resId)` reads it to decide what can be reopened offline.
-- **Many2X cache**: encrypted `many2x_<model>` tables of relational-search results; offline, the autocomplete falls back to substring matching over them.
-- **`data-available-offline`**: the attribute that keeps a button enabled while offline. It must sit on the interactive element itself, not a wrapper.
-- **Parked entry / Sync issues**: a replayed call that failed with a non-connection error keeps its queue entry with `extras.error` set and surfaces as a danger badge in the offline systray.
-- **Last write wins**: the queue's conflict semantics: timestamp-ordered verbatim replay, no `write_date` comparison, no merge, no conflict dialog. Deliberate.
+- **QUEUE / SKIP / DISABLE** — the three dispositions of the offline surface inventory (`addons/crm/static/src/mobile/offline_inventory.md`): queue the write into the framework queue, skip the decorative read silently, or disable the control offline.
+- **Chained id** — an id that only exists after another server call returns it (for example `name_create` before an attachment write). Anything needing one is DISABLE, never queued.
+- **Offline guard** — a crm-side patch that disables or blocks a control offline because the framework does not queue what it does (wizards, group edits, reports, module installs).
+- **useCrmOffline()** — crm's single hook over the framework's `OfflinePlugin` (`addons/crm/static/src/mobile/offline_hooks/offline_hooks.js`): offline state, pending marks, queue helpers.
+- **Mobile pipeline** — the small-screen branch of the `crm_kanban` renderer showing one stage at full width with a fixed header; distinct from the mobile kanban *arch* (`view_crm_lead_kanban`).
+- **Pending lead create** — a lead create still sitting in the queue; shown as a non-clickable card until it syncs.
+- **Quick create** — the six-field bottom-sheet lead create on small screens; its save is one `web_save`, queued on connection loss like any form save.
+- **`action_log_call`** — a `crm.lead` method that creates a Call activity and marks it done in a single server call, so logging a call offline queues exactly one call.
+- **Milestones M1-M5** — the fork's five delivery phases: the surface inventory, offline fixes, data coverage, evidence/QA, and the mobile pipeline.
 
-## CRM
+## Dev environment
 
-- **Lead vs opportunity**: two `type` values on `crm.lead`. Leads are unqualified contacts; opportunities sit in the pipeline with stages and probability. The lead stage is gated on the `crm.group_use_lead` group.
-- **Stage**: a pipeline step (`crm.stage`); `is_won` marks the Won stage, `rotating_threshold_days` feeds the rotting kanban.
-- **PLS**: Predictive Lead Scoring: a naive-Bayes model over per-team won/lost frequencies (`crm.lead.scoring.frequency`), recomputed by cron, shown in a tooltip on the form.
-- **MRR / recurring plan**: monthly recurring revenue: `recurring_revenue` normalized by `crm.recurring.plan` months. Forecast views aggregate prorated MRR over future periods.
-- **Forecast**: views (kanban/list/graph/pivot) that extend the CRM views with time-bucket filling (`fill_temporal_service.js`) to project revenue into the future.
-- **Rainbowman**: the celebration animation when a lead is won (`check_rainbowman_message.js`).
-- **Rotting kanban**: mail's kanban extension that colors cards by days without activity; CRM's pipeline kanban builds on it.
-- **Share target**: PWA feature letting the mobile OS "Share to" the installed app; crm registers `crm_share_target_item.js` so sharing text creates a lead on a chosen team.
-- **Scoped app**: an installable PWA per business app (routes under `/scoped_app`), with its own manifest and icon set.
+- **`crm_offline`** — the dev database (crm, mail, demo data); log in as `admin` / `admin`.
+- **Presets** — the JS test suites run twice: `desktop`, and `mobile` at 375x667 with touch.
+- **Asset bundles** — the compiled JS/CSS packages (`web.assets_backend`, ...); rebuilt by `rebuild-assets.sh` and invalidated by asset registry changes.
+- **`mockCrmOffline()`** — the test helper that flips connectivity in JS tests after the mail store settles, instead of the raw `mockOffline()`.

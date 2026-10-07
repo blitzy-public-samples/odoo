@@ -1,138 +1,108 @@
 # Development workflow
 
-Active contributors: bobbyabbott421-glitch (fork), Odoo SA (upstream)
+The edit-rebuild-test-report cycle of this fork: which branch to work on, how commits are written, how a milestone's work is structured, what every change must carry with it, and the list of things that never change. There is no CI, so the cycle's last step — reporting what ran, including what was skipped and why — is part of the work, not optional bookkeeping.
 
-## Purpose
+## Branches
 
-This page is the concrete cycle for a change in this fork: branch, implement under `addons/crm/`, regenerate assets if anything front-end moved, run the Python and JavaScript suites under both presets, run the forbidden-statement guard, read the logs, and reset the database when it is polluted. Every command here is a wrapper in `scripts/dev/`, which prints the `./odoo-bin` invocation it runs.
+The fork's work branch is `eval/factory-crm-offline`, sitting on top of `origin/20.0`, the upstream default branch (`origin/HEAD` points at it). The 76 commits between them are all authored by `bobbyabbott421-glitch`, September 30 to October 5, 2026, and all confined to `addons/crm/` plus the dev scripts, the offline QA skill, the root `AGENTS.md`, and this wiki. A second local branch, `eval/base`, holds the earlier round that only added `scripts/dev/`.
 
-## Directory layout
+Practical rules:
+
+- Fork work continues on `eval/factory-crm-offline`; a new line of work starts from a branch off `origin/20.0` so it stays rebasable.
+- Keep the diff confined to `addons/crm/`. That is what keeps the fork rebasable onto upstream 20.0 — the scope rule `AGENTS.md` states outright.
+- Upstream Odoo contributions are a separate flow: `CONTRIBUTING.md` points at Odoo's own contribution guide (pull requests against the correct version, restrictions on stable-series changes), and `doc/cla/` holds the contributor license agreements and their signatory lists. Fork work is not submitted upstream.
+
+## Commit messages
+
+Format: `[TAG] module: short description`, optionally with validation codes in parentheses. The tags seen in `git log --oneline -20`:
 
 ```text
-scripts/dev/
-├── README.md            # usage and the notes on the test runner
-├── _common.sh           # shared config, port/db guards, result checks (sourced, not run)
-├── setup.sh             # once per machine
-├── start.sh             # serve, optionally --https
-├── stop.sh              # stop a start.sh server and its TLS proxy
-├── test-py.sh           # crm Python tests
-├── test-js.sh           # JS unit tests, desktop|mobile [crm|web]
-├── test-guard.sh        # only(/debug( guard
-├── rebuild-assets.sh    # regenerate front-end bundles
-└── reset-db.sh          # drop and recreate crm_offline
-logs/                    # gitignored: odoo.log, <script>.log, measure-*.txt
+[ADD] crm: developer README for the offline and mobile CRM
+[FIX] crm: bypass user.hasGroup's poisoned cache on team-switcher reconnect
+[IMP] crm: PWA shortcuts "My Pipeline" and "New Lead" (VAL-PWA-001..007)
+[ADD] crm: offline E2E tour, pipeline to reconnect (VAL-E2E-001/002)
+[FIX] crm: mobile pipeline scrutiny round-1 blockers 1-6
+[IMP] crm: mobile quick create (VAL-MOBILE-009/010/011/013)
+[ADD] crm: milestone-3 close-out tests (VAL-DATA-017, VAL-CROSS-001)
+[FIX] crm: close M4 user-testing round-1 evidence gaps (m4-fix-ut-evidence)
 ```
 
-## The cycle
+Conventions the history makes visible:
 
-```mermaid
-graph LR
-    B[branch off eval base] --> I[implement under addons/crm]
-    I --> R[rebuild-assets.sh]
-    R --> T1[test-js desktop]
-    T1 --> T2[test-js mobile]
-    T2 --> P[test-py.sh]
-    P --> G[test-guard.sh]
-    G --> L[read logs and measure files]
-    L -->|failures| I
-```
+- `ADD` for new files or features, `IMP` for improvements to existing behavior, `FIX` for bug fixes. The module part is the addon or area: `crm:` for nearly everything, also `scripts/dev:` and `wiki:`.
+- Scrutiny fixes name the round and the finding numbers: `scrutiny round-1 fixes 8,9,10,20,21,27,28 (chatter followers, ...)`.
+- User-testing fixes name the round and carry the `VAL-*` codes being closed: `close M5 user-testing round-1 online-guard gaps (m5-fix-online-guards)`.
+- One commit per coherent unit (a feature, a round of findings, a close-out), with the tests that prove it in the same commit.
 
-1. **Branch.** Fork lineage is `20.0` to `eval/base`, upstream is `origin/20.0`. Keep the change confined to `addons/crm/`; the rules are on [How to contribute](index.md) and the code patterns on [Patterns and conventions](patterns-and-conventions.md).
-2. **Implement.** New files are covered by the manifest's existing globs, see below. A new Python test module must be imported in `addons/crm/tests/__init__.py`, and a new model, controller, or data file in its own `__init__.py` or the manifest's `data` list.
-3. **Rebuild assets** if the change touched js, css, scss, or xml: `./scripts/dev/rebuild-assets.sh`. It stops a `start.sh` server first, because the server caches assets in memory and would keep serving stale ones. Restart the server afterwards if you were checking in the browser.
-4. **Test.** `./scripts/dev/test-js.sh desktop`, then `./scripts/dev/test-js.sh mobile`, then `./scripts/dev/test-py.sh`, then `./scripts/dev/test-guard.sh`. Tests bind port 8069 themselves, so the scripts stop a `start.sh` server first and refuse to run if another process holds the port.
-5. **Read the logs**, not just the exit code: `logs/test-py-all.log`, `logs/test-js-desktop-crm.log`, `logs/test-js-mobile-crm.log`, `logs/test-guard.log`, plus the wall time and peak RSS in `logs/measure-<script>.txt`.
-6. **Reset when polluted.** `./scripts/dev/reset-db.sh` drops `crm_offline` and its filestore (`~/.local/share/Odoo/filestore/<db>`) and recreates it with crm, mail, and demo data. The server is not started afterwards.
+## The milestone loop
 
-## Commands the wrappers run
+The fork's five milestones all follow the same loop, and it is the template for new work:
 
-`./scripts/dev/test-py.sh` prints and logs the exact command. Without arguments it runs the whole crm Python suite, choosing between two forms: `-i crm` only if crm is not yet installed in the database, otherwise `-u crm --test-tags /crm`. `-i crm` on a database where crm is already installed installs nothing and collects zero tests, which is one of the false-green modes described on [Testing](testing.md).
+1. **Foundation** — one `[ADD]` commit laying the base: `[ADD] crm: lay milestone-2 offline-fixes foundation`, `[IMP] crm: extend the mobile offline hooks module (VAL-MOBILE-001)`.
+2. **A run of feature or fix commits**, each carrying its proof: `[ADD] crm: offline mark-won (VAL-DATA-005/006/007)` landed with the mark-won tests.
+3. **Close-out** — wiring proofs, cross-cutting coverage, and QA in one commit: `[ADD] crm: milestone-2 close-out (cross-cutting re-enable test, QA, wiring)`.
+4. **Scrutiny rounds** — internal review, numbered findings, batched fixes: `[FIX] crm: scrutiny round-1 fixes 2,3,4,5,6,7,11 (switcher, MRR, lead-gen, PLS tooltip, Restore)`, then round 2, round 3.
+5. **User-testing rounds** — validation runs producing `VAL-*` codes, closed by commits like `[FIX] crm: close M3 user-testing round-1 evidence gaps (VAL-DATA-002/004/005, VAL-FIX-007)`.
+6. **Stabilization** — de-flaking commits when the suites expose races: `[FIX] crm: stabilize mobile-preset flakes in crm_offline_cold_start/config_list_guards`, `[FIX] crm: restore crm_test_helpers.js, move mockCrmOffline (VAL-REPO-005)`.
+
+M1 is the precedent for document-shaped work: the offline surface inventory landed as one `[ADD]`, then absorbed five scrutiny rounds and two user-review rounds as `[FIX] crm: close round-N scrutiny gaps ...` commits — before any product code changed.
+
+## The cycle, concretely
 
 ```bash
-# all crm Python tests
-./odoo-bin -d crm_offline -u crm --test-enable --test-tags /crm --stop-after-init --log-level=test
-./odoo-bin -d crm_offline -i crm --test-enable --test-tags /crm --stop-after-init --log-level=test
+# after any js/css/scss/xml change, before testing:
+./scripts/dev/rebuild-assets.sh
 
-# one crm Python test class
-./scripts/dev/test-py.sh TestCRMLead
-./odoo-bin -d crm_offline -u crm --test-enable --test-tags /crm:TestCRMLead --stop-after-init --log-level=test
-
-# crm JS unit tests, desktop and mobile presets
-./scripts/dev/test-js.sh desktop
-./scripts/dev/test-js.sh mobile
-./odoo-bin -d crm_offline -u crm,web --test-enable --test-tags /crm:WebSuite.test_unit_desktop --stop-after-init --log-level=test
-./odoo-bin -d crm_offline -u crm,web --test-enable --test-tags /crm:MobileWebSuite.test_unit_mobile --stop-after-init --log-level=test
-
-# the whole web JS suite instead of crm's (thousands of tests, slow)
-./scripts/dev/test-js.sh desktop web
-
-# forbidden-statement guard
-./scripts/dev/test-guard.sh
-./odoo-bin -d crm_offline -u crm,web --test-enable --test-tags /web:HootSuite.test_check_suite --stop-after-init --log-level=test
+# the suites (all must be run and reported; see Testing for details):
+./scripts/dev/test-py.sh                 # all crm Python tests
+./scripts/dev/test-py.sh TestCrmOffline   # one test class
+./scripts/dev/test-js.sh desktop          # crm JS unit tests, desktop preset
+./scripts/dev/test-js.sh mobile           # same suite, 375x667 touch preset
+./scripts/dev/test-guard.sh               # no only( / debug( in .test.js
 ```
 
-`test-js.sh` and `test-guard.sh` use `-u crm,web`; `web` is required because both suites live in `addons/web/tests/test_js.py`, and Odoo collects tests only from modules installed or updated during the run. The module part of the tag then selects whose `*.test.js` files run: `/crm:` is the fast default, `/web:` is the full suite.
+Before committing, walk the wiring checklist — the items that silently fail when missed:
 
-## Front-end changes and assets
+| What you added | What it must have |
+| --- | --- |
+| A Python test module | An import in `addons/crm/tests/__init__.py`; otherwise it is silently never collected. |
+| A model or controller file | An import in `addons/crm/models/__init__.py` or `addons/crm/controllers/__init__.py`. |
+| An XML data file | An entry in the `data` list of `addons/crm/__manifest__.py`, in dependency order. |
+| A custom view | A registration in `registry.category("views")` **and** a `js_class` binding in `addons/crm/views/crm_lead_views.xml`. |
+| A component | A rendered parent template that reaches it, plus a test proving the reach. |
+| A server touchpoint (button, entry point) | A row in `addons/crm/static/src/mobile/offline_inventory.md` classified QUEUE / SKIP / DISABLE. |
+| Any js/css/scss/xml file | Nothing in the manifest: the existing globs (`crm/static/src/**`, `crm/static/tests/**/*.test.js`, ...) already cover it. Add a bundle entry only to exclude or lazily load a file, in the existing `('remove', ...)` + `web.assets_backend_lazy` pair style. |
 
-After any js, css, scss, or xml edit, run `./scripts/dev/rebuild-assets.sh` before re-testing. It deletes every generated asset attachment and regenerates the bundles in the database:
+## What never changes
 
-```bash
-./odoo-bin shell -d crm_offline --no-http
-env['ir.attachment'].regenerate_assets_bundles()
-env['ir.qweb']._pregenerate_assets_bundles()
-env.cr.commit()
-```
+From `AGENTS.md` section 4, the list every change is checked against:
 
-Assets are generated at install or upgrade time and served as `ir.attachment` records, so a change is invisible to the running server and to the test browser until this runs. See [Assets](../systems/assets.md) for how bundles are built.
-
-## UI changes and tours
-
-A UI change needs a tour to be provable. Onboarding steps live in `addons/crm/static/src/js/tours/crm.js`, registered in the `web_tour.tours` registry and enabled by the `crm_tour` record in `addons/crm/data/crm_tour.xml`. Test tours driven by Python live in `addons/crm/static/tests/tours/` and ship in the `web.assets_tests` bundle. The Python test is an `HttpCase` subclass tagged `post_install` that calls `self.start_tour("/odoo", "tour_name", login="admin")`, as in `addons/crm/tests/test_crm_ui.py`. The framework behind both is on [Test framework](../systems/test-framework.md) and [Onboarding tours](../features/onboarding-tours.md).
-
-## Manifest asset globs
-
-Verify rather than touch the manifest. `addons/crm/__manifest__.py` already routes new files:
-
-- `web.assets_backend` includes `crm/static/src/**`, so new front-end source needs no manifest change.
-- `web.assets_tests` includes `crm/static/tests/tours/**/*`.
-- `web.assets_unit_tests` includes `crm/static/tests/mock_server/**/*`, `crm/static/tests/crm_test_helpers.js`, `crm/static/tests/**/*.test.js`, and `crm/static/tests/crm_mock_server.js`.
-
-The only reason to edit that block is to exclude or lazily load a file, done as a pair: `('remove', 'crm/static/src/views/<dir>/**')` under `web.assets_backend` plus the same path in `web.assets_backend_lazy`, the pattern used for `crm_activity`, `crm_graph`, `crm_pivot`, `forecast_graph`, and `forecast_pivot`.
-
-## Overrides
-
-`scripts/dev/_common.sh` defines the defaults the wrappers read from the environment: `ODOO_DB` (`crm_offline`), `ODOO_PORT` (`8069`), `ODOO_HTTPS_BACKEND_PORT` (`8070`), `ODOO_ADMIN_LOGIN` and `ODOO_ADMIN_PASSWORD` (`admin`), `PGHOST` (`/var/run/postgresql`), and `PGPORT` (`5432`). So `ODOO_DB=other_db ./scripts/dev/test-py.sh` runs the same suite against a different database. The full tooling inventory is on [Tooling](tooling.md).
-
-## Entry points for modification
-
-Change `scripts/dev/_common.sh` only for shared configuration or a new result guard, and add a new script rather than overloading an existing one. For the application itself, work under `addons/crm/`: `models/` for server behavior, `views/crm_lead_views.xml` for arch and `js_class` bindings, `static/src/views/<component>/` for view code, and `tests/` plus `static/tests/` for the proof.
+- No files outside `addons/crm/`. Other addons are extended, not edited: `_inherit`, controller subclassing, JS `patch()`, XML inheritance.
+- No second offline engine: no new sync queue, IndexedDB wrapper, service worker, cache layer, encryption helper, connectivity detector, offline-state store, or conflict resolver. `addons/web` owns all of it.
+- No change to queue semantics: timestamp-ordered replay, last write wins, failed calls parked in the systray. No conflict detection, no `write_date` comparison, no field-level merge, no conflict dialog. The queue replays model, method, args, and kwargs verbatim — anything needing a server onchange, a transient-model wizard, or an id from another call is disabled offline, never queued.
+- No new dependencies: no Python or JS package, no new addon in `depends`, `requirements.txt` unchanged, no npm/bundler/JS build tooling.
+- No new or changed access rule, record rule, or group.
+- No new fields on `crm.lead`, `crm.stage`, or `crm.team`.
+- Every mobile behavior gated on the small-screen signal (`usePlugin(UIPlugin).isSmall()`); desktop behavior must not change. "Native mobile" means the installable PWA; no React Native, Flutter, Swift, Kotlin, Gradle, Xcode, Capacitor.
+- New OWL code uses the plugin API (`Plugin`, `usePlugin`, `signal`), not the legacy `"offline"` service bridge.
+- Only the changes the task needs: no refactoring or optimizing code the task does not touch.
 
 ## Key source files
 
 | File | Purpose |
 | --- | --- |
-| `scripts/dev/README.md` | Authoritative usage of every wrapper and the notes on the three false-green modes. |
-| `scripts/dev/_common.sh` | Environment defaults, port and database guards, `assert_tests_selected` / `assert_no_skips`. |
-| `scripts/dev/test-py.sh` | Chooses `-i crm` or `-u crm --test-tags /crm`, asserts tests were selected, lists skips. |
-| `scripts/dev/test-js.sh` | Desktop and mobile presets, `-u crm,web`, asserts selection and no skips. |
-| `scripts/dev/test-guard.sh` | `HootSuite.test_check_suite` against the whole unit-test bundle. |
-| `scripts/dev/rebuild-assets.sh` | Deletes generated attachments and regenerates bundles through `odoo-bin shell`. |
-| `scripts/dev/reset-db.sh` | Drops the database and filestore, recreates with crm, mail, demo data. |
-| `scripts/dev/start.sh` | Serves on 8069, or TLS on 8069 with Odoo on 8070 with `--https`. |
-| `scripts/dev/setup.sh` | System packages, PostgreSQL, `.venv`, Chrome, `websocket-client`, `phonenumbers`. |
-| `addons/crm/__manifest__.py` | The asset globs and data file order a new file must fit into. |
-| `addons/crm/tests/test_crm_ui.py` | The `HttpCase` plus `start_tour` pattern for UI changes. |
-| `addons/crm/static/tests/tours/` | Test tours shipped in `web.assets_tests`. |
-| `addons/crm/static/src/js/tours/crm.js` | The onboarding tour steps. |
+| `AGENTS.md` | The authoritative rules this page narrates. |
+| `addons/crm/__manifest__.py` | Asset globs, bundle exclusions, data file order. |
+| `addons/crm/tests/__init__.py` | Which Python test modules get collected. |
+| `addons/crm/views/crm_lead_views.xml` | Where every `js_class` binds. |
+| `addons/crm/static/src/mobile/offline_inventory.md` | The QUEUE / SKIP / DISABLE classification new entry points join. |
+| `CONTRIBUTING.md` | Upstream Odoo's contribution pointers (CLA, PR flow). |
 
 ## Related pages
 
-- [How to contribute](index.md)
-- [Testing](testing.md)
-- [Patterns and conventions](patterns-and-conventions.md)
-- [Tooling](tooling.md)
-- [Getting started](../overview/getting-started.md)
-- [Assets](../systems/assets.md)
-- [Test framework](../systems/test-framework.md)
-- [CLI and maintenance](../systems/cli-and-maintenance.md)
+- [How to contribute](index.md) — the scope rule, the definition of done, the review culture
+- [Patterns and conventions](patterns-and-conventions.md) — how code is written, not just committed
+- [Testing](testing.md) — what the commands above actually run and guard
+- [Tooling](tooling.md) — what each script wraps
+- [Getting started](../overview/getting-started.md) — setup and the quick command view
+- [Offline surface inventory](../apps/crm/offline-surface-inventory.md) — the classification a new entry point joins

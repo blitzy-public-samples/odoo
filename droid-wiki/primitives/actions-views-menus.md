@@ -1,6 +1,6 @@
 # Actions, views, and menus
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Christophe, Krzysztof, Bruno
 
 ## Purpose
 

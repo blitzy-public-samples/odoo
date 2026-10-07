@@ -1,59 +1,226 @@
 # Pitfalls
 
-Active contributors: bobbyabbott421-glitch (fork), Odoo SA (upstream)
+These are the danger zones of working on this fork, each with its symptom and its fix.
+Most produce a silent wrong result rather than a loud failure, which is what makes them
+expensive: a green test run that tested nothing, an offline stack that quietly disabled
+itself, an error that lands in a different test than the one that caused it. Sources:
+`AGENTS.md`, `addons/crm/static/src/mobile/README.md` (the "Known limits" list), the
+test helpers in `addons/crm/static/tests/mock_server/crm_offline_test_helpers.js`, and
+the fix commits named in each entry.
 
-## Purpose
+## No secure context means no offline at all
 
-These are the traps that bite contributors in this repo, each with its symptom, its fix, and a pointer into the tree. Most of them produce a silent wrong result rather than a loud failure, which is what makes them expensive. Read this page before trusting a green test run, debugging "offline doesn't work", or copying API names from memory or older documentation.
+**Symptom.** The offline stack is entirely absent: offline features don't queue,
+`navigator.serviceWorker` is undefined, and queueing an ORM write throws
+`NonSecureContextError`. This happens when the page is opened over plain HTTP on any
+host other than `localhost`, for example through a port forward.
 
-## The pitfalls
+**Cause.** `OfflinePlugin` gates its store and crypto on `window.isSecureContext`
+(`addons/web/static/src/core/offline/offline_plugin.js:53-59`): outside a secure context
+it degrades to a no-op `FakeIndexedDB` ("used in non secure context to disable the
+offline features as data can't be encrypted") and drops the `Crypto` instance, and
+`scheduleORM()` refuses to queue (`:271-276`). The degradation is total, not partial.
 
-### Test runs can be green while testing nothing
+**Fix.** Serve with `./scripts/dev/start.sh --https` whenever the page is not on
+`localhost` (self-signed certificates in `var/tls/`; accept the warning once). See
+[offline and PWA](../features/offline-and-pwa/index.md).
 
-Symptom: a test command exits 0 in seconds and you move on, but nothing ran. Three separate modes produce this: Odoo exits 0 having collected 0 tests when the module was not installed or updated in that run; the JS suites in `addons/web/tests/test_js.py` are only collected with `-u crm,web`; and browser tests skip themselves, still exiting 0, when a dependency like `websocket-client` or Chrome is missing. The log actually says so: `logs/test-py-TestCrmOffline.log` records "0 failed, 0 error(s) of 0 tests", and Odoo still exited 0. Fix: run everything through `scripts/dev/test-py.sh` and `scripts/dev/test-js.sh`, which grep the log for `of 0 tests` and `: skipped ` and fail (`scripts/dev/_common.sh`, `assert_tests_selected` and `assert_no_skips`). Details in [testing](../how-to-contribute/testing.md).
+## Asset bundles go stale and lie about your change
 
-### Asset bundles go stale after front-end changes
+**Symptom.** A js/css/scss/xml change has no visible effect, or a JS test fails for a
+reason that no longer matches the source you just edited.
 
-Symptom: a js/scss/xml change has no visible effect, or a JS test fails for a reason that no longer matches the source. Asset bundles are generated at install/upgrade time and served as attachments, so the browser keeps getting the old bundle until it is regenerated. Fix: run `./scripts/dev/rebuild-assets.sh` after every front-end change and before re-testing; `AGENTS.md` calls a result obtained from a stale bundle "not a real result". See [assets](../systems/assets.md).
+**Fix.** Run `./scripts/dev/rebuild-assets.sh` after every front-end change and before
+any test run that follows one. `AGENTS.md` is explicit: "A test that fails only because
+an asset bundle is stale is not a real result — rebuild and re-run before drawing
+conclusions."
 
-### Offline features need a secure context
+## Three ways a test run reports success while testing nothing
 
-Symptom: the offline stack is entirely absent, `navigator.serviceWorker` is undefined, and queuing an ORM write throws `NonSecureContextError`, all because the page was opened over plain http on a host other than localhost (for example through a port forward). Browsers only grant the storage and crypto APIs the stack is built on inside a secure context, so the framework disables offline rather than storing unencrypted. Fix: use `./scripts/dev/start.sh --https`, which terminates TLS with a self-signed certificate on 8069 and proxies to Odoo on 8070 (`scripts/dev/start.sh`). See [offline and PWA](../features/offline-and-pwa/index.md).
+**Symptom.** A test command exits 0 in seconds, but nothing ran.
 
-### `TestCrmOffline` does not exist
+**Cause.** Three distinct silent-success modes: Odoo exits 0 having collected 0 tests
+when the module was not installed or updated in that run; the JS suites in
+`addons/web/tests/test_js.py` are only collected with `-u crm,web`; and browser tests
+skip themselves (still exiting 0) when a dependency like `websocket-client` or headless
+Chrome is missing.
 
-Symptom: `./scripts/dev/test-py.sh TestCrmOffline`, the example given in `AGENTS.md` and `scripts/dev/README.md`, runs 0 tests (the wrapper then fails the run for exactly that reason). No such class exists anywhere in the tree; the real crm test classes are names like `TestCRMLead`, `TestCrmPls`, `TestLeadAssign`, and `TestUi` in `addons/crm/tests/`. Fix: pick a class that exists, and take the general lesson: names in this repo's docs are illustrative and were not all verified against the code. See [testing](../how-to-contribute/testing.md).
+**Fix.** Never trust a raw `./odoo-bin` exit code: run everything through
+`./scripts/dev/test-py.sh` and `./scripts/dev/test-js.sh`, which parse the run log and
+fail on `of 0 tests` and skipped tests (`scripts/dev/_common.sh`). Also import every
+new Python test module in `addons/crm/tests/__init__.py` — an unimported module is
+silently never collected. See [testing](../how-to-contribute/testing.md).
 
-### Documentation lags the 20.0 API
+## `mockOffline()` races the mail.store fetch — use `mockCrmOffline()`
 
-Symptom: code written from upstream documentation, tutorials, or pre-20.0 memory fails at load or render. Upstream docs still describe `ir.model.access` + `ir.rule` (unified into `ir.access` here), `attrs=` in view archs, `name_get`, `<tree>`, and older `read_group` signatures, none of which exist in this revision. Fix: confirm an API exists in this tree before using it, by grepping the ORM or a live usage; `skills/odoo-review/SKILL.md` ("Version traps") makes this the standing rule for reviewing too.
+**Symptom.** An uncaught `ConnectionLostError` from `/mail/store` fails a test that
+mounts no `WebClient` and asserts nothing about mail, and the failing file moves
+between runs.
 
-### The POS disables the fork's offline plugin
+**Cause.** Any test that mounts a `WebClient` (directly or through mail's `start()`)
+starts a debounced background `mail.store` fetch. Web's raw `mockOffline()` drops the
+connection immediately; if that fetch is still in flight it rejects a tick later and
+lands in whichever test happens to be running then — observed in
+`crm_offline_config_list_guards.test.js`, `crm_offline_lead_list_controls.test.js`, and
+`crm_offline_email_phone_force_save.test.js` across different runs (commit
+`9adf1c966ec`).
 
-Symptom: offline queue behavior, the offline systray, and button disabling behave differently or not at all inside point_of_sale sessions, and you start debugging the web plugin for nothing. There are two offline stacks: `addons/point_of_sale/static/src/app/plugins/offline_plugin.js` patches the fork's `OfflinePlugin.setup` to skip its setup and set `_crypto = false` in POS / Self-Ordering mode, because the POS wants its own UI to remain functional offline. Fix: when investigating offline behavior in the POS, read that patch first, and remember the web plugin is deliberately neutralized there. See [point of sale](../apps/point-of-sale.md) and [design decisions](design-decisions.md).
+**Fix.** Toggle connectivity with `mockCrmOffline()` from
+`addons/crm/static/tests/mock_server/crm_offline_test_helpers.js` instead of the raw
+`mockOffline()`. It settles the mail store first: `isReadyPromise`, then
+`advanceTime(5)`, `animationFrame()`, and a second `advanceTime(5)` — a deterministic
+timer flush that covers the 1ms debounce without fast-forwarding the framework's own
+long-lived timers (the offline backoff ping, `_syncORM`'s 1s pause).
 
-### `l10n_hr` is Croatia, not human resources
+## Flush the mail.store fetch before `destroyApp()`
 
-Symptom: grepping for HR / payroll code lands on the Croatian localization, whose manifest is "Croatia - Accounting (Euro)" with `countries: ['hr']` (`addons/l10n_hr/__manifest__.py`), because `hr` is Croatia's ISO code. Payroll itself is absent from this repository entirely: there is no `hr_payroll` addon, and the HR family (`addons/hr/`, `hr_holidays`, `hr_expense`, ...) covers employees, leave, and expenses only. Fix: look for payroll in Odoo's enterprise releases, not here. See [HR suite](../apps/hr-suite.md) and [localizations](../apps/localizations-and-integrations.md).
+**Symptom.** In `crm_offline_cold_start.test.js`-style tests (mount a `WebClient`,
+destroy it, mount another, go offline), an intermittent `/mail/store` assertion fails
+in `crm_offline_config_list_guards.test.js` — the next file alphabetically, which never
+mounts a `WebClient` itself.
 
-### `sale` vs `sale_management`
+**Cause.** Destroying the app does not cancel its background fetch.
+`mockCrmOffline()`'s wait only reaches the *currently mounted* app's mail store, so the
+first `WebClient`'s fetch was still in flight when the second test flipped the
+connection offline; the late rejection surfaced wherever hoot happened to be (hoot runs
+file-ordered). Diagnosed and fixed in commit `7eaae3cfa16`.
 
-Symptom: installing or depending on the wrong one changes what users get. Both manifests are named "Sales": `addons/sale` is the model layer (sales orders, order lines, templates), while `addons/sale_management` depends on `sale` (and `digest`) and adds the menus, reporting views, and quotation templates that make it an app. Note that `addons/crm` depends on neither, only on `sales_team`, so `sale` enters the picture only when quotations are installed. Fix: depend on `sale` for the models, on `sale_management` only when the app experience is wanted. See [sales suite](../apps/sales-suite.md).
+**Fix.** Call `waitForMailStoreReady()` (exported from the same helpers file) on a
+`WebClient` mounted online, right before `destroyApp()`.
 
-### `ir.rule` and `ir.model.access` are gone
+## `user.hasGroup` caches rejections forever
 
-Symptom: security data written from upstream examples (`ir.model.access.csv`, `ir.rule` records) fails to load, and tutorials reference models that do not exist. In 20.0 both are unified as `ir.access` (`odoo/addons/base/models/ir_access.py`), and security CSVs are named `ir.access.csv` (for example `addons/crm/security/ir.access.csv`). Fix: write `ir.access` rows with `operation` (a subset of `crud`), optional `group_id`, and optional `domain`. See [users, groups, and access](../primitives/users-groups-and-access.md) and [security](../security.md).
+**Symptom.** A sales manager loses the "Manage Teams" entry for the rest of the page's
+life after a reconnect, with no error dialog; every later probe returns the same dead
+promise.
 
-### OWL 3 lives in the `owl2` directory
+**Cause.** Web's `user.hasGroup` caches the promise per group, and `Cache.read()`
+never evicts a rejection (`addons/web/static/src/core/utils/cache.js`). If the first
+probe for a component rejects with `ConnectionLostError` during a brief false-online
+moment, every subsequent `hasGroup("sales_team.group_sale_manager")` returns that same
+rejected promise. Commit `e73c21d0720` added the recovery; commit `eb41b7fd512` first
+hardened the rejection handling whose absence made it loop.
 
-Symptom: you look for OWL version boundaries and find the compatibility layer at `addons/web/static/src/owl2/owl3_compatibility_layer.js`, a directory named `owl2` that patches the vendored OWL 3 (`addons/web/static/lib/owl/owl.js`). Imports of `@odoo/owl` resolve through that compat layer, not to raw OWL 3, so new code must use the APIs the layer provides (the plugin/service split, `usePlugin`, signals). Fix: treat `@odoo/owl` as "OWL 3 plus compat", and write new code on the plugin API rather than the legacy service bridges marked `@todo owl3 migration`. See [web client](../apps/web/index.md).
+**Fix.** Already shipped in `addons/crm/static/src/components/team_switcher/team_switcher.js`:
+once a `ConnectionLostError` poisons the cache, later online probes bypass
+`user.hasGroup` entirely and issue a fresh, uncached `orm.silent.call("res.users",
+"has_group", ...)`. The general lesson for any new code probing groups: never call
+`hasGroup` unguarded from an effect that re-runs on `isOffline()` flips, and treat a
+`ConnectionLostError` as a skip, not a poison.
 
-### Git history cannot answer "who wrote this"
+## A brief false-online flip leaves stale offline UI
 
-Symptom: `git log`, `git blame`, and per-author statistics return almost nothing meaningful, because the entire `20.0` base is one squashed commit (an upstream mail fix message with an `X-original-commit` trailer) that also contains the offline framework without attribution, plus one `scripts/dev` commit on top. Nothing records why it was squashed. Fix: date and attribute nothing from git in this repo, read the code instead, and see [lore](../lore.md) for what the two commits actually tell you.
+**Symptom.** After reconnecting, the offline systray badge and disabled buttons can
+persist with no network traffic; or, before the fix, the page looped back to offline
+repeatedly. A reload clears it.
+
+**Cause.** `isOffline()` can briefly read `false` while the network is actually still
+down — a stray successful `RPC:RESPONSE` lands ahead of a parked request's own failure.
+A reactive probe that fires on the online flip then rejects with
+`ConnectionLostError`, and (combined with the poisoned `hasGroup` cache above) could
+re-trigger `setOffline(true)` in a loop (commit `eb41b7fd512`). The mobile README
+lists the residual cosmetic case: "A brief false-online flip can leave the offline UI
+showing after reconnect; reload clears it."
+
+**Fix.** Handle the rejection in every effect that re-runs on `isOffline()` flips:
+swallow `ConnectionLostError`, keep the last known value, re-probe on the next flip.
+The team-switcher fix scanned every other CRM effect for the same pattern and found
+none; new effects must not reintroduce it.
+
+## Queuing a method web's systray doesn't know crashes the systray
+
+**Symptom.** Opening the offline systray dropdown throws
+(`element.status.color` of undefined) once a non-standard method is queued.
+
+**Cause.** Web's systray only assigns `item.status` for the four methods it produces
+itself (`web_save`, `web_unlink`, `action_archive`, `action_unarchive`); any other
+queued method leaves `status` undefined and the dropdown template dereferences it.
+The fix is deliberately CRM-side (commit `04c021aeb50`): "Work around it from crm's
+side (never fixed in addons/web itself, see known limits) with
+`offline_systray_patch.js`", patching `OfflineSystray.setup()` to label every method
+CRM queues — `action_set_won` ("Won"), `action_restore` ("Restored"),
+`action_log_call` ("Call logged"), `mail.activity` create ("Activity scheduled"),
+`action_done` ("Activity done").
+
+**Fix.** If you queue a new method through `useCrmOffline().queueCall`, add its label
+to `addons/crm/static/src/webclient/offline_systray_patch.js` in the same change, or
+the systray crashes the first time the entry is listed. The known limit stays open
+because the root cause is in `addons/web`.
+
+## Service-worker and manifest gotchas
+
+**Symptom.** Two offline PWA scenarios behave in surprising ways:
+
+- The manifest's `start_url` opens the first app, not CRM: web serves
+  `'start_url': '/odoo'` (`addons/web/controllers/webmanifest.py:47`), and a full
+  offline relaunch shows web's offline page. The "New Lead" shortcut shows the cached
+  pipeline instead of a new-lead form while offline.
+- If CRM was first opened by typing `/odoo/crm`, the CRM shortcut shows a blank page
+  offline: the action is cached under the *string* key `crm`, while the app tile and
+  menus cache the *numeric* action id.
+
+**Cause.** `isAvailableOffline(actionId, ...)` keys offline availability on the action
+id the view was opened with (`addons/web/static/src/core/offline/offline_plugin.js:229-238`;
+`addons/web/static/src/webclient/actions/action_plugin.js:1309-1315`), while menus carry
+numeric ids (`addons/web/static/src/webclient/menus/menu_providers.js:39`). Typing
+`/odoo/crm` records the visit under the string `crm`, so the numeric-id lookup misses.
+
+**Fix.** Documented avoidance, not code: open CRM from the app tile or the menu, not a
+typed URL. Both quirks are entries in the mobile README's known-limits list because
+the manifest and the keying live in `addons/web`, outside the fork's scope. See
+[service worker and install](../features/offline-and-pwa/service-worker-and-install.md).
+
+## Mobile-preset flakes: deterministic timers, not wall-clock waits
+
+**Symptom.** `./scripts/dev/test-js.sh mobile` fails intermittently (1-2 runs of 3)
+with no code change, always in a different file, and passes on rerun; new JS tests
+must pass under both presets, so these look like real regressions.
+
+**Cause.** Two flake classes fixed in commit `9adf1c966ec`: asserting
+(`expect.verifyErrors`) right after a disk-cache `doAction` resolved, before the
+declared background `ConnectionLostError`s had been logged — fixed with an extra
+`animationFrame()` tick; and replacing a single real `animationFrame()` wall-clock
+wait with `advanceTime(5)`, because under full-suite load one real tick is not always
+enough time for a 1ms debounced timer to fire. A related chatter paste/drop timeout was
+stabilized the same way (commit `f297e5e5e6c`).
+
+**Fix.** Prefer hoot's deterministic timer control (`advanceTime`, `animationFrame`)
+over real waits; never assert immediately after a promise resolves if background
+declarations are still in flight; and always run both presets before reporting a
+front-end result.
+
+## Known baseline failures are not regressions
+
+**Symptom.** Two failures appear on the untouched baseline and will reappear in your
+runs: the `scroll loses target` test of the `throttleForAnimation` group
+(`addons/web/static/tests/core/utils/timing.test.js`, full web JS suite), and
+`TestConfig.test_settings_pls_start_date`, which fails only when the run happens
+between 22:00 and 24:00 UTC (a user-timezone vs UTC date mismatch in upstream code).
+
+**Fix.** `AGENTS.md` defines them out of scope: do not fix them, do not treat them as
+regressions, and never modify, skip, or retag the timezone test to make it pass.
+Report them as known baseline failures in that window and move on. See
+[debugging](../how-to-contribute/debugging.md).
+
+## Key sources
+
+| Source | What it holds |
+| --- | --- |
+| `AGENTS.md` | The secure-context warning, the stale-assets rule, the silent-success modes, the baseline failures |
+| `addons/crm/static/src/mobile/README.md` | The "Known limits" list most of these traps ship as, and the `mockCrmOffline()` testing guidance |
+| `addons/crm/static/tests/mock_server/crm_offline_test_helpers.js` | `mockCrmOffline()` and `waitForMailStoreReady()`, with the full race documented in the doc comments |
+| `addons/web/static/src/core/offline/offline_plugin.js` | The secure-context gates, the visited-action keying, the queue |
+| `addons/crm/static/src/components/team_switcher/team_switcher.js` | The poisoned-cache bypass and the false-online rejection handling |
+| `addons/crm/static/src/webclient/offline_systray_patch.js` | The systray label patch for CRM-queued methods |
 
 ## Related pages
 
-- [Design decisions](design-decisions.md) for the reasoning these pitfalls hang off
-- [Testing](../how-to-contribute/testing.md) and [debugging](../how-to-contribute/debugging.md) for the workflows that catch these traps
-- [Assets](../systems/assets.md), [offline and PWA](../features/offline-and-pwa/index.md), and [test framework](../systems/test-framework.md) for the subsystems behind the biggest three
+- [Design decisions](design-decisions.md) for the rules these traps hang off
+- [Background](index.md) for the hub
+- [Debugging](../how-to-contribute/debugging.md),
+  [testing](../how-to-contribute/testing.md), and
+  [patterns and conventions](../how-to-contribute/patterns-and-conventions.md) for the
+  workflows that catch them
+- [Offline CRM](../apps/crm/offline-crm.md) for the feature surface the traps guard,
+  and the mobile README's "Testing" section
+  (`addons/crm/static/src/mobile/README.md`) for the manual offline QA procedure

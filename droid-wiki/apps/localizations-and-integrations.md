@@ -1,6 +1,6 @@
 # Localizations and integrations
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Christophe, Olivier, Fabien
 
 ## Purpose
 
@@ -24,7 +24,7 @@ graph TD
 
 The `template()` decorator is defined at `addons/account/models/chart_template.py:53`; `_get_chart_template_mapping` (same file, line 108) discovers every decorated method across installed modules and builds the list of selectable charts, and the loader instantiates accounts, taxes, fiscal positions and journals for one company. Country variants live side by side, `l10n_be` ships `template_be.py`, `template_be_asso.py` (non-profits) and `template_be_comp.py` (companies). Country-specific behavior that cannot be expressed as data goes in small `_inherit` files next to the templates (`account_move.py`, `account_tax.py`, `account_journal.py`, `res_company.py`).
 
-Bank and tax EDI is layered on top: 39 modules match `l10n_*edi*` (for example `l10n_it_edi`, `l10n_es_edi_sii`, `l10n_in_edi`, `l10n_hu_edi`), and they build on three core modules, `addons/account_edi`, `addons/account_edi_ubl_cii` (UBL and Factur-X/CII document formats) and `addons/account_edi_proxy_client` (the client for Odoo's proxy to government endpoints). See [accounting](accounting.md) for the `account` models they extend.
+Bank and tax EDI is layered on top: 39 modules match `l10n_*edi*` (for example `l10n_it_edi`, `l10n_es_edi_sii`, `l10n_in_edi`, `l10n_hu_edi`), and they build on three core modules, `addons/account_edi`, `addons/account_edi_ubl_cii` (UBL and Factur-X/CII document formats) and `addons/account_edi_proxy_client` (the client for Odoo's proxy to government endpoints), with `addons/account_peppol` riding on the formats and the proxy to send and receive invoices over the Peppol network. See [accounting](accounting.md) for the `account` models they extend.
 
 ## Payment providers
 
@@ -35,7 +35,7 @@ A provider module is a thin adapter with a predictable shape, visible in `addons
 ## Login providers, connectors and services
 
 - **Authentication.** 12 `auth_*` modules add login mechanisms to `res.users`: `auth_ldap`, `auth_oauth` (which also pulls in `auth_signup`), `auth_signup` (self-registration and invitation), `auth_passkey` (+ `auth_passkey_portal`), `auth_totp` (+ `auth_totp_mail`, `auth_totp_portal`), `auth_password_policy` (+ `_portal`, `_signup`) and `auth_timeout`. Several are `auto_install`, so they are present in most databases.
-- **Google and Microsoft.** `addons/google_account` and `addons/microsoft_account` hold the shared OAuth token plumbing; `google_calendar` and `microsoft_calendar` synchronise `calendar.event` both ways; `google_gmail` and `microsoft_outlook` provide OAuth for outgoing and incoming mail servers; `google_recaptcha` protects public forms and `google_address_autocomplete` fills addresses. There is no Drive connector in this repository.
+- **Google and Microsoft.** `addons/google_account` and `addons/microsoft_account` hold the shared OAuth token plumbing; `google_calendar` and `microsoft_calendar` synchronise `calendar.event` both ways; `google_gmail` and `microsoft_outlook` provide OAuth for outgoing and incoming mail servers; `google_recaptcha` protects public forms and `google_address_autocomplete` fills addresses. There is no Drive connector in this repository, and no `fetchmail`, `link_preview`, `web_gantt` or `web_map` module; the `web_*` companions that do exist (`web_hierarchy`, `web_tour`, `web_unsplash`) are listed in [other business apps](other-business-apps.md).
 - **In-app purchase.** `addons/iap` (`auto_install`, depends on `web` and `base_setup`) holds the credit-account model and the RPC helper that calls Odoo's IAP endpoints. `iap_mail` and `iap_crm` are the per-domain glue, and the consumers are feature modules: `partner_autocomplete` (company data lookup, `auto_install` on `iap_mail`), `crm_iap_enrich` (enrich a lead from its email domain, `auto_install`) and `crm_iap_mine` / `website_crm_iap_reveal` (lead generation and visitor reveal), described in [CRM](crm/index.md).
 - **Storage and certificates.** `addons/cloud_storage` redirects large `ir.attachment` uploads to an external bucket through `models/ir_attachment.py` and `models/ir_http.py`, with `cloud_storage_azure`, `cloud_storage_google` and `cloud_storage_migration` as the concrete backends. `addons/certificate` (`certificate.py`, `key.py`) stores X.509 certificates and private keys for the EDI modules that must sign documents.
 - **Hardware.** `addons/iot_drivers` is marked `installable: False` in its manifest: it is the code that runs on an IoT Box to expose printers, scales and payment terminals, not a server-side app. `addons/iot_webserial` is its browser-side counterpart.
@@ -54,6 +54,7 @@ A new localization is a new module: manifest with `countries` and `auto_install:
 | `addons/l10n_be/models/account_move.py` | Country-specific behavior via `_inherit` |
 | `addons/account_edi_ubl_cii/` | UBL and Factur-X/CII document builders shared by EDI localizations |
 | `addons/account_edi_proxy_client/` | Client for Odoo's proxy to government e-invoicing endpoints |
+| `addons/account_peppol/models/account_move.py` | Peppol send and receive on top of UBL through the proxy client |
 | `addons/payment/models/payment_provider.py` | Provider configuration and capability flags |
 | `addons/payment/models/payment_transaction.py` | Transaction state machine shared by all providers |
 | `addons/payment/controllers/portal.py` | Portal payment flow |
@@ -74,4 +75,4 @@ A new localization is a new module: manifest with `countries` and `auto_install:
 - [CRM](crm/index.md): consumer of `crm_iap_enrich` and `crm_iap_mine`.
 - [Module system](../systems/module-system.md): manifests, `depends`, `auto_install`, data loading order.
 - [Patterns and conventions](../how-to-contribute/patterns-and-conventions.md): `_inherit`, controller subclassing, and this fork's scope rules.
-- [Other apps](other-business-apps.md): `calendar`, `portal` and the other modules these connectors plug into.
+- [Other business apps](other-business-apps.md): `calendar`, `portal` and the other modules these connectors plug into.

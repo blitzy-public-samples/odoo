@@ -1,26 +1,31 @@
-# Odoo 20.0 offline CRM fork
+# Odoo, offline and mobile CRM fork
 
-This repository is a fork of Odoo 20.0, the open-source business application suite. The fork exists for one purpose: an **offline-capable, installable-PWA CRM**. Sales people in the field open the CRM pipeline on a phone, go through tunnels and dead zones, and their edits survive: writes made offline are queued locally, encrypted, and replayed to the server when the connection returns.
+Odoo is an open-source suite of business applications: CRM, accounting, inventory, manufacturing, website building, HR, point of sale, marketing, and project management. A Python server stores everything in PostgreSQL, and a large OWL-based JavaScript client renders every screen. The server code lives in the `odoo/` package and in 642 addon directories under `addons/`, each contributing models, views, controllers, and front-end assets.
 
-Everything the offline stack needs lives in `addons/web`: encrypted IndexedDB storage, an ORM call sync queue, a service worker, PWA install plumbing. `addons/crm` only consumes it. The project rules in `AGENTS.md` are explicit: changes stay under `addons/crm/`, the fork stays rebasable onto upstream Odoo 20.0, and nobody builds a second offline engine.
+This repository is a fork of Odoo 20.0 with one mission: an offline-capable, mobile-first CRM. The offline and PWA framework lives in `addons/web` (sync queue, encrypted local store, service worker, offline user interface). All of the fork's own work lives in `addons/crm` and consumes that framework: queued offline writes for leads and activities, offline guards for everything that needs a live server, a small-screen mobile pipeline, and PWA shortcuts and share target. The fork must stay rebasable on upstream 20.0, so changes are confined to `addons/crm` (plus this wiki and the dev scripts).
 
-## What the codebase is
+If you are new here, three files carry the ground truth:
 
-- **`odoo/`**: the core server: an HTTP/WSGI stack with three server models (threaded, prefork, gevent longpolling), a full ORM (`odoo/orm/`), a module loader driven by manifests and a dependency graph, connection pooling, and an integrated test framework. See [systems](../systems/index.md).
-- **`addons/`**: 642 business modules. The `base` module lives inside the core package at `odoo/addons/base` and defines the `ir.*`/`res.*` system models. Business apps cover CRM, sales, accounting, inventory, manufacturing, HR, websites, point of sale, marketing, and 229 country localizations. See [apps](../apps/index.md).
-- **`addons/web`**: the OWL-based web client every addon uses, plus this fork's offline/PWA stack. See [web client](../apps/web/index.md) and [offline and PWA](../features/offline-and-pwa/index.md).
-- **`scripts/dev/`**: a reproducible dev environment: PostgreSQL, a virtualenv, headless Chrome, a `crm_offline` demo database, and one wrapper script per task. See [getting started](getting-started.md).
+- `AGENTS.md` — the rules agents and developers follow in this fork: commands, the offline framework's API, crm conventions, and project rules.
+- `scripts/dev/README.md` — the reproducible dev environment and every test command.
+- `addons/crm/static/src/mobile/README.md` — developer notes for the offline and mobile CRM itself, including its known limits.
 
-Scale: roughly 1.36M lines of Python across 9,397 files, another ~1.2M lines of JavaScript (plus 250k vendored), 6,044 XML files, 20,189 translation catalogs. It is a monorepo with no CI pipelines; every test run is manual through `scripts/dev/` and its result is reported by hand.
+## What is where
 
-## Who uses it
+| Area | Where |
+| --- | --- |
+| Server core (ORM, HTTP, fields, module loading) | `odoo/` |
+| Addons, including the CRM | `addons/` |
+| Offline/PWA framework (queue, store, service worker, offline UI) | `addons/web/static/src/core/offline/`, `addons/web/static/src/core/pwa/` |
+| The fork's offline/mobile CRM | `addons/crm/static/src/mobile/`, `addons/crm/static/src/views/view_components/` |
+| The offline surface inventory (every crm server touchpoint classified) | `addons/crm/static/src/mobile/offline_inventory.md` |
+| Dev environment and test scripts | `scripts/dev/` |
+| Offline QA skill for browser testing | `.factory/skills/odoo-offline-qa/SKILL.md` |
 
-Two audiences share this repo. Engineers working on the fork add features to the CRM app and its offline behavior, gated by the rules in `AGENTS.md`. Anyone else reading the code is likely coming from upstream Odoo and needs to find where this fork diverges: the offline stack in `addons/web/static/src/core/offline/`, the share-target controller in `addons/crm/controllers/webmanifest.py`, the CRM custom views, and the dev scripts.
+## Where to read next
 
-## Where to go next
-
-- New to the codebase: [architecture](architecture.md), then [getting started](getting-started.md).
-- Building offline features: [offline and PWA](../features/offline-and-pwa/index.md): start with the [sync queue](../features/offline-and-pwa/sync-queue.md).
-- Working on CRM: [CRM app](../apps/crm/index.md) and its [custom views](../apps/crm/crm-views.md).
-- Understanding the server: [ORM](../systems/orm.md), [HTTP server](../systems/http-server.md), [module system](../systems/module-system.md).
-- Vocabulary: [glossary](glossary.md).
+- [Architecture](architecture.md) — how the server, the web client, and the offline stack fit together.
+- [Getting started](getting-started.md) — prerequisites, setup, running, and testing.
+- [The offline and PWA framework](../features/offline-and-pwa/index.md) — the queue, the local store, and the service worker that crm builds on.
+- [Offline CRM](../apps/crm/offline-crm.md) and [Mobile CRM](../apps/crm/mobile-crm.md) — what the fork added to the CRM.
+- [Glossary](glossary.md) — the vocabulary this wiki uses.

@@ -1,6 +1,6 @@
 # Cron and scheduled actions
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Krzysztof, Julien, Xavier
 
 ## Purpose
 
@@ -92,11 +92,20 @@ CRM ships two scheduled actions, both inactive by default:
 
 Both are plain `state = 'code'` server actions calling a model method, which is the normal shape for an addon cron. `_cron_assign_leads(force_quota=False, creation_delta_days=7)` in `addons/crm/models/crm_team.py` is written to be safe when the cron runs more than once a day, because it accounts for the leads already assigned that day rather than assuming one run per interval. The CRM test suite drives the crons directly (`addons/crm/tests/common.py` resolves `crm.ir_cron_crm_lead_assign`) instead of waiting for a worker.
 
+### Automation rules reuse the same cron row
+
+`addons/base_automation` builds record-triggered automation on top of this machinery. `base.automation` (`addons/base_automation/models/base_automation.py:130`) is another server-action holder — it delegates to an `ir.actions.server` the way `ir.cron` does — and its `trigger` is `on_create`, `on_write`, `on_create_or_write`, `on_unlink`, `on_change`, or one of the time-based triggers. Time-based rules carry `trg_date_id`, `trg_date_range`, and `trg_date_range_type`, and they are executed by a cron, not by the ORM directly: `_update_cron()` keeps `base_automation.ir_cron_data_base_automation_check` ("Automation Rules: check and execute", `addons/base_automation/data/base_automation_data.xml`) active with the shortest interval any time-based rule needs, and writes it back to inactive when none is left. So `base_automation` is just another producer of an `ir.cron` row, and the acquisition, trigger, and failure policy described above applies to it unchanged.
+
+### Where administrators find them
+
+Settings > Technical > Automation holds the Scheduled Actions list (`base.menu_ir_cron_act`, `odoo/addons/base/views/base_menus.xml`, sequence 2) and the Cron Triggers list (`base.ir_cron_trigger_menu`, backing `ir.cron.trigger`). The list action is `base.ir_cron_act`; the form's "Run Manually" button is what calls `method_direct_trigger`.
+
 ## Integration points
 
 - A cron is an `ir.actions.server`, so its `code` field is protected by `groups='base.group_system'` and the whole record is `_allow_sudo_commands = False`.
 - Cron rows are shipped as XML data inside `<data noupdate="1">` so that a module upgrade does not reset a schedule an administrator has changed.
 - `_process_jobs` is invoked from `odoo/service/server.py` in both the threaded and prefork servers, and from `odoo/cli/` when the server is started in a cron-only configuration.
+- `addons/base_automation` owns one more `ir.cron` row for its time-based automation rules and keeps its interval in sync with the rules that exist; see [base addon](../apps/base.md).
 
 ## Entry points for modification
 
@@ -117,6 +126,9 @@ To add background work, write a model method and declare a cron record in your a
 | `addons/crm/models/res_config_settings.py` | Settings that read and write the assignment cron's schedule. |
 | `addons/crm/models/crm_lead.py` | `_cron_update_automated_probabilities`. |
 | `odoo/addons/base/tests/test_ir_cron.py` | Behavior tests, including trigger coalescing. |
+| `addons/base_automation/models/base_automation.py` | `base.automation`, time-based triggers, `_update_cron`. |
+| `addons/base_automation/data/base_automation_data.xml` | The "Automation Rules: check and execute" cron. |
+| `odoo/addons/base/views/base_menus.xml` | Settings > Technical > Automation menu entries for crons and triggers. |
 
 ## Related pages
 

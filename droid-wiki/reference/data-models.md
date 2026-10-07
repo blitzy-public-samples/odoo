@@ -1,160 +1,175 @@
 # Data models
-Active contributors: Odoo SA (upstream)
 
 ## Purpose
 
-Odoo has thousands of models, so this page is a map of the records that
-explain most server behavior rather than an exhaustive catalog. The `ir.*`
-registry models describe metadata and execution, `res.*` models describe
-identity and company context, and `crm.lead` is the business schema most
-relevant to this fork.
+A map of the data layer, at reference depth: how models are declared, which
+field types and constraint kinds exist, where the core models live, which
+inheritance pattern to pick for a given extension, and where schema changes
+happen. It points into the code; it does not catalog every field. For how the
+ORM executes all this, read [ORM](../systems/orm.md); for how models get
+loaded into the registry, [Module system](../systems/module-system.md).
 
-## Directory layout
+## Model definition attributes
 
-```text
-odoo/addons/base/models/       ir.* and res.* system models
-addons/crm/models/crm_lead.py  crm.lead schema and behavior
-odoo/orm/                      model, field, environment, and registry machinery
-odoo/cli/shell.py              interactive ORM shell
-```
+Models are Python classes inheriting `Model`, `AbstractModel`, or
+`TransientModel` (exported from `odoo/models/__init__.py`, defined in
+`odoo/orm/models.py` and `odoo/orm/models_transient.py`). The class
+attributes the ORM reads (`odoo/orm/models.py:428-482`):
 
-## Key abstractions
+| Attribute | Default | Meaning |
+| --- | --- | --- |
+| `_name` | — | Model name in dot-notation (e.g. `crm.lead`). Absent on `_inherit`-only extensions. |
+| `_description` | `None` | Informal name used in logs and the UI. |
+| `_inherit` | `()` | Model(s) to extend: a string, or a list for mixins. Same `_name` (or none) extends in place; a new `_name` + `_inherit` creates a copy under a new name. |
+| `_inherits` | `{}` | Delegation: `{parent_model: m2o_field}` — parent columns readable/writable through the child. Example: `res.users` → `{'res.partner': 'partner_id'}` (`odoo/addons/base/models/res_users.py`). |
+| `_rec_name` | `'name'` | Field used as the record label (`display_name` builds on it). |
+| `_rec_names_search` | `()` | Extra fields searched by `name_search`. |
+| `_order` | `'id'` | Default `search()` order. Example: `crm.lead` uses `"priority desc, id desc"` (`addons/crm/models/crm_lead.py`). |
+| `_parent_name` | `'parent_id'` | The many2one used as the tree parent (`res.partner`, `crm.stage`...). |
+| `_parent_store` | `False` | Maintain `parent_path` for subtree reads on parent-structured models. |
+| `_active_name` | `None` | Archiving field if not `active`. |
+| `_auto` / `_transient` | `True` / per class | Table creation; `TransientModel` sets `_transient=True` (auto-vacuumed, see `odoo/orm/models_transient.py`). |
 
-| Model | File | Role |
-|---|---|---|
-| `ir.model` | `odoo/addons/base/models/ir_model.py` | Registry metadata for model names and fields. |
-| `ir.access` | `odoo/addons/base/models/ir_access.py` | CRUD permissions and domain restrictions, unified in 20.0. |
-| `ir.actions.*` | `odoo/addons/base/models/ir_actions.py` | Actions that open views, URLs, reports, or server code. |
-| `ir.ui.view` | `odoo/addons/base/models/ir_ui_view.py` | Stored view architecture and inheritance. |
-| `ir.ui.menu` | `odoo/addons/base/models/ir_ui_menu.py` | Navigation tree and action bindings. |
-| `ir.cron` | `odoo/addons/base/models/ir_cron.py` | Scheduled server actions and retry state. |
-| `ir.attachment` | `odoo/addons/base/models/ir_attachment.py` | Binary or URL attachments linked to records. |
-| `ir.config_parameter` | `odoo/addons/base/models/ir_config_parameter.py` | Database-scoped string parameters with typed accessors. |
+`AbstractModel` classes are the mixins: `mail.thread`, `mail.activity.mixin`,
+`utm.mixin`, ... A concrete model lists them in `_inherit` — `crm.lead`
+inherits `mail.thread.subject.suggested`, `mail.thread.blacklist`,
+`mail.thread.phone`, `mail.activity.mixin`, `utm.mixin`,
+`format.address.mixin`, `mail.tracking.duration.mixin`
+(`addons/crm/models/crm_lead.py`).
 
-## How it works
+## Field types
 
-```mermaid
-graph TD
-    R[Registry] --> M[ir.model]
-    M --> F[Model fields]
-    A[ir.access] -->|checks| X[ORM operations]
-    V[ir.ui.view] -->|architecture| U[Web views]
-    N[ir.ui.menu] -->|action binding| U
-    C[ir.cron] -->|scheduled call| X
-    P[res.users] -->|identity and groups| A
-    L[crm.lead] -->|business data| X
-```
+`odoo/fields/__init__.py` is the public import surface
+(`from odoo import fields`); the implementations live in
+`odoo/orm/fields_*.py`:
 
-### The `ir.*` registry layer
+| Module | Types |
+| --- | --- |
+| `odoo/orm/fields_misc.py` | `Id`, `Json`, `Boolean` |
+| `odoo/orm/fields_numeric.py` | `Integer`, `Float`, `Monetary` |
+| `odoo/orm/fields_textual.py` | `Char`, `Text`, `Html` |
+| `odoo/orm/fields_selection.py` | `Selection` |
+| `odoo/orm/fields_temporal.py` | `Date`, `Datetime` |
+| `odoo/orm/fields_relational.py` | `Many2one`, `One2many`, `Many2many` |
+| `odoo/orm/fields_reference.py` | `Reference`, `Many2oneReference` |
+| `odoo/orm/fields_binary.py` | `Binary`, `Image` |
+| `odoo/orm/fields_properties.py` | `Properties`, `PropertiesDefinition` |
 
-`ir.model` is metadata for model identity and field introspection. Access
-records in `odoo/addons/base/models/ir_access.py:64-124` point to an
-`ir.model`, a group, CRUD operations, and an optional domain. In this Odoo
-20.0 tree, that model replaces the older split between ACL and record-rule
-records.
+`Command` (write commands for relational fields) and `Domain` are
+imported from `odoo/orm/commands.py` and `odoo/orm/domains.py` through the
+same package.
 
-`ir.actions.actions` is the common action table; window, URL, report, client,
-server, and todo actions extend it (`odoo/addons/base/models/ir_actions.py:54-80`).
-`ir.ui.view` stores the model, type, architecture, inheritance, groups, and
-priority. Its `arch_db`, `inherit_id`, and `mode` fields are the key pieces for
-view resolution (`odoo/addons/base/models/ir_ui_view.py:146-205`).
-`ir.ui.menu` forms the parent/child navigation tree and points at an action.
-`ir.cron` delegates to a server action and stores interval, next execution,
-priority, and consecutive failure fields (`odoo/addons/base/models/ir_cron.py:93-131`).
-`ir.attachment` links binary data to a model and selects database or filestore
-storage through `ir_attachment.location` (`odoo/addons/base/models/ir_attachment.py:68-112`).
-`ir.config_parameter` is a unique key/value table; `get_bool`, `get_int`,
-`get_float`, and `get_str` convert its stored text
-(`odoo/addons/base/models/ir_config_parameter.py:20-117`).
+### Field behavior flags
 
-### The `res.*` identity layer
+Common constructor arguments with their file anchor
+(`odoo/orm/fields.py:264-315`):
 
-`res.partner` is the contact and company-facing identity record. It holds
-names, parent/child relationships, language, timezone, tax ID, addresses,
-tags, and communication details (`odoo/addons/base/models/res_partner.py:266-344`).
-`res.users` delegates contact data to `res.partner` through `_inherits`, then
-adds login, password handling, groups, home action, default company, and
-allowed companies (`odoo/addons/base/models/res_users.py:166-230`).
-`res.groups` holds users, implied groups, menu/view access, and linked
-`ir.access` records (`odoo/addons/base/models/res_groups.py:14-42`).
-`res.company` is the legal entity and multi-company boundary, with parent
-companies, users, partner, currency, report branding, and address fields
-(`odoo/addons/base/models/res_company.py:60-124`). `res.currency` stores ISO
-name, symbol, rounding, decimal places, position, and rates
-(`odoo/addons/base/models/res_currency.py:51-93`). `res.lang` stores locale,
-date/time formats, direction, and separators used by translations and
-formatting (`odoo/addons/base/models/res_lang.py:75-119`).
+| Flag | Effect |
+| --- | --- |
+| `compute` / `compute_sudo` / `precompute` / `compute_sql` | Computed fields; `compute_sudo` recomputes as superuser, `precompute` forces computation at creation, `compute_sql` pushes the computation into SQL. |
+| `store` | Persist in the database (default `True`). Non-stored computes are request-time values. |
+| `related` | Follow a field path (e.g. `alias_full_name = fields.Char(related='alias_id.alias_full_name')` on `crm.team`). |
+| `company_dependent` | One value per company: stored on the model table as a jsonb dict keyed by company id, with `ir.default` values as fallback (`odoo/orm/fields.py`). |
+| `translate` | Per-language values: stored as jsonb on the model table (no separate `ir.translation` table in 20.0). |
+| `groups` | Restrict visibility to given security groups. |
+| `config_parameter` (settings fields) | On `res.config.settings`, mirror the value into an `ir.config_parameter` key — see [Configuration](configuration.md). |
+| `default`, `required`, `readonly`, `copy`, `index`, `help` | The usual suspects. |
 
-### The `crm.lead` schema
+## Constraints
 
-`addons/crm/models/crm_lead.py:85-247` defines `crm.lead` and inherits mail
-thread/activity, UTM, address, phone, blacklist, and tracking-duration mixins.
-The required `name` is the opportunity label. `type` distinguishes `lead` from
-`opportunity`; `active`, `priority`, `team_id`, `user_id`, and `stage_id` drive
-pipeline ownership and ordering. `partner_id`, contact/company names, email,
-phone, website, language, and address fields represent the prospective
-customer, often before a partner is created.
+Three kinds, all verified in the 20.0 tree:
 
-Revenue fields include `expected_revenue`, prorated revenue, `recurring_revenue`,
-`recurring_plan`, expected and prorated MRR, and the company currency. Dates
-track assignment, stage changes, conversion, closing, automation, and expected
-closing. `probability` is editable and constrained from 0 to 100;
-`automated_probability` is computed by Predictive Lead Scoring, and
-`is_automated_probability` indicates which value is active. `won_status` tracks
-won, lost, or pending state, with `lost_reason_id` for losses. Tags, meetings,
-duplicate-lead statistics, UTM campaign/medium/source, and partner-sync flags
-complete the operational schema.
+| Kind | Declaration | Example |
+| --- | --- | --- |
+| SQL constraint | Class attribute `models.Constraint('<sql>', '<message>')` — `CHECK (...)`, `UNIQUE (...)`, `FOREIGN KEY ...` (`odoo/orm/table_objects.py:88`). The legacy `_sql_constraints` list is no longer supported (`odoo/orm/model_classes.py` logs a warning). | `_key_uniq = models.Constraint('unique (key)', "Key must be unique.")` in `odoo/addons/base/models/ir_config_parameter.py`. |
+| SQL index | `models.Index(...)` / `models.UniqueIndex(...)` class attributes, same file. | `_user_id_ref_id = models.Index('(user_id, ref_id)')` in `odoo/addons/base/models/ir_ui_view.py`. |
+| Python constraint | `@api.constrains('field', ...)` method raising `ValidationError` (`odoo/orm/decorators.py`). | `_check_model_name` in `odoo/addons/base/models/ir_access.py`. |
 
-## Integration points
+There are also `@api.ondelete(at_uninstall=...)` hooks controlling unlink
+behavior, and `@api.onchange` for form-time recomputation. SQL constraint
+names must start with `_` on the class and must not end with `_not_null`
+(PostgreSQL 18 reserves that suffix — `odoo/orm/table_objects.py:118-128`).
 
-The registry creates these models and fields, the ORM enforces access and
-computed values, and web views consume `ir.ui.view` and action metadata.
-CRM extends mail, calendar, sales-team, and partner behavior; its model is
-explored further in the [CRM page](../apps/crm/index.md) and its access model
-in [the ORM page](../systems/orm.md).
+## Core models map
 
-## Entry points for modification
+| Area | Models | Source |
+| --- | --- | --- |
+| Identity | `res.partner`, `res.users`, `res.company`, `res.groups`, `res.lang`, `res.currency`, `res.country` | `odoo/addons/base/models/res_*.py` |
+| System | `ir.model`, `ir.model.fields`, `ir.module.module`, `ir.ui.view`, `ir.ui.menu`, `ir.actions.*` (window/report/server/url), `ir.cron`, `ir.sequence`, `ir.attachment`, `ir.asset`, `ir.config_parameter`, `ir.default`, `ir.exports`, `ir.filters`, `ir.mail_server`, `ir.http`, `ir.qweb`, `ir.actions.report` | `odoo/addons/base/models/` |
+| Access control | `ir.access` — one model that replaces the old `ir.model.access` + `ir.rule` pair: a record with `model_id`, an optional `group_id` (set = permission, unset = global restriction), a `domain`, and per-operation flags (`odoo/addons/base/models/ir_access.py`) | same directory; the fork rule: never widen it — see [Users, groups, and access](../primitives/users-groups-and-access.md) |
+| CRM | `crm.lead`, `crm.stage`, `crm.team`, `crm.team.member`, `crm.recurring.plan`, `crm.lost.reason`, `crm.lead.scoring.frequency`, `crm.lead.scoring.frequency.field` | `addons/crm/models/` |
+| Messaging | `mail.message`, `mail.activity`, `mail.thread` (+ other mixins), `mail.mail`, `mail.template`, `mail.alias`, `discuss.*` | `addons/mail/models/` |
+| Accounting | `account.move`, `account.move.line`, `account.account`, `account.journal`, ... | `addons/account/models/` |
 
-For a schema question, inspect the model's `_name`, `_inherit` or `_inherits`,
-and field declarations before searching views and security. For CRM changes,
-start at `addons/crm/models/crm_lead.py` and follow the mixin or related model
-before adding fields, subject to the fork rules.
+## Inheritance patterns, with the fork's example
 
-To explore interactively, run `./odoo-bin shell -d crm_offline`. The shell
-provides `env` when a database is selected (`odoo/cli/shell.py:130-153`):
+Which pattern to use is decided by what must change:
 
-```python
-env['crm.lead']._fields.keys()
-env['crm.lead']._fields['probability']
-env['ir.model'].search([('model', '=', 'crm.lead')])
-env['ir.model.fields'].search([('model', '=', 'crm.lead')])
-```
+| Pattern | Declaration | When |
+| --- | --- | --- |
+| Extend in place | `_inherit = "some.model"` | Add fields or override methods on an existing model. |
+| Mixin composition | `_inherit = ['mail.thread', ...]` | Attach generic behavior to a new model. |
+| Delegation | `_inherits = {'parent.model': 'field'}` | Split storage over tables (`res.users` → `res.partner`). |
+| Extension module | a new addon whose manifest `depends` on the owner | Any change to another addon's behavior — the only option this fork allows outside `addons/crm/`. |
+
+The fork's canonical example is `addons/crm/models/mail_activity.py`:
+`_inherit = "mail.activity"`, overriding `create` (with
+`@api.model_create_multi`) so a queued offline
+`mail.activity.create` — which replays `{res_model: 'crm.lead', res_id}`
+verbatim, with no `res_model_id` — gets `res_model_id` mapped server-side,
+only when `res_model == 'crm.lead'` and `res_id` is set; every other input
+takes the stock `super().create()` path unchanged. The same file overrides
+`action_create_calendar_event` to amend the returned action's context for
+meetings scheduled from a lead. This is the shape every cross-addon override
+in the fork follows: catch your case, delegate the rest to `super()`.
+
+## Where schema changes happen
+
+- **Install/update**: declaring or changing fields is enough. The ORM
+  creates tables and columns during module load (`_auto`, registry setup in
+  `odoo/orm/registry.py`); `ir.model` / `ir.model.fields` records track the
+  schema for the UI. No handwritten DDL for ordinary column adds.
+- **Data or destructive changes** (backfills, renames, splits) use migration
+  scripts, handled by the `MigrationManager` in
+  `odoo/modules/migration.py`: a `<module>/migrations/<version>/` folder with
+  `pre-*.py`, `post-*.py`, `end-*.py` files defining
+  `migrate(cr, installed_version)`. Version folders may be module versions
+  or server-prefixed (`9.0.1.1` runs only on a 9.0 server); the special
+  `0.0.0` folder runs on every version change (pre first, post/end last).
+- **Upgrade service scripts** come from `<module>/upgrades/` and the
+  server-side `--upgrade-path`; the in-tree `odoo/upgrade/` directory is
+  empty (`.gitkeep`) in the community tree — Odoo SA's official data-upgrade
+  scripts are not shipped here.
+- **Source-code migration** is separate: `odoo/upgrade_code/*.py`
+  (e.g. `owl3-migration.py`, `19.4-00-ir-access.py`) are applied by
+  `odoo-bin upgrade_code` to rewrite module source across versions, not to
+  migrate database content.
+
+Verified: beyond `odoo/modules/migration.py` and per-module `migrations/`
+folders, there is no schema-version framework (no Alembic-style tooling) in
+this tree; the ORM's own setup is the primary schema mechanism.
 
 ## Key source files
 
 | File | Purpose |
-|---|---|
-| `odoo/addons/base/models/ir_model.py` | Model and field registry metadata. |
-| `odoo/addons/base/models/ir_access.py` | Unified access permissions and domains. |
-| `odoo/addons/base/models/ir_actions.py` | Action model family. |
-| `odoo/addons/base/models/ir_ui_view.py` | View storage and inheritance. |
-| `odoo/addons/base/models/ir_ui_menu.py` | Menu tree and action references. |
-| `odoo/addons/base/models/ir_cron.py` | Scheduled action model. |
-| `odoo/addons/base/models/ir_attachment.py` | Attachment storage and links. |
-| `odoo/addons/base/models/ir_config_parameter.py` | Database parameters. |
-| `odoo/addons/base/models/res_partner.py` | Contacts and companies as partners. |
-| `odoo/addons/base/models/res_users.py` | Users and partner delegation. |
-| `odoo/addons/base/models/res_groups.py` | Groups and implied access. |
-| `odoo/addons/base/models/res_company.py` | Companies and multi-company fields. |
-| `odoo/addons/base/models/res_currency.py` | Currencies and rates. |
-| `odoo/addons/base/models/res_lang.py` | Languages and formatting. |
-| `addons/crm/models/crm_lead.py` | CRM lead schema and lifecycle. |
-| `odoo/cli/shell.py` | Interactive environment setup. |
+| --- | --- |
+| `odoo/orm/models.py` | `BaseModel`, `Model`, model attributes, create/write/unlink. |
+| `odoo/orm/fields.py` + `odoo/orm/fields_*.py` | Field class, behavior flags, all concrete field types. |
+| `odoo/fields/__init__.py` | Public import surface (`from odoo import fields`). |
+| `odoo/orm/table_objects.py` | `Constraint`, `Index`, `UniqueIndex` declarations. |
+| `odoo/orm/model_classes.py` | Registry class assembly (definitions → model classes). |
+| `odoo/orm/models_transient.py` | `TransientModel` and vacuum behavior. |
+| `odoo/modules/migration.py` | Migration script discovery and execution. |
+| `odoo/addons/base/models/ir_access.py` | `ir.access`, the 20.0 access model. |
+| `addons/crm/models/mail_activity.py` | The fork's reference `_inherit` extension. |
+| `addons/crm/models/crm_lead.py` | `crm.lead` and its mixin list. |
 
 ## Related pages
 
 - [Reference](index.md)
 - [ORM](../systems/orm.md)
+- [Module system](../systems/module-system.md)
 - [Base](../apps/base.md)
 - [CRM](../apps/crm/index.md)
-- [Glossary](../overview/glossary.md)
+- [Users, groups, and access](../primitives/users-groups-and-access.md)
+- [Companies and multi-company](../primitives/companies-and-multi-company.md)

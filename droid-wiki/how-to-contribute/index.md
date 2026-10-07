@@ -1,85 +1,68 @@
 # How to contribute
 
-Active contributors: bobbyabbott421-glitch (fork), Odoo SA (upstream)
+How work happens in this fork: one hard scope rule, a task pipeline modeled on the fork's own milestone history, a definition of done that no CI will enforce for you, and a review culture of scrutiny and user-testing rounds. `AGENTS.md` at the repo root is the authoritative rule set; this section of the wiki is its narrative companion, one page per topic.
 
-## Purpose
+## The scope rule
 
-This fork takes changes only under `addons/crm/`, on top of the offline and PWA framework that `addons/web` already provides, and it must stay rebasable onto upstream Odoo 20.0. There is no CI, so a change is finished only when the relevant suites have been run on this machine and their results reported. This page states the rules and the definition of done; the sibling pages cover the edit-and-test cycle, the suites themselves, debugging, and the tooling.
+Changes go only under `addons/crm/`, and the fork must stay rebasable onto upstream Odoo 20.0 (`origin/20.0`). To change behavior owned by another addon, extend it from inside `addons/crm/` with Python `_inherit`, controller subclassing, JS `patch()`, or XML view/template inheritance — never by editing `addons/web/`, `odoo/`, or any other addon directly. The offline and PWA framework belongs to `addons/web`; crm only consumes it.
 
-## Work pickup: the fork's rules
+That single rule explains most of the rest: no second sync queue, no new encryption or storage layer, no new dependencies (nothing added to `requirements.txt`, `depends`, or npm), no changes to access rules or groups (the offline cache must never widen what a user can see), and no new fields on `crm.lead`, `crm.stage`, or `crm.team`. The full list, with the reasoning, is on [Patterns and conventions](patterns-and-conventions.md).
 
-`AGENTS.md` at the repo root is the authoritative rule set, and it is untracked in git (it appears as `?? AGENTS.md` in `git status`), so it is not part of what a rebase carries. The rules that decide whether a change is acceptable:
+## Where tasks come from
 
-| Rule | What it means in practice |
-| --- | --- |
-| Change files only under `addons/crm/` | To change behavior owned by another addon, extend it from inside `addons/crm/`: Python `_inherit`, controller subclassing, JS `patch()`, or XML view and template inheritance. Do not edit `odoo/`, `addons/web/`, or any other addon. |
-| Stay rebasable onto upstream 20.0 | The upstream branch is `origin/20.0`; the fork lineage is `20.0` to `eval/base`. Keep the diff small and confined to `addons/crm/`. |
-| Never build a second offline engine | No new sync queue, IndexedDB wrapper, service worker, cache layer, encryption helper, connectivity detector, or conflict resolver. Everything exists in `addons/web/static/src/core/offline/`, `addons/web/static/src/core/utils/indexed_db.js`, and `addons/web/static/src/core/crypto.js`. |
-| No new dependencies | No pip or npm package, no new addon in the manifest's `depends`, `requirements.txt` unchanged, no JS build tooling or bundler. |
-| No access-rule, record-rule, or group changes | The offline cache must never widen what a user can see. |
-| No new fields on `crm.lead`, `crm.stage`, or `crm.team` | Extend behavior with methods and views instead. |
-| No native app project | "Native mobile" means the installable PWA this fork already supports. No React Native, Flutter, Swift, Kotlin, Gradle, Xcode, or Capacitor. |
-| New OWL code uses the plugin API | `Plugin`, `usePlugin`, `signal`, registered with `services.add(...)`, not the legacy offline service bridge. |
-| Make only the changes the task needs | No refactoring or optimizing code the task does not touch. |
+The fork's own history is the model for how work is picked up and structured. The branch `eval/factory-crm-offline` sits 76 commits ahead of `origin/20.0` (September 30 to October 5, 2026), and those commits organize into five milestones, each visible in `git log --oneline origin/20.0..HEAD`:
 
-The reasoning behind these rules is on [Patterns and conventions](patterns-and-conventions.md), which also covers Python, XML, JavaScript, offline, and mobile conventions.
+| Milestone | What it delivered | Representative commits |
+| --- | --- | --- |
+| M1 — inventory | `addons/crm/static/src/mobile/offline_inventory.md`: every crm entry point that needs a server, classified QUEUE / SKIP / DISABLE (26 QUEUE, 9 SKIP, 115 DISABLE, 150 rows). No product code. | `[ADD] crm: offline surface inventory`, then five rounds of `[FIX] crm: close ... scrutiny gaps in offline surface inventory` |
+| M2 — offline fixes | Queue semantics, offline guards (disable or skip what the framework cannot queue), the cross-cutting re-enable proof, close-out tests. | `[ADD] crm: lay milestone-2 offline-fixes foundation`, `[ADD] crm: queue-semantics tests ...`, `[ADD] crm: milestone-2 close-out ...` |
+| M3 — data coverage | Offline mark won, the activity panel on the lead form, offline contact lookup through the many2x cache, `action_log_call`. | `[ADD] crm: offline mark-won (VAL-DATA-005/006/007)`, `[ADD] crm: milestone-3 framework data-coverage proofs ...` |
+| M4 — evidence and PWA | Proof tests for the framework data path, PWA shortcuts ("My Pipeline", "New Lead"), the offline E2E tour. | `[IMP] crm: PWA shortcuts "My Pipeline" and "New Lead" (VAL-PWA-001..007)`, `[ADD] crm: offline E2E tour, pipeline to reconnect (VAL-E2E-001/002)` |
+| M5 — mobile | The small-screen pipeline (one stage at a time), the mobile lead card, the bottom-sheet quick create, pending-create cards. | `[IMP] crm: mobile pipeline, one stage at a time (VAL-MOBILE-003/006)`, `[IMP] crm: mobile quick create (VAL-MOBILE-009/010/011/013)` |
 
-## Definition of done
+A new task today follows the same shape: find the gap (a row in `addons/crm/static/src/mobile/offline_inventory.md`, or a "Known limits" entry in `addons/crm/static/src/mobile/README.md`), decide its disposition (QUEUE, SKIP, or DISABLE — see [Offline surface inventory](../apps/crm/offline-surface-inventory.md)), implement it inside `addons/crm/`, and prove it with tests. Anything that needs a server onchange, a transient-model wizard, or an id produced by another call is disabled offline, never queued.
 
-- **The suites ran and their results were reported.** There is no CI: `.github/` holds only `ISSUE_TEMPLATE/` and `PULL_REQUEST_TEMPLATE.md`, with no `workflows/` directory. An unreported run is not evidence.
-  - `./scripts/dev/test-py.sh` (all crm Python tests).
-  - `./scripts/dev/test-js.sh desktop` and `./scripts/dev/test-js.sh mobile`. New JS tests must pass under **both** presets.
-  - `./scripts/dev/test-guard.sh`, which fails if any `.test.js` contains `only(` or `debug(`.
-- **Front-end changes were rebuilt.** Run `./scripts/dev/rebuild-assets.sh` after the last js/css/scss/xml edit and before re-testing. A test that fails only because an asset bundle is stale is not a real result.
-- **Everything new is wired and imported.** New Python test modules must be imported in `addons/crm/tests/__init__.py`; new model and controller files in their package `__init__.py`; new XML data files in `addons/crm/__manifest__.py` in dependency order. New views must be registered in the view registry *and* bound by a `js_class` in the addon's lead views; new components must be reachable from a rendered parent.
-- **Asset globs were verified, not edited.** `crm/static/src/**`, `crm/static/tests/tours/**/*`, and `crm/static/tests/**/*.test.js` already cover new source, tour, and test files in `addons/crm/__manifest__.py`. Add a bundle entry only to exclude or lazily load a file, as the existing `('remove', ...)` plus `web.assets_backend_lazy` pairs do.
-- **No existing test was weakened.** Tests are never deleted, skipped, retagged, or otherwise made easier to pass. The only existing test file that may change is `addons/crm/tests/__init__.py`, and only to add imports.
-- **Known baseline failures were left alone.** The `scroll loses target` test in `addons/web/static/tests/core/utils/timing.test.js` fails on the untouched baseline (upstream `addons/web`, out of scope). It is not a regression.
+## What "done" means
 
-The mechanics of the cycle are on [Development workflow](development-workflow.md); why each command is the shape it is is on [Testing](testing.md).
+There is no CI: `.github/` holds only issue templates and `PULL_REQUEST_TEMPLATE.md`, with no `workflows/` directory. A change is finished only when the work itself and its evidence are complete:
 
-## Branches and commits
+- **The suites ran and their results were reported**, including the runs you skipped and why. `./scripts/dev/test-py.sh` (all crm Python tests), `./scripts/dev/test-js.sh desktop` and `./scripts/dev/test-js.sh mobile` — new JS tests must pass under **both** presets — and `./scripts/dev/test-guard.sh`.
+- **Assets were rebuilt** after the last js/css/scss/xml change and before re-testing. A test that fails only because an asset bundle is stale is not a real result.
+- **New entry points got a row in the offline inventory** (`addons/crm/static/src/mobile/offline_inventory.md`), classified QUEUE / SKIP / DISABLE.
+- **Everything new is wired and proven reachable**: new Python test modules imported in `addons/crm/tests/__init__.py`, new model and controller files in their package `__init__.py`, new XML data files in the manifest's data list; new views registered in the view registry *and* bound by a `js_class`; new components reachable from a rendered parent — a component reachable solely from its own unit test does not count. A component that exists but is never reached is the most common failure.
+- **Asset globs were verified, not edited**: the manifest's existing globs (`crm/static/src/**`, `crm/static/tests/**/*.test.js`, ...) already cover new files. Add a bundle entry only to exclude or lazily load a file.
+- **No existing test was weakened.** Tests are never deleted, skipped, retagged, or made easier; the only existing file that may change is `addons/crm/tests/__init__.py` (to add imports).
 
-The fork's current branch is `eval/base`, one commit ahead of `20.0`: `[ADD] scripts/dev: reproducible local dev environment`. History is squashed, so `git log` shows the whole codebase as a single upstream commit (`[FIX] mail: duplicate notifications`, carrying an `X-original-commit` trailer) with the fork's offline framework already fused into it. Per-person history is therefore not recoverable, and commit messages follow the convention visible in that log, `[TAG] module: description`.
+The command details are on [Testing](testing.md); the cycle and commit conventions are on [Development workflow](development-workflow.md).
 
-Upstream Odoo contributions go through GitHub pull requests against the correct version and require a signed CLA; `doc/cla/` holds the signatory lists, and `CONTRIBUTING.md` points at Odoo's own contribution wiki. Fork work happens on a branch of this repository and is not submitted upstream.
+## The review culture
 
-## Pages in this section
+Each milestone closed under two review loops, both visible in the commit history:
 
-| Page | What it covers |
-| --- | --- |
-| [Development workflow](development-workflow.md) | The edit, rebuild, test cycle, and the `odoo-bin` commands the wrappers run. |
-| [Testing](testing.md) | The three false-green modes and their guards, Python/JS/tour conventions, offline coverage. |
-| [Debugging](debugging.md) | Where logs go, `--dev` and client debug mode, the fork's specific errors, DevTools. |
-| [Patterns and conventions](patterns-and-conventions.md) | Python, ORM, XML, JavaScript, offline, and mobile patterns. |
-| [Tooling](tooling.md) | `scripts/dev/`, the `skills/` rule packs, ruff, packaging, maintenance commands. |
+- **Scrutiny rounds** — an internal review that produces numbered findings, fixed in batches: `[FIX] crm: scrutiny round-1 fixes 1,12,14,22,23,24 (card menu, column delete, progress bar, send mail, calendar single click, team configuration)`. M1 alone absorbed five rounds on the inventory document itself before any product code was written.
+- **User-testing rounds** — validation runs whose findings carry `VAL-*` codes, traced into fix commits: `VAL-DATA-*` (M3 data coverage), `VAL-PWA-*` (shortcuts), `VAL-MOBILE-*` (M5), `VAL-E2E-*` (the tour), `VAL-REPO-*` (repository hygiene), e.g. `[FIX] crm: close M5 user-testing round-1 online-guard gaps (m5-fix-online-guards)`.
+- **Close-out commits** — each milestone ends with one: `[ADD] crm: milestone-2 close-out (cross-cutting re-enable test, QA, wiring)`, `[ADD] crm: milestone-3 close-out tests ...`. Close-out is where wiring proofs and cross-cutting coverage land, not an afterthought.
 
-## Integration points
-
-- The rule set is `AGENTS.md`, backed by the rule packs in `skills/`.
-- The dev scripts are the only supported way to run the suites: `scripts/dev/test-py.sh`, `scripts/dev/test-js.sh`, `scripts/dev/test-guard.sh` each guard against a false-green test run that raw `./odoo-bin` would hide.
-- The offline rules exist because the framework is owned by `addons/web`: see [Offline and PWA](../features/offline-and-pwa/index.md) and [Local store](../features/offline-and-pwa/local-store.md).
+Treat review findings as first-class work: the fix commit names the finding, and the tests that prove the fix land with it.
 
 ## Key source files
 
 | File | Purpose |
 | --- | --- |
-| `AGENTS.md` | The fork's project rules, test commands, and known baseline failures. |
-| `scripts/dev/README.md` | Usage of the dev wrappers and the notes on the test runner's false-green modes. |
-| `scripts/dev/_common.sh` | Shared configuration, database checks, and the `assert_tests_selected` / `assert_no_skips` result guards. |
-| `addons/crm/__manifest__.py` | Asset globs, data file order, and the dependency list. |
-| `addons/crm/tests/__init__.py` | The list of Python test modules that actually get collected. |
-| `addons/crm/models/__init__.py` | Imports every CRM model file. |
-| `addons/crm/controllers/__init__.py` | Imports the webmanifest controller subclass. |
-| `addons/crm/views/crm_lead_views.xml` | Where `js_class` binds every custom CRM view. |
-| `.github/PULL_REQUEST_TEMPLATE.md` | The upstream PR template, the only file left in `.github/` besides issue templates. |
-| `CONTRIBUTING.md` | Upstream Odoo's contribution pointers. |
+| `AGENTS.md` | The authoritative rule set: commands, the offline framework's API, crm conventions, project rules, known baseline failures. |
+| `scripts/dev/README.md` | Every dev command, the exact `odoo-bin` invocations the wrappers run, and the test runner's three silent-success modes. |
+| `addons/crm/static/src/mobile/README.md` | Developer notes for the offline and mobile CRM: what was built, how to run it, known limits. |
+| `addons/crm/static/src/mobile/offline_inventory.md` | The QUEUE / SKIP / DISABLE classification of every crm server touchpoint. |
+| `addons/crm/__manifest__.py` | Asset globs, bundle exclusions, data file order, dependencies. |
+| `addons/crm/tests/__init__.py` | The Python test modules that actually get collected. |
 
 ## Related pages
 
-- [Patterns and conventions](patterns-and-conventions.md)
-- [Development workflow](development-workflow.md)
-- [Testing](testing.md)
-- [Getting started](../overview/getting-started.md)
-- [Offline and PWA](../features/offline-and-pwa/index.md)
-- [Pitfalls](../background/pitfalls.md)
+- [Patterns and conventions](patterns-and-conventions.md) — the coding and offline rules in detail
+- [Development workflow](development-workflow.md) — branches, commits, the milestone loop
+- [Testing](testing.md) — the suites, the wrappers, offline test conventions
+- [Debugging](debugging.md) — logs, devtools, the fork's specific failure modes
+- [Tooling](tooling.md) — the dev scripts, the QA skill, the `droid` CLI
+- [Getting started](../overview/getting-started.md) — setup and the command quick view
+- [Offline CRM](../apps/crm/offline-crm.md) and [Mobile CRM](../apps/crm/mobile-crm.md) — what the fork built
+- [Offline surface inventory](../apps/crm/offline-surface-inventory.md) — the QUEUE / SKIP / DISABLE classification

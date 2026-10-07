@@ -1,201 +1,165 @@
 # TODOs and FIXMEs
-Active contributors: Odoo SA (upstream)
 
-## Purpose
+A census of deferred-work markers in `odoo/` and `addons/`, taken on 2026-10-07 at
+`30955b57688`. This page reports; it fixes nothing. Marker comments identify deferred
+compatibility, migration, testing, and design work — a census is a reading guide, not a
+defect list, and most of what it finds belongs to upstream.
 
-This page samples deferred work in comments without turning every marker into
-a defect. The counts are a reproducible inventory as of the scan, and the
-examples show the kinds of compatibility, migration, testing, and design debt
-that a maintainer will encounter.
+## The census
 
-## Directory layout
+Commands (case-sensitive, all three markers):
 
-```text
-odoo/                              core Python markers
-addons/                            addon Python and JavaScript markers
-addons/web/static/src/             web framework markers
-addons/crm/                        fork-specific marker scope
+```sh
+rg -c "TODO|FIXME|HACK" --no-messages odoo addons | sort -t: -k2 -rn | head -20
+rg -o "TODO|FIXME|HACK" odoo addons --no-messages | wc -l
 ```
 
-## Key abstractions
+Totals: **2,246 occurrences across 1,468 files** — TODO 1,112, FIXME 1,107, HACK 27.
+Excluding vendored libraries (`**/static/lib/**`), 2,003 occurrences across 1,435
+files, so vendored code carries about a tenth of the markers but owns the top of the
+per-file table:
 
-| Scope | File or command | Result |
-|---|---|---|
-| Python addons | `addons/` with `rg -n -i '\b(TODO\|FIXME)\b' --glob '*.py'` | 1,341 marker-bearing lines, 1,363 occurrences. |
-| Python core | `odoo/` with the same expression | 193 marker-bearing lines, 194 occurrences. |
-| JavaScript source | Every `*/static/src/` directory under `addons/` | 457 marker-bearing lines, 462 occurrences. |
-| JavaScript source plus tests | `*/static/src/` and `*/static/tests/` | 712 marker-bearing lines, 720 occurrences. |
-| CRM scope | `addons/crm/`, all three markers | 20 occurrences on 20 lines, 19 TODO/FIXME and one HACK. |
+| File | Marker lines |
+| --- | ---: |
+| `addons/web/static/lib/fullcalendar/core/index.global.js` | 105 |
+| `addons/web/static/lib/zxing-library/zxing-library.js` | 26 |
+| `addons/test_mail/tests/test_mail_composer.py` | 19 |
+| `addons/web/static/lib/fullcalendar/interaction/index.global.js` | 15 |
+| `addons/web/static/lib/fullcalendar/daygrid/index.global.js` | 14 |
+| `addons/web/static/lib/fullcalendar/timegrid/index.global.js` | 13 |
+| `odoo/addons/base/tests/test_ir_actions.py` | 9 |
+| `addons/stock/tests/test_move2.py` | 9 |
+| `addons/payment_adyen/tests/test_adyen.py` | 9 |
+| `addons/spreadsheet/static/lib/chartjs-chart-geo/chartjs-chart-geo.js` | 8 |
+| `addons/website_sale/controllers/main.py` | 7 |
+| `addons/web/static/tests/views/list/list_view.test.js` | 7 |
+| `addons/mail/static/lib/odoo_sfu/odoo_sfu.js` | 7 |
+| `addons/mail/static/lib/lame/lame.js` | 7 |
+| `addons/l10n_fr_pdp/views/account_move_views.xml` | 7 |
+| `addons/html_editor/static/tests/utils/selection.test.js` | 7 |
+| `addons/website_sale/static/src/website_builder/donation/donation_option_plugin.js` | 6 |
+| `addons/website/static/src/scss/website.scss` | 6 |
+| `addons/stock_account/tests/test_stockvaluationlayer.py` | 6 |
+| `addons/spreadsheet/static/src/o_spreadsheet/o_spreadsheet.js` | 6 |
 
-The headline Python and JavaScript counts intentionally match TODO and FIXME
-only. HACK is reported separately because it is a different signal. The scan
-counts matching lines and occurrences, and includes comments and strings, so
-identifiers such as a local variable named `todo` can contribute to the
-occurrence total. It does not search generated logs or Markdown.
+Census caveats, worth stating because they change the reading:
 
-## How it works
+- **Case sensitivity.** The uppercase pattern misses lowercase markers: 25 `@todo`
+  occurrences live in `addons/web/static/src/` alone, including the temporary
+  OWL-2-to-3 service bridges (for example
+  `addons/web/static/src/core/offline/offline_plugin.js:489`, the legacy `"offline"`
+  service wrapper). The headline 2,246 therefore undercounts by at least that family.
+- **Vendored dominance.** The top two files are vendored libraries; marker "debt" there
+  is upstream-vendor noise, not actionable work.
+- **Markers are not defects.** A `FIXME` in an upstream test documents a known
+  behavior question (see the `TDE FIXME` cluster below); removing it would delete
+  information, and `AGENTS.md` forbids weakening existing tests.
 
-```mermaid
-graph LR
-    A[Source files] -->|rg marker scan| B[Counts]
-    A -->|sample paths and lines| C[Categories]
-    B --> D[Maintenance reading guide]
-    C --> D
-    D -->|scope check| E[addons/crm only for fork cleanup]
-```
+## Upstream debt (out of the fork's scope)
 
-### Core compatibility and migration debt
+The scope rule confines changes to `addons/crm/` (see
+[design decisions](../background/design-decisions.md)), so everything below is context,
+not a cleanup candidate.
 
-These comments are useful context when reading upstream code, but are not
-local refactoring instructions:
+### Core compatibility and migration seams
 
-- `odoo/tools/config.py:493` records that the three multiprocessing memory
-  limits still need a sensible default.
-- `odoo/tools/config.py:790-797` retains empty `db_replica_host` handling for
-  old SaaS versions.
-- `odoo/http/session.py:78` keeps an 84-character compatibility length until
-  v18.4 is deprecated.
-- `odoo/http/session.py:321` marks a v20 backward-compatibility path for
-  removal.
-- `odoo/http/router.py:24` still imports the Werkzeug URL helper while
-  planning a switch to `urllib`.
-- `odoo/modules/migration.py:48` calls out the version comparison case that
-  will matter in the year 2106.
-- `odoo/tools/safe_eval/runtime.py:763-764` leaves addon restrictions in the
-  safe-evaluation whitelist for a future tightening.
-- `odoo/orm/models.py:492` marks the old translation API flag for deprecation
-  or removal.
+- `odoo/tools/config.py:493` — "TODO sensible default for the three following limits."
+  (the three multiprocessing memory limits; the file's first TODO-introducing commit
+  is dated 2016-09-02).
+- `odoo/tools/config.py:790-797` — "TODO saas-22.1: remove support for the empty
+  db_replica_host" and its saas-21.1 sibling, old-SaaS compatibility retained in the
+  core config.
+- `odoo/http/session.py:78` — "TODO: remove `84` length when v18.4 is deprecated";
+  `:321` — "TODO (v20): remove backward compatibility". The file's TODO population
+  was last touched 2025-12-19.
+- `odoo/modules/migration.py:48` — "FIXME handle version >= saas~100 (expected in year
+  2106)" — the version-comparison edge case; the file's FIXME population was last
+  touched 2023-04-13.
+- `odoo/orm/models.py:394` and `:492` — pool-vs-registry disentangling and the old-API
+  `_translate` flag, both deferred inside the extracted ORM.
 
-### Web client migration and legacy bridges
+### Web-client migration bridges
 
-The web source has 17 exact `@todo owl3 migration` markers. They cluster in
-the plugin/service transition, including
-`addons/web/static/src/core/orm_plugin.js:401`,
-`addons/web/static/src/core/offline/offline_plugin.js:489`,
-`addons/web/static/src/core/ui/ui_plugin.js:212`,
-`addons/web/static/src/core/overlay/overlay_plugin.js:74`,
-`addons/web/static/src/core/dialog/dialog_plugin.js:122`,
-`addons/web/static/src/core/popover/popover_plugin.js:82`,
-`addons/web/static/src/core/legacy_service_starter.js:2`, and
-`addons/web/static/src/core/l10n/localization_plugin.js:156`.
+The OWL 2-to-OWL 3 transition is the biggest self-aware debt cluster in
+`addons/web/static/src/`: 25 lowercase `@todo` markers, each on a legacy service
+wrapper the plugin API is meant to replace. `AGENTS.md` names the contract: new code
+uses the plugin API (Plugin, usePlugin, signal), never the bridges marked
+`@todo owl3 migration`. These are upstream's plan, not the fork's.
 
-Other frontend markers describe concrete compatibility seams:
+### Business addons and tests
 
-- `addons/web/static/src/start.js:64` keeps `odoo.debug` because legacy code
-  still relies on it.
-- `addons/web/static/src/core/global_bus_plugin.js:13` calls the service-to-
-  plugin bridge temporary.
-- `addons/web/static/src/views/form/form_controller.js:752` notes incomplete
-  disable/enable handling during pager updates.
-- `addons/web/static/src/views/list/list_arch_parser.js:146` documents a
-  deliberately awkward encoded object for a widget.
-- `addons/web/static/src/views/view_compiler.js:494` says the compiler cache
-  purge does not purge OWL's application cache.
-- `addons/web/static/src/views/fields/relational_utils.js:77` identifies
-  duplicated active-action logic that should be merged.
-- `addons/web/static/src/model/model.js:240` keeps an OWL 3 compatibility
-  addition for Studio.
+Typical upstream markers: `addons/mail/models/mail_activity.py:740` ("Fix void res_id
+on attachment when you create an activity with an image"),
+`addons/website_sale/controllers/main.py` (7 marker lines; its first TODO-introducing
+commit is dated 2013-08-05), and large test files that encode
+fixtures and known gaps (`addons/test_mail/tests/test_mail_composer.py`, 19 marker
+lines).
 
-These are especially risky to “clean up” locally because the web addon owns
-the shared offline and mobile framework.
+## CRM-scope debt (inside the fork's reach, upstream-owned)
 
-### Business-addon and test debt
+`addons/crm/` holds 20 markers on 20 lines across 10 files — all of them pre-fork
+upstream comments, not fork work:
 
-Many markers describe stable behavior that is hard to remove without changing
-an addon contract:
+- `addons/crm/models/crm_lead.py:2679` — "TODO : check if we need to handle specific
+  team_id stages [for lost count]" (the file's TODO population was last changed
+  2021-07-02, first introduced 2016-04-26).
+- `addons/crm/models/crm_stage.py:45` — "TODO stop hardcoding ids in tests and remove
+  this".
+- `addons/crm/models/res_config_settings.py:164` — "TDE FIXME: re create cron if not
+  found ?"
+- The `TDE FIXME` cluster in the conversion and merge tests
+  (`addons/crm/tests/test_crm_lead_convert.py:143,161,171,239`,
+  `addons/crm/tests/test_crm_lead_convert_mass.py:109,203`,
+  `addons/crm/tests/test_crm_lead_merge.py:219,235,238`,
+  `addons/crm/tests/test_crm_pls.py:926`) records long-standing behavior questions
+  around team/stage recomputation on convert and merge.
+- `addons/crm/tests/common.py:406` and `:657` — email-normalization and
+  merge/assignment conditions (TODO population dating to 2021-03-26), plus
+  `addons/crm/tests/test_sales_team_ui.py:13`.
 
-- `addons/stock/wizard/stock_replenishment_info.py:179` plans to remove the
-  `json_replenishment_graph` field.
-- `addons/mail/models/mail_thread_blacklist.py:84` questions a `sudo` that is
-  now related to `compute_sudo`.
-- `addons/mail/models/mail_activity.py:740` records a missing cleanup for an
-  attachment with a void `res_id`.
-- `addons/stock/models/stock_move.py:72` says a field should be stored for
-  grouping to work.
-- `addons/website_sale/controllers/main.py:334` and `:362` retain old
-  `category` and `attribute_values` query parameters during v20 migration.
-- `addons/website/models/website_page.py:328` keeps a workaround until domain
-  support for translated XML fields improves.
-- `addons/hr/models/hr_version.py:190` marks a field for removal in master.
-- `addons/purchase/models/purchase_order_line.py:505` keeps logic until
-  onchanges are replaced with computes.
+These are the only markers the fork could technically act on, and even then they
+describe upstream behavior questions (team-specific stages, lost-count semantics)
+where a "cleanup" would change CRM behavior — each needs a regression test and a
+check against upstream intent, not a drive-by deletion.
 
-Tests contain many markers because they document fixtures and known gaps:
-`addons/stock/tests/test_batch_picking.py:102` cannot handle an onchange in
-the test form, `addons/website/tests/test_ui.py:210` postpones debug mode
-until props validation is fixed, and `addons/mail/tests/test_res_partner.py:236`
-documents repeated partner creation for normalized multi-email input.
+## Fork debt: zero markers, a list instead
 
-### CRM-specific scope
+All 92 files the fork added under `addons/crm/`
+(`git diff --name-only --diff-filter=A origin/20.0..HEAD -- addons/crm`) contain
+**no** TODO/FIXME/HACK markers. The fork tracks its deferred work in prose instead: the 22-item "Known
+limits" list in `addons/crm/static/src/mobile/README.md` and the "Superseded"
+annotations in `addons/crm/static/src/mobile/offline_inventory.md` (the VAL-INV-011
+producer reclassification). That choice keeps debt visible in review (a known-limits
+entry ships with its fix commit) but means marker scans cannot find fork debt — read
+the known-limits list for that.
 
-The fork's `addons/crm/` scan is small: 20 marker occurrences across 20
-lines. The most actionable samples are all in tests or narrowly scoped model
-comments:
+## Sampled marker ages
 
-- `addons/crm/models/crm_stage.py:45` wants hard-coded test IDs removed.
-- `addons/crm/models/crm_lead.py:2646` questions team-specific stages when
-  calculating lost counts.
-- `addons/crm/models/res_config_settings.py:164` asks whether a missing cron
-  should be recreated.
-- `addons/crm/tests/common.py:406` says normalized email matching currently
-  works only for exact email.
-- `addons/crm/tests/common.py:657` identifies a merge/assignment condition
-  that is not fulfilled.
-- `addons/crm/tests/test_crm_lead_convert.py:143` notes that setting a lead
-  won does not account for the sales team when finding a won stage.
-- `addons/crm/tests/test_crm_lead_convert_mass.py:109` says partner creation
-  is not checked for lost leads.
-- `addons/crm/tests/test_crm_lead_merge.py:219` points to a historical
-  no-user/no-team merge case by commit hash.
+`git log -1 --format=%ad --date=short -S'<marker>' -- <file>` dates the *last commit
+that changed the file's marker population*, and `--reverse` finds the first such
+commit — a population-level proxy, precise per file, not per marker:
 
-This is the only section that can directly become a cleanup candidate for
-this fork. Each item still needs a regression test and a check against the
-CRM extension boundary.
+| File | First marker-introducing commit | Last population change |
+| --- | --- | --- |
+| `addons/website_sale/controllers/main.py` | 2013-08-05 | 2025-11-17 (TODO) |
+| `odoo/tools/config.py` | 2016-09-02 | 2025-01-27 (TODO) |
+| `addons/crm/models/crm_lead.py` | 2016-04-26 | 2021-07-02 (TODO) |
+| `addons/crm/tests/common.py` | 2021-03-26 | 2021-03-26 (TODO) |
+| `odoo/http/session.py` | 2025-12-19 | 2025-12-19 (TODO) |
+| `odoo/modules/migration.py` | — | 2023-04-13 (FIXME) |
 
-## Integration points
+## Key sources
 
-Markers occur in the ORM, HTTP, web client, and business addons. The
-`addons/crm/` examples interact with [CRM's model and view
-extensions](../apps/crm/index.md), while the web examples touch the shared
-[offline/PWA stack](../features/offline-and-pwa/index.md). The broad counts
-also feed the [repository size snapshot](../by-the-numbers.md).
-
-## Entry points for modification
-
-For upstream markers, look for an existing upstream fix or add an extension
-from `addons/crm/`; do not edit `odoo/` or another upstream addon as local
-cleanup. For CRM markers, start at the cited line, write a focused regression
-test, and run the CRM test wrappers described in
-[tooling](../how-to-contribute/tooling.md).
-
-## Oldest or most interesting markers
-
-Git cannot prove an oldest marker here because the upstream history is a
-squashed commit. The most time-specific examples are the v18.4 and v20
-compatibility removals in `odoo/http/session.py:78` and `:321`, the
-saas-21.1/22.1 migration comments in `odoo/tools/config.py:790-797`, and the
-year-2106 edge case in `odoo/modules/migration.py:48`. The 17 OWL migration
-markers are interesting because they sit beside a functioning plugin API,
-including the offline plugin, rather than representing unused code.
-
-## Key source files
-
-| File | Purpose |
-|---|---|
-| `odoo/tools/config.py` | Core configuration and compatibility options. |
-| `odoo/http/session.py` | Session compatibility behavior. |
-| `odoo/modules/migration.py` | Module version comparison and migration helpers. |
-| `odoo/orm/models.py` | ORM compatibility and model behavior. |
-| `addons/web/static/src/start.js` | Web client bootstrap and legacy debug bridge. |
-| `addons/web/static/src/core/offline/offline_plugin.js` | Shared offline plugin marked for OWL migration. |
-| `addons/web/static/src/core/legacy_service_starter.js` | Temporary service startup bridge. |
-| `addons/crm/models/crm_lead.py` | CRM lead model marker. |
-| `addons/crm/tests/common.py` | CRM test helper markers. |
-| `addons/crm/tests/test_crm_lead_convert.py` | Lead conversion marker examples. |
+| Source | What it holds |
+| --- | --- |
+| `AGENTS.md` | The scope rule that makes nearly all of this upstream debt, and the "make only the changes the current task needs" rule |
+| `addons/crm/static/src/mobile/README.md` | The known-limits list that carries the fork's actual deferred work |
+| `rg` census output | The counts and top-file table above, reproducible with the two commands |
 
 ## Related pages
 
-- [Cleanup opportunities](index.md)
-- [Complexity hotspots](complexity-hotspots.md)
-- [Contribution patterns](../how-to-contribute/patterns-and-conventions.md)
-- [Offline and PWA](../features/offline-and-pwa/index.md)
+- [Cleanup opportunities](index.md) for the hub and the theme
+- [Complexity hotspots](complexity-hotspots.md) for the size side of the census
+- [By the numbers](../by-the-numbers.md) for repository-wide size and activity
+- [Patterns and conventions](../how-to-contribute/patterns-and-conventions.md) for
+  how fork-side work must extend upstream code

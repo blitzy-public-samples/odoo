@@ -1,6 +1,6 @@
 # Primitives
 
-Active contributors: Odoo SA (upstream)
+Active contributors: Krzysztof, Rémy, Raphael
 
 ## Purpose
 
@@ -17,6 +17,21 @@ These pages describe each primitive from the server model outward: the record th
 | [Companies and multi-company](companies-and-multi-company.md) | `res.company`, the allowed-companies context, `company_dependent` fields stored as jsonb, the standard company-isolation access domain, and per-company sequences and defaults. |
 | [Cron and scheduled actions](cron-and-scheduled-actions.md) | The `ir.cron` model delegating to `ir.actions.server`, `_process_jobs` job acquisition, `ir.cron.trigger` with the `cron_trigger` PostgreSQL notification, and the CRM assignment and scoring crons. |
 | [Translations](translations.md) | `.po` files per addon, code terms versus model terms (jsonb columns, no `ir.translation` table in 20.0), `odoo-bin i18n`, and `_t()` in the web client. |
+
+## Where they are defined
+
+Every primitive lives in `base` or the ORM; addons only ship data for them. The full paths, all repo-root relative:
+
+| Primitive | Main source |
+| --- | --- |
+| Actions | `odoo/addons/base/models/ir_actions.py`, `odoo/addons/base/models/ir_actions_report.py` |
+| Views | `odoo/addons/base/models/ir_ui_view.py` |
+| Menus | `odoo/addons/base/models/ir_ui_menu.py` |
+| Users | `odoo/addons/base/models/res_users.py` |
+| Groups and access | `odoo/addons/base/models/res_groups.py`, `odoo/addons/base/models/ir_access.py`, `odoo/orm/models.py` |
+| Companies | `odoo/addons/base/models/res_company.py`, `odoo/orm/environments.py` |
+| Scheduled actions | `odoo/addons/base/models/ir_cron.py`, `odoo/service/server.py` |
+| Translations | `odoo/tools/translate.py`, `odoo/orm/fields.py` |
 
 ## Related pages
 

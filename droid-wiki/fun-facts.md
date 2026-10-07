@@ -1,46 +1,40 @@
 # Fun facts
 
-Active contributors: bobbyabbott421-glitch (fork), Odoo SA (upstream)
+Four findings from this tree that reward a second look: the animation Odoo plays when you win a deal, a markdown document that audits itself, a git history that begins seven times over, and easter eggs hiding in plain sight.
 
-Seven things in this tree that will make you look twice. Each one was checked against the file it names.
+*Everything below was verified in the working tree at `/home/factory-user/repos/odoo` (branch `eval/factory-crm-offline`) on 2026-10-07. The git commands named run from the repo root and reproduce each dated claim.*
 
-## `odoo` is a namespace package with no `__init__.py`
+## The rainbowman
 
-`import odoo` works, but there is no `odoo/__init__.py`. The bootstrap lives in `odoo/init.py`, one letter and one convention away, and every entry point imports it explicitly (`odoo/orm/__init__.py` opens with `import odoo.init  # noqa: F401`, commented "import first for core setup"). That file is also where the server refuses to start under `python -O` and where it raises the garbage-collector threshold from the CPython default to `(12_000, 20, 25)`, on the grounds that "handling requests can sometimes allocate over 5k new objects". A `.py` file that looks optional turns out to configure the GC for the whole server.
+The congratulation animation that greets a won lead entered the codebase on 2017-05-11 in commit `4330ea02676`, "[ADD] web, *: add rainbowification", whose message explains it as "a way to display a nice friendly message when some business event happens" — for example when "a salesman closes a deal". It arrived as a 77-line widget, `addons/web/static/src/js/widgets/rainbow_man.js`, plus 250 lines of `rainbow.less`; in this tree the effect lives at `addons/web/static/src/core/effects/rainbow_man.js`.
 
-## OWL 3 lives in a directory called `owl2/`
+CRM wired it up through `get_rainbowman_message()` at `addons/crm/models/crm_lead.py:1138`, first appearing 2020-07-06 in "[IMP] crm: harmonize won triggers with rainbowman". The method is more sentimental than an ERP has any right to be: it runs raw SQL over `crm_lead` to compute the closer's win streaks and records, then answers with lines like "Go, go, go! Congrats for your first deal.", "Boom! Team record for the past 30 days.", "You're on fire! Fifth deal won today 🔥" and — for a lead with 25 or more messages — "Phew, that took some effort — but you nailed it. Good job!"
 
-The vendored framework at `addons/web/static/lib/owl/owl.js` is OWL 3, but the shim that lets the existing client run on it sits in `addons/web/static/src/owl2/owl3_compatibility_layer.js`. The header calls it "a temporary bridge to ease incremental migration from Owl 2 to Owl 3" and lists the renames it papers over: `t-portal` becomes `t-custom-portal`, `t-model` becomes `t-custom-model`, every `useEffect` becomes `useLayoutEffect`. The directory is named for the code being migrated away from, not the library it contains.
+In this fork the animation has an offline epilogue. `addons/crm/static/src/views/check_rainbowman_message.js` returns before making any RPC when the offline plugin reports the client is offline, per its own comment: "offline there is no server to ask, so the lookup must be skipped outright". Even a connection that drops mid-lookup is treated as a skip, not as an error on top of an already-successful save (commit `82cf2fd8856`, 2026-10-01). Three of the offline inventory's nine SKIP rows — A12, A14 and A16 — are this one animation. See [Offline surface inventory](apps/crm/offline-surface-inventory.md).
 
-## The service worker redacts your session with a literal magic string
+## The offline inventory keeps an audit trail of itself
 
-`addons/web/static/src/service_worker.js` caches the `/odoo` homepage so the client can boot offline, but that HTML contains `odoo.__session_info__`. Rather than parse it out, the worker does a string replace before caching (line 50) and the inverse replace when serving (line 67), using the token `@@@session_info_secret@@@`. The fresh session data is kept in worker memory and re-injected on the way out, so the cached copy on disk never holds it. Three at-signs on each side, because one apparently was not enough.
+`addons/crm/static/src/mobile/offline_inventory.md` is a 1,248-line, 168 KB markdown table classifying every crm control that needs a live server: 150 rows, 26 QUEUE, 9 SKIP, 115 DISABLE, spread over four sections. What makes it unusual is that it records its own revision history like a ledger. The original sweep states the HEAD every citation was re-read at (`8916e416`, committed as `a6a1ceef`), and each later round names the commit it re-verified against (`6e6de2b8`, `cf127d42`, `4bdd42c3`, `01ccefaa`), with every file:line citation re-read again at that HEAD.
 
-## `doc/` contains no documentation
+The counts section alone narrates eight revision rounds after the original sweep: a round-1 fix closing 7 blocking gaps, a round-2 fix closing 4 more findings, a round-3 relational-field sweep that added a whole new section (B-REL), a round-4 close-out adding 32 rows, a round-5 correction pass, a user-testing round (VAL-INV-005, VAL-INV-007), and two milestone-2 reviews — with the totals moving 147 (39 QUEUE / 9 SKIP / 99 DISABLE) to 149 (28 / 9 / 112) to the final 150 (26 / 9 / 115) as rows were added, removed and reclassified, and each intermediate total preserved in prose.
 
-Nothing in this repository explains how to develop for it. The `doc/` directory holds exactly one thing: `doc/cla/`, the contributor license agreements. Under it are 286 signed corporate CLAs and 753 signed individual ones, plus the agreement templates `doc/cla/ccla-1.0.md` and `doc/cla/icla-1.0.md` and a `doc/cla/stats.py`. A thousand-plus signatures and not one page of developer docs. The nearest substitute in-tree is `skills/`, four agent rule packs written for code review rather than for onboarding.
+Two of the document's own rules make it an audit trail rather than a changelog. Rows are never renumbered; new rows are appended to the end of each table so every cross-reference keeps pointing at the same row. And superseded plans are kept rather than quietly deleted, marked as "sweep history": "'Left to milestone 2' describes a plan milestone 2 did not take; kept only as sweep history, not as an open item." The sweep method section even reproduces its grep patterns and lists all 47 JS/XML files under `addons/crm/static/src/`, so that zero-hit files are "confirmed empty, not skipped". See [Offline surface inventory](apps/crm/offline-surface-inventory.md) and [Offline CRM](apps/crm/offline-crm.md).
 
-## The biggest Python file is accounting, not the ORM
+## The git history begins seven times
 
-You would expect the heart of an ERP framework to be its largest file. It is not. `addons/account/models/account_move.py` is 8,339 lines, the largest tracked Python file in the repository. `odoo/orm/models.py`, which defines `BaseModel` and the entire recordset API that all 642 addons are built on, is 6,617. The runner-up is not framework code either: `addons/stock/tests/test_move.py` at 7,043 lines. Two of the three largest Python files in an ERP are about moving things, one kind financial and one kind physical.
+`git rev-list --max-parents=0 HEAD` in this clone returns seven root commits, not one, out of 211,650 commits in total. The oldest is "New trunk" (`004a0b996ff`, 2006-12-07) — and the next commit in date order carries the exact same title. The day after, 2006-12-08, the history records "Merge with trunk_old", so even the first trunk had a predecessor that predates this repository.
 
-## A code comment addressed to a person, in the offline storage layer
+The 2006 tree still says TinyERP everywhere a name could go: `bin/PKG-INFO` carries "Summary: TinyERP is an Enterprise Resource Management written entirely in python" and "Download-url: http://tinyerp.org/download.php", and the base module's manifest, `bin/addons/base/__terp__.py`, declares author "Tiny", website "http://tinyerp.com", description "The kernel of Tiny ERP, needed for all installation." The TinyERP name was baked into the manifest filename itself — every module shipped a `__terp__.py` — while in this tree the same file is `__manifest__.py` (`addons/crm/__manifest__.py`). The other roots joined later: "Initial commit, .gitignore" (2009-04-21, a second beginning two and a half years in), "[IMP] Piratepad web addons." (2010-10-15), a website_form_editor root (2015-08-25) and three sale-coupon roots (2016-12-20). The first commit already contained 67 "TODO" strings; today `TODO|FIXME|HACK` appears 2,246 times across 1,468 files. The TinyERP → OpenERP → Odoo lineage is told on [Lore](lore.md).
 
-`addons/web/static/src/core/utils/indexed_db.js:266`, inside the `_write` method that every offline write funnels through, opens with:
+## Easter eggs: Odoobot has feelings, the test models catch Pokémon
 
-```js
-// AAB: do we care about write performance?
-// Relaxed durability improves the write performances
-```
+`addons/mail_bot/models/mail_bot.py:132` has a comment that says exactly what it is — `# easter eggs` — and the bot's idle-state replies are written with real feeling: tell Odoobot "i love you" or send it a ❤️ and it answers "Aaaaaw that's really cute but, you know, bots don't work that way. You're too human for me! Let's keep it professional ❤️"; swear at it and it replies "That's not nice! I'm a bot but I have feelings... 💔".
 
-followed by the answer, a transaction opened with `{ durability: "relaxed" }` and two reference links. The initials survived the review that resolved the question; the decision is now load-bearing for every queued lead edit made offline.
-
-## A CRM pipeline screenshot in the gitignored logs directory
-
-`logs/` is gitignored (`.gitignore:57` is `/logs/`) and holds the dev scripts' run output: `odoo.log`, per-suite `test-*.log` files, and `measure-*.txt` timing files. It also holds `logs/crm-pipeline.png`, a 1280x633 screenshot of the CRM kanban at desktop width showing the demo pipeline (New / Qualified / Proposition / Won, with the progress bars and per-column revenue totals), captured 2026-09-30. Next to it, `logs/offline-spike/` holds nine more, named for the offline QA steps they document: `01-offline-pipeline.png`, `02-offline-reload.png`, `04-offline-action-helper.png`, `06-cdp-bottomsheet.png`, `09-no-touch-popover.png`. A manual offline QA session, preserved by accident in a directory git was told to ignore.
+The ORM's selection-field tests needed values nobody would put in real business data, and chose a Pokédex: `odoo/addons/test_base/models/test_orm.py:1489-1491` extends a selection with `('pikachu', "Pikachu")` and `('eevee', "Eevee")` — and Eevee's deletion policy is a lambda: `ondelete={'pikachu': 'set default', 'eevee': lambda r: r.write({'my_selection': 'bar'})}`. Pikachu also appears as a customer name in `addons/account/tests/test_invoice_taxes.py:831` and gets typed into a tag input in `addons/web/static/tests/views/fields/many2many_tags_field.test.js:1241`. And the official learning path runs through a game: "To learn the software, we recommend the Odoo eLearning, or Scale-up, the business game" (`README.md:31`).
 
 ## Related pages
 
 - [Lore](lore.md)
 - [By the numbers](by-the-numbers.md)
-- [Architecture](overview/architecture.md)
+- [Offline surface inventory](apps/crm/offline-surface-inventory.md)
+- [Offline CRM](apps/crm/offline-crm.md)
