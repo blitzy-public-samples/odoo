@@ -1,8 +1,15 @@
 import { Domain } from "@web/core/domain";
 import { ActivityMenu } from "@mail/core/web/activity_menu";
 import { patch } from "@web/core/utils/patch";
+import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
 
 patch(ActivityMenu.prototype, {
+    setup() {
+        super.setup(...arguments);
+        // Offline state of the web client, read through the shared CRM offline hooks.
+        this.crmOffline = useCrmOffline();
+    },
+
     availableViews(group) {
         if (group.model === "crm.lead") {
             return [
@@ -22,6 +29,13 @@ patch(ActivityMenu.prototype, {
         // fetch the data from the button otherwise fetch the ones from the parent (.o_ActivityMenuView_activityGroup).
         const context = {};
         if (group.model === "crm.lead") {
+            // The CRM activity views cannot be loaded offline: the entry and its Late/Today/Future
+            // links are inert, before any work (the dropdown stays open, no action is loaded).
+            // The entry is a <div>, so its dimming comes from the selector the CRM offline hooks
+            // add to the framework's offline selectors.
+            if (this.crmOffline.isOffline()) {
+                return;
+            }
             this.dropdown.close();
             if (filter === "my" || filter === "all") {
                 context["search_default_activities_overdue"] = 1;
