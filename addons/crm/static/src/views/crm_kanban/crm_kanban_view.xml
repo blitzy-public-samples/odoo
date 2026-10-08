@@ -7,4 +7,163 @@
             </t>
         </xpath>
     </t>
+
+    <!--
+        Offline availability of the existing controls rendered by CRM lead views.
+
+        While offline, the offline plugin disables every <button> that lacks the
+        `data-available-offline` attribute and re-enables the elements that carry it; it never
+        reads the attribute while online. The extensions below therefore mark, on the
+        interactive element itself, every existing lead control that stays usable offline
+        (edits queue a `web_save`, the card menu exposes the queued delete and color changes).
+
+        Scoping: each attribute is rendered only for `crm.lead` (`'1'`, otherwise `false`,
+        which omits the attribute), so the markup and offline behaviour of every other model
+        are unchanged, and the online DOM of lead views only gains an inert attribute.
+        - Field templates test their own record: `this.props.record?.resModel`. Optional
+          chaining keeps the templates safe where another component t-calls them.
+        - Core components without a record prop (autocomplete, tag) test the view's model:
+          `this.env.model?.root?.resModel`.
+
+        Left unannotated on purpose, because they stay framework-disabled offline: the
+        dynamic-placeholder <button>s of char and text fields, and the <button> variant of the
+        phone actions (only the `href` link variant is marked).
+    -->
+
+    <!-- Kanban card-menu toggler: exposes the queued Delete and color picker offline. -->
+    <t t-inherit="web.KanbanMenu" t-inherit-mode="extension">
+        <xpath expr="//button[hasclass('o-no-caret')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- Kanban color picker: picking a color queues a `web_save` of `color`. -->
+    <t t-inherit="web.KanbanColorPickerField" t-inherit-mode="extension">
+        <xpath expr="//button" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- Char input only; the dynamic-placeholder <button> stays disabled offline. -->
+    <t t-inherit="web.CharField" t-inherit-mode="extension">
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <t t-inherit="web.EmailField" t-inherit-mode="extension">
+        <xpath expr="//a[hasclass('o_form_uri')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Form variants are primary templates built from their parent as it stood in the `web`
+        block, so the `web.EmailField` / `web.UrlField` extensions above do not reach them: each
+        form variant marks its own link(s) and input.
+    -->
+    <t t-inherit="web.FormEmailField" t-inherit-mode="extension">
+        <xpath expr="//a[hasclass('o_form_uri')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//a[hasclass('btn')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <t t-inherit="web.PhoneField" t-inherit-mode="extension">
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- Phone actions: only the `href` link variant is marked; the <button> variant is not. -->
+    <t t-inherit="web.PhoneFieldActions" t-inherit-mode="extension">
+        <xpath expr="//t[@t-tag]" position="attributes">
+            <attribute name="t-att-data-available-offline">btn.href and this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <t t-inherit="web.UrlField" t-inherit-mode="extension">
+        <xpath expr="//a[hasclass('o_form_uri')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <t t-inherit="web.FormUrlField" t-inherit-mode="extension">
+        <xpath expr="//a[hasclass('o_form_uri')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//a[hasclass('btn')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <t t-inherit="web.MonetaryField" t-inherit-mode="extension">
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <t t-inherit="web.FloatField" t-inherit-mode="extension">
+        <xpath expr="//input" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- Textarea only (the lead name uses `widget="text"`); the placeholder <button> is not. -->
+    <t t-inherit="web.TextField" t-inherit-mode="extension">
+        <xpath expr="//textarea" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Many2one and tag inputs, and their suggestion entries (searched from the relational
+        cache offline). The loading entry carries the item class only dynamically, so it is
+        not matched.
+    -->
+    <t t-inherit="web.AutoComplete" t-inherit-mode="extension">
+        <xpath expr="//input[hasclass('o-autocomplete--input')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.env.model?.root?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//li[hasclass('o-autocomplete--dropdown-item')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.env.model?.root?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//li[hasclass('o-autocomplete--dropdown-item')]/t[@t-tag]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.env.model?.root?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Small screens, offline, lead views: a many2one renders the autocomplete marked above
+        (normal dropdown mode, searched from the relational cache, no create) instead of the
+        read-only input that opens the search dialog. `crmOfflineAutocomplete` (patched in
+        `crm_offline_hooks.js`) is false online, on large screens, for every other model and for
+        many2many tags.
+    -->
+    <t t-inherit="web.Many2XAutocomplete" t-inherit-mode="extension">
+        <xpath expr="//input[@readonly]" position="attributes">
+            <attribute name="t-if">this.uiService.isSmall and this.props.dropdown and !this.crmOfflineAutocomplete</attribute>
+        </xpath>
+    </t>
+
+    <!-- Tag remove link of many2many tags. -->
+    <t t-inherit="web.BadgeTag" t-inherit-mode="extension">
+        <xpath expr="//a[hasclass('o_delete')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.env.model?.root?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
 </templates>
