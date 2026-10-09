@@ -1,27 +1,17 @@
 /**
- * Mobile lead quick create, shown as a bottom sheet by the small-screen CRM pipeline.
+ * Lead quick create of the small-screen CRM pipeline, shown in a bottom sheet. It creates a
+ * `crm.lead` through `runOrQueue` from the shared CRM offline hooks: online, the pipeline adds the
+ * created lead to its stage (`onCreated`); offline, or when the connection drops during the call,
+ * the `web_save` is queued and the pipeline renders the pending card from the queue.
  *
- * The sheet captures exactly six values (lead name, contact name, phone, email, expected revenue
- * and stage) and creates a `crm.lead` through `runOrQueue` from the shared CRM offline hooks:
- *
- * - online, it calls `web_save` and hands the created id, with the live group of the chosen stage,
- *   to the pipeline (`onCreated`), which adds the card to that stage exactly as the framework
- *   kanban quick create does;
- * - offline, or when the connection drops during the call, the same `web_save` is scheduled in the
- *   framework offline queue. No server id exists then, so the pipeline renders the pending card
- *   from the queue (`pendingLeadCreates`) and the framework replays the call on reconnect.
- *
- * Constraints this component keeps:
- * - It queues only `crm.lead` `web_save`, a family the shared offline systray renders.
- * - It never sends `partner_id`: the contact is captured as `contact_name` (char), so no contact is
- *   created offline. No user or assignee is chosen either: the server applies the session user.
- * - It has no offline machinery of its own and registers nothing. It is opened only by the mobile
- *   pipeline, through
- *   `usePopover(CrmMobileQuickCreate, { useBottomSheet: true, withScope: true })`.
- *   `withScope` makes the sheet share the pipeline's plugin manager, hence its env and action
- *   config: the queued call is listed in the systray under the pipeline's action.
- * - Focus: the sheet focuses its lead name input as it opens; the pipeline moves the focus back
- *   to its Add button as the sheet closes (`onClose`).
+ * - Only `crm.lead` `web_save` is queued, a family the shared offline systray renders.
+ * - `partner_id` is never sent: the contact is `contact_name` (char), so no contact is created
+ *   offline. No user or assignee is sent either: the server applies the session user.
+ * - It registers nothing and has no offline machinery of its own. Only the mobile pipeline opens
+ *   it, with `withScope`, so the sheet shares the pipeline's plugin manager, hence its env and
+ *   action config: the queued call is listed in the systray under the pipeline's action.
+ * - The sheet focuses its lead name input as it opens; the pipeline moves the focus back to its
+ *   Add button as the sheet closes (`onClose`).
  *
  * @example
  * this.quickCreatePopover = usePopover(CrmMobileQuickCreate, {
@@ -358,7 +348,6 @@ export class CrmMobileQuickCreate extends Component {
         }
     }
 
-    /** Closes the sheet; nothing is saved or queued. */
     discard() {
         this.props.close();
     }

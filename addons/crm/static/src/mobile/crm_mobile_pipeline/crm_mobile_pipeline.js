@@ -1,43 +1,30 @@
 /**
  * Small-screen, stage-at-a-time CRM pipeline.
  *
- * Registered as the view `crm_mobile_pipeline`, selected by `js_class="crm_mobile_pipeline"` on the
- * pipeline arch (`crm.crm_case_kanban_view_leads`). It is the CRM kanban view (`crmKanbanView`)
- * with two classes swapped in:
+ * Registered as the view `crm_mobile_pipeline`, selected by `js_class` on the pipeline arch
+ * (`crm.crm_case_kanban_view_leads`): the CRM kanban view (`crmKanbanView`) with its renderer and
+ * controller swapped, and no second model.
  *
- * - `CrmMobilePipeline`, the renderer: on small screens, while the pipeline is grouped by
- *   `stage_id`, it displays one stage at a time (fixed header with the stage name, lead count and
- *   revenue sum, previous/next navigation and swipe), the CRM mobile lead cards, the mobile quick
- *   create bottom sheet and the offline helpers. Everywhere else its template renders the standard
- *   `web.KanbanRenderer`, so desktop and every other grouping keep exactly the kanban DOM;
- * - `CrmMobilePipelineController`, the controller adapter: it keeps the displayed stage across
- *   reloads and breadcrumbs, restores the mobile scroll of that stage, and opens the framework
- *   quick create (New) in the displayed stage. Outside the mobile pipeline every override calls
- *   `super`.
+ * - `CrmMobilePipeline`, the renderer, renders the mobile markup only while `isCrmMobilePipeline`
+ *   holds (small screen, grouped by `stage_id`, at least one stage group). Everywhere else it
+ *   renders the standard `web.KanbanRenderer`, so desktop and every other grouping keep exactly
+ *   the kanban DOM.
+ * - `CrmMobilePipelineController`, the controller adapter, keeps the displayed stage across reloads
+ *   and breadcrumbs, restores that stage's scroll and opens New's quick create in it. Outside the
+ *   mobile pipeline every override calls `super`.
  *
- * Model, arch parser, search model, control panel and button template stay the CRM kanban view's:
- * there is no second model.
+ * Offline rules:
+ * - No offline machinery of its own: offline and small-screen state come from `useCrmOffline()`,
+ *   reads go through the framework disk cache and nothing is persisted.
+ * - It queues nothing itself: stage moves go through the framework `moveRecords`, lead and
+ *   activity creates through the child components' `runOrQueue`.
+ * - Placement and totals are derived from framework state only, memoized per change of that
+ *   state. No correction is stored.
+ * - Every read is issued only in the small-screen stage pipeline, so desktop RPC sequences are
+ *   unchanged.
  *
- * Offline rules this file keeps:
- * - It has no offline machinery of its own: offline and small-screen state come from
- *   `useCrmOffline()`, reads go through the framework disk cache (`loadActivityTypes`,
- *   `loadLeadActivities`) and nothing is persisted.
- * - It queues nothing itself. Stage moves go through the framework kanban move (`moveRecords`),
- *   which queues the stage write offline; lead and activity creates are queued by the child
- *   components through `runOrQueue`.
- * - Pending placement and pending-aware totals are derived from framework state only: the offline
- *   queue entries, each record's framework group, its `stage_id` and its `serverStageId` (set by
- *   the CRM kanban model's record class). The derivation is memoized until that state changes, so
- *   every reader shares one derivation per change. No correction is stored.
- * - Every read (activities, activity types, reconciliation reload) is issued only on small screens
- *   in the stage pipeline, so desktop RPC sequences are unchanged.
- *
- * Status region: the mobile root holds one polite, atomic `role="status"` element, empty at mount,
- * that outlives stage changes and card remounts. It announces the queue changes that create,
- * remount or destroy a card, which the card's own region cannot tell: a card move the framework
- * made that left the lead pending sync, and a queued lead create appearing in or leaving the live
- * queue (replay or systray discard). The changes are read from the framework queue only; nothing
- * is stored but the last announcement and the keys and names of the creates last compared.
+ * Status-region announcements: see `_setupPendingCreateAnnouncements`, `onCardMove` and
+ * `_announce`.
  */
 
 import {
@@ -326,7 +313,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     // Getters
     // -------------------------------------------------------------------------
 
-    /** Whether the mobile markup is rendered (see `isCrmMobilePipeline`). */
     get isMobilePipeline() {
         return isCrmMobilePipeline(this.props.list, this.crmOffline.isSmall());
     }
@@ -390,12 +376,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         ]);
     }
 
-    /** Whether the arch declares a sum field (`expected_revenue` on the pipeline arch). */
     get hasRevenue() {
         return Boolean(this.props.progressBarState?.progressAttributes?.sumField);
     }
 
-    /** Whether the header offers the mobile quick create. */
     get canAdd() {
         return Boolean(this.props.archInfo.activeActions?.create);
     }

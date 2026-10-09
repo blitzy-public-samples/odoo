@@ -2,40 +2,35 @@
 <templates xml:space="preserve">
 
     <!--
-        Renderer of the `crm_mobile_pipeline` view (CrmMobilePipeline).
+        Renderer of the `crm_mobile_pipeline` view. Unless the screen is small and the pipeline
+        is grouped by stage with at least one stage (`isMobilePipeline`), it renders
+        `web.KanbanRenderer` through `t-call`, so desktop and every other grouping keep exactly
+        the kanban DOM.
 
-        Desktop, and every grouping other than a non-empty grouping by stage on a small screen
-        (`isMobilePipeline` false), renders the standard `web.KanbanRenderer` through `t-call`, so
-        their DOM is exactly the kanban DOM.
-
-        The mobile markup shows one stage at a time:
+        Mobile markup:
         - The root keeps `o_kanban_renderer o_renderer o_kanban_grouped`: the upstream mobile main
           flow targets `.o_kanban_renderer`, and the base kanban controller restores the scroll of
           `.o_renderer` without a null guard.
-        - The displayed stage is the only `.o_kanban_group` in the DOM. It carries the group's
-          `data-id` and never `o_column_folded`, so the base controller saves and restores its
-          scroll. It hosts the framework quick create (`.o_kanban_quick_create`, `.o_kanban_add`)
-          when New opened it in this stage, and the cards (`.o_kanban_record`, name in a span).
-        - Placement and totals come from the renderer's derived getters (pending-aware), never from
-          state stored by the template.
-        - Previous is not rendered on the first stage, nor Next on the last one. When the one that
-          disappears held the focus, the renderer moves the focus to the first header control
-          (the remaining navigation button, else Add), never to the document body.
-        - Space keydowns from any control inside the root stop at the root (onPipelineKeydown):
-          the inherited kanban Space hotkey listens on the window and would otherwise cancel the
-          native activation of the focused button (header, Back, Load more, helpers, quick create).
-        - One visually hidden status region (role=status, polite, atomic), the root's last child,
-          outside the stage body and every control, is rendered, empty, from mount, so it outlives
-          stage changes and card remounts. It announces, naming the lead, the queue changes that
-          create, remount or destroy a card, which no card region can tell: a card move the
-          framework made that left the lead pending sync, and a queued lead create appearing in
-          or leaving the live queue (replay or systray discard). Changes a mounted card sees stay
-          on that card's own region. Its message is a div, never a span, and lies outside every
-          .o_kanban_group and .o_kanban_record, so no card or stage selector matches it.
+        - The displayed stage is the only `.o_kanban_group`. It carries the group's `data-id` and
+          never `o_column_folded`, so the base controller saves and restores its scroll. It hosts
+          the framework quick create (`.o_kanban_quick_create`, `.o_kanban_add`) and the cards
+          (`.o_kanban_record`, name in a span).
+        - Placement and totals come from the renderer's pending-aware getters, not template state.
+        - Previous is not rendered on the first stage, nor Next on the last one. When the removed
+          button held the focus, the renderer moves the focus to the first header control (the
+          remaining navigation button, else Add), else to the first control of the pipeline,
+          instead of letting it drop to the document body.
+        - Space keydowns stop at the root (onPipelineKeydown): the inherited kanban Space hotkey
+          would otherwise cancel the native activation of the focused button.
+        - The status region (role=status, polite, atomic, visually hidden) is the root's last
+          child, outside the stage body and every control, and is rendered empty from mount, so it
+          outlives stage changes and card remounts. It announces the queue changes that create,
+          remount or destroy a card, which no card's own region can tell. Its message is a div
+          outside every .o_kanban_group and .o_kanban_record, so no card or stage selector
+          matches it.
 
-        Offline: every button here carries `data-available-offline`, so the framework offline UI
-        leaves navigation (prev/next), Add and Back usable. Load more is rendered online only, so
-        offline no uncached read is attempted. The attribute is inert online.
+        Offline: every button of this template carries `data-available-offline` (inert online).
+        Load more is rendered online only, so offline no uncached read is attempted.
     -->
     <t t-name="crm.CrmMobilePipeline">
         <t t-if="this.isMobilePipeline">
@@ -177,11 +172,9 @@
                         <div t-if="unavailableCount > 0"
                             class="o_crm_mobile_pipeline_unavailable_more text-muted small text-center py-2"
                             t-out="this.unavailableMoreLabel(group, unavailableCount)"/>
-                        <!-- Online only: offline, no uncached read is attempted. -->
                         <t t-if="!this.crmOffline.isOffline()">
                             <t t-set="unloadedCount" t-value="this.getGroupUnloadedCount(group)"/>
                             <div t-if="unloadedCount > 0" class="o_kanban_load_more o_crm_mobile_pipeline_load_more" t-key="unloadedCount">
-                                <!-- Busy and disabled while its load is in flight. -->
                                 <button t-if="group.isFolded" type="button"
                                     class="btn btn-outline-primary w-100 mt-3"
                                     data-available-offline="1"

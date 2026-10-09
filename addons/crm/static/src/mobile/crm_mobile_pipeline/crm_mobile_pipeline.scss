@@ -1,9 +1,5 @@
 // Small-screen CRM pipeline (template `crm.CrmMobilePipeline`): one stage at a time.
 //
-// Layout only. Colors, borders and spacing come from the Bootstrap utility classes of the template
-// (`bg-view`, `border-bottom`, `px-2`, `gap-1`, `btn-*`, ...), so the pipeline follows the active
-// theme and this file holds no palette.
-//
 // The mobile root keeps `o_kanban_renderer o_renderer o_kanban_grouped`: the upstream mobile main
 // flow targets those classes and the base kanban controller saves and restores the scroll of
 // `.o_renderer` and of every unfolded `.o_kanban_group`. On small screens the web kanban styles
@@ -38,7 +34,6 @@ $o-crm-mobile-touch: 44px;
     overflow: hidden !important;
     scroll-snap-type: none;
 
-    // Fixed header: previous stage, stage name with lead count and revenue sum, next stage, Add.
     .o_crm_mobile_pipeline_header {
         position: sticky;
         top: 0;

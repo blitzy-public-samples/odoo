@@ -19,13 +19,12 @@ export class TeamSwitcher extends Component {
         super.setup();
         this.actionService = useService("action");
         this.crmOffline = useCrmOffline();
-        // Result of the sales-manager group probe: `null` until it has been probed online, then
-        // the boolean answer. It is retained across disconnections, so reconnecting never probes
-        // again once an answer is known (see `isSaleManager`).
+        // Sales-manager probe answer: `null` until a probe succeeds online, then the boolean. It is
+        // retained across disconnections, so a known answer is never probed again.
         this.probedSaleManager = signal(null);
 
-        // The group probe is advisory (it only toggles the "Manage Teams" item), so it is skipped
-        // offline: a cold offline mount must not fail on an RPC that cannot be answered.
+        // The probe is advisory (it only toggles "Manage Teams"), so it is skipped offline and a
+        // cold offline mount does not fail.
         onWillStart(async () => {
             if (this.crmOffline.isOffline()) {
                 return;
@@ -33,24 +32,20 @@ export class TeamSwitcher extends Component {
             try {
                 await this._probeSaleManager();
             } catch (error) {
-                // A probe that lost the connection, whether it just happened (the client may
-                // already be back online by now) or is the failed answer the user group cache
-                // keeps and replays to every later mount, leaves the answer unknown: the mount
-                // goes on with "Manage Teams" hidden instead of failing, the safe outcome until
-                // the page is reloaded. Any other error received online propagates, as it always
-                // did.
+                // A probe that lost the connection, just now or replayed by the user group cache
+                // (which keeps rejected answers), leaves the answer unknown: the mount completes
+                // with "Manage Teams" hidden until the page is reloaded. Any other error received
+                // online propagates.
                 if (!(error instanceof ConnectionLostError) && !this.crmOffline.isOffline()) {
                     throw error;
                 }
             }
         });
 
-        // Probes whenever the client is online and no answer is known yet. The effect runs once
-        // synchronously here, so an online mount starts the probe now and `onWillStart` awaits
-        // that same promise: exactly one `has_group` call, as before. After a cold offline mount
-        // it re-runs on reconnect (it reads `isOffline()`) and probes once. The probe runs
-        // untracked so the effect only depends on the two signals read above it, and the block
-        // body returns nothing because an effect's return value is its cleanup.
+        // Probes while online and the answer is unknown. The effect runs at setup, so `onWillStart`
+        // awaits this same request (a single `has_group`); after a cold offline mount it re-runs on
+        // reconnect. The probe runs untracked so only the two signals read above are dependencies;
+        // the block body returns nothing because an effect's return value is its cleanup.
         useEffect(() => {
             if (this.crmOffline.isOffline() || this.probedSaleManager() !== null) {
                 return;
@@ -63,8 +58,8 @@ export class TeamSwitcher extends Component {
     }
 
     /**
-     * Probes the sales-manager group, sharing one in-flight request between the mount and the
-     * reconnect effect. A failed probe is forgotten so that a later trigger may probe again.
+     * Probes the sales-manager group. Callers share the in-flight request; a failed probe is
+     * cleared so a later trigger can retry.
      *
      * @returns {Promise<void>}
      */
@@ -82,10 +77,8 @@ export class TeamSwitcher extends Component {
     }
 
     /**
-     * Whether the "Manage Teams" item is offered. Navigating to the team configuration is not
-     * possible offline, so the item is hidden whenever the client is offline, whether the
-     * component was mounted offline or the connection dropped later, and shown again on
-     * reconnect from the retained probe answer.
+     * Whether "Manage Teams" is offered: never offline, where the team configuration cannot open;
+     * otherwise the retained probe answer.
      *
      * @returns {boolean}
      */

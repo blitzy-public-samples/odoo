@@ -2,26 +2,18 @@
 <templates xml:space="preserve">
 
     <!--
-        Mobile lead quick create, rendered inside the bottom sheet the small-screen CRM pipeline
-        opens (`usePopover(CrmMobileQuickCreate, {useBottomSheet: true, withScope: true})`).
-
-        - Exactly six labelled controls, in this order: lead name, contact name, phone, email,
-          expected revenue and stage. There is deliberately no partner control: the contact is
-          captured as a char (`contact_name`), so no contact can be created offline.
-        - Every interactive element carries `data-available-offline`: the framework offline UI
-          disables each `<button>` without it, and the sheet must stay fully usable offline, where
-          `save()` queues the create.
         - Values are bound with `t-model.proxy`, because the component state is a `proxy`; a plain
           `t-model` expects a signal. The stage options' values are group datapoint ids (strings),
           as `state.stageGroupId` is, so the select's strict comparison selects the right option.
-          The expected revenue is the exception, bound one way (`onRevenueInput`): a number input
-          reports an empty value for a text it cannot parse (`1e`, typed on the way to `1e3`), and
-          writing that value back would erase the text and its `badInput` state, which `save()`
-          reads to reject it.
+        - The expected revenue is bound one way (`onRevenueInput`): a number input reports an empty
+          value for a text it cannot parse (`1e`), and writing that value back would erase the text
+          and its `badInput` state, which `save()` reads to reject it.
+        - Every interactive element carries `data-available-offline`: the framework offline UI
+          disables each `<button>` without it, and the sheet must stay usable offline.
+        - No `<form>` wrapper and only `type="button"` buttons, so `save()` is the sole create path.
+          The framework classes `o_kanban_quick_create` and `o_kanban_add` are not used: they belong
+          to the framework kanban quick create, which the upstream mobile main-flow tour drives.
         - Comments stay outside the template: Owl renders a comment inside a template into the DOM.
-        - No `<form>` wrapper and only `type="button"` buttons, so the sole path that creates a lead
-          is `save()`. The framework quick-create classes (`o_kanban_quick_create`, `o_kanban_add`)
-          are not used: they belong to the framework kanban quick create.
     -->
     <t t-name="crm.CrmMobileQuickCreate">
         <div class="o_crm_mobile_quick_create d-flex flex-column gap-3 p-3">

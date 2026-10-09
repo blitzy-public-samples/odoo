@@ -1,17 +1,10 @@
 // Mobile lead quick create (bottom sheet opened by the small-screen CRM pipeline).
-//
-// Only touch-target sizing lives here: colors and spacing come from the Bootstrap utility
-// classes of the `crm.CrmMobileQuickCreate` template (`p-3`, `gap-*`, `btn-primary`, ...).
-// Every rule is scoped to `.o_crm_mobile_quick_create`, which only that small-screen sheet
-// renders, so desktop and other apps are unaffected. The framework kanban quick create
-// (`.o_kanban_quick_create`, `.o_kanban_add`) is deliberately left untouched.
 
 // Minimum touch-target size in CSS pixels. Declared locally on purpose: each mobile CRM
 // stylesheet owns its own value instead of sharing a global variable.
 $o-crm-mobile-touch: 44px;
 
 .o_crm_mobile_quick_create {
-    // The six controls: name, contact name, phone, email, expected revenue and stage.
     input,
     select {
         min-height: $o-crm-mobile-touch;
