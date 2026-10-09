@@ -40,12 +40,15 @@ import { defineCrmModels } from "@crm/../tests/crm_test_helpers";
 import {
     click as mailClick,
     contains as mailContains,
+    dragenterFiles,
+    dropFiles,
     hover,
     insertText,
     listenStoreFetch,
     mailModels,
     openFormView,
     openView,
+    pasteFiles,
     start,
     startServer,
     waitStoreFetch,
@@ -90,6 +93,7 @@ import { ScheduledMessage } from "@mail/chatter/web/scheduled_message";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
 import { MessageAction } from "@mail/core/common/message_actions";
+import { MessageDeleteDialog } from "@mail/core/common/message_delete_dialog";
 import { MessageReactionList } from "@mail/core/common/message_reaction_list";
 import { MessageReactionMenu } from "@mail/core/common/message_reaction_menu";
 import { QuickReactionMenu } from "@mail/core/common/quick_reaction_menu";
@@ -3374,6 +3378,98 @@ describe("SKIP and remaining DISABLE", () => {
         expect(".modal button[name='edit_followers']").toHaveCount(1);
     });
 
+    test("chatter file drop on an offline lead saves, uploads, reloads and queues nothing", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        // Every chatter write and every reload of the lead is stepped, online or offline.
+        watchRpcs([...MAIL_WRITES, "crm.lead/web_read"]);
+        const chatters = captureInstances(Chatter);
+        const leadChatter = () =>
+            chatters.findLast((c) => c.threadModel() === "crm.lead" && status(c) === "mounted");
+        const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
+        const dropFile = async () => {
+            await dragenterFiles(".o-mail-Chatter", [file]);
+            await dropFiles(".o-Dropzone", [file]);
+            await animationFrame();
+        };
+        // The chatter saves and reloads the form once its attachments change.
+        const arch = /* xml */ `
+            <form js_class="crm_form">
+                <sheet>
+                    <field name="name"/>
+                </sheet>
+                <chatter reload_on_post="True" reload_on_attachment="True"/>
+            </form>`;
+        await start();
+
+        // 1. A saved lead with unsaved edits, offline: the drop saves, uploads and reloads
+        // nothing, so the edits stay in the form.
+        await openFormView("crm.lead", 1, { arch });
+        await mailContains(".o-mail-Chatter");
+        expect.verifySteps(["crm.lead/web_read"]);
+        let chatter = leadChatter();
+        const savedLead = chatter.webChatterProps.record;
+        await contains(".o_field_widget[name=name] input").edit("Lead 1 (unsaved)");
+        await setOffline(true);
+        await animationFrame();
+        await dropFile();
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(savedLead.dirty).toBe(true);
+        expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 (unsaved)");
+        // Called directly, the parent reload and the record-save callback do nothing.
+        expect(chatter.reloadParentView()).toBe(undefined);
+        expect(await chatter.webChatterProps.saveRecord()).toBe(false);
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(savedLead.dirty).toBe(true);
+
+        // 2. Online again, the callback is the form's own, and the drop uploads, then saves and
+        // reloads the lead, as before.
+        await setOffline(false);
+        expect(chatter.webChatterProps.saveRecord).toBe(
+            Object.getPrototypeOf(chatter.webChatterProps).saveRecord
+        );
+        await dropFile();
+        await expect.waitForSteps([
+            "/mail/attachment/upload",
+            "crm.lead/web_save",
+            "crm.lead/web_read",
+        ]);
+        expect(savedLead.dirty).toBe(false);
+        expect(queuedEntries()).toHaveLength(0);
+
+        // 3. A valid unsaved lead, offline: the drop does not save it, so it stays new, and it
+        // uploads nothing and switches no panel.
+        await openFormView("crm.lead", undefined, { arch });
+        await mailContains(".o-mail-Chatter");
+        chatter = leadChatter();
+        expect(chatter.webChatterProps.record.isNew).toBe(true);
+        await contains(".o_field_widget[name=name] input").edit("Dropped lead");
+        await setOffline(true);
+        await animationFrame();
+        const panel = chatter.state.activePanel;
+        await dropFile();
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(chatter.webChatterProps.record.isNew).toBe(true);
+        expect(chatter.state.activePanel).toBe(panel);
+        expect(".o_field_widget[name=name] input").toHaveValue("Dropped lead");
+
+        // 4. Online again, the same drop saves the new lead before uploading, as before.
+        await setOffline(false);
+        await dropFile();
+        await expect.waitForSteps([
+            "crm.lead/web_save",
+            "/mail/attachment/upload",
+            "crm.lead/web_read",
+        ]);
+        expect(leadChatter().webChatterProps.record.isNew).toBe(false);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
     test("chatter patches are inert for non-CRM threads", async () => {
         const pyEnv = await startServer();
         const partnerId = pyEnv["res.partner"].create({ name: "Customer" });
@@ -3426,6 +3522,10 @@ describe("SKIP and remaining DISABLE", () => {
         await animationFrame();
         const chatter = components.chatters.find((c) => c.threadModel() === "res.partner");
         expect(chatter.isDisabled).toBe(false);
+        // The CRM save-callback guard returns the form's own callback for other models.
+        expect(chatter.webChatterProps.saveRecord).toBe(
+            Object.getPrototypeOf(chatter.webChatterProps).saveRecord
+        );
         // The composer still opens through `toggleComposer`.
         chatter.toggleComposer("note");
         await animationFrame();
@@ -3447,6 +3547,201 @@ describe("SKIP and remaining DISABLE", () => {
         expect(partnerScheduledMessage.props.scheduledMessage.thread.id).toBe(partnerId);
         partnerScheduledMessage.onClickCancel();
         await mailContains(".modal-footer button:contains('Cancel Message')");
+    });
+
+    test("message delete confirmation opened online closes on disconnect and removes nothing", async () => {
+        await seedLeadThread();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        watchRpcs(MAIL_WRITES);
+        const deleteDialogs = captureInstances(MessageDeleteDialog);
+        const messageActions = captureInstances(MessageAction);
+        await start();
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message:contains('Hello lead')");
+        const deleteAction = () =>
+            [...messageActionsByOwner(messageActions, "crm.lead").values()]
+                .flat()
+                .find(
+                    (action) =>
+                        action.id === "delete" && action.owner.constructor.name === "Message"
+                );
+        const DELETE_DIALOG =
+            ".modal:contains('Are you sure you want to permanently delete this message?')";
+
+        // Opened online through the message "delete" action, then the connection drops.
+        const owner = deleteAction().owner;
+        deleteAction().onSelected();
+        await mailContains(DELETE_DIALOG);
+        const openedOnline = deleteDialogs.at(-1);
+        await setOffline(true);
+        await animationFrame();
+        expect(DELETE_DIALOG).toHaveCount(0);
+        // Its confirmation, called directly once offline, removes nothing.
+        openedOnline.onClickConfirm();
+        // Opened offline by the message itself (an emptied edit composer does so): it closes, and
+        // its confirmation removes nothing either.
+        openedOnline.props.message.showDeleteConfirm(owner);
+        await animationFrame();
+        expect(deleteDialogs.at(-1)).not.toBe(openedOnline);
+        deleteDialogs.at(-1).onClickConfirm();
+        await animationFrame();
+        expect(".modal").toHaveCount(0);
+        expect(".o-mail-Message:contains('Hello lead')").toHaveCount(1);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Online, the confirmation still removes the message.
+        await setOffline(false);
+        await animationFrame();
+        deleteAction().onSelected();
+        await mailContains(DELETE_DIALOG);
+        await mailClick(".modal-footer button:contains('Delete')");
+        await expect.waitForSteps(["/mail/message/update_content"]);
+        await mailContains(DELETE_DIALOG, { count: 0 });
+    });
+
+    test("composer mass-mention confirmation answered after disconnection posts nothing", async () => {
+        await seedLeadThread();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        watchRpcs(MAIL_WRITES);
+        const components = captureChatterComponents();
+        await start();
+        // The composer counts the users of the mentioned roles: above 50, it asks before posting.
+        // No "@" is typed, so no mention suggestion is looked up.
+        patchWithCleanup(getService("mail.store"), {
+            getMentionsFromText(body, options) {
+                const mentions = super.getMentionsFromText(...arguments);
+                // The post itself (which passes its thread) keeps the real mentions.
+                return options?.thread
+                    ? mentions
+                    : { ...mentions, roles: [{ name: "Sales", user_ids_count: 51 }] };
+            },
+        });
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message:contains('Hello lead')");
+        const CONFIRM_BUTTON = ".modal-footer button:contains('Send Message')";
+
+        // The confirmation is opened online, then the connection drops before it is answered.
+        await mailClick(".o-mail-Chatter-logNote");
+        await insertText(".o-mail-Composer-input", "Notify the whole team");
+        await mailClick(".o-mail-Composer-send:enabled");
+        await mailContains(".modal-body:contains('about to notify 51 people')");
+        const composer = components.composers.find(
+            (c) => c.props.composer?.thread?.model === "crm.lead" && !c.props.composer.message
+        );
+        await setOffline(true);
+        await animationFrame();
+        expect(".o-mail-Chatter .o-mail-Composer").toHaveCount(0);
+        await contains(CONFIRM_BUTTON).click();
+        await animationFrame();
+        // The continuation, called directly offline, runs nothing either.
+        await composer.processMessage(async () => expect.step("processed"));
+        await animationFrame();
+        expect(".modal").toHaveCount(0);
+        expect(".o-mail-Message:contains('Notify the whole team')").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Online, the confirmed note is posted.
+        await setOffline(false);
+        await animationFrame();
+        await mailClick(".o-mail-Chatter-logNote");
+        await insertText(".o-mail-Composer-input", "Notify the whole team", { replace: true });
+        await mailClick(".o-mail-Composer-send:enabled");
+        await mailClick(CONFIRM_BUTTON);
+        await expect.waitForSteps(["/mail/message/post"]);
+        await mailContains(".o-mail-Message:contains('Notify the whole team')");
+    });
+
+    test("edit composer opened online uploads and unlinks nothing after disconnection", async () => {
+        const { pyEnv, messageId } = await seedLeadThread();
+        const postedId = pyEnv["ir.attachment"].create({
+            mimetype: "text/plain",
+            name: "posted.txt",
+            res_id: 1,
+            res_model: "crm.lead",
+        });
+        pyEnv["mail.message"].write([messageId], { attachment_ids: [[4, postedId]] });
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        watchRpcs(MAIL_WRITES);
+        const components = captureChatterComponents();
+        const messageActions = captureInstances(MessageAction);
+        await start();
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message:contains('Hello lead')");
+        const editComposer = () =>
+            components.composers
+                .filter((c) => c.props.composer?.message && status(c) === "mounted")
+                .at(-1);
+        const attachmentNames = () =>
+            editComposer()
+                .props.composer.attachments.map(({ name }) => name)
+                .sort();
+        const EDIT_ATTACHMENTS = ".o-mail-Message .o-mail-Composer .o-mail-AttachmentContainer";
+        const textFile = (name) => new File(["hello"], name, { type: "text/plain" });
+
+        // Opened online through the message "edit" action; a pasted file is uploaded.
+        [...messageActionsByOwner(messageActions, "crm.lead").values()]
+            .flat()
+            .find((action) => action.id === "edit" && action.owner.constructor.name === "Message")
+            .onSelected();
+        await mailContains(".o-mail-Message .o-mail-Composer-input");
+        await pasteFiles(".o-mail-Message .o-mail-Composer-input", [textFile("draft.txt")]);
+        await mailContains(`${EDIT_ATTACHMENTS}:not(.o-isUploading):contains('draft.txt')`);
+        expect.verifySteps(["/mail/attachment/upload"]);
+        expect(attachmentNames()).toEqual(["draft.txt", "posted.txt"]);
+
+        // The connection drops: the textarea paste and the drop zone upload nothing.
+        await setOffline(true);
+        await animationFrame();
+        const file = textFile("offline.txt");
+        await pasteFiles(".o-mail-Message .o-mail-Composer-input", [file]);
+        await dragenterFiles(".o-mail-Message-body", [file]);
+        await dropFiles(".o-Dropzone.o-mail-Composer-dropzone", [file]);
+        // The same handlers and the uploader (also behind the file input and voice messages),
+        // called directly; the unlink covers the posted attachment and the uploaded one.
+        const transfer = { files: [file], items: [], types: ["Files"] };
+        editComposer().onDropFile({ dataTransfer: transfer });
+        editComposer().onPaste({
+            clipboardData: transfer,
+            preventDefault: () => expect.step("paste prevented"),
+        });
+        await editComposer().attachmentUploader.uploadFile(file);
+        await editComposer().attachmentUploader.uploadData({
+            data: "aGVsbG8=",
+            name: "offline.txt",
+            type: "text/plain",
+        });
+        await editComposer().unlinkAttachments([...editComposer().props.composer.attachments]);
+        await animationFrame();
+        expect(attachmentNames()).toEqual(["draft.txt", "posted.txt"]);
+        expect(EDIT_ATTACHMENTS).toHaveCount(2);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // The html composer's editor pastes through the same handler: online it uploads,
+        // offline it does not.
+        await setOffline(false);
+        await animationFrame();
+        getService("mail.composer").setHtmlComposer();
+        const EDITABLE = ".o-mail-Message .o-mail-Composer-html.odoo-editor-editable";
+        await mailContains(EDITABLE);
+        await pasteFiles(EDITABLE, [textFile("html.txt")]);
+        await mailContains(`${EDIT_ATTACHMENTS}:not(.o-isUploading):contains('html.txt')`);
+        expect.verifySteps(["/mail/attachment/upload"]);
+        await setOffline(true);
+        await animationFrame();
+        await pasteFiles(EDITABLE, [file]);
+        await animationFrame();
+        expect(attachmentNames()).toEqual(["draft.txt", "html.txt", "posted.txt"]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
     });
 
     test("share target item issues no team read offline", async () => {
@@ -3698,6 +3993,81 @@ describe("K9 attributes", () => {
         if (isSmall()) {
             expect(".o_field_widget[name=parent_id] input").toHaveAttribute("readonly");
         }
+    });
+
+    test("lead chatter Files toggler stays usable offline; upload launchers stay disabled", async () => {
+        const pyEnv = await startServer();
+        pyEnv["ir.attachment"].create({
+            mimetype: "text/plain",
+            name: "lead_notes.txt",
+            res_id: 1,
+            res_model: "crm.lead",
+        });
+        const partnerId = pyEnv["res.partner"].create({ name: "Customer" });
+        pyEnv["ir.attachment"].create({
+            mimetype: "text/plain",
+            name: "partner_notes.txt",
+            res_id: partnerId,
+            res_model: "res.partner",
+        });
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        await start();
+        const toggler = ".o-mail-Chatter-attachFiles";
+        const panel = ".o-mail-AttachmentBox";
+
+        // 1. Lead with a cached attachment: the toggler only opens and closes the read-only Files
+        // panel, so it is marked and stays enabled offline.
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Followers-counter");
+        await mailContains(`${toggler} sup:text('1')`);
+        expect(toggler).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
+        await setOffline(true);
+        expect(toggler).toBeEnabled();
+        expect(toggler).not.toHaveClass("o_disabled_offline");
+        await mailClick(toggler);
+        await mailContains(`${panel} .o-mail-AttachmentContainer[title='lead_notes.txt']`);
+        await animationFrame();
+        // The panel's own upload launcher is not marked and stays disabled offline.
+        const panelUploader = `${panel} .o-mail-Chatter-attachmentActions button:contains('Attach files')`;
+        expect(panelUploader).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
+        expect(isDisabledOffline(panelUploader)).toBe(true);
+        await mailClick(toggler);
+        await mailContains(panel, { count: 0 });
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+        await setOffline(false);
+
+        // 2. Lead without attachments: the same button is the upload launcher of the chatter's
+        // `FileUploader`, not marked, so disabled offline.
+        await openFormView("crm.lead", 2, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Followers-counter");
+        await mailContains(".o-mail-Chatter-topbar input.o-mail-Chatter-fileUploader");
+        expect(`${toggler} sup`).toHaveCount(0);
+        expect(toggler).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
+        await setOffline(true);
+        expect(toggler).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
+        expect(isDisabledOffline(toggler)).toBe(true);
+        expect.verifySteps([]);
+        await setOffline(false);
+
+        // 3. Another model's chatter, with an attachment: never marked, disabled offline as before.
+        await openFormView("res.partner", partnerId, {
+            arch: /* xml */ `
+                <form>
+                    <sheet><field name="name"/></sheet>
+                    <chatter/>
+                </form>`,
+        });
+        await mailContains(".o-mail-Followers-counter");
+        await mailContains(`${toggler} sup:text('1')`);
+        expect(toggler).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
+        await setOffline(true);
+        expect(toggler).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
+        expect(isDisabledOffline(toggler)).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
     });
 
     test("html field editor: the lead notes editable is marked usable offline, other models' are not", async () => {

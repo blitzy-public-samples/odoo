@@ -12,6 +12,7 @@ import { ScheduledMessage } from "@mail/chatter/web/scheduled_message";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
 import { MessageAction } from "@mail/core/common/message_actions";
+import { MessageDeleteDialog } from "@mail/core/common/message_delete_dialog";
 import { MessageReactionList } from "@mail/core/common/message_reaction_list";
 import { MessageReactionMenu } from "@mail/core/common/message_reaction_menu";
 import { QuickReactionMenu } from "@mail/core/common/quick_reaction_menu";
@@ -22,7 +23,7 @@ import { ActivityMarkAsDone } from "@mail/core/web/activity_markasdone_popover";
 import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
-import { status, untrack, useEffect } from "@odoo/owl";
+import { computed, status, untrack, useEffect } from "@odoo/owl";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { patch } from "@web/core/utils/patch";
 
@@ -130,12 +131,18 @@ registry.category("views").add("crm_form", {
 // -----------------------------------------------------------------------------
 //
 // Chatter support offline is out of scope: the mail components call the server directly and never
-// queue. While the client is offline, every mutation reachable from a `crm.lead` thread (composer,
-// activities, followers, attachments, reactions, message actions, scheduled messages) is refused at
-// the handler itself, so a hotkey, a keyboard selection, a direct call or an overlay opened before
-// the connection dropped does nothing. Overlays whose mutation sits in a closure or a template
-// expression close themselves when the connection drops. Reads (opening the attachment panel,
-// searching, reading messages) stay available.
+// queue. While the client is offline, the mutation paths patched below for a `crm.lead` thread
+// (composer, including an edit composer's attachments; activities; followers; chatter attachments
+// and file drops; reactions; message actions and the message delete confirmation; scheduled
+// messages) are refused at the handler itself, so a hotkey, a keyboard selection, a direct call or
+// an overlay opened before the connection dropped does nothing. Where the mutation sits in a
+// closure no patch can reach, what that closure calls is refused instead: the chatter's uploader,
+// its record-save callback and its parent reload (file drops), and the composer's post
+// continuation (a confirmation answered after the connection dropped). Overlays whose mutation
+// sits in a closure or a template expression close themselves when the connection drops. Reads
+// of what the chatter already holds (reading messages, opening the attachment panel through its
+// Files toggler) stay available; controls that need the server, such as message search, stay
+// disabled by the framework.
 //
 // Every guard applies only while offline and only when the target model is exactly `crm.lead`:
 // online, and for every other model, each patched method calls `super` with its arguments.
@@ -144,8 +151,10 @@ registry.category("views").add("crm_form", {
 // `mail.followers.edit`, `mail.compose.message`) are framework views; their buttons and saves are
 // guarded in `@crm/mobile/crm_offline_hooks`.
 //
-// Removing an attachment from a posted message is left unpatched: offline, its request fails
-// before anything changes, and the lost-connection error is silenced by the framework.
+// One path is not patched: removing an attachment from a posted message
+// (`Message.onClickAttachmentUnlink`). It relies on the framework's connection-loss handling
+// instead: offline, its request fails before anything changes, the lost-connection error is
+// silenced by the framework, and its delete buttons are disabled by the framework.
 
 const CRM_LEAD = "crm.lead";
 
@@ -175,9 +184,11 @@ function isDestroyedComponent(target) {
  * Closes an overlay when its target is a lead and the client goes offline, or when it is opened
  * on a lead while offline.
  *
- * The effect tracks the model accessor and the offline signal. The close is deferred to a
- * microtask, so an overlay is never removed synchronously while it is still being set up, and it
- * runs only if the predicate still holds and the component is alive at that point.
+ * The predicate is a computed over the model accessor and, through it, the offline signal. The
+ * effect tracks only that computed, so it re-runs when the predicate flips, not on every change of
+ * the model accessor. The close is deferred to a microtask, so an overlay is never removed
+ * synchronously while it is still being set up, and it runs only if the component is alive and
+ * the predicate still holds at that point.
  *
  * @param {Object} holder the patched component or message action holding `crmOffline`
  * @param {() => string | undefined} getModel returns the target model
@@ -185,14 +196,15 @@ function isDestroyedComponent(target) {
  * @param {Object} [lifecycleOwner=holder] the component whose destruction cancels the close
  */
 function useCloseOnCrmOffline(holder, getModel, close, lifecycleOwner = holder) {
+    const mustClose = computed(() => isCrmLeadOffline(holder, getModel()));
     useEffect(() => {
-        if (isCrmLeadOffline(holder, getModel())) {
+        if (mustClose()) {
             untrack(() => {
                 Promise.resolve().then(() => {
                     if (isDestroyedComponent(lifecycleOwner)) {
                         return;
                     }
-                    if (isCrmLeadOffline(holder, getModel())) {
+                    if (mustClose()) {
                         close();
                     }
                 });
@@ -201,10 +213,38 @@ function useCloseOnCrmOffline(holder, getModel, close, lifecycleOwner = holder) 
     });
 }
 
+/**
+ * The chatter's record-save callback as the chatter of an offline lead sees it: it saves nothing.
+ * Every caller treats `false` as "not saved" and stops.
+ *
+ * @returns {Promise<false>}
+ */
+const refuseChatterSave = () => Promise.resolve(false);
+
 patch(Chatter.prototype, {
     setup() {
         super.setup(...arguments);
         this.crmOffline = useCrmOffline();
+        // The drop zone's `onDrop` saves an unsaved lead through the record-save callback before
+        // uploading, in a closure no patch can reach. For an offline lead this instance's view of
+        // the callback refuses, so a drop on an unsaved lead stops before saving, uploading,
+        // reloading or switching panel; on a saved lead, the guarded uploader and parent reload
+        // leave it nothing to do but open the read-only attachment panel. Online, and for every
+        // other model, the getter returns the original callback.
+        const webChatterProps = this.webChatterProps;
+        if (webChatterProps) {
+            this.webChatterProps = Object.create(webChatterProps, {
+                saveRecord: {
+                    enumerable: true,
+                    get: () => {
+                        const saveRecord = webChatterProps.saveRecord;
+                        return saveRecord && isCrmLeadOffline(this, this.threadModel())
+                            ? refuseChatterSave
+                            : saveRecord;
+                    },
+                },
+            });
+        }
         /** @type {WeakMap<Function, Function>} upload handler -> guarded handler */
         this.crmUploadWrappers = new WeakMap();
         // The drop zone's `onDrop` uploads through this instance's uploader in a closure no patch
@@ -306,6 +346,19 @@ patch(Chatter.prototype, {
             this.crmUploadWrappers.set(handler, wrapper);
         }
         return wrapper;
+    },
+
+    /**
+     * Saves the lead and reloads it. For an offline lead the save would be queued and the reload
+     * would replace the form's unsaved edits, so it is refused. This covers the completion of a
+     * file drop and every other chatter callback: the web chatter's `setup` binds
+     * `this.reloadParentView` to this patched method.
+     */
+    reloadParentView() {
+        if (isCrmLeadOffline(this, this.threadModel())) {
+            return;
+        }
+        return super.reloadParentView(...arguments);
     },
 
     scheduleActivity() {
@@ -609,6 +662,51 @@ patch(Composer.prototype, {
     setup() {
         super.setup(...arguments);
         this.crmOffline = useCrmOffline();
+        // An edit composer opened online stays open offline. Its `FileUploader` uploads through
+        // an `onUploaded` closure of the template and voice messages through a recorder callback,
+        // both on this instance's uploader, which no patch can reach: the uploader itself is
+        // made inert for an offline lead. `uploadData` calls `this.uploadFile` internally: both
+        // layers are guarded.
+        const uploader = this.attachmentUploader;
+        if (uploader) {
+            const uploadFile = uploader.uploadFile.bind(uploader);
+            const uploadData = uploader.uploadData.bind(uploader);
+            uploader.uploadFile = (...args) =>
+                isCrmLeadOffline(this, this.thread?.model)
+                    ? Promise.resolve()
+                    : uploadFile(...args);
+            uploader.uploadData = (...args) =>
+                isCrmLeadOffline(this, this.thread?.model)
+                    ? Promise.resolve()
+                    : uploadData(...args);
+        }
+    },
+    /** The drop zone's `onDrop`, bound to this method during setup. */
+    onDropFile() {
+        if (isCrmLeadOffline(this, this.thread?.model)) {
+            return;
+        }
+        return super.onDropFile(...arguments);
+    },
+    /**
+     * Reached from the textarea and from the editor's paste handler. Offline, no file is
+     * uploaded; the event is left to the textarea or the editor, which paste only its text.
+     */
+    onPaste() {
+        if (isCrmLeadOffline(this, this.thread?.model)) {
+            return;
+        }
+        return super.onPaste(...arguments);
+    },
+    /**
+     * Also reached by the composer's `AttachmentList` through its `unlinkAttachments` prop.
+     * Returns before the posted attachments are removed from the composer.
+     */
+    unlinkAttachments() {
+        if (isCrmLeadOffline(this, this.thread?.model)) {
+            return;
+        }
+        return super.unlinkAttachments(...arguments);
     },
     /** Covers the send button, the Enter key and an edit composer left open. */
     sendMessage() {
@@ -626,6 +724,38 @@ patch(Composer.prototype, {
             return;
         }
         return super.editMessage(...arguments);
+    },
+    /**
+     * The continuation of `sendMessage` and `editMessage`, which can run after an awaited
+     * confirmation (such as the mass-mention one) answered once the connection dropped: checked
+     * again here, so such a confirmation posts and edits nothing.
+     */
+    processMessage() {
+        if (isCrmLeadOffline(this, this.thread?.model)) {
+            return;
+        }
+        return super.processMessage(...arguments);
+    },
+});
+
+patch(MessageDeleteDialog.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOffline = useCrmOffline();
+        // Its confirmation runs `message.remove()` through a callback captured when it opened,
+        // which no message action guard reaches: the dialog closes when the connection drops.
+        useCloseOnCrmOffline(
+            this,
+            () => this.props.message?.thread?.model,
+            () => this.props.close()
+        );
+    },
+    /** Also covers a direct call on a dialog opened before the connection dropped. */
+    onClickConfirm() {
+        if (isCrmLeadOffline(this, this.props.message?.thread?.model)) {
+            return;
+        }
+        return super.onClickConfirm(...arguments);
     },
 });
 

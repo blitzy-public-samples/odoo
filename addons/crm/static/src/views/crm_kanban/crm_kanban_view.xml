@@ -26,6 +26,7 @@
           chaining keeps the templates safe where another component t-calls them.
         - Core components without a record prop (autocomplete, tag) test the view's model:
           `this.env.model?.root?.resModel`.
+        - The chatter Files toggler tests its thread model: `this.threadModel()`.
 
         Left unannotated on purpose, because they stay framework-disabled offline: the
         dynamic-placeholder <button>s of char and text fields, and the <button> variant of the
@@ -165,6 +166,19 @@
     <t t-inherit="web.BadgeTag" t-inherit-mode="extension">
         <xpath expr="//a[hasclass('o_delete')]" position="attributes">
             <attribute name="t-att-data-available-offline">this.env.model?.root?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Lead chatter Files toggler. With attachments, the button only opens and closes the
+        read-only Files panel, so the cached attachments stay viewable offline. Without
+        attachments, the same button is the `FileUploader` toggler that launches an upload: it
+        carries no attribute and stays disabled offline, as do the panel's own upload buttons.
+        The template is rendered by the chatter, whose model accessor is `threadModel()`.
+    -->
+    <t t-inherit="mail.Chatter.attachFiles" t-inherit-mode="extension">
+        <xpath expr="//button[hasclass('o-mail-Chatter-attachFiles')]" position="attributes">
+            <attribute name="t-att-data-available-offline">this.threadModel() === 'crm.lead' and this.attachments.length > 0 ? '1' : false</attribute>
         </xpath>
     </t>
 </templates>
