@@ -6,10 +6,14 @@ from datetime import timedelta
 from lxml import etree
 
 from odoo import fields
+from odoo.exceptions import AccessError
 from odoo.service.model import call_kw
 from odoo.tests import HttpCase, tagged
+from odoo.tools import mute_logger
+from odoo.tools.safe_eval import safe_eval
 
 from odoo.addons.crm.tests.common import TestCrmCommon
+from odoo.addons.web.models.models import UnlinkBlockedError
 
 # Icon of the CRM shortcuts: the addon's existing 100x100 asset.
 CRM_SHORTCUT_ICONS = [
@@ -52,6 +56,10 @@ TOUR_FOLLOWUP_SUMMARY = 'Offline tour follow-up'
 TOUR_FOLLOWUP_DATE = '2030-01-15'
 # "move the lead to the won stage": the tour picks the stage option whose text is exactly this.
 TOUR_WON_STAGE_LABEL = 'Won'
+
+# The values the mobile quick create queues, exactly
+# (addons/crm/static/src/mobile/crm_mobile_quick_create/crm_mobile_quick_create.js).
+QUICK_CREATE_FIELDS = {'name', 'contact_name', 'phone', 'email_from', 'expected_revenue', 'stage_id'}
 
 
 @tagged('post_install', '-at_install')
@@ -213,6 +221,22 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             'user_id': self.user_sales_leads.id,
             'date_deadline': fields.Date.today() + timedelta(days=2),
         })
+
+    def _action_context(self, xmlid, **group_defaults):
+        """ Context the views of a window action store with the calls they queue.
+
+        The action's own context, evaluated as the web client evaluates it, plus the
+        defaults a grouped view gives each group (``default_<group by field>``, see the
+        group configs of ``RelationalModel``). The session keys of the client user
+        context (``lang``, ``tz``, ``uid``, ``allowed_company_ids``) are left out, as in
+        every replay of this class: the replaying user's environment carries the session.
+
+        :param str xmlid: xmlid of the ``ir.actions.act_window``
+        :param group_defaults: group defaults, such as ``default_stage_id``
+        :return: stored context
+        :rtype: dict
+        """
+        return {**safe_eval(self.env.ref(xmlid).context), **group_defaults}
 
     # ------------------------------------------------------------
     # PART 5: PWA manifest
@@ -429,6 +453,184 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(lead.priority, '3')
 
     # ------------------------------------------------------------
+    # PART 3a, rows A, B, C1 and D1-D6: replay of the other framework-queued CRM calls
+    # ------------------------------------------------------------
+
+    def test_offline_partner_color_edit_replay(self):
+        """ PART 3a, 3c, K9 (Q13, Q14): replayed partner and kanban color edits reach the lead as online saves do. """
+        with self.subTest(shape='Q13 partner edit'):
+            partner = self.env['res.partner'].create({
+                'name': 'Offline Edit Partner',
+                'email': 'offline.edit.partner@test.example.com',
+                'phone': '+32 470 99 88 77',
+            })
+            lead = self._create_opportunity('Offline Partner Lead')
+            self.assertFalse(lead.partner_id)
+            self.assertFalse(lead.email_from)
+            self.assertFalse(lead.phone)
+
+            # the form save of a name edit and of a partner picked from the cached suggestions
+            self._replay([self._queued('crm.lead', 'web_save', [
+                [lead.id], {'name': 'Offline Partner Lead Edited', 'partner_id': partner.id},
+            ], {'context': {}, 'specification': {}}, time_stamp=1)])
+
+            self.assertEqual(lead.name, 'Offline Partner Lead Edited')
+            self.assertEqual(lead.partner_id, partner)
+            # the partner's email and phone reach the lead through its computes, as online
+            self.assertEqual(lead.email_from, 'offline.edit.partner@test.example.com')
+            self.assertEqual(lead.phone, '+32 470 99 88 77')
+            self.assertFalse(lead.partner_email_update)
+            self.assertFalse(lead.partner_phone_update)
+
+        with self.subTest(shape='Q14 color edit'):
+            lead = self._create_opportunity('Offline Color Lead')
+            self.assertEqual(lead.color, 0)
+
+            # the kanban color picker's save
+            self._replay([self._queued(
+                'crm.lead', 'web_save', [[lead.id], {'color': 2}],
+                {'context': {}, 'specification': {}}, time_stamp=2,
+            )])
+
+            self.assertEqual(lead.color, 2)
+
+    def test_offline_archive_unarchive_replay(self):
+        """ PART 3a, rows C1, D1-D3 (Q15, Q16, Q18, Q19): replayed lead and team archives and unarchives reach the server. """
+        # Archive and Unarchive store the view's context as their only keyword argument
+        pipeline_context = self._action_context('crm.crm_lead_action_pipeline')
+        team_context = self._action_context('sales_team.crm_team_action_config')
+
+        with self.subTest(shape='Q15 lead archive'):
+            lead_1 = self._create_opportunity('Offline Archived Lead 1')
+            lead_2 = self._create_opportunity('Offline Archived Lead 2')
+
+            # the list selection's Archive: one positional argument holding the ids
+            [result] = self._replay([self._queued(
+                'crm.lead', 'action_archive', [[lead_1.id, lead_2.id]],
+                {'context': pipeline_context}, time_stamp=1,
+            )])
+
+            self.assertFalse(result, 'No action for the client to open')
+            self.assertFalse(lead_1.active)
+            self.assertFalse(lead_2.active)
+
+        with self.subTest(shape='Q16 lead unarchive'):
+            lost_reason = self.env['crm.lost.reason'].create({'name': 'Offline Lost Reason'})
+            lead = self._create_opportunity('Offline Lost Lead')
+            lead.action_set_lost(lost_reason_id=lost_reason.id)
+            self.assertFalse(lead.active)
+            self.assertEqual(lead.won_status, 'lost')
+
+            # the form's Unarchive
+            [result] = self._replay([self._queued(
+                'crm.lead', 'action_unarchive', [[lead.id]], {'context': pipeline_context}, time_stamp=2,
+            )])
+
+            self.assertFalse(result, 'No action for the client to open')
+            self.assertTrue(lead.active)
+            # the CRM override of ``action_unarchive`` reverts the loss, as online
+            self.assertFalse(lead.lost_reason_id)
+            self.assertEqual(lead.won_status, 'pending')
+
+        with self.subTest(shape='Q18, Q19 team archive and unarchive'):
+            team = self.env['crm.team'].create({'name': 'Offline Archived Team'})
+
+            self._replay([self._queued(
+                'crm.team', 'action_archive', [[team.id]], {'context': team_context}, time_stamp=3,
+            )], user=self.user_sales_manager)
+            self.assertFalse(team.active)
+
+            self._replay([self._queued(
+                'crm.team', 'action_unarchive', [[team.id]], {'context': team_context}, time_stamp=4,
+            )], user=self.user_sales_manager)
+            self.assertTrue(team.active)
+
+    def test_offline_unlink_replay(self):
+        """ PART 3a, rows B and D4-D6 (Q17, Q20, Q21): replayed lead, team and stage deletes of a sales manager reach the server. """
+        # Delete stores the view's context as its only keyword argument
+        with self.subTest(shape='Q17 lead delete'):
+            leads = self._create_opportunity('Offline Deleted Lead 1') + self._create_opportunity('Offline Deleted Lead 2')
+
+            # the list selection's Delete: one positional argument holding the ids
+            [result] = self._replay([self._queued(
+                'crm.lead', 'web_unlink', [leads.ids],
+                {'context': self._action_context('crm.crm_lead_action_pipeline')}, time_stamp=1,
+            )], user=self.user_sales_manager)
+
+            self.assertIs(result, True)
+            self.assertFalse(leads.exists())
+
+        with self.subTest(shape='Q20 team delete'):
+            # a team no stage lists: ``crm.stage.team_ids`` restricts the deletion of a listed team
+            team = self.env['crm.team'].create({'name': 'Offline Deleted Team'})
+            self.assertFalse(self.env['crm.stage'].search_count([('team_ids', 'in', team.ids)]))
+
+            [result] = self._replay([self._queued(
+                'crm.team', 'web_unlink', [[team.id]],
+                {'context': self._action_context('sales_team.crm_team_action_config')}, time_stamp=2,
+            )], user=self.user_sales_manager)
+
+            self.assertIs(result, True)
+            self.assertFalse(team.exists())
+
+        with self.subTest(shape='Q21 stage delete'):
+            # a stage of the team's pipeline holding no lead
+            stage = self.env['crm.stage'].create({
+                'name': 'Offline Deleted Stage',
+                'team_ids': [(4, self.sales_team_1.id)],
+            })
+            self.assertFalse(self.env['crm.lead'].with_context(active_test=False).search_count([
+                ('stage_id', '=', stage.id),
+            ]))
+
+            [result] = self._replay([self._queued(
+                'crm.stage', 'web_unlink', [[stage.id]],
+                {'context': self._action_context('crm.crm_stage_action')}, time_stamp=3,
+            )], user=self.user_sales_manager)
+
+            self.assertIs(result, True)
+            self.assertFalse(stage.exists())
+
+    def test_offline_unlink_rejected_replay(self):
+        """ PART 3a, rows B and D4-D6 (Q17, Q21): a replayed delete the server forbids raises and deletes nothing, so the client parks it. """
+        with self.subTest(case='Q17 lead delete without the unlink right'):
+            # ``group_sale_salesman_all_leads`` may create, read and write leads, not delete them
+            lead = self._create_opportunity('Offline Undeletable Lead')
+            message_count = self._count_lead_messages(lead)
+            self.assertTrue(message_count)
+
+            with self.assertRaises(AccessError):
+                self._replay([self._queued(
+                    'crm.lead', 'web_unlink', [[lead.id]],
+                    {'context': self._action_context('crm.crm_lead_action_pipeline')}, time_stamp=1,
+                )])
+
+            # the transaction stays usable, and neither the lead nor its chatter is deleted
+            self.assertTrue(lead.exists())
+            self.assertEqual(self._count_lead_messages(lead), message_count)
+
+        with self.subTest(case='Q21 stage delete of a stage holding a lead'):
+            # ``crm.lead.stage_id`` restricts the deletion of a stage that still holds a lead
+            stage = self.env['crm.stage'].create({
+                'name': 'Offline Undeletable Stage',
+                'team_ids': [(4, self.sales_team_1.id)],
+            })
+            lead = self._create_opportunity('Offline Staged Lead', stage_id=stage.id)
+
+            # the database refuses the DELETE, which ``web_unlink`` rolls back and reports
+            with mute_logger('odoo.sql_db'), self.assertRaises(UnlinkBlockedError) as blocked:
+                self._replay([self._queued(
+                    'crm.stage', 'web_unlink', [[stage.id]],
+                    {'context': self._action_context('crm.crm_stage_action')}, time_stamp=2,
+                )], user=self.user_sales_manager)
+
+            self.assertEqual(blocked.exception.context['res_model'], 'crm.stage')
+            self.assertEqual(blocked.exception.context['blocked_ids'], stage.ids)
+            self.assertIs(blocked.exception.context['archivable'], False, 'A stage cannot be archived instead')
+            self.assertTrue(stage.exists())
+            self.assertEqual(lead.stage_id, stage)
+
+    # ------------------------------------------------------------
     # PART 3b: replay of the activity calls queued by the lead card
     # ------------------------------------------------------------
 
@@ -534,6 +736,67 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             self.assertEqual(self.env['ir.attachment'].search_count(attachment_domain), attachment_count,
                              'No document is uploaded')
             self.assertEqual(self._count_lead_messages(lead), message_count, 'No feedback message')
+
+    # ------------------------------------------------------------
+    # PART 4, N1: replay of the mobile quick create
+    # ------------------------------------------------------------
+
+    def test_offline_quick_create_replay(self):
+        """ PART 4, N1 (Q01): a replayed mobile quick create makes an opportunity of the six values and the group defaults, and no contact. """
+        stage = self.stage_team1_2
+        # the context of the pipeline group the sheet saves into, as the quick create stores it
+        group_context = self._action_context('crm.crm_lead_action_pipeline', default_stage_id=stage.id)
+        self.assertEqual(group_context['default_type'], 'opportunity')
+        # without the group's ``default_type``, this user would create a lead, not an opportunity
+        self.assertTrue(self.user_sales_leads.has_group('crm.group_use_lead'))
+        partners = self.env['res.partner'].with_context(active_test=False)
+        partner_count = partners.search_count([])
+
+        for case, vals in (
+            ('all values', {
+                'name': 'Offline Quick Lead',
+                'contact_name': 'Offline Quick Contact',
+                'phone': '+32 470 12 34 56',
+                'email_from': 'offline.quick@test.example.com',
+                'expected_revenue': 1500.0,
+                'stage_id': stage.id,
+            }),
+            # the sheet writes ``false`` for an empty char and 0 for an empty revenue
+            ('empty optional values', {
+                'name': 'Offline Quick Lead Empty',
+                'contact_name': False,
+                'phone': False,
+                'email_from': False,
+                'expected_revenue': 0,
+                'stage_id': stage.id,
+            }),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(set(vals), QUICK_CREATE_FIELDS)
+                [result] = self._replay([self._queued(
+                    'crm.lead', 'web_save', [[], vals],
+                    {'context': group_context, 'specification': {}}, time_stamp=1,
+                )])
+
+                # ``web_save`` answers with the saved records: the client reads ``result[0]['id']``
+                self.assertEqual(len(result), 1)
+                self.assertIsInstance(result[0], dict)
+                lead = self.env['crm.lead'].browse(result[0]['id'])
+                self.assertEqual(lead, self.env['crm.lead'].search([('name', '=', vals['name'])]))
+                self.assertEqual(lead.name, vals['name'])
+                self.assertEqual(lead.contact_name, vals['contact_name'])
+                self.assertEqual(lead.phone, vals['phone'])
+                self.assertEqual(lead.email_from, vals['email_from'])
+                self.assertEqual(lead.expected_revenue, vals['expected_revenue'])
+                self.assertEqual(lead.stage_id, stage)
+                # defaults: the group's type, the replaying salesperson and that salesperson's team
+                self.assertEqual(lead.type, 'opportunity')
+                self.assertEqual(lead.user_id, self.user_sales_leads)
+                self.assertEqual(lead.team_id, self.sales_team_1)
+                self.assertTrue(lead.active)
+                # the contact is captured as a name only: no partner is linked or created
+                self.assertFalse(lead.partner_id)
+                self.assertEqual(partners.search_count([]), partner_count)
 
     # ------------------------------------------------------------
     # K9 and DISABLE guards: offline wiring of the production views
