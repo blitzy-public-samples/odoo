@@ -256,6 +256,17 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             self.assertGreater(len(shortcut['icons']), 0)
             self.assertTrue(shortcut['url'].startswith('/odoo?menu_id='))
 
+        with self.subTest(case='missing pipeline menu'):
+            # a customization removed the pipeline menu's reference: no partial CRM set is published
+            self.env['ir.model.data'].search([
+                ('module', '=', 'crm'), ('name', '=', 'menu_crm_opportunities'),
+            ]).unlink()
+            self.assertIsNone(self.env.ref('crm.menu_crm_opportunities', raise_if_not_found=False))
+            data = self._get_manifest()
+            self.assertEqual(data['shortcuts'], self._expected_parent_shortcuts(self.user_sales_salesman),
+                             'A missing pipeline menu leaves the parent shortcuts untouched')
+            self.assertEqual(data['icons'], CRM_MANIFEST_ICONS, 'The CRM app entry is still listed')
+
     def test_webmanifest_crm_icon(self):
         """ PART 5, K3: CRM users get the addon's icons; every other manifest key, route and icon stays the parent's. """
         self.authenticate('user_sales_salesman', 'user_sales_salesman')
@@ -512,6 +523,7 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             activity = self._create_lead_activity(lead, upload_type, 'Upload the offer')
             attachment_domain = [('res_model', '=', 'crm.lead'), ('res_id', '=', lead.id)]
             attachment_count = self.env['ir.attachment'].search_count(attachment_domain)
+            message_count = self._count_lead_messages(lead)
 
             self._replay([self._queued('mail.activity', 'action_archive', [[activity.id]], kwargs={}, time_stamp=3)])
 
@@ -519,6 +531,7 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             self.assertEqual(activity.state, 'done')
             self.assertEqual(self.env['ir.attachment'].search_count(attachment_domain), attachment_count,
                              'No document is uploaded')
+            self.assertEqual(self._count_lead_messages(lead), message_count, 'No feedback message')
 
     # ------------------------------------------------------------
     # Lane 3: end-to-end offline session on the mobile pipeline

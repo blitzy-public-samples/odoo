@@ -37,28 +37,30 @@ class WebManifest(webmanifest.WebManifest):
 
         The parent's entries come first and stay untouched, the CRM app entry
         included. The CRM shortcuts follow in the parent's shape, and only
-        when that entry is present, so anonymous visitors and users without
-        CRM access get exactly the parent's list.
+        when that entry and the pipeline menu are present, so anonymous
+        visitors and users without CRM access get exactly the parent's list.
         """
         shortcuts = super()._get_shortcuts()
         if not self._crm_app_entry_present(shortcuts):
             return shortcuts
         root = request.env.ref('crm.crm_menu_root')
         # "My Pipeline" opens through the legacy ``menu_id`` URL, which the
-        # webclient resolves to the menu's action. A missing menu (removed by a
-        # customization) drops only this entry, never the whole manifest.
+        # webclient resolves to the menu's action. A missing pipeline menu
+        # (removed by a customization) leaves the parent's shortcuts untouched
+        # rather than publishing a partial CRM set.
         pipeline_menu = request.env.ref('crm.menu_crm_opportunities', raise_if_not_found=False)
-        if pipeline_menu:
-            shortcuts.append({
-                'name': request.env._("My Pipeline"),
-                'url': f'/odoo?menu_id={pipeline_menu.id}',
-                'description': request.env._("Open your CRM pipeline"),
-                'icons': [{
-                    'sizes': '100x100',
-                    'src': '/crm/static/description/icon.png',
-                    'type': 'image/png',
-                }],
-            })
+        if not pipeline_menu:
+            return shortcuts
+        shortcuts.append({
+            'name': request.env._("My Pipeline"),
+            'url': f'/odoo?menu_id={pipeline_menu.id}',
+            'description': request.env._("Open your CRM pipeline"),
+            'icons': [{
+                'sizes': '100x100',
+                'src': '/crm/static/description/icon.png',
+                'type': 'image/png',
+            }],
+        })
         # "New Lead" opens the pipeline action's form view on a new record.
         shortcuts.append({
             'name': request.env._("New Lead"),

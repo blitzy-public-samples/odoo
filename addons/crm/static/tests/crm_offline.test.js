@@ -97,8 +97,10 @@ import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
+import { FormController } from "@web/views/form/form_controller";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { ListController } from "@web/views/list/list_controller";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
@@ -1113,13 +1115,31 @@ describe("Email/phone copy", () => {
         CrmLead._records[1].phone = "+32 555 02";
         CrmLead._records[1].partner_email_update = true;
         CrmLead._records[1].partner_phone_update = true;
+        CrmLead._records[2].email_from = "lead3@example.com";
+        CrmLead._records[2].phone = "+32 555 03";
+        CrmLead._records[2].partner_email_update = true;
+        CrmLead._records[2].partner_phone_update = true;
+        CrmLead._records[3].email_from = "lead4@example.com";
+        CrmLead._records[3].phone = "+32 555 04";
+        CrmLead._records[3].partner_email_update = true;
+        CrmLead._records[3].partner_phone_update = true;
+        CrmLead._records[4].email_from = "lead5@example.com";
+        CrmLead._records[4].phone = "+32 555 05";
+        CrmLead._records[4].partner_email_update = false;
+        CrmLead._records[4].partner_phone_update = false;
+        const formControllers = captureInstances(FormController);
         const setOffline = mockOffline();
         const connection = mockConnectionDrop();
         watchRpcs(["crm.lead/web_save"]);
         keepPingsFailing();
 
-        // Both forms are loaded online; each is then saved through one path to the queue.
+        // Every form is loaded online. Leads 1 and 2 are each saved through one UI path to the
+        // queue. Leads 3 to 5 enter `_offlineSave` directly; they are mounted between leads 1 and
+        // 2, so that `:first` and `:last` keep targeting leads 1 and 2.
         await mountView({ type: "form", resModel: "crm.lead", resId: 1, arch: STAGE_FORM_ARCH });
+        await mountView({ type: "form", resModel: "crm.lead", resId: 3, arch: STAGE_FORM_ARCH });
+        await mountView({ type: "form", resModel: "crm.lead", resId: 4, arch: STAGE_FORM_ARCH });
+        await mountView({ type: "form", resModel: "crm.lead", resId: 5, arch: STAGE_FORM_ARCH });
         await mountView({ type: "form", resModel: "crm.lead", resId: 2, arch: STAGE_FORM_ARCH });
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
 
@@ -1156,6 +1176,68 @@ describe("Email/phone copy", () => {
             phone: "+32 555 02",
         });
         expect(queuedEntries()).toHaveLength(2);
+
+        // Path 3: `_offlineSave` is entered directly, never through `_save`, as the framework does
+        // for the records of a list or kanban save that loses the connection. The lead's CRM form
+        // record queues one entry of its own, with its context and an empty specification.
+        const CrmFormRecord = registry.category("views").get("crm_form").Model.Record;
+        const offlineSaveDirectly = async (resId) => {
+            const record = formControllers
+                .map(({ model }) => model.root)
+                .find((root) => root.resId === resId);
+            expect(record).toBeInstanceOf(CrmFormRecord);
+            expect(record.resModel).toBe("crm.lead");
+            expect(record.resId).toBe(resId);
+            expect(record._offlineSave()).toBe(true);
+            await animationFrame();
+            expect.verifySteps([]);
+            const calls = queuedCalls("crm.lead", "web_save").filter(
+                ({ args }) => args[0][0] === resId
+            );
+            expect(calls).toHaveLength(1);
+            expect(calls[0].kwargs).toEqual({ context: record.context, specification: {} });
+            return calls[0];
+        };
+
+        // Path 3, both flags set, email and phone untouched: both are copied next to the edit.
+        expect(".o_field_widget[name=name]:eq(1) input").toHaveValue("Lead 3");
+        expect(".o_field_widget[name=email_from]:eq(1) input").toHaveValue("lead3@example.com");
+        expect(".o_field_widget[name=phone]:eq(1) input").toHaveValue("+32 555 03");
+        await contains(".o_field_widget[name=name]:eq(1) input").edit("Lead 3 (edited)");
+        let save = await offlineSaveDirectly(3);
+        expect(save.args).toEqual([
+            [3],
+            {
+                name: "Lead 3 (edited)",
+                email_from: "lead3@example.com",
+                phone: "+32 555 03",
+            },
+        ]);
+
+        // Path 3, both flags set, email changed by the user: the user's email is queued, not the
+        // stored one, and the untouched phone is copied.
+        expect(".o_field_widget[name=name]:eq(2) input").toHaveValue("Lead 4");
+        expect(".o_field_widget[name=phone]:eq(2) input").toHaveValue("+32 555 04");
+        await contains(".o_field_widget[name=email_from]:eq(2) input").edit(
+            "lead4.new@example.com"
+        );
+        save = await offlineSaveDirectly(4);
+        expect(save.args).toEqual([
+            [4],
+            {
+                email_from: "lead4.new@example.com",
+                phone: "+32 555 04",
+            },
+        ]);
+
+        // Path 3, both flags unset, email and phone untouched: neither is queued.
+        expect(".o_field_widget[name=name]:eq(3) input").toHaveValue("Lead 5");
+        expect(".o_field_widget[name=email_from]:eq(3) input").toHaveValue("lead5@example.com");
+        expect(".o_field_widget[name=phone]:eq(3) input").toHaveValue("+32 555 05");
+        await contains(".o_field_widget[name=name]:eq(3) input").edit("Lead 5 (edited)");
+        save = await offlineSaveDirectly(5);
+        expect(save.args).toEqual([[5], { name: "Lead 5 (edited)" }]);
+        expect(queuedEntries()).toHaveLength(5);
     });
 });
 
@@ -2984,6 +3066,18 @@ async function letQueueReplay(count) {
     await animationFrame();
 }
 
+/**
+ * Deep copy of an ORM call: a queued value, or the params of a call the mock server received.
+ * The queue is persisted and reloaded as JSON before its replay, so a JSON copy is exactly what
+ * `OfflinePlugin._syncORM` sends, and it no longer changes with the live queue.
+ *
+ * @param {{ model: string, method: string, args: any[], kwargs: Object }} call
+ * @returns {{ model: string, method: string, args: any[], kwargs: Object }}
+ */
+function copyOrmCall({ model, method, args, kwargs }) {
+    return JSON.parse(JSON.stringify({ model, method, args, kwargs }));
+}
+
 describe("Stage and team coverage", () => {
     test.tags("desktop");
     test("crm.stage and crm.team: offline create and edit queue client-resolved web_save and replay", async () => {
@@ -2995,29 +3089,35 @@ describe("Stage and team coverage", () => {
         keepPingsFailing();
         watchRpcs(["crm.stage/web_save", "crm.team/web_save"]);
         // Online calls only: the replayed ones.
-        onRpc("web_save", ({ model, args }) => {
+        const serverCalls = [];
+        onRpc("web_save", ({ model, method, args, kwargs }) => {
+            serverCalls.push(copyOrmCall({ model, method, args, kwargs }));
             expect.step(`replayed ${model}: ${JSON.stringify(args)}`);
         });
         await mountWithCleanup(WebClient);
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
 
+        // `createValues` is every value the new-record form sends: the name typed, and the
+        // defaults of the other fields of its view.
         const cases = [
             {
                 actionId: STAGE_ACTION_ID,
                 model: "crm.stage",
                 existing: { id: 1, name: "New" },
-                created: "Proposition",
-                renamed: "Incoming",
+                created: "Offline Stage",
+                createValues: { name: "Offline Stage", sequence: 1 },
+                renamed: "Offline Stage Renamed",
             },
             {
                 actionId: TEAM_ACTION_ID,
                 model: "crm.team",
                 existing: { id: 1, name: "Mushroom Kingdom" },
-                created: "Direct Sales",
-                renamed: "Mushroom Kingdom Sales",
+                created: "Offline Team",
+                createValues: { name: "Offline Team" },
+                renamed: "Offline Team Renamed",
             },
         ];
-        for (const { actionId, model, existing, created, renamed } of cases) {
+        for (const { actionId, model, existing, created, createValues, renamed } of cases) {
             // Online: the list, an existing record and a new record are visited (cached).
             await getService("action").doAction(actionId);
             await contains(`.o_data_row .o_data_cell:contains('${existing.name}')`).click();
@@ -3046,14 +3146,19 @@ describe("Stage and team coverage", () => {
                 `${model}/web_read`,
             ]);
 
-            // Both writes are queued with client-resolved arguments only.
+            // Both writes are queued with client-resolved arguments only. `Record._offlineSave`
+            // stores the record's context, here the user context alone since the action has
+            // none, and an empty specification.
             const saves = queuedCalls(model, "web_save").sort(
                 (a, b) => a.extras.timeStamp - b.extras.timeStamp
             );
             expect(saves).toHaveLength(2);
-            expect(saves[0].args[0]).toEqual([]);
-            expect(saves[0].args[1]).toMatchObject({ name: created });
-            expect(saves[1].args).toEqual([[existing.id], { name: renamed }]);
+            const queued = saves.map(copyOrmCall);
+            const kwargs = { context: user.context, specification: {} };
+            expect(queued).toEqual([
+                { model, method: "web_save", args: [[], createValues], kwargs },
+                { model, method: "web_save", args: [[existing.id], { name: renamed }], kwargs },
+            ]);
             const replayedArgs = saves.map(({ args }) => JSON.stringify(args));
             // The optimistic names: the breadcrumb shows the server-computed `display_name`,
             // which only the replay recomputes, so offline the queued writes are listed under
@@ -3072,14 +3177,18 @@ describe("Stage and team coverage", () => {
             expect.verifySteps(
                 replayedArgs.flatMap((args) => [`${model}/web_save`, `replayed ${model}: ${args}`])
             );
+            // Each replayed call is the stored one, kwargs included: the ORM merges the user
+            // context under the stored context, which already holds it.
+            expect(serverCalls.splice(0)).toEqual(queued);
             expect(queuedEntries()).toHaveLength(0);
             const serverRecords = MockServer.env[model].search_read([], ["name"]);
             expect(serverRecords.map(({ name }) => name)).toInclude(created);
             expect(serverRecords.find(({ id }) => id === existing.id).name).toBe(renamed);
-            // Once replayed, both records carry their new names, breadcrumb included.
+            // Once replayed, both records carry their new names, breadcrumb included. The
+            // created name is a prefix of the renamed one, so rows are matched on their exact text.
             await contains(".o_breadcrumb .o_back_button").click();
             for (const name of [created, renamed]) {
-                await contains(`.o_data_row .o_data_cell:contains('${name}')`).click();
+                await contains(`.o_data_row .o_data_cell:text('${name}')`).click();
                 expect(".o_breadcrumb .active").toHaveText(name);
                 await contains(".o_breadcrumb .o_back_button").click();
             }
@@ -3100,6 +3209,13 @@ async function visitPipelineAndLead(leadName) {
     expect(".o_kanban_view").toHaveCount(1);
 }
 
+/** The context of the Pipeline action, as `defineActions` gives it above. */
+const PIPELINE_ACTION_CONTEXT = {
+    show_team_switcher: true,
+    show_lead_gen_button: true,
+    default_type: "opportunity",
+};
+
 describe("Queue semantics", () => {
     test.tags("desktop");
     test("two separate offline writes to the same lead field replay in timestamp order; the later value wins; no dialog", async () => {
@@ -3109,7 +3225,9 @@ describe("Queue semantics", () => {
         const setOffline = mockOffline();
         keepPingsFailing();
         watchRpcs(["crm.lead/web_save"]);
-        onRpc("crm.lead", "web_save", ({ args }) => {
+        const serverCalls = [];
+        onRpc("crm.lead", "web_save", ({ model, method, args, kwargs }) => {
+            serverCalls.push(copyOrmCall({ model, method, args, kwargs }));
             expect.step(`replayed priority ${args[1].priority}`);
         });
         await mountWithCleanup(WebClient);
@@ -3141,8 +3259,28 @@ describe("Queue semantics", () => {
         expect(k1.value.extras.timeStamp).toBeLessThan(k2.value.extras.timeStamp);
         expect(k1.value.extras.viewType).toBe("form");
         expect(k2.value.extras.viewType).toBe("kanban");
-        expect(k1.value.args).toEqual([[1], { priority: "1" }]);
-        expect(k2.value.args).toEqual([[1], { priority: "3" }]);
+        // Each record stores its own context: the form's is the user context with the
+        // action's; the card's adds the CRM search context (`team_switcher_enabled`) and the
+        // `default_stage_id` of its stage group.
+        const formContext = { ...user.context, ...PIPELINE_ACTION_CONTEXT };
+        const queued = [k1, k2].map(({ value }) => copyOrmCall(value));
+        expect(queued).toEqual([
+            {
+                model: "crm.lead",
+                method: "web_save",
+                args: [[1], { priority: "1" }],
+                kwargs: { context: formContext, specification: {} },
+            },
+            {
+                model: "crm.lead",
+                method: "web_save",
+                args: [[1], { priority: "3" }],
+                kwargs: {
+                    context: { ...formContext, team_switcher_enabled: true, default_stage_id: 1 },
+                    specification: {},
+                },
+            },
+        ]);
 
         // Reconnect: K1 then K2 reach the server, the later value wins, nothing asks the user.
         await setOffline(false);
@@ -3153,6 +3291,8 @@ describe("Queue semantics", () => {
             "crm.lead/web_save",
             "replayed priority 3",
         ]);
+        // The server receives the stored calls, kwargs included, in that order.
+        expect(serverCalls).toEqual(queued);
         expect(MockServer.env["crm.lead"].browse(1)[0].priority).toBe("3");
         expect(queuedEntries()).toHaveLength(0);
         expect(".modal").toHaveCount(0);
@@ -3176,7 +3316,18 @@ describe("Queue semantics", () => {
         await contains(".o_form_button_save").click();
         expect(queuedEntries()).toHaveLength(1);
         const [{ key, value: first }] = queuedEntries();
-        expect(first.args).toEqual([[1], { priority: "1" }]);
+        // Every save stores the whole call again: the form record's context (the user context
+        // with the action's) and an empty specification, next to the last values.
+        const leadFormSave = (priority) => ({
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { priority }],
+            kwargs: {
+                context: { ...user.context, ...PIPELINE_ACTION_CONTEXT },
+                specification: {},
+            },
+        });
+        expect(copyOrmCall(first)).toEqual(leadFormSave("1"));
 
         await advanceTime(5000);
         await contains(".o_field_widget[name=priority] .o_priority_star:eq(1)").click();
@@ -3184,7 +3335,7 @@ describe("Queue semantics", () => {
         expect(queuedEntries()).toHaveLength(1);
         expect(queuedEntries()[0].key).toBe(key);
         expect(queuedEntries()[0].value.extras.timeStamp).toBe(first.extras.timeStamp);
-        expect(queuedEntries()[0].value.args).toEqual([[1], { priority: "2" }]);
+        expect(copyOrmCall(queuedEntries()[0].value)).toEqual(leadFormSave("2"));
 
         // Back to the pipeline, the lead form is reopened: it adopts the queued entry.
         await advanceTime(5000);
@@ -3198,7 +3349,7 @@ describe("Queue semantics", () => {
         expect(entry.key).toBe(key);
         expect(entry.value.extras.timeStamp).toBe(first.extras.timeStamp);
         expect(entry.value.extras.viewType).toBe("form");
-        expect(entry.value.args).toEqual([[1], { priority: "3" }]);
+        expect(copyOrmCall(entry.value)).toEqual(leadFormSave("3"));
         await expect.waitForErrors([
             "crm.lead/web_read",
             "crm.team/get_team_switcher_data",
@@ -3211,7 +3362,9 @@ describe("Queue semantics", () => {
     test("rejected replay parked in systray, no CRM error UI", async () => {
         const setOffline = mockOffline();
         keepPingsFailing();
-        onRpc("crm.lead", "web_save", () => {
+        const serverCalls = [];
+        onRpc("crm.lead", "web_save", ({ model, method, args, kwargs }) => {
+            serverCalls.push(copyOrmCall({ model, method, args, kwargs }));
             expect.step("replay rejected");
             throw makeServerError({ message: "This lead is locked" });
         });
@@ -3223,15 +3376,25 @@ describe("Queue semantics", () => {
         await contains(".o_field_widget[name=name] input").edit("Lead 1 (offline)");
         await contains(".o_form_button_save").click();
         expect(queuedEntries()).toHaveLength(1);
+        // The stored call: the form record's context, the user context alone since the action
+        // has none, and an empty specification.
+        const [queued] = queuedEntries().map(({ value }) => copyOrmCall(value));
+        expect(queued).toEqual({
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { name: "Lead 1 (offline)" }],
+            kwargs: { context: user.context, specification: {} },
+        });
 
         await setOffline(false);
         await letQueueReplay(1);
         expect.verifySteps(["replay rejected"]);
+        // The server received the stored call, kwargs included, and rejected it.
+        expect(serverCalls).toEqual([queued]);
         // The call stays in the queue, parked with the server error, and is not retried.
         const [parked] = queuedEntries();
         expect(queuedEntries()).toHaveLength(1);
-        expect(parked.value.method).toBe("web_save");
-        expect(parked.value.args).toEqual([[1], { name: "Lead 1 (offline)" }]);
+        expect(copyOrmCall(parked.value)).toEqual(queued);
         expect(parked.value.extras.error).toMatch(/This lead is locked/);
         expect(".o_menu_systray .o_offline_systray").toHaveText("Sync issues");
         expect(".o_menu_systray .o_offline_systray [data-icon='error']").toHaveCount(1);
