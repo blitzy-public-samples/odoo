@@ -100,12 +100,14 @@
                                 context="group.context"
                             />
                         </t>
+                        <!-- One ordered stage array, shared by every card of both loops. -->
+                        <t t-set="stages" t-value="this.stageGroups"/>
                         <!-- Queued lead creates, keyed by queue key: they leave with their entry. -->
                         <t t-foreach="this.pendingCreatesFor(group)" t-as="entry" t-key="entry.key">
                             <CrmMobileLeadCard
                                 pendingCall="entry"
                                 group="group"
-                                stages="this.stageGroups"
+                                stages="stages"
                                 displayedStageValue="group.serverValue"
                             />
                         </t>
@@ -121,8 +123,10 @@
                             <CrmMobileLeadCard
                                 record="record"
                                 group="group"
-                                stages="this.stageGroups"
+                                stages="stages"
                                 activities="this.mobileState.activitiesByLead[record.resId] ?? null"
+                                activityTotal="this.mobileState.activityTotalsByLead[record.resId] ?? null"
+                                onShowAllActivities="(resId) => this.onShowAllActivities(resId)"
                                 activityTypes="this.mobileState.activityTypes"
                                 unavailable="this.isCardUnavailable(record)"
                                 displayedStageValue="group.serverValue"
@@ -134,9 +138,10 @@
                         </t>
                         <!-- Offline, the stage holds leads none of which was loaded online. -->
                         <OfflineActionHelper t-if="this.isStageDataMissing(group)"/>
-                        <div t-if="this.unavailableMoreCount(group) > 0"
+                        <t t-set="unavailableCount" t-value="this.unavailableMoreCount(group)"/>
+                        <div t-if="unavailableCount > 0"
                             class="o_crm_mobile_pipeline_unavailable_more text-muted small text-center py-2"
-                            t-out="this.unavailableMoreLabel(group)"/>
+                            t-out="this.unavailableMoreLabel(group, unavailableCount)"/>
                         <!-- Online only: offline, no uncached read is attempted. -->
                         <t t-if="!this.crmOffline.isOffline()">
                             <t t-set="unloadedCount" t-value="this.getGroupUnloadedCount(group)"/>

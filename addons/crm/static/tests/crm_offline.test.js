@@ -76,12 +76,18 @@ import {
     toggleActionMenu,
     toggleMenuItem,
 } from "@web/../tests/web_test_helpers";
-import { status } from "@odoo/owl";
+import { Component, status, xml } from "@odoo/owl";
 
 import {
     CRM_FOREIGN_DISABLED_BUTTONS,
+    CRM_MAIL_FORM_TARGETS,
     CRM_OFFLINE_DISABLED_SELECTORS,
     CRM_OFFLINE_MODELS,
+    isOfflineModel,
+    loadActivityTypes,
+    loadLeadActivities,
+    targetsCrmLead,
+    useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
 import { LeadGenerationDropdown } from "@crm/components/lead_generation_dropdown/lead_generation_dropdown";
 import { TeamSwitcher } from "@crm/components/team_switcher/team_switcher";
@@ -104,6 +110,8 @@ import { ActivityMarkAsDone } from "@mail/core/web/activity_markasdone_popover";
 import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
+import { NonSecureContextError } from "@web/core/errors/non_secure_context_error";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
@@ -112,6 +120,7 @@ import { Many2One } from "@web/views/fields/many2one/many2one";
 import { FormController } from "@web/views/form/form_controller";
 import { KanbanController } from "@web/views/kanban/kanban_controller";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
+import { KanbanRenderer } from "@web/views/kanban/kanban_renderer";
 import { ListController } from "@web/views/list/list_controller";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { MultiRecordViewButton } from "@web/views/view_button/multi_record_view_button";
@@ -4612,5 +4621,1012 @@ describe("Queue semantics", () => {
         // The framework systray is the only error UI: no CRM notification, no dialog.
         expect(".o_notification").toHaveCount(0);
         expect(".modal").toHaveCount(0);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Shared hooks contract: plain helpers, loaders, queue readers, `runOrQueue` and the fallback
+// and delegation branches of the handler patches (`@crm/mobile/crm_offline_hooks`)
+// -----------------------------------------------------------------------------
+
+/** Env config of the hooks harness: `runOrQueue` copies it into the extras of a queued call. */
+const HARNESS_CONFIG = Object.freeze({
+    actionId: PIPELINE_ACTION_ID,
+    actionName: "Pipeline",
+    viewType: "kanban",
+});
+
+/** The smallest component using the shared hook: its `crmOffline` is the object under test. */
+class CrmOfflineHarness extends Component {
+    static template = xml`<div class="o_crm_hooks_harness"/>`;
+
+    setup() {
+        this.crmOffline = useCrmOffline();
+    }
+}
+
+/**
+ * Mounts the hooks harness in an action env (`HARNESS_CONFIG`) and lets the offline plugin finish
+ * its start-up synchronisation, which reloads the queue from its storage: a call scheduled
+ * afterwards keeps its stored entry.
+ *
+ * @returns {Promise<ReturnType<typeof useCrmOffline>>} the harness's `crmOffline`
+ */
+async function mountHooksHarness() {
+    const harness = await mountWithCleanup(CrmOfflineHarness, {
+        componentEnv: { config: { ...HARNESS_CONFIG } },
+    });
+    expect(".o_crm_hooks_harness").toHaveCount(1);
+    await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+    await animationFrame();
+    expect(getService(OfflinePlugin).syncingORM()).toBe(false);
+    return harness.crmOffline;
+}
+
+/**
+ * Schedules a call in the framework offline queue, through the framework, with the extras CRM
+ * code gives its calls, and returns its entry exactly as the queue stores it (`{key, value}`).
+ *
+ * @param {string} model
+ * @param {string} method
+ * @param {any[]} args
+ * @param {Object} [kwargs]
+ * @returns {{ key: number | string, value: Object }}
+ */
+function scheduleQueueFixture(model, method, args, kwargs = {}) {
+    const offlinePlugin = getService(OfflinePlugin);
+    const key = offlinePlugin.scheduleORM(model, method, args, kwargs, {
+        extras: {
+            ...HARNESS_CONFIG,
+            timeStamp: Date.now(),
+            displayName: `${model}/${method} ${JSON.stringify(args)}`,
+            changes: {},
+        },
+    });
+    return offlinePlugin._ormToSync()[key];
+}
+
+/**
+ * Steps, as `"<model>/<method>"` or the path, every request issued once `start()` is called,
+ * except the offline plugin's reconnection pings. Registered after `mockOffline()`, it also sees
+ * the requests the offline mock answers with a 502.
+ *
+ * @returns {{ start: () => void }}
+ */
+function watchRequestsFromNowOn() {
+    let watching = false;
+    onRpc("/*", (request) => {
+        const path = new URL(request.url).pathname;
+        if (!watching || path === "/web/webclient/version_info") {
+            return;
+        }
+        const match = path.match(R_CALL_KW);
+        expect.step(match ? `${match.groups.model}/${match.groups.method}` : path);
+    });
+    return {
+        start() {
+            watching = true;
+        },
+    };
+}
+
+/**
+ * @template T
+ * @param {T[]} instances captured component instances
+ * @returns {T[]} those still mounted
+ */
+function mountedInstances(instances) {
+    return instances.filter((instance) => status(instance) === "mounted");
+}
+
+/**
+ * @param {Object} kwargs the kwargs of a `web_search_read` request, as the mock server gets them
+ * @returns {Object} their named arguments (no mock server marker), the user context left out
+ */
+function searchKwargs(kwargs) {
+    return Object.fromEntries(Object.entries(kwargs).filter(([name]) => name !== "context"));
+}
+
+/**
+ * @param {{ key: number | string }[]} entries queue entries
+ * @returns {(number | string)[]} their keys, sorted
+ */
+function queueKeys(entries) {
+    return entries.map(({ key }) => key).sort();
+}
+
+describe("Shared hooks contract", () => {
+    test("isOfflineModel: false without a model or offline plugin, else the plugin's state", async () => {
+        expect(isOfflineModel(undefined)).toBe(false);
+        expect(isOfflineModel(null)).toBe(false);
+        expect(isOfflineModel({})).toBe(false);
+        expect(isOfflineModel({ offlinePlugin: null })).toBe(false);
+        expect(isOfflineModel({ offlinePlugin: { isOffline: () => false } })).toBe(false);
+        expect(isOfflineModel({ offlinePlugin: { isOffline: () => true } })).toBe(true);
+    });
+
+    test("targetsCrmLead: the form's own target field, else default_res_model ?? default_model", async () => {
+        expect(CRM_MAIL_FORM_TARGETS).toEqual({
+            "mail.activity": "res_model",
+            "mail.activity.schedule": "res_model",
+            "mail.followers.edit": "res_model",
+            "mail.compose.message": "model",
+        });
+        /** A record-like object: the guards read only these three keys. */
+        const record = (resModel, data = {}, context = {}) => ({ resModel, data, context });
+
+        // Not a record, or not a mail dialog form, whatever it targets.
+        expect(targetsCrmLead(undefined)).toBe(false);
+        expect(targetsCrmLead(null)).toBe(false);
+        expect(targetsCrmLead({})).toBe(false);
+        const leadContext = { default_res_model: "crm.lead", default_model: "crm.lead" };
+        const leadData = { res_model: "crm.lead", model: "crm.lead" };
+        expect(targetsCrmLead(record("res.partner", leadData, leadContext))).toBe(false);
+        expect(targetsCrmLead(record("crm.lead", leadData, leadContext))).toBe(false);
+        // An inherited key of the map is not a mail dialog form.
+        expect(targetsCrmLead(record("constructor", leadData, leadContext))).toBe(false);
+
+        const targets = Object.entries(CRM_MAIL_FORM_TARGETS);
+        expect(targets).toHaveLength(4);
+        for (const [resModel, field] of targets) {
+            const message = { message: `${resModel} (${field})` };
+            const isTarget = (data, context) => targetsCrmLead(record(resModel, data, context));
+            // The target field decides whenever it holds a value, over a conflicting context.
+            expect(isTarget({ [field]: "crm.lead" })).toBe(true, message);
+            expect(isTarget({ [field]: "res.partner" }, leadContext)).toBe(false, message);
+            // An empty target field defers to the context.
+            expect(isTarget({ [field]: false }, { default_res_model: "crm.lead" })).toBe(
+                true,
+                message
+            );
+            expect(isTarget({ [field]: "" }, { default_model: "crm.lead" })).toBe(true, message);
+            expect(isTarget({}, { default_res_model: "res.partner" })).toBe(false, message);
+            expect(isTarget({}, {})).toBe(false, message);
+            // `default_model` counts only when `default_res_model` is absent (null or undefined):
+            // an explicit false or empty `default_res_model` is the target.
+            for (const absent of [null, undefined]) {
+                const context = { default_res_model: absent, default_model: "crm.lead" };
+                expect(isTarget({}, context)).toBe(true, message);
+            }
+            for (const explicit of [false, ""]) {
+                const context = { default_res_model: explicit, default_model: "crm.lead" };
+                expect(isTarget({}, context)).toBe(false, message);
+            }
+            expect(
+                isTarget({}, { default_res_model: "res.partner", default_model: "crm.lead" })
+            ).toBe(false, message);
+            // A record without data or without context.
+            const contextOnly = { resModel, context: { default_res_model: "crm.lead" } };
+            expect(targetsCrmLead(contextOnly)).toBe(true, message);
+            expect(targetsCrmLead({ resModel, data: {} })).toBe(false, message);
+        }
+
+        // The composer names its target in `default_model`, the schedule wizard in
+        // `default_res_model`; each form reads its own target field only.
+        const composer = record("mail.compose.message", { model: false }, leadContext);
+        expect(targetsCrmLead(composer)).toBe(true);
+        const composerByModel = { default_model: "crm.lead" };
+        expect(targetsCrmLead(record("mail.compose.message", {}, composerByModel))).toBe(true);
+        const scheduleContext = { default_res_model: "crm.lead" };
+        expect(targetsCrmLead(record("mail.activity.schedule", {}, scheduleContext))).toBe(true);
+        expect(targetsCrmLead(record("mail.compose.message", { res_model: "crm.lead" }))).toBe(
+            false
+        );
+        expect(targetsCrmLead(record("mail.activity", { model: "crm.lead" }))).toBe(false);
+    });
+
+    test("loadActivityTypes: bounded request, cached list first, onUpdate on a changed answer only, errors", async () => {
+        let answer = {
+            length: 4,
+            records: [
+                { id: 1, display_name: "Email", category: "default" },
+                { id: 2, display_name: "Call", category: "phonecall" },
+                { id: 3, display_name: "Meeting", category: "meeting" },
+                { id: 4, display_name: "Upload Document", category: "upload_file" },
+            ],
+        };
+        let failure = null;
+        const requests = [];
+        onRpc("mail.activity.type", "web_search_read", ({ kwargs }) => {
+            requests.push(kwargs);
+            expect.step("types read");
+            if (failure) {
+                throw failure;
+            }
+            return answer;
+        });
+        // Registered after the server answer: while offline, its 502 comes first.
+        const setOffline = mockOffline();
+        const { orm } = await mountHooksHarness();
+        const onUpdate = (types) => expect.step(`onUpdate ${types.map(({ id }) => id)}`);
+        const creatable = [
+            { id: 1, display_name: "Email", category: "default" },
+            { id: 2, display_name: "Call", category: "phonecall" },
+        ];
+
+        // Cold and offline: nothing cached, so the lost connection resolves null.
+        await setOffline(true);
+        await expect(loadActivityTypes(orm, onUpdate)).resolves.toBe(null);
+        expect.verifySteps([]);
+        await setOffline(false);
+
+        // Any other server error, nothing cached: rethrown to the caller.
+        failure = makeServerError({ message: "Activity types are locked" });
+        await expect(loadActivityTypes(orm, onUpdate)).rejects.toThrow(/Activity types are locked/);
+        expect.verifySteps(["types read"]);
+        failure = null;
+
+        // The first read: the server answer without meeting and upload types, no onUpdate.
+        await expect(loadActivityTypes(orm, onUpdate)).resolves.toEqual(creatable);
+        expect.verifySteps(["types read"]);
+        expect(requests).toHaveLength(2);
+        expect(searchKwargs(requests.at(-1))).toEqual({
+            domain: [["res_model", "in", [false, "crm.lead"]]],
+            specification: { display_name: {}, category: {} },
+            order: "sequence ASC, id ASC",
+            limit: 80,
+        });
+
+        // The same answer: the cached list first; the refresh changes nothing, so no onUpdate.
+        await expect(loadActivityTypes(orm, onUpdate)).resolves.toEqual(creatable);
+        await animationFrame();
+        expect.verifySteps(["types read"]);
+        expect(searchKwargs(requests.at(-1))).toEqual(searchKwargs(requests.at(-2)));
+
+        // A changed answer: the cached list first, then onUpdate once with the fresh list.
+        const followUp = { id: 5, display_name: "Follow-up", category: "default" };
+        answer = { length: 5, records: [...answer.records, followUp] };
+        await expect(loadActivityTypes(orm, onUpdate)).resolves.toEqual(creatable);
+        await expect.waitForSteps(["types read", "onUpdate 1,2,5"]);
+
+        // A changed answer without onUpdate raises nothing; the next read starts from it.
+        const todo = { id: 6, display_name: "To-Do", category: "default" };
+        answer = { length: 1, records: [todo] };
+        await expect(loadActivityTypes(orm)).resolves.toEqual([...creatable, followUp]);
+        await animationFrame();
+        await expect(loadActivityTypes(orm, onUpdate)).resolves.toEqual([todo]);
+        await animationFrame();
+        expect.verifySteps(["types read", "types read"]);
+    });
+
+    test("loadLeadActivities: per-lead bounded request, limit and withLength options, cached first, errors", async () => {
+        let total = 3;
+        let failure = null;
+        const requests = [];
+        /** @param {number} count @returns {Object[]} the first `count` activities of the lead */
+        const activities = (count) =>
+            Array.from({ length: count }, (_, index) => ({
+                id: index + 1,
+                summary: `Activity ${index + 1}`,
+            }));
+        onRpc("mail.activity", "web_search_read", ({ kwargs }) => {
+            requests.push(kwargs);
+            expect.step(`activities read: lead ${kwargs.domain[1][2]}, limit ${kwargs.limit}`);
+            if (failure) {
+                throw failure;
+            }
+            // As the server does: at most `limit` records, and the total count of the lead's.
+            return { length: total, records: activities(Math.min(total, kwargs.limit)) };
+        });
+        // Registered after the server answer: while offline, its 502 comes first.
+        const setOffline = mockOffline();
+        const { orm } = await mountHooksHarness();
+        /** @param {Object[] | { records: Object[], length: number }} value */
+        const onUpdate = (value) =>
+            expect.step(
+                Array.isArray(value)
+                    ? `onUpdate ${value.length} records`
+                    : `onUpdate ${value.records.length} records of ${value.length}`
+            );
+
+        // Invalid limits throw before any request.
+        for (const limit of [0, -1, 1.5, "40", null, Number.NaN]) {
+            await expect(loadLeadActivities(orm, 7, onUpdate, { limit })).rejects.toThrow(
+                /`limit` must be a positive integer/
+            );
+        }
+        expect.verifySteps([]);
+
+        // Cold and offline: nothing cached, so the lost connection resolves null.
+        await setOffline(true);
+        await expect(loadLeadActivities(orm, 7, onUpdate)).resolves.toBe(null);
+        await expect(loadLeadActivities(orm, 7, onUpdate, { withLength: true })).resolves.toBe(
+            null
+        );
+        expect.verifySteps([]);
+        await setOffline(false);
+
+        // Any other server error, nothing cached: rethrown to the caller.
+        failure = makeServerError({ message: "Activities are locked" });
+        await expect(loadLeadActivities(orm, 7, onUpdate)).rejects.toThrow(/Activities are locked/);
+        expect.verifySteps(["activities read: lead 7, limit 40"]);
+        failure = null;
+
+        // The first read: the lead's own activities, by deadline, 40 at most; no onUpdate.
+        await expect(loadLeadActivities(orm, 7, onUpdate)).resolves.toEqual(activities(3));
+        expect.verifySteps(["activities read: lead 7, limit 40"]);
+        expect(requests).toHaveLength(2);
+        expect(searchKwargs(requests.at(-1))).toEqual({
+            domain: [
+                ["res_model", "=", "crm.lead"],
+                ["res_id", "=", 7],
+            ],
+            specification: {
+                activity_type_id: { fields: { display_name: {} } },
+                activity_category: {},
+                summary: {},
+                date_deadline: {},
+                state: {},
+                user_id: { fields: { display_name: {} } },
+            },
+            order: "date_deadline ASC, id ASC",
+            limit: 40,
+        });
+
+        // The same answer: the cached records first; the refresh changes nothing.
+        await expect(loadLeadActivities(orm, 7, onUpdate)).resolves.toEqual(activities(3));
+        await animationFrame();
+        expect.verifySteps(["activities read: lead 7, limit 40"]);
+        expect(searchKwargs(requests.at(-1))).toEqual(searchKwargs(requests.at(-2)));
+
+        // A changed answer: the cached records first, then onUpdate once with the fresh ones.
+        total = 4;
+        await expect(loadLeadActivities(orm, 7, onUpdate)).resolves.toEqual(activities(3));
+        await expect.waitForSteps(["activities read: lead 7, limit 40", "onUpdate 4 records"]);
+
+        // A changed answer without onUpdate raises nothing; the next read starts from it.
+        total = 5;
+        await expect(loadLeadActivities(orm, 7)).resolves.toEqual(activities(4));
+        await animationFrame();
+        await expect(loadLeadActivities(orm, 7, undefined, null)).resolves.toEqual(activities(5));
+        await animationFrame();
+        expect.verifySteps([
+            "activities read: lead 7, limit 40",
+            "activities read: lead 7, limit 40",
+        ]);
+
+        // With `withLength`, the same request: the promise and onUpdate also carry the server's
+        // total, so a truncated read (45 activities, 40 read) is told apart.
+        total = 45;
+        await expect(loadLeadActivities(orm, 7, onUpdate, { withLength: true })).resolves.toEqual({
+            records: activities(5),
+            length: 5,
+        });
+        await expect.waitForSteps([
+            "activities read: lead 7, limit 40",
+            "onUpdate 40 records of 45",
+        ]);
+        await expect(loadLeadActivities(orm, 7, onUpdate, { withLength: true })).resolves.toEqual({
+            records: activities(40),
+            length: 45,
+        });
+        await animationFrame();
+        expect.verifySteps(["activities read: lead 7, limit 40"]);
+
+        // A larger limit is sent as given: a separate request, read from the server.
+        await expect(
+            loadLeadActivities(orm, 7, onUpdate, { limit: 45, withLength: true })
+        ).resolves.toEqual({ records: activities(45), length: 45 });
+        expect.verifySteps(["activities read: lead 7, limit 45"]);
+        expect(searchKwargs(requests.at(-1))).toEqual({
+            ...searchKwargs(requests.at(-2)),
+            limit: 45,
+        });
+
+        // Another lead: its own request.
+        await expect(loadLeadActivities(orm, 8, onUpdate)).resolves.toEqual(activities(40));
+        expect.verifySteps(["activities read: lead 8, limit 40"]);
+        expect(searchKwargs(requests.at(-1)).domain).toEqual([
+            ["res_model", "=", "crm.lead"],
+            ["res_id", "=", 8],
+        ]);
+    });
+
+    test("isRecordPendingSync: a live offlineId, or a queued pending-method call on the record's model and id", async () => {
+        const setOffline = mockOffline();
+        const crmOffline = await mountHooksHarness();
+        await setOffline(true);
+        expect(crmOffline.isOffline()).toBe(true);
+        expect(crmOffline.isRecordPendingSync(null)).toBe(false);
+        expect(crmOffline.isRecordPendingSync(undefined)).toBe(false);
+        expect(crmOffline.isRecordPendingSync({ resModel: "crm.lead", resId: 11 })).toBe(false);
+
+        const create = scheduleQueueFixture("crm.lead", "web_save", [[], { name: "New lead" }], {
+            context: {},
+            specification: {},
+        });
+        const discarded = scheduleQueueFixture("crm.lead", "web_save", [[], { name: "Gone" }]);
+        getService(OfflinePlugin).removeScheduledORM(discarded.key);
+        const pendingCalls = [
+            ["web_save", [[11], { priority: "1" }]],
+            ["web_unlink", [[12]]],
+            ["unlink", [[13]]],
+            ["action_archive", [[14, 19]]],
+            ["action_unarchive", [[15]]],
+        ];
+        for (const [method, args] of pendingCalls) {
+            scheduleQueueFixture("crm.lead", method, args);
+        }
+        scheduleQueueFixture("crm.team", "web_save", [[30], { name: "Renamed team" }]);
+        // Calls of other method families: framework queue fixtures, no CRM code queues them.
+        scheduleQueueFixture("crm.lead", "action_done", [[17]]);
+        scheduleQueueFixture("crm.lead", "write", [[18], { priority: "2" }]);
+        expect(crmOffline.queuedEntries()).toHaveLength(9);
+        expect(getService(OfflinePlugin)._ormToSync()[discarded.key]).toBe(undefined);
+
+        const isPending = (resModel, resId, offlineId) =>
+            crmOffline.isRecordPendingSync({ resModel, resId, offlineId });
+        // A new record (no id): only its offlineId, while that key is still queued.
+        expect(isPending("crm.lead", false, undefined)).toBe(false);
+        expect(isPending("crm.lead", false, create.key)).toBe(true);
+        expect(isPending("crm.lead", false, discarded.key)).toBe(false);
+        // Each pending method family, for the record's model and an id of `args[0]`.
+        const pendingIds = [
+            [11, "web_save"],
+            [12, "web_unlink"],
+            [13, "unlink"],
+            [14, "action_archive"],
+            [19, "action_archive"],
+            [15, "action_unarchive"],
+        ];
+        for (const [resId, method] of pendingIds) {
+            const message = { message: `${method} on ${resId}` };
+            expect(isPending("crm.lead", resId)).toBe(true, message);
+            expect(isPending("crm.lead", resId, discarded.key)).toBe(true, message);
+            // The same call on another model.
+            expect(isPending("crm.stage", resId)).toBe(false, message);
+        }
+        expect(isPending("crm.team", 30)).toBe(true);
+        expect(isPending("crm.lead", 30)).toBe(false);
+        // Another id, and other method families.
+        expect(isPending("crm.lead", 16)).toBe(false);
+        expect(isPending("crm.lead", 17)).toBe(false);
+        expect(isPending("crm.lead", 18)).toBe(false);
+    });
+
+    test("pendingLeadCreates: crm.lead creates of a stage, by stage_id ?? context default_stage_id, as stored", async () => {
+        const setOffline = mockOffline();
+        const crmOffline = await mountHooksHarness();
+        await setOffline(true);
+        const offlinePlugin = getService(OfflinePlugin);
+        const byValues = scheduleQueueFixture(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Stage in values", stage_id: 2 }],
+            { context: { default_stage_id: 1 }, specification: {} }
+        );
+        const byContext = scheduleQueueFixture(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Stage in context" }],
+            { context: { default_stage_id: 2 }, specification: {} }
+        );
+        const firstStage = scheduleQueueFixture(
+            "crm.lead",
+            "web_save",
+            [[], { name: "First stage", stage_id: 1 }],
+            { context: {} }
+        );
+        const noStage = scheduleQueueFixture(
+            "crm.lead",
+            "web_save",
+            [[], { name: "No stage", stage_id: false }],
+            { context: { default_stage_id: 2 } }
+        );
+        // Never a pending create: a write, another model, another method.
+        const stageContext = { context: { default_stage_id: 2 } };
+        scheduleQueueFixture("crm.lead", "web_save", [[3], { stage_id: 2 }], stageContext);
+        scheduleQueueFixture("crm.stage", "web_save", [[], { name: "Stage", stage_id: 2 }]);
+        scheduleQueueFixture(
+            "mail.activity",
+            "web_save",
+            [[], { res_model: "crm.lead", res_id: 1, stage_id: 2 }],
+            stageContext
+        );
+        scheduleQueueFixture("crm.lead", "action_unarchive", [[]], stageContext);
+        const live = crmOffline.queuedEntries();
+        expect(live).toHaveLength(8);
+        const stored = JSON.stringify(offlinePlugin._ormToSync());
+
+        const secondStage = crmOffline.pendingLeadCreates(2);
+        expect(queueKeys(secondStage)).toEqual(queueKeys([byValues, byContext]));
+        // The entries themselves, as the queue stores them: key next to value.
+        for (const entry of secondStage) {
+            expect(entry).toBe(live.find(({ key }) => key === entry.key));
+            expect(entry).toBe(offlinePlugin._ormToSync()[entry.key]);
+        }
+        const [first] = crmOffline.pendingLeadCreates(1);
+        expect(crmOffline.pendingLeadCreates(1)).toHaveLength(1);
+        expect(first).toBe(firstStage);
+        // An explicit `stage_id: false` is the create's stage, whatever the context says.
+        const [unstaged] = crmOffline.pendingLeadCreates(false);
+        expect(crmOffline.pendingLeadCreates(false)).toHaveLength(1);
+        expect(unstaged).toBe(noStage);
+        expect(crmOffline.pendingLeadCreates(3)).toEqual([]);
+        // Reading changes nothing in the queue.
+        expect(JSON.stringify(offlinePlugin._ormToSync())).toBe(stored);
+
+        // An explicit list (the pipeline's sync-window copy) is read instead of the live queue.
+        const snapshot = JSON.parse(stored);
+        const copies = Object.values(snapshot);
+        offlinePlugin.removeScheduledORM(byContext.key);
+        expect(queueKeys(crmOffline.pendingLeadCreates(2))).toEqual([byValues.key]);
+        const fromCopies = crmOffline.pendingLeadCreates(2, copies);
+        expect(queueKeys(fromCopies)).toEqual(queueKeys([byValues, byContext]));
+        for (const entry of fromCopies) {
+            expect(copies.includes(entry)).toBe(true);
+        }
+        expect(crmOffline.pendingLeadCreates(2, [])).toEqual([]);
+    });
+
+    test("runOrQueue: an invalid call is refused before anything runs, is requested or is queued", async () => {
+        const setOffline = mockOffline();
+        const requests = watchRequestsFromNowOn();
+        const crmOffline = await mountHooksHarness();
+        requests.start();
+        const online = async () => expect.step("online call");
+        const queue = {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[], { name: "Lead" }],
+            kwargs: { context: {}, specification: {} },
+        };
+        const invalidCalls = [
+            [{ queue }, /`online` must be a function/],
+            [{ online: "crm.lead/web_save", queue }, /`online` must be a function/],
+            [{ online }, /only web_save and action_archive can be queued, got "undefined"/],
+            [{ online, queue: { ...queue, model: undefined } }, /can be queued, got "web_save"/],
+            [{ online, queue: { ...queue, model: "" } }, /can be queued, got "web_save"/],
+            [{ online, queue: { ...queue, method: "write" } }, /can be queued, got "write"/],
+            [{ online, queue: { ...queue, method: "unlink" } }, /can be queued, got "unlink"/],
+            [{ online, queue: { ...queue, method: undefined } }, /got "undefined"/],
+        ];
+        for (const offline of [false, true]) {
+            await setOffline(offline);
+            expect(crmOffline.isOffline()).toBe(offline);
+            for (const [params, error] of invalidCalls) {
+                await expect(crmOffline.runOrQueue(params)).rejects.toThrow(error);
+            }
+        }
+        expect.verifySteps([]);
+        expect(crmOffline.queuedEntries()).toEqual([]);
+    });
+
+    test("runOrQueue: online result, connection-loss fallback, propagated errors and the queued call's defaults", async () => {
+        const setOffline = mockOffline();
+        const requests = watchRequestsFromNowOn();
+        const crmOffline = await mountHooksHarness();
+        requests.start();
+        const offlinePlugin = getService(OfflinePlugin);
+        const queue = { model: "crm.lead", method: "web_save", args: [[], { name: "Quick" }] };
+        const online = async () => expect.step("online call");
+        const extrasKeys = [
+            "actionId",
+            "actionName",
+            "viewType",
+            "timeStamp",
+            "displayName",
+            "changes",
+        ];
+        /**
+         * Asserts that `outcome` is a queued call whose entry holds `value`, the timestamp being
+         * taken while the call ran, and returns that entry.
+         */
+        const expectQueued = (outcome, value, before) => {
+            expect(Object.keys(outcome)).toEqual(["queued", "key"]);
+            expect(outcome.queued).toBe(true);
+            const entry = offlinePlugin._ormToSync()[outcome.key];
+            expect(entry.key).toBe(outcome.key);
+            expect(Object.keys(entry.value.extras)).toEqual(extrasKeys);
+            const { timeStamp } = entry.value.extras;
+            expect(typeof timeStamp).toBe("number");
+            expect(timeStamp >= before && timeStamp <= Date.now()).toBe(true);
+            expect(entry.value).toEqual({
+                ...value,
+                extras: { ...value.extras, timeStamp },
+            });
+            return entry;
+        };
+        const defaultExtras = { ...HARNESS_CONFIG, displayName: "", changes: {} };
+
+        // Online: the live call's result; nothing queued.
+        const result = [{ id: 9, name: "Quick" }];
+        const done = await crmOffline.runOrQueue({
+            online: async () => {
+                expect.step("online call");
+                return result;
+            },
+            queue,
+        });
+        expect(done).toEqual({ queued: false, result });
+        expect.verifySteps(["online call"]);
+        expect(crmOffline.queuedEntries()).toEqual([]);
+
+        // Online, a live call rejected for another reason than a lost connection: propagated.
+        const refusal = makeServerError({ message: "Leads are locked" });
+        await expect(
+            crmOffline.runOrQueue({
+                online: async () => {
+                    throw refusal;
+                },
+                queue,
+            })
+        ).rejects.toBe(refusal);
+        expect(crmOffline.queuedEntries()).toEqual([]);
+
+        // Online, the connection drops during the live call: the call is queued instead, with
+        // empty kwargs and the default extras (the env's action and view type).
+        let before = Date.now();
+        const lost = await crmOffline.runOrQueue({
+            online: async () => {
+                throw new ConnectionLostError("/web/dataset/call_kw/crm.lead/web_save");
+            },
+            queue,
+        });
+        const lostEntry = expectQueued(
+            lost,
+            { ...queue, kwargs: {}, extras: defaultExtras },
+            before
+        );
+        expect(crmOffline.queuedEntries()).toEqual([lostEntry]);
+        offlinePlugin.removeScheduledORM(lost.key);
+
+        // Offline: queued at once, the live call never runs.
+        await setOffline(true);
+        before = Date.now();
+        const queued = await crmOffline.runOrQueue({ online, queue });
+        const queuedEntry = expectQueued(
+            queued,
+            { ...queue, kwargs: {}, extras: defaultExtras },
+            before
+        );
+        // The caller's kwargs, view type, display name and changes override the defaults.
+        before = Date.now();
+        const archive = {
+            model: "mail.activity",
+            method: "action_archive",
+            args: [[5]],
+            kwargs: { context: { active_test: false } },
+        };
+        const extras = { viewType: "form", displayName: "Call: Lead 1", changes: { done: true } };
+        const archived = await crmOffline.runOrQueue({
+            online,
+            queue: { ...archive, extras },
+        });
+        const archivedEntry = expectQueued(
+            archived,
+            { ...archive, extras: { ...HARNESS_CONFIG, ...extras } },
+            before
+        );
+        expect(archived.key).not.toBe(queued.key);
+        expect(queueKeys(crmOffline.queuedEntries())).toEqual(
+            queueKeys([queuedEntry, archivedEntry])
+        );
+        expect.verifySteps([]);
+    });
+
+    test("runOrQueue: a NonSecureContextError of the framework queue propagates", async () => {
+        const setOffline = mockOffline();
+        const crmOffline = await mountHooksHarness();
+        const offlinePlugin = getService(OfflinePlugin);
+        const securityError = new NonSecureContextError(
+            "Offline features not available in a non-secure context"
+        );
+        patchWithCleanup(offlinePlugin, {
+            scheduleORM() {
+                expect.step("scheduleORM");
+                throw securityError;
+            },
+        });
+        const queue = { model: "crm.lead", method: "web_save", args: [[], { name: "Quick" }] };
+
+        // Online, on a lost connection.
+        await expect(
+            crmOffline.runOrQueue({
+                online: async () => {
+                    expect.step("online call");
+                    throw new ConnectionLostError("/web/dataset/call_kw/crm.lead/web_save");
+                },
+                queue,
+            })
+        ).rejects.toBe(securityError);
+        expect.verifySteps(["online call", "scheduleORM"]);
+
+        // Offline.
+        await setOffline(true);
+        const error = await crmOffline
+            .runOrQueue({ online: async () => expect.step("online call"), queue })
+            .catch((rejection) => rejection);
+        expect(error).toBeInstanceOf(NonSecureContextError);
+        expect(error).toBe(securityError);
+        expect.verifySteps(["scheduleORM"]);
+        expect(crmOffline.queuedEntries()).toEqual([]);
+    });
+
+    test("ViewButton guard: special and non-server buttons run offline; without its hook it reads the record's model", async () => {
+        const setOffline = mockOffline();
+        watchOfflineRpcs();
+        const buttons = captureInstances(ViewButton);
+        await mountView({
+            type: "form",
+            resModel: "crm.lead",
+            resId: 1,
+            arch: /* xml */ `
+                <form>
+                    <sheet>
+                        <button name="action_set_won_rainbowman" type="object" string="Won"/>
+                        <button name="crm.crm_lead_lost_action" type="action" string="Lost"/>
+                        <button special="save" string="Save now"/>
+                        <button special="cancel" string="Discard now"/>
+                        <button name="https://www.odoo.com/app/crm" type="url" string="CRM"/>
+                        <field name="name"/>
+                    </sheet>
+                </form>`,
+        });
+        const labels = [
+            "action_set_won_rainbowman",
+            "crm.crm_lead_lost_action",
+            "save",
+            "cancel",
+            "https://www.odoo.com/app/crm",
+        ];
+        const button = (label) =>
+            mountedInstances(buttons).find(
+                ({ clickParams }) => (clickParams.special ?? clickParams.name) === label
+            );
+        // The base handler runs the button (it would save the record first): stepped instead.
+        for (const label of labels) {
+            expect(button(label).props.record.resModel).toBe("crm.lead", { message: label });
+            button(label).handleViewButton = ({ clickParams }) =>
+                expect.step(`run ${clickParams.special ?? clickParams.name}`);
+        }
+
+        // Online, every button runs.
+        for (const label of labels) {
+            button(label).onClick();
+        }
+        expect.verifySteps(labels.map((label) => `run ${label}`));
+
+        // Offline, the server buttons are inert; a special button (save, discard: no type) and a
+        // button of another type still run.
+        await setOffline(true);
+        for (const label of labels) {
+            button(label).onClick();
+        }
+        expect.verifySteps(["run save", "run cancel", "run https://www.odoo.com/app/crm"]);
+
+        // An instance without its hook (`crmOffline`) reads the record's model instead.
+        const won = button("action_set_won_rainbowman");
+        delete won.crmOffline;
+        expect(won.crmOffline).toBe(undefined);
+        expect(isOfflineModel(won.props.record.model)).toBe(true);
+        won.onClick();
+        expect.verifySteps([]);
+        await setOffline(false);
+        expect(isOfflineModel(won.props.record.model)).toBe(false);
+        won.onClick();
+        expect.verifySteps(["run action_set_won_rainbowman"]);
+    });
+
+    test.tags("desktop");
+    test("MultiRecordViewButton guard: without its hook it reads the list's model", async () => {
+        const setOffline = mockOffline();
+        watchOfflineRpcs();
+        const buttons = captureInstances(MultiRecordViewButton);
+        await mountView({ type: "list", resModel: "crm.lead" });
+        await contains(".o_data_row:first .o_list_record_selector input").click();
+        await contains(".o_data_row:eq(1) .o_list_record_selector input").click();
+        const lost = mountedInstances(buttons).find(
+            ({ clickParams }) => clickParams.name === "crm.crm_lead_lost_action"
+        );
+        expect(lost.props.list.resModel).toBe("crm.lead");
+        // The base handler runs the button on the selected ids: stepped instead.
+        lost.handleViewButton = ({ clickParams, getResParams }) => {
+            const { resModel, resIds } = getResParams();
+            expect.step(`run ${clickParams.name} on ${resModel} ${resIds}`);
+        };
+        delete lost.crmOffline;
+        expect(lost.crmOffline).toBe(undefined);
+
+        await lost.onClick();
+        expect.verifySteps(["run crm.crm_lead_lost_action on crm.lead 1,2"]);
+        await setOffline(true);
+        expect(isOfflineModel(lost.props.list.model)).toBe(true);
+        await lost.onClick();
+        expect.verifySteps([]);
+        await setOffline(false);
+        await lost.onClick();
+        expect.verifySteps(["run crm.crm_lead_lost_action on crm.lead 1,2"]);
+    });
+
+    test.tags("desktop");
+    test("MultiRecordViewButton guard: a header button of a non-CRM list runs offline", async () => {
+        const setOffline = mockOffline();
+        watchOfflineRpcs();
+        const buttons = captureInstances(MultiRecordViewButton);
+        await mountView({
+            type: "list",
+            resModel: "res.partner",
+            arch: /* xml */ `
+                <list>
+                    <header>
+                        <button name="action_partner_mass_update" type="object" string="Update"/>
+                    </header>
+                    <field name="name"/>
+                </list>`,
+        });
+        await contains(".o_data_row:first .o_list_record_selector input").click();
+        const [update] = mountedInstances(buttons);
+        expect(mountedInstances(buttons)).toHaveLength(1);
+        const [selectedId] = update.props.list.selection.map(({ resId }) => resId);
+        update.handleViewButton = ({ clickParams, getResParams }) => {
+            const { resModel, resIds } = getResParams();
+            expect.step(`run ${clickParams.name} on ${resModel} ${resIds}`);
+        };
+
+        await setOffline(true);
+        // With its hook, and without it (the list's model is read instead).
+        await update.onClick();
+        delete update.crmOffline;
+        expect(isOfflineModel(update.props.list.model)).toBe(true);
+        await update.onClick();
+        const run = `run action_partner_mass_update on res.partner ${selectedId}`;
+        expect.verifySteps([run, run]);
+    });
+
+    test.tags("desktop");
+    test("KanbanRecord team card offline: selection toggles, Alt-click and cancelled clicks are the base's, one selection read per click", async () => {
+        const setOffline = mockOffline();
+        watchOfflineRpcs();
+        mockViewButtonActions();
+        let selectionReads = 0;
+        patchWithCleanup(KanbanRenderer.prototype, {
+            getSelection() {
+                selectionReads++;
+                return super.getSelection(...arguments);
+            },
+            toggleSelection(record, isRange) {
+                expect.step(`toggleSelection ${record.resId} isRange=${isRange}`);
+                return super.toggleSelection(...arguments);
+            },
+        });
+        const records = captureInstances(KanbanRecord);
+        await mountView({ type: "kanban", resModel: "crm.team" });
+        const teamCards = mountedInstances(records).filter(
+            ({ props }) => props.record.resModel === "crm.team"
+        );
+        expect(teamCards.map(({ props }) => props.record.data.name)).toEqual([
+            "Mushroom Kingdom",
+            "Hyrule",
+        ]);
+        const [mushroom, hyrule] = teamCards;
+        expect(mushroom.props.openAction.action).toBe("action_primary_channel_button");
+        expect(mushroom.props.forceGlobalClick).not.toBe(true);
+        /** Runs `click` and returns the number of selection reads it made. */
+        const selectionReadsOf = (click) => {
+            const before = selectionReads;
+            click();
+            return selectionReads - before;
+        };
+        /** An event-like card click that steps the default handling it receives. */
+        const clickEvent = (target, modifiers = {}) => ({
+            target,
+            altKey: false,
+            shiftKey: false,
+            ...modifiers,
+            stopPropagation: () => expect.step("stopPropagation"),
+            preventDefault: () => expect.step("preventDefault"),
+        });
+
+        // Online, without a selection, a card click runs the team's open action.
+        expect(selectionReadsOf(() => mushroom.rootRef().click())).toBe(1);
+        await animationFrame();
+        expect.verifySteps(["doActionButton:action_primary_channel_button"]);
+
+        await setOffline(true);
+        // Offline, without a selection, a click (or a direct call without event) is inert.
+        expect(selectionReadsOf(() => mushroom.rootRef().click())).toBe(1);
+        expect(selectionReadsOf(() => mushroom.onGlobalClick())).toBe(1);
+        await animationFrame();
+        expect.verifySteps([]);
+
+        // Alt-click: the base method selects the card.
+        const altClick = clickEvent(mushroom.rootRef(), { altKey: true });
+        expect(selectionReadsOf(() => mushroom.onGlobalClick(altClick))).toBe(1);
+        expect.verifySteps([
+            "stopPropagation",
+            "preventDefault",
+            "toggleSelection 1 isRange=false",
+        ]);
+        await animationFrame();
+        expect(mushroom.props.record.selected).toBe(true);
+        expect(document.activeElement).toBe(mushroom.rootRef());
+
+        // With a selection, a click toggles the clicked card as the base method would (Shift for
+        // a range), with its event handling and focus, after a single read.
+        const shiftClick = clickEvent(hyrule.rootRef(), { shiftKey: true });
+        expect(selectionReadsOf(() => hyrule.onGlobalClick(shiftClick))).toBe(1);
+        expect.verifySteps(["stopPropagation", "preventDefault", "toggleSelection 2 isRange=true"]);
+        await animationFrame();
+        expect(hyrule.props.record.selected).toBe(true);
+        expect(document.activeElement).toBe(hyrule.rootRef());
+        expect(selectionReadsOf(() => hyrule.rootRef().click())).toBe(1);
+        expect.verifySteps(["toggleSelection 2 isRange=false"]);
+        await animationFrame();
+        expect(hyrule.props.record.selected).toBe(false);
+        expect(mushroom.props.record.selected).toBe(true);
+
+        // A click on an anchor or a dropdown of the card (CANCEL_GLOBAL_CLICK) does nothing.
+        const anchor = hyrule.rootRef().querySelector("a[type]");
+        expect(anchor.matches(KanbanRecord.CANCEL_GLOBAL_CLICK)).toBe(true);
+        expect(selectionReadsOf(() => hyrule.onGlobalClick(clickEvent(anchor)))).toBe(1);
+        expect.verifySteps([]);
+        expect(hyrule.props.record.selected).toBe(false);
+
+        // A direct call without an event toggles the card, without event handling.
+        expect(selectionReadsOf(() => hyrule.onGlobalClick())).toBe(1);
+        expect.verifySteps(["toggleSelection 2 isRange=undefined"]);
+        await animationFrame();
+        expect(hyrule.props.record.selected).toBe(true);
+
+        // Back online, without a selection, the card runs the open action again.
+        mushroom.props.record.toggleSelection(false);
+        hyrule.props.record.toggleSelection(false);
+        await animationFrame();
+        await setOffline(false);
+        expect(selectionReadsOf(() => hyrule.rootRef().click())).toBe(1);
+        await animationFrame();
+        expect.verifySteps(["doActionButton:action_primary_channel_button"]);
+    });
+
+    test.tags("desktop");
+    test("KanbanRecord team card offline: a forced global click opens the record through the base method", async () => {
+        const setOffline = mockOffline();
+        watchOfflineRpcs();
+        mockViewButtonActions();
+        const records = captureInstances(KanbanRecord);
+        await mountView({
+            type: "kanban",
+            resModel: "crm.team",
+            forceGlobalClick: true,
+            selectRecord: (resId) => expect.step(`selectRecord ${resId}`),
+        });
+        const [mushroom] = mountedInstances(records);
+        expect(mushroom.props.record.resModel).toBe("crm.team");
+        expect(mushroom.props.forceGlobalClick).toBe(true);
+        expect(mushroom.props.openAction.action).toBe("action_primary_channel_button");
+
+        await setOffline(true);
+        mushroom.rootRef().click();
+        await animationFrame();
+        expect.verifySteps([`selectRecord ${mushroom.props.record.resId}`]);
+    });
+
+    test.tags("desktop");
+    test("KanbanRecord guard: a card of another model keeps the base click offline", async () => {
+        const setOffline = mockOffline();
+        watchOfflineRpcs();
+        mockViewButtonActions();
+        const records = captureInstances(KanbanRecord);
+        await mountView({
+            type: "kanban",
+            resModel: "res.partner",
+            arch: /* xml */ `
+                <kanban action="action_view_partner_card" type="object">
+                    <templates>
+                        <t t-name="card">
+                            <field name="name"/>
+                        </t>
+                    </templates>
+                </kanban>`,
+        });
+        const [card] = mountedInstances(records);
+        expect(card.props.record.resModel).toBe("res.partner");
+        expect(card.props.openAction.action).toBe("action_view_partner_card");
+
+        await setOffline(true);
+        card.rootRef().click();
+        await animationFrame();
+        expect.verifySteps(["doActionButton:action_view_partner_card"]);
     });
 });

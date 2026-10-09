@@ -10,11 +10,17 @@
  *   kanban move (choosing the won stage is mark-won); the framework queues the stage write offline;
  * - Log call and Follow-up: `mail.activity` creates (`web_save`), queued offline;
  * - an activity list with Mark done: `action_done` online, `action_archive` (state only) offline.
+ *   The pipeline loads a bounded page of activities with their total count; the count shows the
+ *   total, and when the page misses some the list ends with "Show all (N)" online or "N more
+ *   activities are not available offline" offline, so no activity is hidden silently.
  *
  * Offline rules:
  * - All offline state is read through `useCrmOffline()`. The card keeps no dirty flag and persists
- *   nothing: the pending-sync badge and the pending activity rows are derived from the framework
- *   offline queue on every render, so they clear when replay or a systray discard removes the entry.
+ *   nothing: the pending-sync badge and the pending activity rows are derived from the live
+ *   framework offline queue, memoized and recomputed on every queue change, so they clear when
+ *   replay or a systray discard removes the entry. A pending lead create stays on screen as long
+ *   as the pipeline holds it (through a sync window, until the reconciliation reload), but its
+ *   badge follows the live queue: it clears as soon as its own entry has been replayed.
  * - The card queues only `mail.activity` `web_save` and `mail.activity` `action_archive`, the two
  *   families the shared offline systray renders, through `runOrQueue`.
  * - Activities need the lead's server id, so a pending lead create offers no action at all, and an
@@ -23,11 +29,20 @@
  *   round-trip, an upload a file transfer). Marking any persisted activity done is offered whatever
  *   its category, because archiving only writes `active`.
  * - The activity owner is always the session user: no assignee picker is offered.
- * - Every handler re-checks its own predicate first, so a direct call without a DOM event (or on a
- *   control the template renders disabled) does nothing.
+ * - The handlers that open the lead, toggle a panel, move the card or write an activity
+ *   (`onOpenCard`, `toggleStageList`, `onChooseStage`, `onLogCall`, `toggleFollowUp`,
+ *   `onSaveFollowUp`, `onMarkDone`, `toggleActivities`) re-check their own predicate first, so a
+ *   direct call, without a DOM event or on a control the template renders disabled, does nothing
+ *   while that predicate fails. The follow-up input handlers (`onFollowUpType`,
+ *   `onFollowUpSummary`, `onFollowUpDate`) only copy their event's value into the card's local
+ *   state, and need that event; `onCancelFollowUp` only resets the follow-up form.
+ * - A call that completes after the card was destroyed (stage navigation, a filter, a move or a
+ *   reload re-keyed or removed it) writes no card state. After an online activity write that
+ *   succeeded, the card still asks the pipeline to read the lead's activities again; the pipeline
+ *   reads them only while it is alive and displays the lead.
  */
 
-import { Component, proxy, t, useProps } from "@odoo/owl";
+import { Component, computed, proxy, status, t, useProps } from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
 import { deserializeDate, formatDate, serializeDate, today } from "@web/core/l10n/dates";
 import { formatMonetary } from "@web/views/fields/formatters";
@@ -63,8 +78,18 @@ export class CrmMobileLeadCard extends Component {
         group: t.any(),
         /** Every group of the pipeline (folded ones included), for the stage list. */
         stages: t.array(),
-        /** Cached activities of the lead; `null` when not loaded and not cached. */
+        /**
+         * Cached activities of the lead, a bounded page of them; `null` when not loaded and not
+         * cached.
+         */
         activities: t.or([t.array(), t.literal(null)]).optional(null),
+        /**
+         * The server's total count of the lead's activities, read with `activities`; `null` when
+         * unknown. When it exceeds the page, the count shows the total and the list says so.
+         */
+        activityTotal: t.or([t.number(), t.literal(null)]).optional(null),
+        /** `(resId) => …`: online, the pipeline reads every activity of the lead. */
+        onShowAllActivities: t.function().optional(),
         /** Cached creatable activity types `{id, display_name, category}`. */
         activityTypes: t.or([t.array(), t.literal(null)]).optional(null),
         /** Whether the lead's form is unavailable offline (the card is dimmed). */
@@ -154,15 +179,29 @@ export class CrmMobileLeadCard extends Component {
     }
 
     /**
-     * Whether the lead has a write the server has not received yet. Derived from the framework
-     * queue: it clears when replay or a systray discard removes the entry.
+     * Whether the lead has a write the server has not received yet. Derived from the live
+     * framework queue: it clears when replay or a systray discard removes the entry.
+     *
+     * A pending create counts only while its own key is still queued. The pipeline keeps showing a
+     * replayed create from its sync-window copy until the reconciliation reload; that card stays,
+     * without the badge. A create parked with an error is re-queued under the same key and keeps it.
+     *
+     * Memoized (as every queue projection of the card): the queue is read again only when the
+     * queue signal or the props change, not on every access.
      */
     get isPendingSync() {
+        return this._pendingSync();
+    }
+
+    _pendingSync = computed(() => {
         if (this.isPending) {
-            return true;
+            // The queue is keyed by object property, so keys compare as strings (an entry the
+            // framework rebuilt from its storage may carry the same key as a number or a string).
+            const key = String(this.props.pendingCall.key);
+            return this.crmOffline.queuedEntries().some((entry) => String(entry.key) === key);
         }
         return this.crmOffline.isRecordPendingSync(this.props.record);
-    }
+    });
 
     // -------------------------------------------------------------------------
     // Getters: activities
@@ -191,36 +230,68 @@ export class CrmMobileLeadCard extends Component {
 
     /**
      * Queued activity calls of the lead, as stored by the framework (never copied or mutated).
+     * Memoized: the queue is scanned once per queue change, whatever the number of readers.
      *
      * @returns {QueueEntry[]}
      */
     get pendingActivityEntries() {
-        return this.isPersisted
-            ? this.crmOffline.pendingActivityCalls(this.props.record.resId)
-            : [];
+        return this._pendingActivityEntries();
     }
 
-    /** @returns {QueueEntry[]} the queued activity creates of the lead */
+    _pendingActivityEntries = computed(() =>
+        this.isPersisted ? this.crmOffline.pendingActivityCalls(this.props.record.resId) : []
+    );
+
+    /** @returns {QueueEntry[]} the queued activity creates of the lead (memoized) */
     get pendingActivityCreates() {
-        return this.pendingActivityEntries.filter((entry) => entry.value.method === "web_save");
+        return this._pendingActivityCreates();
     }
 
-    /** @returns {Set<number>} ids of the activities whose mark-done is queued */
+    _pendingActivityCreates = computed(() =>
+        this.pendingActivityEntries.filter((entry) => entry.value.method === "web_save")
+    );
+
+    /** @returns {Set<number>} ids of the activities whose mark-done is queued (memoized) */
     get pendingArchivedIds() {
-        return new Set(
-            this.pendingActivityEntries
-                .filter((entry) => entry.value.method === "action_archive")
-                .map((entry) => entry.value.args?.[0]?.[0])
-        );
+        return this._pendingArchivedIds();
     }
 
-    /** Cached activities of the lead, as read by the pipeline. */
+    _pendingArchivedIds = computed(
+        () =>
+            new Set(
+                this.pendingActivityEntries
+                    .filter((entry) => entry.value.method === "action_archive")
+                    .map((entry) => entry.value.args?.[0]?.[0])
+            )
+    );
+
+    /** Cached activities of the lead, as read by the pipeline (a bounded page). */
     get activityRows() {
         return this.props.activities ?? [];
     }
 
+    /** Activities of the lead the server counted but the loaded page does not hold. */
+    get hiddenActivityCount() {
+        const total = this.props.activityTotal;
+        return typeof total === "number" ? Math.max(0, total - this.activityRows.length) : 0;
+    }
+
+    /** Every activity of the lead: its server total (or loaded rows) plus its queued creates. */
     get activityCount() {
-        return this.activityRows.length + this.pendingActivityCreates.length;
+        return (
+            Math.max(this.props.activityTotal ?? 0, this.activityRows.length) +
+            this.pendingActivityCreates.length
+        );
+    }
+
+    get showAllActivitiesLabel() {
+        return _t("Show all (%(count)s)", { count: this.props.activityTotal });
+    }
+
+    get hiddenActivitiesLabel() {
+        return _t("%(count)s more activities are not available offline", {
+            count: this.hiddenActivityCount,
+        });
     }
 
     get noActivitiesLabel() {
@@ -352,7 +423,10 @@ export class CrmMobileLeadCard extends Component {
         try {
             await this.props.onMove?.(this.props.record, group);
         } finally {
-            this.state.busy = false;
+            // A move re-keys or removes the card: a destroyed card gets no state write.
+            if (status(this) !== "destroyed") {
+                this.state.busy = false;
+            }
         }
     }
 
@@ -384,8 +458,10 @@ export class CrmMobileLeadCard extends Component {
         this.state.busy = true;
         try {
             const res = await this.crmOffline.runOrQueue({
+                // Unscoped ORM: the ORM scoped to the card rejects a result that arrives after the
+                // card was destroyed, and the completion below must still request the refresh then.
                 online: () =>
-                    this.crmOffline.orm.webSave(
+                    this.crmOffline.orm.unscoped.webSave(
                         "mail.activity",
                         [],
                         { ...vals },
@@ -407,11 +483,17 @@ export class CrmMobileLeadCard extends Component {
                 },
             });
             if (!res.queued) {
+                // Requested even when this card was destroyed meanwhile: a reload re-keys the card
+                // of a lead that stays displayed, and its new card would keep the activities read
+                // before this write. The pipeline drops the request when it was destroyed itself
+                // or no longer displays the lead, so no read starts for a lead nobody shows.
                 this.props.onActivitiesChanged?.(record.resId);
             }
             return res;
         } finally {
-            this.state.busy = false;
+            if (status(this) !== "destroyed") {
+                this.state.busy = false;
+            }
         }
     }
 
@@ -451,7 +533,9 @@ export class CrmMobileLeadCard extends Component {
             return;
         }
         await this._createActivity(type, this.state.summary.trim(), this._followUpDeadline());
-        this.onCancelFollowUp();
+        if (status(this) !== "destroyed") {
+            this.onCancelFollowUp();
+        }
     }
 
     onCancelFollowUp() {
@@ -493,8 +577,11 @@ export class CrmMobileLeadCard extends Component {
         this.state.busy = true;
         try {
             const res = await this.crmOffline.runOrQueue({
+                // Unscoped ORM, as in `_createActivity`.
                 online: () =>
-                    this.crmOffline.orm.call("mail.activity", "action_done", [[activity.id]]),
+                    this.crmOffline.orm.unscoped.call("mail.activity", "action_done", [
+                        [activity.id],
+                    ]),
                 queue: {
                     model: "mail.activity",
                     method: "action_archive",
@@ -507,10 +594,13 @@ export class CrmMobileLeadCard extends Component {
                 },
             });
             if (!res.queued) {
+                // Requested even when this card was destroyed meanwhile, as in `_createActivity`.
                 this.props.onActivitiesChanged?.(resId);
             }
         } finally {
-            this.state.busy = false;
+            if (status(this) !== "destroyed") {
+                this.state.busy = false;
+            }
         }
     }
 
@@ -522,6 +612,22 @@ export class CrmMobileLeadCard extends Component {
         const open = !this.state.activitiesOpen;
         this._closePanels();
         this.state.activitiesOpen = open;
+    }
+
+    /**
+     * Asks the pipeline to read every activity of the lead. Online only, and only when the loaded
+     * page misses some: offline the expanded read was never cached.
+     */
+    onShowAllActivities() {
+        if (
+            !this.isPersisted ||
+            !this.hiddenActivityCount ||
+            this.crmOffline.isOffline() ||
+            !this.props.onShowAllActivities
+        ) {
+            return;
+        }
+        return this.props.onShowAllActivities(this.props.record.resId);
     }
 
     // -------------------------------------------------------------------------

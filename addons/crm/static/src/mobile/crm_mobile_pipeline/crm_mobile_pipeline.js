@@ -24,14 +24,15 @@
  * - It queues nothing itself. Stage moves go through the framework kanban move (`moveRecords`),
  *   which queues the stage write offline; lead and activity creates are queued by the child
  *   components through `runOrQueue`.
- * - Pending placement and pending-aware totals are derived on every render from framework state
- *   only: the offline queue entries, each record's framework group, its `stage_id` and its
- *   `serverStageId` (set by the CRM kanban model's record class). No correction is stored.
+ * - Pending placement and pending-aware totals are derived from framework state only: the offline
+ *   queue entries, each record's framework group, its `stage_id` and its `serverStageId` (set by
+ *   the CRM kanban model's record class). The derivation is memoized until that state changes, so
+ *   every reader shares one derivation per change. No correction is stored.
  * - Every read (activities, activity types, reconciliation reload) is issued only on small screens
  *   in the stage pipeline, so desktop RPC sequences are unchanged.
  */
 
-import { proxy, status, useOnChange } from "@odoo/owl";
+import { computed, proxy, status, useOnChange } from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { usePopover } from "@web/core/popover/popover_hook";
@@ -61,6 +62,15 @@ const SWIPE_THRESHOLD = 50;
  * @typedef {{ key: string | number, value: { model: string, method: string, args: any[],
  *   kwargs: Object, extras: Object } }} QueueEntry an entry of the framework offline queue,
  *   exactly as the framework stores it
+ * @typedef {{ cards: RelationalRecord[], pendingCreates: QueueEntry[], count: number,
+ *   revenueAdjustments: number[] }} StageSummary what a stage displays: its cards (its own
+ *   records first, then the records a queued write places there), its queued lead creates, its
+ *   pending-aware lead count, and the signed sum-field amounts added, in order, to its loaded
+ *   aggregate. The arrays are shared by every reader and must not be mutated.
+ * @typedef {{ placement: Map<string, number | false | undefined>,
+ *   groupsByValue: Map<number | false, Group[]>, byGroupId: Map<string, StageSummary> }}
+ *   StageProjection the displayed stage of every loaded record (by record datapoint id), the
+ *   groups of the pipeline by stage id, and the summary of every group (by group datapoint id)
  */
 
 // -----------------------------------------------------------------------------
@@ -146,8 +156,22 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this.mobileState = proxy({
             /** Lead whose form is not available offline: the stage body shows the helper. */
             unavailableLeadId: null,
-            /** Cached activities by lead id, as read by `loadLeadActivities`. */
+            /**
+             * Cached activities by lead id, as read by `loadLeadActivities`: a bounded page (the
+             * loader's default limit, or the limit in `activityLimitsByLead`).
+             */
             activitiesByLead: {},
+            /**
+             * The server's total count of each lead's activities, read with its page: when it
+             * exceeds the page, the card shows the total and offers "Show all" online.
+             */
+            activityTotalsByLead: {},
+            /**
+             * Activity limit by lead id, set only by an explicit online "Show all": every later
+             * revalidation of that lead reissues the same expanded request (answered by the cache
+             * offline). A lead without an entry is read with the loader's default request.
+             */
+            activityLimitsByLead: {},
             /** Cached creatable activity types, `null` until read (or when not cached). */
             activityTypes: null,
             /**
@@ -162,6 +186,26 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this.stageState = this.env.crmMobileStage ?? proxy({ serverValue: null });
         /** Touch gesture in progress on the stage body (swipe navigation). */
         this.touch = null;
+        /**
+         * Placement of every loaded record and summary of every stage, derived in one pass (see
+         * `_computeStageProjection`). Lazy: derived on the first read after a change of the
+         * framework state it reads, then shared by every reader until the next change; never
+         * read outside the mobile pipeline.
+         *
+         * @type {() => StageProjection}
+         */
+        this._stageProjection = computed(() => this._computeStageProjection());
+        /**
+         * The stage groups in display order, one array until the groups or their order change,
+         * so the navigation and every card share it.
+         *
+         * @type {() => Group[]}
+         */
+        this._orderedStageGroups = computed(() => orderedStageGroups(this.props.list), {
+            equals: (previous, next) =>
+                previous.length === next.length &&
+                previous.every((group, index) => group === next[index]),
+        });
 
         this._setupActivityRevalidation();
         this._setupSyncReconciliation();
@@ -176,9 +220,12 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         return isCrmMobilePipeline(this.props.list, this.crmOffline.isSmall());
     }
 
-    /** @returns {Group[]} the stage groups in display order */
+    /**
+     * @returns {Group[]} the stage groups in display order: the same array until the groups or
+     *   their order change (shared, must not be mutated)
+     */
     get stageGroups() {
-        return orderedStageGroups(this.props.list);
+        return this._orderedStageGroups();
     }
 
     /** @returns {Group | undefined} the displayed stage, always defined while the gate holds */
@@ -214,16 +261,20 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * Union rather than replacement: an entry queued while the snapshot is held (the connection
      * dropped again during the sync, for instance) is placed at once as well.
      *
-     * @returns {QueueEntry[]}
+     * @returns {readonly QueueEntry[]} a frozen array, so the hook readers index it once (only the
+     *   array is frozen, never the entries)
      */
     get stageEntries() {
         const live = this.crmOffline.queuedEntries();
         const snapshot = this.mobileState.syncEntries;
         if (!snapshot?.length) {
-            return live;
+            return Object.freeze(live);
         }
         const liveKeys = new Set(live.map((entry) => String(entry.key)));
-        return [...live, ...snapshot.filter((entry) => !liveKeys.has(String(entry.key)))];
+        return Object.freeze([
+            ...live,
+            ...snapshot.filter((entry) => !liveKeys.has(String(entry.key))),
+        ]);
     }
 
     /** Whether the arch declares a sum field (`expected_revenue` on the pipeline arch). */
@@ -240,10 +291,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     // Pending placement and pending-aware totals
     // -------------------------------------------------------------------------
     //
-    // Recomputed on every render from framework state alone; nothing here writes any state. An
+    // Derived from framework state alone: the queue entries (`stageEntries`) and each loaded
+    // record's framework group, `stage_id` and `serverStageId`. `_computeStageProjection` derives
+    // the placement of every record and the summary of every stage in one pass, and
+    // `_stageProjection` memoizes it until one of those inputs changes, so the header, the card
+    // loops, the helper, the remaining count and the activity revalidation share one derivation
+    // per change. Nothing here writes any state, and the memo is never a stored correction: an
     // offline move returns from the framework save before the aggregates are refreshed, and every
     // reload rebuilds the groups and records from server or cache data that predate the queued
-    // writes, so stored corrections would go stale: derived ones survive a form → back, an
+    // writes, so stored corrections would go stale, while derived ones survive a form → back, an
     // offline reload and a reconciliation that leaves a parked write. A parked entry
     // (`extras.error`) stays in the queue and keeps its placement; a systray discard removes the
     // entry and ends it.
@@ -259,10 +315,34 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *   stage. This is the state after a reload rebuilt the record from data predating the write.
      * - Else its framework group.
      *
+     * Read from the stage projection; a record the list does not hold is placed on its own with
+     * the same rules.
+     *
      * @param {RelationalRecord} record
      * @returns {number | false | undefined} the stage id (`serverValue`)
      */
     displayStage(record) {
+        const { placement, groupsByValue } = this._stageProjection();
+        if (placement.has(record.id)) {
+            return placement.get(record.id);
+        }
+        const entries = this.stageEntries;
+        return this._placeRecord(record, groupsByValue, (resId) =>
+            this.crmOffline.latestStageWrite(resId, entries)
+        );
+    }
+
+    /**
+     * The placement rules of `displayStage`, for one record.
+     *
+     * @private
+     * @param {RelationalRecord} record
+     * @param {Map<number | false, Group[]>} groupsByValue the groups of the pipeline by stage id
+     * @param {(resId: number) => QueueEntry | undefined} latestStageWriteOf the latest queued
+     *   stage write of a lead (`latestStageWrite` over the placement's queue entries)
+     * @returns {number | false | undefined} the stage id (`serverValue`)
+     */
+    _placeRecord(record, groupsByValue, latestStageWriteOf) {
         const frameworkStage = record.group?.serverValue;
         if (!this._tracksStage(record)) {
             return frameworkStage;
@@ -272,15 +352,128 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             return frameworkStage;
         }
         if (record.resId) {
-            const entry = this.crmOffline.latestStageWrite(record.resId, this.stageEntries);
+            const entry = latestStageWriteOf(record.resId);
             if (entry) {
                 const stageValue = entry.value.args?.[1]?.stage_id;
-                if (this.props.list.groups.some((group) => group.serverValue === stageValue)) {
+                if (groupsByValue.has(stageValue)) {
                     return stageValue;
                 }
             }
         }
         return frameworkStage;
+    }
+
+    /**
+     * Derives the stage projection in one pass over the loaded records: the queue entries are
+     * taken once (`stageEntries`, a frozen array), each loaded lead's latest stage write is looked
+     * up once and each stage's queued creates once. Queue parsing stays in the shared hook
+     * readers, which index the frozen entries in one traversal on the first lookup and answer the
+     * others from that index, so a pass reads each entry once whatever the number of leads and
+     * stages. Every record is then placed once and counted in the summaries of its framework group
+     * and of the stage it is displayed in. The summaries follow `cardsFor`, `stageCount` and
+     * `_stageRevenue`: same cards in the same order, same count, and the same revenue additions
+     * and subtractions in the same order.
+     *
+     * Pure: it reads framework state and writes none (in particular, the progress bar state's
+     * `getGroupInfo`, which registers aggregates, is called by `_stageAggregate`, outside).
+     *
+     * @private
+     * @returns {StageProjection}
+     */
+    _computeStageProjection() {
+        const groups = this.props.list.groups ?? [];
+        const entries = this.stageEntries;
+        const sumFieldName = this.hasRevenue
+            ? this.props.progressBarState.progressAttributes.sumField.name
+            : null;
+        /** @type {Map<number | false, Group[]>} */
+        const groupsByValue = new Map();
+        const tallies = new Map();
+        for (const group of groups) {
+            const sameStage = groupsByValue.get(group.serverValue);
+            if (sameStage) {
+                sameStage.push(group);
+            } else {
+                groupsByValue.set(group.serverValue, [group]);
+            }
+            tallies.set(group.id, { own: [], placed: [], removed: 0, adjustments: [] });
+        }
+        const latestStageWriteOf = (resId) => this.crmOffline.latestStageWrite(resId, entries);
+
+        const placement = new Map();
+        for (const group of groups) {
+            const tally = tallies.get(group.id);
+            for (const record of group.list.records ?? []) {
+                const stageValue = this._placeRecord(record, groupsByValue, latestStageWriteOf);
+                placement.set(record.id, stageValue);
+                if (stageValue !== group.serverValue) {
+                    tally.removed++;
+                }
+                for (const target of groupsByValue.get(stageValue) ?? []) {
+                    const targetTally = tallies.get(target.id);
+                    (target.id === group.id ? targetTally.own : targetTally.placed).push(record);
+                }
+                // Displaced: out of the aggregate of its server stage (an empty group's aggregate
+                // is already 0), into the stage it is displayed in.
+                if (
+                    sumFieldName !== null &&
+                    this._tracksStage(record) &&
+                    stageValue !== record.serverStageId
+                ) {
+                    const recordValue = Number(record.data[sumFieldName]) || 0;
+                    for (const source of groupsByValue.get(record.serverStageId) ?? []) {
+                        if (source.count !== 0) {
+                            tallies.get(source.id).adjustments.push(-recordValue);
+                        }
+                    }
+                    for (const target of groupsByValue.get(stageValue) ?? []) {
+                        tallies.get(target.id).adjustments.push(recordValue);
+                    }
+                }
+            }
+        }
+
+        /** @type {Map<string, StageSummary>} */
+        const byGroupId = new Map();
+        for (const group of groups) {
+            const { own, placed, removed, adjustments } = tallies.get(group.id);
+            const pendingCreates = this.crmOffline.pendingLeadCreates(group.serverValue, entries);
+            if (sumFieldName !== null) {
+                for (const entry of pendingCreates) {
+                    adjustments.push(Number(entry.value.args?.[1]?.[sumFieldName]) || 0);
+                }
+            }
+            byGroupId.set(group.id, {
+                cards: [...own, ...placed],
+                pendingCreates,
+                count: Math.max(
+                    0,
+                    (group.count || 0) - removed + placed.length + pendingCreates.length
+                ),
+                revenueAdjustments: adjustments,
+            });
+        }
+        return { placement, groupsByValue, byGroupId };
+    }
+
+    /**
+     * The projection's summary of a stage. A group the current list does not hold (a datapoint of
+     * a list a reload replaced, which no template renders) displays nothing: no card, no queued
+     * create, a count of 0 and no revenue adjustment.
+     *
+     * @private
+     * @param {Group} group
+     * @returns {StageSummary}
+     */
+    _stageSummary(group) {
+        return (
+            this._stageProjection().byGroupId.get(group.id) ?? {
+                cards: [],
+                pendingCreates: [],
+                count: 0,
+                revenueAdjustments: [],
+            }
+        );
     }
 
     /**
@@ -319,7 +512,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Records displayed in a stage: the group's own records first (framework order), then the
-     * records of other groups that a queued write places there.
+     * records of other groups that a queued write places there. Read from the stage projection
+     * (shared array, must not be mutated).
      *
      * @param {Group} group
      * @returns {RelationalRecord[]}
@@ -328,22 +522,12 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!group) {
             return [];
         }
-        const stageValue = group.serverValue;
-        const own = (group.list.records ?? []).filter(
-            (record) => this.displayStage(record) === stageValue
-        );
-        const placedHere = this.props.list.groups
-            .filter((other) => other.id !== group.id)
-            .flatMap((other) =>
-                (other.list.records ?? []).filter(
-                    (record) => this.displayStage(record) === stageValue
-                )
-            );
-        return [...own, ...placedHere];
+        return this._stageSummary(group).cards;
     }
 
     /**
      * Queued `crm.lead` creates targeting a stage (rendered as pending cards, keyed by queue key).
+     * Read from the stage projection (shared array, must not be mutated).
      *
      * @param {Group} group
      * @returns {QueueEntry[]}
@@ -352,13 +536,14 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!group) {
             return [];
         }
-        return this.crmOffline.pendingLeadCreates(group.serverValue, this.stageEntries);
+        return this._stageSummary(group).pendingCreates;
     }
 
     /**
      * Lead count of a stage: the framework group count (already adjusted for in-memory moves),
      * minus the group's records a queued write places elsewhere, plus the other groups' records a
-     * queued write places here, plus the queued creates of the stage.
+     * queued write places here, plus the queued creates of the stage. Read from the stage
+     * projection.
      *
      * @param {Group} group
      * @returns {number}
@@ -367,24 +552,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!group) {
             return 0;
         }
-        const stageValue = group.serverValue;
-        let count = group.count || 0;
-        for (const record of group.list.records ?? []) {
-            if (this.displayStage(record) !== stageValue) {
-                count--;
-            }
-        }
-        for (const other of this.props.list.groups) {
-            if (other.id === group.id) {
-                continue;
-            }
-            for (const record of other.list.records ?? []) {
-                if (this.displayStage(record) === stageValue) {
-                    count++;
-                }
-            }
-        }
-        return Math.max(0, count + this.pendingCreatesFor(group).length);
+        return this._stageSummary(group).count;
     }
 
     /**
@@ -429,7 +597,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * Revenue of a stage with its currencies: the loaded aggregate (see `_stageAggregate`), minus
      * the sum field of the displaced records the aggregate counts here (nothing to subtract when
      * the group is empty: the aggregate of an empty group is already 0), plus that of the displaced
-     * records displayed here, plus that of the queued creates of the stage.
+     * records displayed here, plus that of the queued creates of the stage. The adjustments come
+     * from the stage projection; the aggregate is read here, outside it, because `getGroupInfo`
+     * writes the progress bar state.
      *
      * @private
      * @param {Group} group
@@ -439,24 +609,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!group || !this.hasRevenue) {
             return { value: 0 };
         }
-        const fieldName = this.props.progressBarState.progressAttributes.sumField.name;
-        const stageValue = group.serverValue;
         const { value: loadedValue, currencies } = this._stageAggregate(group);
         let value = loadedValue;
-        for (const record of this.allLoadedRecords()) {
-            if (!this.isDisplaced(record)) {
-                continue;
-            }
-            const recordValue = Number(record.data[fieldName]) || 0;
-            if (record.serverStageId === stageValue && group.count !== 0) {
-                value -= recordValue;
-            }
-            if (this.displayStage(record) === stageValue) {
-                value += recordValue;
-            }
-        }
-        for (const entry of this.pendingCreatesFor(group)) {
-            value += Number(entry.value.args?.[1]?.[fieldName]) || 0;
+        for (const adjustment of this._stageSummary(group).revenueAdjustments) {
+            value += adjustment;
         }
         return { value, currencies };
     }
@@ -502,14 +658,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * @returns {boolean}
      */
     isStageDataMissing(group) {
-        return Boolean(
-            group &&
-                this.crmOffline.isOffline() &&
-                group.count > 0 &&
-                this.stageCount(group) > 0 &&
-                this.cardsFor(group).length === 0 &&
-                this.pendingCreatesFor(group).length === 0
-        );
+        if (!group || !this.crmOffline.isOffline() || !(group.count > 0)) {
+            return false;
+        }
+        const { count, cards, pendingCreates } = this._stageSummary(group);
+        return count > 0 && cards.length === 0 && pendingCreates.length === 0;
     }
 
     /**
@@ -522,22 +675,17 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!group || !this.crmOffline.isOffline() || this.isStageDataMissing(group)) {
             return 0;
         }
-        return Math.max(
-            0,
-            this.stageCount(group) -
-                this.cardsFor(group).length -
-                this.pendingCreatesFor(group).length
-        );
+        const { count, cards, pendingCreates } = this._stageSummary(group);
+        return Math.max(0, count - cards.length - pendingCreates.length);
     }
 
     /**
      * @param {Group} group
+     * @param {number} [count] the stage's `unavailableMoreCount`, when the caller already has it
      * @returns {string}
      */
-    unavailableMoreLabel(group) {
-        return _t("%(count)s more leads are not available offline", {
-            count: this.unavailableMoreCount(group),
-        });
+    unavailableMoreLabel(group, count = this.unavailableMoreCount(group)) {
+        return _t("%(count)s more leads are not available offline", { count });
     }
 
     /**
@@ -571,10 +719,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * signal. On each change, while the gate holds, every displayed lead's activities and the
      * activity types are read again through the framework disk cache: online that refreshes the
      * cache, and a changed server answer is delivered through the cache callback; offline the
-     * cache answers. The per-lead request never changes, so a lead's activities read online come
-     * back offline whichever stage, filter or page displayed it, and the types are read again on
-     * reconnect, so a cold offline cache miss clears without a manual reload. The connection
-     * dropping alone triggers no read (what is in memory is what the cache would answer).
+     * cache answers. The per-lead request is the same on every trigger (the loader's bounded
+     * default, or the expansion an online "Show all" chose for that lead), so a lead's activities
+     * read online come back offline whichever stage, filter or page displayed it, and the types
+     * are read again on reconnect, so a cold offline cache miss clears without a manual reload.
+     * Each read carries the lead's total count, so a truncated page is shown as such. The
+     * connection dropping alone triggers no read (what is in memory is what the cache would
+     * answer).
      *
      * Outside the gate the dependencies are constants (plus the offline signal) and nothing is
      * read, so desktop issues no extra RPC.
@@ -731,18 +882,32 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Reads a lead's activities through the disk cache; the first value and any changed refresh
-     * are both applied.
+     * Reads a lead's activities through the disk cache, with their total count; the first value
+     * and any changed refresh are both applied. The request is the loader's default bounded one,
+     * or the expanded one an online "Show all" chose for this lead. A value of a request whose
+     * limit is no longer the lead's (a bounded read still in flight when "Show all" expanded it)
+     * is dropped, so it never replaces the expanded page.
      *
      * @private
      * @param {number} resId
-     * @returns {Promise<void>}
+     * @returns {Promise<{ records: Object[], length: number } | null>} the value read, `null` when
+     *   the connection is lost and nothing is cached
      */
     async _loadLeadActivities(resId) {
-        const activities = await loadLeadActivities(this.crmOffline.orm, resId, (fresh) =>
-            this._applyActivities(resId, fresh)
+        const limit = this.mobileState.activityLimitsByLead[resId];
+        const apply = (result) => {
+            if (this.mobileState.activityLimitsByLead[resId] === limit) {
+                this._applyActivities(resId, result);
+            }
+        };
+        const activities = await loadLeadActivities(
+            this.crmOffline.orm,
+            resId,
+            apply,
+            limit ? { withLength: true, limit } : { withLength: true }
         );
-        this._applyActivities(resId, activities);
+        apply(activities);
+        return activities;
     }
 
     /**
@@ -761,7 +926,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * @private
-     * @param {Object[] | { records: Object[] } | null} result
+     * @param {Object[] | { records: Object[], length?: number } | null} result
      * @returns {Object[] | null} the records, `null` when there is nothing to apply
      */
     _normalizeRecords(result) {
@@ -772,13 +937,26 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Stores a lead's activities. A result arriving after the gate turned false, or after the
-     * pipeline was destroyed, is dropped; `null` (connection lost, nothing cached) keeps what is
-     * displayed.
+     * @private
+     * @param {Object[] | { records: Object[], length?: number }} result a result that has records
+     * @param {Object[]} records its records (`_normalizeRecords`)
+     * @returns {number} the total count of matching records: the server's `length` when the result
+     *   carries one, never less than the records it holds; the record count for a plain array
+     */
+    _normalizeLength(result, records) {
+        const length =
+            !Array.isArray(result) && Number.isInteger(result?.length) ? result.length : 0;
+        return Math.max(length, records.length);
+    }
+
+    /**
+     * Stores a lead's activities and their total count. A result arriving after the gate turned
+     * false, or after the pipeline was destroyed, is dropped; `null` (connection lost, nothing
+     * cached) keeps what is displayed.
      *
      * @private
      * @param {number} resId
-     * @param {Object[] | null} result
+     * @param {Object[] | { records: Object[], length: number } | null} result
      */
     _applyActivities(resId, result) {
         if (status(this) === "destroyed" || !this.isMobilePipeline) {
@@ -787,6 +965,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         const records = this._normalizeRecords(result);
         if (records) {
             this.mobileState.activitiesByLead[resId] = records;
+            this.mobileState.activityTotalsByLead[resId] = this._normalizeLength(result, records);
         }
     }
 
@@ -931,7 +1110,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * @returns {Promise<void>}
      */
     async onCardMove(record, targetGroup) {
-        if (!record || !targetGroup || record.group?.id === targetGroup.id) {
+        if (!record || !targetGroup || record.group === targetGroup) {
             return;
         }
         try {
@@ -941,7 +1120,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 throw error;
             }
         }
-        if (status(this) !== "destroyed" && record.group?.id === targetGroup.id) {
+        if (status(this) !== "destroyed" && record.group === targetGroup) {
             this.stageState.serverValue = targetGroup.serverValue;
         }
     }
@@ -968,15 +1147,64 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Called by a card after an online activity create or mark-done: reads the lead's activities
-     * again.
+     * again, with the lead's current request (bounded, or expanded by "Show all"), only while
+     * this pipeline is alive and the displayed stage shows the lead (the same placement the
+     * activity revalidation reads for). A card can call it after it was destroyed (stage
+     * navigation, a filter, a move or a reload re-keyed or removed it): a lead no longer
+     * displayed is not read now, and is read again when a stage displays it.
      *
      * @param {number} resId
+     * @returns {Promise<{ records: Object[], length: number } | null> | undefined} the read, if any
      */
     onActivitiesChanged(resId) {
-        if (!resId || !this.isMobilePipeline || this.props.list.model.useSampleModel) {
+        if (
+            !resId ||
+            status(this) === "destroyed" ||
+            !this.isMobilePipeline ||
+            this.props.list.model.useSampleModel
+        ) {
+            return;
+        }
+        if (!this.cardsFor(this.currentGroup).some((record) => record.resId === resId)) {
             return;
         }
         return this._loadLeadActivities(resId);
+    }
+
+    /**
+     * Called by a card's "Show all": online, when the lead has more activities than its loaded
+     * page, reads all of them (the known total) and keeps that limit for every later revalidation
+     * of the lead. Offline, or when nothing is missing, it does nothing: the expanded request was
+     * never cached. When the connection drops during the read and nothing is cached for it, the
+     * lead's previous request is restored, so later revalidations keep the one the cache answers.
+     *
+     * @param {number} resId
+     * @returns {Promise<void>}
+     */
+    async onShowAllActivities(resId) {
+        if (
+            !resId ||
+            !this.isMobilePipeline ||
+            this.props.list.model.useSampleModel ||
+            this.crmOffline.isOffline()
+        ) {
+            return;
+        }
+        const { activitiesByLead, activityLimitsByLead, activityTotalsByLead } = this.mobileState;
+        const total = activityTotalsByLead[resId];
+        if (!Number.isInteger(total) || total <= (activitiesByLead[resId]?.length ?? 0)) {
+            return;
+        }
+        const previousLimit = activityLimitsByLead[resId];
+        activityLimitsByLead[resId] = total;
+        const result = await this._loadLeadActivities(resId);
+        if (result === null && activityLimitsByLead[resId] === total) {
+            if (previousLimit === undefined) {
+                delete activityLimitsByLead[resId];
+            } else {
+                activityLimitsByLead[resId] = previousLimit;
+            }
+        }
     }
 }
 

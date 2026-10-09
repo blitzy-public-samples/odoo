@@ -10,6 +10,8 @@
  *   back to the standard renderer for any other grouping;
  * - pending stage placement and pending-aware totals are derived from framework state only, survive
  *   remounts and reloads, and end once the write is replayed (or discarded) and reloaded;
+ * - activity reads are bounded pages that carry the lead's total, so the card shows the total and
+ *   says what the page misses ("Show all" online, a muted count offline);
  * - the lead card (44x44 touch targets, pending-sync badge, stage list, activities), the six-field
  *   bottom-sheet quick create and the activity controls queue their writes offline through the
  *   shared framework queue, and are disabled when their data is missing.
@@ -37,6 +39,7 @@ import {
     runAllTimers,
     test,
 } from "@odoo/hoot";
+import { status } from "@odoo/owl";
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
 import {
     contains,
@@ -73,7 +76,7 @@ import {
 import { CrmMobileQuickCreate } from "@crm/mobile/crm_mobile_quick_create/crm_mobile_quick_create";
 import { CrmKanbanDynamicGroupList } from "@crm/views/crm_kanban/crm_kanban_model";
 import { crmKanbanView } from "@crm/views/crm_kanban/crm_kanban_view";
-import { serializeDate, today } from "@web/core/l10n/dates";
+import { deserializeDate, formatDate, serializeDate, today } from "@web/core/l10n/dates";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { formatMonetary } from "@web/views/fields/formatters";
@@ -1381,6 +1384,134 @@ describe("Mobile pipeline", () => {
     });
 
     test.tags("mobile");
+    test("mobile: stage writes of a lead with the same timestamp are placed where the framework replay leaves it", async () => {
+        const errors = cachedReadErrors([
+            // the queued writes take Lead 1 out of New (Lead 2's activities, the types), then
+            // Qualified is displayed (the types; Lead 3's activities were never cached), then
+            // Proposition (Lead 1's activities, the types; Lead 4's were never cached)
+            ACTIVITIES,
+            TYPES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${JSON.stringify(args)}`);
+        });
+        watchRpcs([LEAD_GROUPS]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        expect.verifySteps([LEAD_GROUPS]);
+        const { crmOffline } = renderers.at(-1);
+        const totals = (stageId) => {
+            const renderer = renderers.at(-1);
+            const group = groupOf(renderer, stageId);
+            return [renderer.stageCount(group), renderer.stageRevenueValue(group)];
+        };
+
+        // Offline, two stage writes of Lead 1 share their timestamp, as two record datapoints
+        // saving within one millisecond do. Tied writes replay in the enumeration order of their
+        // keys, so "b0000002" (Proposition) is applied after "a0000001" (Qualified) and the server
+        // keeps Proposition. A browser's IndexedDB returns the entries in key order, the Hoot
+        // IndexedDB mock in insertion order: scheduling them in key order makes the mock replay
+        // them as a browser does.
+        await setOffline(true);
+        const timeStamp = Date.now();
+        const scheduleStageWrite = (key, stageId, stageName) =>
+            getService(OfflinePlugin).scheduleORM(
+                "crm.lead",
+                "web_save",
+                [[1], { stage_id: stageId }],
+                { context: {}, specification: {} },
+                {
+                    id: key,
+                    extras: {
+                        actionId: PIPELINE_ACTION_ID,
+                        actionName: "Pipeline",
+                        viewType: "kanban",
+                        timeStamp,
+                        displayName: "Lead 1",
+                        changes: { stage_id: { id: stageId, display_name: stageName } },
+                        originalValues: { stage_id: { id: 1, display_name: "New" } },
+                    },
+                }
+            );
+        expect(scheduleStageWrite("a0000001", 2, "Qualified")).toBe("a0000001");
+        expect(scheduleStageWrite("b0000002", 3, "Proposition")).toBe("b0000002");
+        await animationFrame();
+        const entries = queued();
+        expect(entries.map(({ key }) => key)).toEqual(["a0000001", "b0000002"]);
+        const replayedLast = entries[1];
+
+        // Lead 1 is placed in Proposition, not in Qualified, whichever order the entries are
+        // read in.
+        expect(crmOffline.latestStageWrite(1)).toBe(replayedLast);
+        expect(crmOffline.latestStageWrite(1, entries)).toBe(replayedLast);
+        expect(crmOffline.latestStageWrite(1, [...entries].reverse())).toBe(replayedLast);
+        expectHeader("New", 1, 20);
+        expect(cardNames()).toEqual(["Lead 2"]);
+        expect(totals(1)).toEqual([1, 20]);
+        expect(totals(2)).toEqual([1, 30]);
+        expect(totals(3)).toEqual([2, 140]);
+        await goToStage("Qualified");
+        expectHeader("Qualified", 1, 30);
+        expect(cardNames()).toEqual(["Lead 3"]);
+        await goToStage("Proposition");
+        expectHeader("Proposition", 2, 140);
+        expect(cardNames().sort()).toEqual(["Lead 1", "Lead 4"]);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_pending_badge`).toHaveCount(1);
+
+        // Reconnect: the replay applies both writes in that order, and the server ends with the
+        // stage the card was placed in. After the reconciliation reload nothing is displaced.
+        await setOffline(false);
+        await expect.waitForSteps(['replayed [[1],{"stage_id":2}]']);
+        expectHeader("Proposition", 2, 140);
+        await letQueueReplay(1);
+        expect.verifySteps(['replayed [[1],{"stage_id":3}]', LEAD_GROUPS]);
+        expect(queued()).toHaveLength(0);
+        expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(3);
+        const reconciled = renderers.at(-1);
+        expect(reconciled.mobileState.syncEntries).toBe(null);
+        expect(recordOf(reconciled, 1).serverStageId).toBe(3);
+        expect(reconciled.allLoadedRecords().some((record) => reconciled.isDisplaced(record))).toBe(
+            false
+        );
+        expectHeader("Proposition", 2, 140);
+        expect(cardNames().sort()).toEqual(["Lead 1", "Lead 4"]);
+        expect(".o_crm_mobile_pending_badge").toHaveCount(0);
+
+        // The tie rule on its own, with no replay: tied keys rank in IndexedDB key order whatever
+        // order they are passed in, a key that is an array index ("12345678") ranks before every
+        // other key, and a later timestamp outranks any tie.
+        const stageWrite = (key, stageId, at = timeStamp) => ({
+            key,
+            value: {
+                model: "crm.lead",
+                method: "web_save",
+                args: [[1], { stage_id: stageId }],
+                kwargs: {},
+                extras: { timeStamp: at },
+            },
+        });
+        const keyD = stageWrite("d0000004", 2);
+        const keyC = stageWrite("c0000003", 3);
+        expect(crmOffline.latestStageWrite(1, [keyD, keyC])).toBe(keyD);
+        expect(crmOffline.latestStageWrite(1, [keyC, keyD])).toBe(keyD);
+        const indexKey = stageWrite("12345678", 2);
+        const hashKey = stageWrite("0abcdef0", 3);
+        expect(crmOffline.latestStageWrite(1, [hashKey, indexKey])).toBe(hashKey);
+        expect(crmOffline.latestStageWrite(1, [indexKey, hashKey])).toBe(hashKey);
+        const later = stageWrite("00000000", 4, timeStamp + 1);
+        expect(crmOffline.latestStageWrite(1, [keyD, later, keyC, indexKey, hashKey])).toBe(later);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
     test("mobile: after replay, the created lead and activity show as server records without a manual reload", async () => {
         const [activityId] = await createActivities([
             { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
@@ -1541,6 +1672,352 @@ describe("Mobile pipeline", () => {
         expect(cardNames()).toEqual(["Lead 1", "Lead 2", "Pending A", "Pending B"]);
         expectHeader("New", 4, 140);
         expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: placement and totals are derived once per change and shared by every reader", async () => {
+        const errors = cachedReadErrors([
+            // a queued write places Lead 3 in New: Lead 1's and Lead 2's activities (Lead 3's
+            // were never read, so they are not cached and raise nothing) and the types
+            ACTIVITIES,
+            ACTIVITIES,
+            TYPES,
+            // its discard takes Lead 3 out of New again: the same
+            ACTIVITIES,
+            ACTIVITIES,
+            TYPES,
+            // a card move takes Lead 1 out of New (Lead 2's activities, the types), then
+            // displays Qualified (Lead 1's activities, the types)
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const renderers = captureInstances(CrmMobilePipeline);
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const mountedCards = () => cards.filter((card) => status(card) === "mounted");
+        const shareStages = (stages) =>
+            mountedCards().every((card) => card.props.stages === stages);
+
+        // The ordered stages are one array, shared by every card, until the groups change.
+        let renderer = renderers.at(-1);
+        const loadedStages = renderer.stageGroups;
+        expect(renderer.stageGroups).toBe(loadedStages);
+        expect(loadedStages.map((group) => group.serverValue)).toEqual([1, 2, 3, 4]);
+        expect(mountedCards()).toHaveLength(2);
+        expect(shareStages(loadedStages)).toBe(true);
+        await renderer.props.list.load();
+        await animationFrame();
+        renderer = renderers.at(-1);
+        const stages = renderer.stageGroups;
+        expect(stages).not.toBe(loadedStages);
+        expect(stages.map((group) => group.serverValue)).toEqual([1, 2, 3, 4]);
+        expect(renderer.stageGroups).toBe(stages);
+        expect(shareStages(stages)).toBe(true);
+
+        await setOffline(true);
+        await animationFrame();
+        const calls = { queuedEntries: 0, latestStageWrite: 0, pendingLeadCreates: 0 };
+        patchWithCleanup(renderer.crmOffline, {
+            queuedEntries() {
+                calls.queuedEntries++;
+                return super.queuedEntries(...arguments);
+            },
+            latestStageWrite() {
+                calls.latestStageWrite++;
+                return super.latestStageWrite(...arguments);
+            },
+            pendingLeadCreates() {
+                calls.pendingLeadCreates++;
+                return super.pendingLeadCreates(...arguments);
+            },
+        });
+        /** @returns {Object} the reader calls since the previous check */
+        const takeCalls = () => {
+            const taken = { ...calls };
+            for (const reader of Object.keys(calls)) {
+                calls[reader] = 0;
+            }
+            return taken;
+        };
+        const noCall = { queuedEntries: 0, latestStageWrite: 0, pendingLeadCreates: 0 };
+        // One derivation: the queue read once, each loaded lead's latest stage write looked up
+        // once (5 leads) and each stage's queued creates once (4 stages).
+        const onePass = { queuedEntries: 1, latestStageWrite: 5, pendingLeadCreates: 4 };
+
+        // A render that changes nothing the placement reads (new activity types) derives
+        // nothing again and hands every card the same stages array.
+        renderer.mobileState.activityTypes = [...renderer.mobileState.activityTypes];
+        const types = renderer.mobileState.activityTypes; // as the template reads it
+        await animationFrame();
+        expect(mountedCards().every((card) => card.props.activityTypes === types)).toBe(true);
+        expect(takeCalls()).toEqual(noCall);
+        expect(shareStages(stages)).toBe(true);
+
+        // A queued stage write of Lead 3 into New: one derivation shared by the header count
+        // and revenue, both card loops, the helper, the remaining count and the activity
+        // revalidation; direct reads afterwards reuse it.
+        const offline = getService(OfflinePlugin);
+        const key = offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[3], { stage_id: 1 }],
+            { context: {}, specification: {} },
+            { extras: { timeStamp: Date.now(), viewType: "kanban", displayName: "Lead 3" } }
+        );
+        await animationFrame();
+        expect(takeCalls()).toEqual(onePass);
+        expectHeader("New", 3, 150);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2", "Lead 3"]);
+        const lead3 = recordOf(renderer, 3);
+        expect(renderer.displayStage(lead3)).toBe(1);
+        expect(renderer.isDisplaced(lead3)).toBe(true);
+        const qualified = groupOf(renderer, 2);
+        expect([renderer.stageCount(qualified), renderer.stageRevenueValue(qualified)]).toEqual([
+            0, 0,
+        ]);
+        expect(renderer.isStageDataMissing(qualified)).toBe(false);
+        expect(takeCalls()).toEqual(noCall);
+        expect(renderer.stageGroups).toBe(stages);
+        expect(shareStages(stages)).toBe(true);
+
+        // Its discard: one derivation again, and the placement ends at once.
+        offline.removeScheduledORM(key);
+        await animationFrame();
+        expect(takeCalls()).toEqual(onePass);
+        expectHeader("New", 2, 120);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expect(renderer.isDisplaced(lead3)).toBe(false);
+        expect([renderer.stageCount(qualified), renderer.stageRevenueValue(qualified)]).toEqual([
+            1, 30,
+        ]);
+        expect(takeCalls()).toEqual(noCall);
+
+        // An offline move through the card: the projection follows the framework move, and the
+        // stages array, whose groups did not change, stays the same.
+        await chooseStage("Lead 1", 2);
+        expectHeader("Qualified", 2, 130);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 3"]);
+        expect(renderer.displayStage(recordOf(renderer, 1))).toBe(2);
+        expect([
+            renderer.stageCount(groupOf(renderer, 1)),
+            renderer.stageRevenueValue(groupOf(renderer, 1)),
+        ]).toEqual([1, 20]);
+        expect(renderer.stageGroups).toBe(stages);
+        expect(shareStages(stages)).toBe(true);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: one projection pass reads each queue entry once, whatever the number of leads and stages", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        const renderer = renderers.at(-1);
+        const { crmOffline } = renderer;
+        const offline = getService(OfflinePlugin);
+        const timeStamp = Date.now();
+        const schedule = (model, method, args, kwargs, at) =>
+            offline.scheduleORM(model, method, args, kwargs, {
+                extras: { timeStamp: at, viewType: "kanban", displayName: "Lead", changes: {} },
+            });
+
+        // Offline, none of these changes what New (displayed) shows: stage writes of three leads
+        // of other stages (two of Lead 3), lead creates in Qualified (stage in the values) and in
+        // Proposition (stage in the context), a lead write without a stage and an activity call.
+        schedule("crm.lead", "web_save", [[3], { stage_id: 3 }], {}, timeStamp);
+        schedule("crm.lead", "web_save", [[4], { stage_id: 4 }], {}, timeStamp + 1);
+        schedule("crm.lead", "web_save", [[5], { stage_id: 2 }], {}, timeStamp + 2);
+        schedule("crm.lead", "web_save", [[3], { stage_id: 4 }], {}, timeStamp + 3);
+        schedule(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Pending Q", stage_id: 2, expected_revenue: 7 }],
+            { context: {} },
+            timeStamp + 4
+        );
+        schedule(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Pending P", expected_revenue: 9 }],
+            { context: { default_stage_id: 3 } },
+            timeStamp + 5
+        );
+        schedule("crm.lead", "web_save", [[2], { priority: "1" }], {}, timeStamp + 6);
+        schedule("mail.activity", "action_archive", [[999]], {}, timeStamp + 7);
+        await animationFrame();
+        expect(queued()).toHaveLength(8);
+
+        // The pipeline takes its entries from `queuedEntries`: each entry is handed over behind a
+        // wrapper counting the reads of its value.
+        let passes = 0;
+        let visits = 0;
+        patchWithCleanup(crmOffline, {
+            queuedEntries() {
+                passes++;
+                return super.queuedEntries(...arguments).map((entry) => ({
+                    key: entry.key,
+                    get value() {
+                        visits++;
+                        return entry.value;
+                    },
+                }));
+            },
+        });
+
+        // One more stage write (Lead 4 into Qualified, later than its write into Won): one pass,
+        // in which the stage readers read each of the 9 entries once, and the pipeline reads the
+        // value of the latest write of each of the 3 leads it places (Leads 3, 4 and 5) and of each
+        // of the 2 queued creates (their revenue). Per-lead or per-stage scans of the queue would
+        // read every entry again for each of the 5 loaded leads and each of the 4 stages.
+        schedule("crm.lead", "web_save", [[4], { stage_id: 2 }], {}, timeStamp + 8);
+        await animationFrame();
+        const entryCount = queued().length;
+        expect(entryCount).toBe(9);
+        const loadedLeads = renderer.allLoadedRecords().length;
+        expect(loadedLeads).toBe(5);
+        expect({ passes, visits }).toEqual({ passes: 1, visits: entryCount + 3 + 2 });
+        expect(visits).toBeLessThan(loadedLeads * entryCount);
+
+        // The pass placed and counted as the queue says, and every reader shares it.
+        expectHeader("New", 2, 120);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        const placedIn = (resId) => renderer.displayStage(recordOf(renderer, resId));
+        expect([1, 2, 3, 4, 5].map(placedIn)).toEqual([1, 1, 4, 2, 2]);
+        const totals = (stageId) => {
+            const group = groupOf(renderer, stageId);
+            return [renderer.stageCount(group), renderer.stageRevenueValue(group)];
+        };
+        expect([1, 2, 3, 4].map(totals)).toEqual([
+            [2, 120],
+            // Lead 3 out, Leads 4 and 5 in, Pending Q
+            [3, 30 - 30 + 50 + 40 + 7],
+            // Lead 4 out, Pending P
+            [1, 40 - 40 + 9],
+            // Lead 5 out, Lead 3 in
+            [1, 50 - 50 + 30],
+        ]);
+        expect(renderer.pendingCreatesFor(groupOf(renderer, 2)).map(({ key }) => key)).toEqual([
+            queued().find(({ value }) => value.args[1]?.name === "Pending Q").key,
+        ]);
+        expect({ passes, visits }).toEqual({ passes: 1, visits: entryCount + 3 + 2 });
+
+        // The readers answer a frozen array (indexed once) exactly as any other array (scanned on
+        // each call): the same entries, in the same order.
+        const entries = queued();
+        const sameEntries = (left, right) =>
+            left.length === right.length && left.every((entry, index) => entry === right[index]);
+        const expectSameAnswers = (list, resIds, stageValues) => {
+            const frozen = Object.freeze([...list]);
+            for (const resId of resIds) {
+                expect(crmOffline.latestStageWrite(resId, frozen)).toBe(
+                    crmOffline.latestStageWrite(resId, [...list])
+                );
+            }
+            for (const stageValue of stageValues) {
+                const indexed = crmOffline.pendingLeadCreates(stageValue, frozen);
+                const scanned = crmOffline.pendingLeadCreates(stageValue, [...list]);
+                expect(sameEntries(indexed, scanned)).toBe(true);
+                // A new array on every call: changing one changes no later answer.
+                indexed.push(entries[0]);
+                expect(crmOffline.pendingLeadCreates(stageValue, frozen)).not.toBe(indexed);
+                expect(crmOffline.pendingLeadCreates(stageValue, frozen)).toHaveLength(
+                    indexed.length - 1
+                );
+            }
+        };
+        const writeOf = (resId, stageId) =>
+            entries.find(
+                ({ value }) => value.args[0][0] === resId && value.args[1]?.stage_id === stageId
+            );
+        const createOf = (name) => entries.find(({ value }) => value.args[1]?.name === name);
+        const frozenEntries = Object.freeze([...entries]);
+        const latestOf = (list, resIds) =>
+            resIds.map((resId) => crmOffline.latestStageWrite(resId, list));
+        expect(
+            sameEntries(latestOf(frozenEntries, [1, 2, 3, 4, 5]), [
+                undefined,
+                undefined,
+                writeOf(3, 4),
+                writeOf(4, 2),
+                writeOf(5, 2),
+            ])
+        ).toBe(true);
+        const createsOf = (list, stageValues) =>
+            stageValues.flatMap((stageValue) => crmOffline.pendingLeadCreates(stageValue, list));
+        expect(
+            sameEntries(createsOf(frozenEntries, [1, 2, 3, 4]), [
+                createOf("Pending Q"),
+                createOf("Pending P"),
+            ])
+        ).toBe(true);
+        expectSameAnswers(entries, [1, 2, 3, 4, 5, 999], [1, 2, 3, 4, false, undefined]);
+        expectSameAnswers([...entries].reverse(), [3, 4, 5], [2, 3]);
+
+        // Tied writes rank in replay order (a key that is an array index before any other key,
+        // the other keys in key order), the first entry kept on an exact tie; a write of several
+        // leads counts for each; a create whose stage is NaN matches no stage.
+        const call = (key, args, at = timeStamp, kwargs = {}) => ({
+            key,
+            value: {
+                model: "crm.lead",
+                method: "web_save",
+                args,
+                kwargs,
+                extras: { timeStamp: at },
+            },
+        });
+        const keyD = call("d0000004", [[1], { stage_id: 2 }]);
+        const keyC = call("c0000003", [[1, 8], { stage_id: 3 }]);
+        const indexKey = call("12345678", [[2], { stage_id: 2 }]);
+        const hashKey = call("0abcdef0", [[2], { stage_id: 3 }]);
+        const sameKeyFirst = call("e0000005", [[6], { stage_id: 2 }]);
+        const sameKeySecond = call("e0000005", [[6], { stage_id: 3 }]);
+        const nanCreate = call("f0000006", [[], { stage_id: NaN }]);
+        const noStageCreate = call("f0000007", [[], { name: "No stage" }]);
+        const contextCreate = call("f0000008", [[], {}], timeStamp, {
+            context: { default_stage_id: 2 },
+        });
+        const tied = [
+            keyD,
+            keyC,
+            indexKey,
+            hashKey,
+            sameKeyFirst,
+            sameKeySecond,
+            nanCreate,
+            noStageCreate,
+            contextCreate,
+        ];
+        const frozenTied = Object.freeze([...tied]);
+        expect(
+            sameEntries(latestOf(frozenTied, [1, 2, 6, 7, 8]), [
+                keyD,
+                hashKey,
+                sameKeyFirst,
+                undefined,
+                keyC,
+            ])
+        ).toBe(true);
+        const tiedCreates = createsOf(frozenTied, [NaN, undefined, 2, 3]);
+        expect(sameEntries(tiedCreates, [noStageCreate, contextCreate])).toBe(true);
+        expectSameAnswers(tied, [1, 2, 6, 7, 8], [NaN, undefined, 2, 3]);
+        expectSameAnswers([...tied].reverse(), [1, 2, 6, 8], [undefined, 2]);
+
+        // An array that is not frozen is scanned on each call, so a change shows at once.
+        const growing = [...tied];
+        expect(crmOffline.latestStageWrite(7, growing)).toBe(undefined);
+        const later = call("00000000", [[7], { stage_id: 4 }], timeStamp + 1);
+        growing.push(later);
+        expect(crmOffline.latestStageWrite(7, growing)).toBe(later);
     });
 
     test.tags("mobile");
@@ -1737,6 +2214,389 @@ describe("Mobile pipeline", () => {
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_follow_up`).not.toHaveAttribute("disabled");
         expect.verifyErrors(errors);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Bounded activity pages
+// -----------------------------------------------------------------------------
+
+/**
+ * Creates `count` activities on a lead, all due the same day, so their per-lead order is their id.
+ *
+ * @param {number} resId
+ * @param {number} count
+ * @returns {Promise<number[]>} the activity ids
+ */
+function createLeadActivities(resId, count) {
+    return createActivities(
+        Array.from({ length: count }, (_, index) => ({
+            res_id: resId,
+            activity_type_id: 1,
+            activity_category: "default",
+            summary: `Task ${index + 1}`,
+        }))
+    );
+}
+
+/**
+ * @param {string} name the lead name
+ * @returns {string} selector of the activity count of that lead's card
+ */
+function activityBadgeOf(name) {
+    return `${cardOf(name)} .o_crm_mobile_card_activities .badge`;
+}
+
+describe("Mobile activity pages", () => {
+    test.tags("mobile");
+    test("mobile: activity reads are bounded: 40 activities per lead and 80 activity types, in a fixed order", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const typeReads = [];
+        onRpc("/web/dataset/call_kw/mail.activity.type/web_search_read", async (request) => {
+            const { params } = await request.clone().json();
+            typeReads.push(params.kwargs);
+        });
+        const requests = watchActivityReads();
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        for (const resId of [1, 2]) {
+            expect(requests.get(resId)).toHaveLength(1);
+            const { kwargs } = JSON.parse(requests.get(resId)[0]);
+            expect(kwargs.domain).toEqual([
+                ["res_model", "=", "crm.lead"],
+                ["res_id", "=", resId],
+            ]);
+            expect(kwargs.order).toBe("date_deadline ASC, id ASC");
+            expect(kwargs.limit).toBe(40);
+        }
+        expect(typeReads).toHaveLength(1);
+        expect(typeReads[0].domain).toEqual([["res_model", "in", [false, "crm.lead"]]]);
+        expect(typeReads[0].specification).toEqual({ display_name: {}, category: {} });
+        expect(typeReads[0].order).toBe("sequence ASC, id ASC");
+        expect(typeReads[0].limit).toBe(80);
+    });
+
+    test.tags("mobile");
+    test("mobile: a lead with more activities than the page shows its total and Show all online, kept on revisits", async () => {
+        await createLeadActivities(1, 45);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const requests = watchActivityReads();
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const card = cardOf("Lead 1");
+        expect(activityBadgeOf("Lead 1")).toHaveText("45");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
+        expect(`${card} .o_crm_mobile_activities_more`).toHaveCount(1);
+        const showAll = `${card} .o_crm_mobile_activities_show_all`;
+        expect(showAll).toHaveText("Show all (45)");
+        expect(showAll).toHaveAttribute("data-available-offline", "1");
+        expect(showAll).toHaveAttribute("aria-label", "Show all (45)");
+        expect(showAll).toHaveAttribute("title", "Show all (45)");
+        expectTouchTarget(queryOne(showAll), "show all");
+
+        // Show all reads the whole list once, with the known total as its limit.
+        await contains(showAll).click();
+        await animationFrame();
+        expect.verifySteps(["activities:1"]);
+        expect(JSON.parse(requests.get(1).at(-1)).kwargs.limit).toBe(45);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(`${card} .o_crm_mobile_activities_more`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("45");
+
+        // A later revisit reissues the expanded request; the other leads keep the bounded one.
+        await goToStage("Qualified");
+        expect.verifySteps(["activities:3"]);
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        expect(JSON.parse(requests.get(1).at(-1)).kwargs.limit).toBe(45);
+        expect(JSON.parse(requests.get(2).at(-1)).kwargs.limit).toBe(40);
+        expect(new Set(requests.get(1)).size).toBe(2);
+        expect(new Set(requests.get(2)).size).toBe(1);
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(`${card} .o_crm_mobile_activities_show_all`).toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: offline, a lead whose bounded page is cached says how many more activities are not available offline", async () => {
+        const errors = cachedReadErrors([
+            // offline, Qualified then New are displayed again: every lead's bounded page and the
+            // types were read online, so each read is answered by the cache
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+        ]);
+        expect.errors(errors.length);
+        await createLeadActivities(1, 45);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        watchActivityReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        expect.verifySteps(["activities:1", "activities:2"]);
+        await goToStage("Qualified");
+        await goToStage("New");
+        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+
+        // Offline, the revisits are answered by the cached bounded pages.
+        await setOffline(true);
+        await goToStage("Qualified");
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+        const card = cardOf("Lead 1");
+        expect(activityBadgeOf("Lead 1")).toHaveText("45");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
+        expect(`${card} .o_crm_mobile_activities_more`).toHaveText(
+            "5 more activities are not available offline"
+        );
+        expect(`${card} .o_crm_mobile_activities_show_all`).toHaveCount(0);
+
+        // Direct calls read nothing offline: the expanded request was never cached.
+        const leadCard = cards.filter((instance) => instance.props.record?.resId === 1).at(-1);
+        await leadCard.onShowAllActivities();
+        await renderer.onShowAllActivities(1);
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(Object.keys(renderer.mobileState.activityLimitsByLead)).toEqual([]);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: a lead with no more activities than the page shows them all and no extra line", async () => {
+        await createLeadActivities(1, 40);
+        await createLeadActivities(2, 3);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const requests = watchActivityReads();
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        expect(JSON.parse(requests.get(1)[0]).kwargs.limit).toBe(40);
+        for (const [name, count] of [
+            ["Lead 1", 40],
+            ["Lead 2", 3],
+        ]) {
+            const card = cardOf(name);
+            expect(activityBadgeOf(name)).toHaveText(String(count));
+            await contains(`${card} .o_crm_mobile_card_activities`).click();
+            expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(count);
+            expect(`${card} .o_crm_mobile_activities_more`).toHaveCount(0);
+        }
+    });
+
+    test.tags("mobile");
+    test("mobile: a first Show all whose read loses the connection keeps the page, and the lead goes back to its default request", async () => {
+        await createLeadActivities(1, 45);
+        mockActivityTypes(ACTIVITY_TYPES);
+        // Every read limited to 45 activities (Lead 1's Show all) loses the connection. Route
+        // listeners run last-registered first: the drop is registered before the watcher, which
+        // still steps it.
+        onRpc("/web/dataset/call_kw/mail.activity/web_search_read", async (request) => {
+            const { params } = await request.clone().json();
+            if (params.kwargs.limit === 45) {
+                return new Response("", { status: 502 });
+            }
+        });
+        const requests = watchActivityReads();
+        const limitsOf = (resId) =>
+            requests.get(resId).map((json) => JSON.parse(json).kwargs.limit);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const card = cardOf("Lead 1");
+        const showAll = `${card} .o_crm_mobile_activities_show_all`;
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
+        expect(showAll).toHaveText("Show all (45)");
+
+        // The expanded read loses the connection, and nothing is cached for it: the page and the
+        // total stay as they were.
+        await contains(showAll).click();
+        await animationFrame();
+        expect.verifySteps(["activities:1"]);
+        expect(limitsOf(1)).toEqual([40, 45]);
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
+        expect(activityBadgeOf("Lead 1")).toHaveText("45");
+        expect(`${card} .o_crm_mobile_activities_more`).toHaveText(
+            "5 more activities are not available offline"
+        );
+
+        // The connection returns: the reads it triggers (the reconnection itself, then the
+        // reconciliation reload) use the lead's default request, not the expansion that never
+        // landed.
+        await getService(OfflinePlugin).checkConnection();
+        await animationFrame();
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect.verifySteps(["activities:1", "activities:2", "activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 45, 40, 40]);
+
+        // So does a revisit, and Show all is offered again with the same page and total.
+        await goToStage("Qualified");
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 45, 40, 40, 40]);
+        expect(activityBadgeOf("Lead 1")).toHaveText("45");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
+        expect(showAll).toHaveText("Show all (45)");
+    });
+
+    test.tags("mobile");
+    test("mobile: a later Show all whose read loses the connection keeps the page, and the lead goes back to its previous expansion", async () => {
+        await createLeadActivities(1, 45);
+        mockActivityTypes(ACTIVITY_TYPES);
+        // Every read limited to 50 activities (Lead 1's second Show all) loses the connection (the
+        // watcher, registered after, still steps it).
+        onRpc("/web/dataset/call_kw/mail.activity/web_search_read", async (request) => {
+            const { params } = await request.clone().json();
+            if (params.kwargs.limit === 50) {
+                return new Response("", { status: 502 });
+            }
+        });
+        const requests = watchActivityReads();
+        const limitsOf = (resId) =>
+            requests.get(resId).map((json) => JSON.parse(json).kwargs.limit);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const card = cardOf("Lead 1");
+        const showAll = `${card} .o_crm_mobile_activities_show_all`;
+
+        // A first expansion succeeds: all 45 activities.
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        await contains(showAll).click();
+        await animationFrame();
+        expect.verifySteps(["activities:1"]);
+        expect(limitsOf(1)).toEqual([40, 45]);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(showAll).toHaveCount(0);
+
+        // The lead reaches 50 activities: a revisit reissues the expansion, which now misses 5.
+        await createLeadActivities(1, 5);
+        await goToStage("Qualified");
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 45, 45]);
+        expect(activityBadgeOf("Lead 1")).toHaveText("50");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(showAll).toHaveText("Show all (50)");
+
+        // The second expansion loses the connection, and nothing is cached for it: the page and
+        // the total stay as they were.
+        await contains(showAll).click();
+        await animationFrame();
+        expect.verifySteps(["activities:1"]);
+        expect(limitsOf(1)).toEqual([40, 45, 45, 50]);
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(activityBadgeOf("Lead 1")).toHaveText("50");
+        expect(`${card} .o_crm_mobile_activities_more`).toHaveText(
+            "5 more activities are not available offline"
+        );
+
+        // The connection returns: the reads it triggers reissue the previous expansion (45), not
+        // the default request nor the expansion that never landed.
+        await getService(OfflinePlugin).checkConnection();
+        await animationFrame();
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect.verifySteps(["activities:1", "activities:2", "activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 45, 45, 50, 45, 45]);
+
+        // So does a revisit, and Show all is offered again with the same page and total.
+        await goToStage("Qualified");
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 45, 45, 50, 45, 45, 45]);
+        expect(activityBadgeOf("Lead 1")).toHaveText("50");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(showAll).toHaveText("Show all (50)");
+    });
+
+    test.tags("mobile");
+    test("mobile: a bounded read answered after Show all never replaces the expanded page", async () => {
+        await createLeadActivities(1, 45);
+        mockActivityTypes(ACTIVITY_TYPES);
+        // Lead 1's bounded reads (limit 40) are held while `hold.armed`: the watcher, registered
+        // after, still steps them when they are issued.
+        const hold = { armed: false, reads: [] };
+        onRpc("/web/dataset/call_kw/mail.activity/web_search_read", async (request) => {
+            const { params } = await request.clone().json();
+            const resId = params.kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            if (hold.armed && resId === 1 && params.kwargs.limit === 40) {
+                const deferred = Promise.withResolvers();
+                hold.reads.push(deferred);
+                await deferred.promise;
+            }
+        });
+        const requests = watchActivityReads();
+        const limitsOf = (resId) =>
+            requests.get(resId).map((json) => JSON.parse(json).kwargs.limit);
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const card = cardOf("Lead 1");
+        const showAll = `${card} .o_crm_mobile_activities_show_all`;
+
+        // A revisit issues Lead 1's bounded read again and its answer is held; the cached page
+        // answers meanwhile.
+        await goToStage("Qualified");
+        hold.armed = true;
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+        expect(hold.reads).toHaveLength(1);
+        expect(limitsOf(1)).toEqual([40, 40]);
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
+        expect(showAll).toHaveText("Show all (45)");
+
+        // Show all reads every activity while the bounded read is still in flight.
+        await contains(showAll).click();
+        await animationFrame();
+        expect.verifySteps(["activities:1"]);
+        expect(limitsOf(1)).toEqual([40, 40, 45]);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(`${card} .o_crm_mobile_activities_more`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("45");
+
+        // The lead gains 3 activities, then the held bounded answer lands. It differs from the
+        // cached page, so the cache delivers it through its callback: it is dropped, and neither
+        // the expanded rows nor the total are replaced by the bounded page.
+        await createLeadActivities(1, 3);
+        hold.reads[0].resolve();
+        await animationFrame();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(`${card} .o_crm_mobile_activities_more`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("45");
+
+        // The lead's current request, the expanded one, brings the new total on the next revisit.
+        hold.armed = false;
+        await goToStage("Qualified");
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 40, 45, 45]);
+        expect(activityBadgeOf("Lead 1")).toHaveText("48");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
+        expect(showAll).toHaveText("Show all (48)");
     });
 });
 
@@ -2128,6 +2988,127 @@ describe("Mobile lead card", () => {
         // A move into the group that already holds the card is not even attempted.
         await renderer.onCardMove(recordOf(renderer, 1), groupOf(renderer, 1));
         expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a replayed pending create keeps its card until the reconciliation reload, but its badge clears with its queue entry", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Each lead create replay is held until the test resolves it.
+        const replays = [];
+        onRpc("crm.lead", "web_save", async ({ args }) => {
+            expect.step(`replay ${args[1].name}`);
+            const deferred = Promise.withResolvers();
+            replays.push(deferred);
+            await deferred.promise;
+        });
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+
+        const quickCreate = async (name) => {
+            await contains(".o_crm_mobile_pipeline_add").click();
+            await fillQuickCreate({ name, expected_revenue: "10" });
+            await contains(".o_crm_mobile_quick_create_save").click();
+            await advanceTime(1000);
+            return queued().find(({ value }) => value.args[1].name === name).key;
+        };
+        const pendingCard = (key) => `.o_crm_mobile_lead_card[data-pending-key='${key}']`;
+        const keyA = await quickCreate("Pending A");
+        const keyB = await quickCreate("Pending B");
+        expect(`${pendingCard(keyA)} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(`${pendingCard(keyB)} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expectHeader("New", 4, 140);
+
+        // Reconnect: A is replayed while B's replay is still in flight. The sync window keeps
+        // both cards and the totals, but A's entry has left the live queue: its badge is gone.
+        await setOffline(false);
+        await expect.waitForSteps(["replay Pending A"]);
+        replays.shift().resolve();
+        await letQueueReplay(1);
+        expect.verifySteps(["replay Pending B"]);
+        expect(getService(OfflinePlugin).syncingORM()).toBe(true);
+        expect(queued().map(({ key }) => String(key))).toEqual([String(keyB)]);
+        expect(pendingCard(keyA)).toHaveCount(1);
+        expect(pendingCard(keyA)).toHaveClass("o_crm_mobile_lead_card_pending");
+        expect(`${pendingCard(keyA)} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(`${pendingCard(keyB)} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expectHeader("New", 4, 140);
+
+        // B is replayed and the reconciliation reload lands: both leads are server cards.
+        replays.shift().resolve();
+        await letQueueReplay(1);
+        expect(getService(OfflinePlugin).syncingORM()).toBe(false);
+        expect(queued()).toHaveLength(0);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(".o_crm_mobile_pending_badge").toHaveCount(0);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2", "Pending A", "Pending B"]);
+        expect(cardOf("Pending A")).toHaveAttribute("data-id");
+        expect(cardOf("Pending B")).toHaveAttribute("data-id");
+        expectHeader("New", 4, 140);
+    });
+
+    test.tags("mobile");
+    test("mobile: pending activity markers read the queue once per queue change and follow every change", async () => {
+        const [firstId, secondId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Call back" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send terms" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        const card = cardOf("Lead 1");
+        const row = (id) => `${card} .o_crm_mobile_activity_row[data-activity-id='${id}']`;
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(3);
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveCount(3);
+        expect(`${card} .o_crm_mobile_pending_badge`).toHaveCount(0);
+
+        // From now on, every read of the shared activity queue reader by Lead 1's card is a step.
+        const lead1Card = cards.find(
+            (instance) => instance.props.record?.resId === 1 && instance.__owl__.status === 1
+        );
+        patchWithCleanup(lead1Card.crmOffline, {
+            pendingActivityCalls(resId) {
+                expect.step(`pendingActivityCalls ${resId}`);
+                return super.pendingActivityCalls(resId);
+            },
+        });
+
+        // Re-rendering the list without a queue change reads nothing again.
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(3);
+        expect.verifySteps([]);
+
+        // Each queued mark-done is one read for the whole card (count, rows and their badges),
+        // whatever the number of rows.
+        await contains(`${row(firstId)} .o_crm_mobile_activity_done`).click();
+        expect.verifySteps(["pendingActivityCalls 1"]);
+        expect(`${row(firstId)} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(`${row(firstId)} .o_crm_mobile_activity_done`).toHaveCount(0);
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveCount(2);
+        await advanceTime(1000);
+        await contains(`${row(secondId)} .o_crm_mobile_activity_done`).click();
+        expect.verifySteps(["pendingActivityCalls 1"]);
+        expect(`${card} .o_crm_mobile_activity_row .o_crm_mobile_pending_badge`).toHaveCount(2);
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveCount(1);
+
+        // Removing the first entry from the queue (as a systray discard does) restores its
+        // Mark done at once; the second stays pending.
+        const firstKey = queued().find(({ value }) => value.args[0][0] === firstId).key;
+        getService(OfflinePlugin).removeScheduledORM(firstKey);
+        await animationFrame();
+        expect.verifySteps(["pendingActivityCalls 1"]);
+        expect(queued()).toHaveLength(1);
+        expect(`${row(firstId)} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(`${row(firstId)} .o_crm_mobile_activity_done`).toHaveCount(1);
+        expect(`${row(secondId)} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveCount(2);
     });
 });
 
@@ -2737,5 +3718,1212 @@ describe("Mobile activities", () => {
         expect(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_activity_type`).toHaveText(
             "Email"
         );
+    });
+
+    test.tags("mobile");
+    test("mobile: an online log call completing after stage navigation destroyed its card is saved, writes no card state and reads no hidden lead", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const save = Promise.withResolvers();
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await save.promise;
+        });
+        watchActivityReads();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const lead1Card = cards.find(
+            (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
+        );
+
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).click();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        expect(lead1Card.state.busy).toBe(true);
+        // Displaying another stage destroys the card while its call is in flight.
+        await goToStage("Qualified");
+        expect.verifySteps(["activities:3"]);
+        expect(status(lead1Card)).toBe("destroyed");
+
+        save.resolve();
+        await animationFrame();
+        // The write reached the server, nothing was queued, the lead no stage displays is not
+        // read, and the destroyed card got no state write.
+        const created = MockServer.env["mail.activity"].search_read(
+            [
+                ["res_model", "=", "crm.lead"],
+                ["res_id", "=", 1],
+            ],
+            ["activity_type_id", "summary"]
+        );
+        expect(
+            created.map(({ activity_type_id, summary }) => [activity_type_id[0], summary])
+        ).toEqual([[2, "Call"]]);
+        expect(queued()).toHaveLength(0);
+        expect.verifySteps([]);
+        expect(lead1Card.state.busy).toBe(true);
+
+        // Displayed again, the lead is read with its new activity, in a new usable card.
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_type`).toHaveText("Call");
+    });
+
+    test.tags("mobile");
+    test("mobile: an online mark done completing after stage navigation destroyed its card is done on the server, writes no card state and reads no hidden lead", async () => {
+        const [activityId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const done = Promise.withResolvers();
+        onRpc("mail.activity", "action_done", async ({ args }) => {
+            expect.step("mail.activity/action_done");
+            await done.promise;
+            MockServer.env["mail.activity"].action_feedback(args[0]);
+            return true;
+        });
+        watchActivityReads();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const lead1Card = cards.find(
+            (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
+        );
+
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
+        await contains(
+            `${cardOf(
+                "Lead 1"
+            )} .o_crm_mobile_activity_row[data-activity-id='${activityId}'] .o_crm_mobile_activity_done`
+        ).click();
+        await expect.waitForSteps(["mail.activity/action_done"]);
+        expect(lead1Card.state.busy).toBe(true);
+        await goToStage("Qualified");
+        expect.verifySteps(["activities:3"]);
+        expect(status(lead1Card)).toBe("destroyed");
+
+        done.resolve();
+        await animationFrame();
+        // Done on the server, nothing queued, no read of the hidden lead, no state write on the
+        // destroyed card (still busy, its activity list still open).
+        expect(
+            MockServer.env["mail.activity"].search_read([["id", "=", activityId]], ["id"])
+        ).toHaveLength(0);
+        expect(queued()).toHaveLength(0);
+        expect.verifySteps([]);
+        expect(lead1Card.state.busy).toBe(true);
+        expect(lead1Card.state.activitiesOpen).toBe(true);
+
+        await goToStage("New");
+        await animationFrame();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_row`).toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: pipeline onActivitiesChanged reads only a lead the displayed stage shows, and nothing once the pipeline is destroyed", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchActivityReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountWithCleanup(WebClient);
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const renderer = renderers.at(-1);
+        expect(renderer.currentGroup.serverValue).toBe(1);
+
+        // Lead 3 (Qualified) and Lead 5 (Won) are not displayed; no lead id, no read either.
+        expect(renderer.onActivitiesChanged(3)).toBe(undefined);
+        expect(renderer.onActivitiesChanged(5)).toBe(undefined);
+        expect(renderer.onActivitiesChanged(false)).toBe(undefined);
+        await animationFrame();
+        expect.verifySteps([]);
+        // A displayed lead is read again, once.
+        await renderer.onActivitiesChanged(2);
+        expect.verifySteps(["activities:2"]);
+
+        // Another view replaces the pipeline: a late request reads nothing.
+        await getService("action").switchView("list");
+        await animationFrame();
+        expect(".o_list_view").toHaveCount(1);
+        expect(status(renderer)).toBe("destroyed");
+        expect(renderer.onActivitiesChanged(1)).toBe(undefined);
+        await animationFrame();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: an online follow-up completing after a reload re-keyed its card refreshes the lead still displayed and closes nothing on the old card", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const save = Promise.withResolvers();
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await save.promise;
+        });
+        watchActivityReads();
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const [renderer] = renderers;
+        const card = cardOf("Lead 1");
+        const mountedLead1Card = () =>
+            cards.find(
+                (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
+            );
+        const oldCard = mountedLead1Card();
+
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Send the proposal", {
+            confirm: false,
+        });
+        await contains(`${card} .o_crm_mobile_follow_up_save`).click();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        // A reload rebuilds the groups and records with new ids: the lead stays displayed in a
+        // new card, whose activities are read before the write has landed.
+        await renderer.props.list.load();
+        await animationFrame();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        expect(status(oldCard)).toBe("destroyed");
+        const newCard = mountedLead1Card();
+        expect(newCard).not.toBe(oldCard);
+
+        save.resolve();
+        await animationFrame();
+        // The completion refreshes the lead the new card shows ...
+        expect.verifySteps(["activities:1"]);
+        // ... and writes nothing on the destroyed card: its form is left as it was.
+        expect(oldCard.state.followUpOpen).toBe(true);
+        expect(oldCard.state.summary).toBe("Send the proposal");
+        expect(oldCard.state.busy).toBe(true);
+        expect(newCard.state.busy).toBe(false);
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_summary`).toHaveText("Send the proposal");
+    });
+
+    test.tags("mobile");
+    test("mobile: a rejected online log call propagates its error and leaves the live card usable", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("mail.activity", "web_save", () => {
+            throw makeServerError({ message: "This lead is locked" });
+        });
+        watchActivityReads();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const lead1Card = cards.find(
+            (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
+        );
+
+        expect.errors(1);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).click();
+        await animationFrame();
+        expect.verifyErrors(["This lead is locked"]);
+        await contains(".modal .modal-footer .btn-primary").click();
+        // No refresh and nothing queued; the card is not left busy.
+        expect.verifySteps([]);
+        expect(queued()).toHaveLength(0);
+        expect(status(lead1Card)).toBe("mounted");
+        expect(lead1Card.state.busy).toBe(false);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+    });
+
+    test.tags("mobile");
+    test("mobile: an online stage move whose card is destroyed before the save returns writes no card state", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const save = Promise.withResolvers();
+        onRpc("crm.lead", "web_save", async () => {
+            expect.step("crm.lead/web_save");
+            await save.promise;
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        const lead1Card = cards.find(
+            (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
+        );
+
+        await chooseStage("Lead 1", 2);
+        await expect.waitForSteps(["crm.lead/web_save"]);
+        // The framework moves the record in memory before saving: its card left the stage.
+        expect(status(lead1Card)).toBe("destroyed");
+        expect(lead1Card.state.busy).toBe(true);
+
+        save.resolve();
+        await animationFrame();
+        // The move completed without a state write on the destroyed card; the target stage is
+        // displayed with the lead's new card, which is usable.
+        expect(lead1Card.state.busy).toBe(true);
+        expect(MockServer.env["crm.lead"].search_read([["id", "=", 1]], ["stage_id"])).toEqual([
+            { id: 1, stage_id: [2, "Qualified"] },
+        ]);
+        expect(".o_crm_mobile_pipeline_stage_name").toHaveText("Qualified");
+        expect(cardNames()).toEqual(["Lead 1", "Lead 3"]);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_stage`).not.toHaveAttribute("disabled");
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Mobile lead card guards
+// -----------------------------------------------------------------------------
+
+/**
+ * @param {CrmMobileLeadCard[]} cards captured card instances
+ * @param {number} resId
+ * @returns {CrmMobileLeadCard | undefined} the mounted card of a lead record
+ */
+function mountedCardOf(cards, resId) {
+    return cards.find(
+        (instance) => instance.props.record?.resId === resId && status(instance) === "mounted"
+    );
+}
+
+/**
+ * @param {CrmMobileLeadCard[]} cards captured card instances
+ * @param {string | number} key the queue key of a pending lead create
+ * @returns {CrmMobileLeadCard | undefined} the mounted card of that pending create
+ */
+function mountedPendingCardOf(cards, key) {
+    return cards.find(
+        (instance) =>
+            String(instance.props.pendingCall?.key) === String(key) &&
+            status(instance) === "mounted"
+    );
+}
+
+/**
+ * @param {string | number} key the queue key of a pending lead create
+ * @returns {string} selector of the card of that pending create
+ */
+function pendingCardOf(key) {
+    return `.o_crm_mobile_lead_card[data-pending-key='${key}']`;
+}
+
+/**
+ * Schedules a call in the framework offline queue as another writer of the queue does (a lead
+ * form saved offline sends its values only, without the card's display values), with the extras
+ * the offline systray reads.
+ *
+ * @param {string} model
+ * @param {"web_save" | "action_archive"} method
+ * @param {any[]} args
+ * @param {Object} [extras] merged over the default extras
+ * @returns {string} the queue key
+ */
+function scheduleCall(model, method, args, extras = {}) {
+    const kwargs = method === "web_save" ? { context: {}, specification: {} } : {};
+    return getService(OfflinePlugin).scheduleORM(model, method, args, kwargs, {
+        extras: {
+            actionId: PIPELINE_ACTION_ID,
+            viewType: "kanban",
+            timeStamp: Date.now(),
+            displayName: "",
+            changes: {},
+            ...extras,
+        },
+    });
+}
+
+/** @returns {string} the framework offline queue, serialized (to assert it did not change) */
+function queueSnapshot() {
+    return JSON.stringify(getService(OfflinePlugin)._ormToSync());
+}
+
+/** @returns {Object} the local state of a card that nothing has changed */
+function untouchedCardState() {
+    return {
+        stageListOpen: false,
+        followUpOpen: false,
+        activitiesOpen: false,
+        typeId: null,
+        summary: "",
+        date: serializeDate(today()),
+        busy: false,
+    };
+}
+
+/**
+ * Mounts a lead card on its own, with every prop the pipeline can give a record card, so that a
+ * guard is the only thing that can stop a handler. Its callbacks are steps.
+ *
+ * @param {Object} props overrides (`record`, `pendingCall`, ...)
+ * @returns {Promise<CrmMobileLeadCard>}
+ */
+function mountStandaloneCard(props) {
+    const stages = [
+        { id: "stage_1", serverValue: 1, displayName: "New", list: { records: [] } },
+        { id: "stage_2", serverValue: 2, displayName: "Qualified", list: { records: [] } },
+    ];
+    return mountWithCleanup(CrmMobileLeadCard, {
+        props: {
+            group: stages[0],
+            stages,
+            activities: [
+                {
+                    id: 7,
+                    activity_type_id: { id: 1, display_name: "Email" },
+                    summary: "Send offer",
+                },
+                { id: 8, activity_type_id: { id: 2, display_name: "Call" }, summary: "Call back" },
+            ],
+            activityTypes: ACTIVITY_TYPES.slice(0, 2),
+            displayedStageValue: 1,
+            frameworkStageValue: 1,
+            onOpen: (record) => expect.step(`onOpen ${record.id}`),
+            onMove: async (record, group) =>
+                expect.step(`onMove ${record.id} ${group.serverValue}`),
+            onActivitiesChanged: (resId) => expect.step(`onActivitiesChanged ${resId}`),
+            ...props,
+        },
+    });
+}
+
+describe("Mobile lead card guards", () => {
+    test.tags("mobile");
+    test("mobile: an activity create queued without display values takes its type label from the cached types, and typeLabel answers known, unknown and uncached types", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        // Two creates queued with their values only: one of a cached type, one of a type the
+        // cache does not hold.
+        const values = (activityTypeId, summary) => ({
+            res_model: "crm.lead",
+            res_id: 1,
+            activity_type_id: activityTypeId,
+            summary,
+            date_deadline: "2030-03-01",
+            user_id: serverState.userId,
+        });
+        const knownKey = scheduleCall("mail.activity", "web_save", [[], values(1, "Known type")]);
+        const unknownKey = scheduleCall("mail.activity", "web_save", [
+            [],
+            values(999, "Unknown type"),
+        ]);
+        await animationFrame();
+        const card = cardOf("Lead 1");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`).toHaveCount(2);
+        const rows = queryAll(`${card} .o_crm_mobile_activity_pending`).map((row) => [
+            row.querySelector(".o_crm_mobile_activity_summary").textContent,
+            row.querySelector(".o_crm_mobile_activity_type").textContent,
+        ]);
+        expect(rows.sort()).toEqual([
+            ["Known type", "Email"],
+            ["Unknown type", ""],
+        ]);
+        const lead1Card = mountedCardOf(cards, 1);
+        const entryOf = (key) =>
+            lead1Card.pendingActivityCreates.find((entry) => entry.key === key);
+        expect(lead1Card.pendingCreateTypeLabel(entryOf(knownKey))).toBe("Email");
+        expect(lead1Card.pendingCreateTypeLabel(entryOf(unknownKey))).toBe("");
+        // typeLabel: the name of a cached type; meeting and upload types are never cached for
+        // the card, and an unknown or missing id has no name.
+        expect(lead1Card.typeLabel(1)).toBe("Email");
+        expect(lead1Card.typeLabel(2)).toBe("Call");
+        expect(lead1Card.typeLabel(31)).toBe("");
+        expect(lead1Card.typeLabel(999)).toBe("");
+        expect(lead1Card.typeLabel(undefined)).toBe("");
+
+        // A card without cached types (a pending lead create is given none) names no type.
+        const pendingKey = scheduleCall(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Pending lead", stage_id: 1 }],
+            { displayName: "Pending lead" }
+        );
+        await animationFrame();
+        const pendingCard = mountedPendingCardOf(cards, pendingKey);
+        expect(pendingCard.props.activityTypes).toBe(null);
+        expect(pendingCard.typeLabel(1)).toBe("");
+        expect(pendingCard.pendingCreateTypeLabel(entryOf(knownKey))).toBe("");
+        expect(queued()).toHaveLength(3);
+    });
+
+    test.tags("mobile");
+    test("mobile: a pending lead card of the pipeline ignores every direct handler call and reads no activity marker", async () => {
+        const [activityId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const rpcs = collectRpcs();
+        patchWithCleanup(CrmKanbanDynamicGroupList.prototype, {
+            moveRecords() {
+                expect.step("moveRecords");
+                return super.moveRecords(...arguments);
+            },
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline({ selectRecord: (resId) => expect.step(`open ${resId}`) });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        await setOffline(true);
+        // Offline: a quick create, and a mark done of Lead 1's activity, both queued.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Pending lead", expected_revenue: "10" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        const [{ key }] = queued();
+        await advanceTime(1000);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_activity_done`).click();
+        expect(queued()).toHaveLength(2);
+        const lead1Card = mountedCardOf(cards, 1);
+        expect(lead1Card.pendingArchivedIds.has(activityId)).toBe(true);
+
+        const pendingCard = mountedPendingCardOf(cards, key);
+        expect(`${pendingCardOf(key)} .o_crm_mobile_lead_card_controls`).toHaveCount(0);
+        expect(pendingCard.isPending).toBe(true);
+        expect(pendingCard.isPersisted).toBe(false);
+        expect(pendingCard.canLogCall).toBe(false);
+        expect(pendingCard.canFollowUp).toBe(false);
+        // Every queued mark done is a candidate activity marker: the pending lead reads none.
+        expect(pendingCard.pendingActivityEntries).toEqual([]);
+        expect(pendingCard.pendingActivityCreates).toEqual([]);
+        expect(pendingCard.pendingArchivedIds.size).toBe(0);
+        expect(pendingCard.activityCount).toBe(0);
+
+        const before = queueSnapshot();
+        const rpcCount = rpcs.length;
+        pendingCard.onOpenCard();
+        pendingCard.onOpenCard({
+            target: queryOne(`${pendingCardOf(key)} .o_crm_mobile_lead_card_name`),
+        });
+        pendingCard.toggleStageList();
+        await pendingCard.onChooseStage(groupOf(renderer, 2));
+        await pendingCard.onLogCall();
+        pendingCard.toggleFollowUp();
+        await pendingCard.onSaveFollowUp();
+        await pendingCard.onMarkDone({ id: activityId });
+        pendingCard.toggleActivities();
+        await animationFrame();
+        // No open, no move, no RPC, no queue change and no panel.
+        expect.verifySteps([]);
+        expect(rpcs.slice(rpcCount)).toEqual([]);
+        expect(queueSnapshot()).toBe(before);
+        expect({ ...pendingCard.state }).toEqual(untouchedCardState());
+        expect(`${pendingCardOf(key)} .o_crm_mobile_lead_card_controls`).toHaveCount(0);
+        expect(`${pendingCardOf(key)} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+    });
+
+    test.tags("mobile");
+    test("mobile: a card whose lead has no server id offers no activity action, and its direct Log call, Follow-up and Mark done write nothing", async () => {
+        const setOffline = mockOffline();
+        // The reference: a persisted lead, whose callbacks and writes are all reachable.
+        const persisted = await mountStandaloneCard({
+            record: {
+                id: "lead_1",
+                resId: 1,
+                resModel: "crm.lead",
+                data: {
+                    display_name: "Lead 1",
+                    expected_revenue: 100,
+                    company_currency: { id: CURRENCY_ID },
+                },
+            },
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        persisted.onOpenCard();
+        await persisted.onChooseStage(persisted.props.stages[1]);
+        expect.verifySteps(["onOpen lead_1", "onMove lead_1 2"]);
+        expect(persisted.canLogCall).toBe(true);
+        await persisted.onLogCall();
+        await persisted.onMarkDone(persisted.props.activities[0]);
+        expect(queuedCalls("mail.activity", "web_save").map(({ args }) => args)).toEqual([
+            [
+                [],
+                {
+                    res_model: "crm.lead",
+                    res_id: 1,
+                    activity_type_id: 2,
+                    summary: "Call",
+                    date_deadline: serializeDate(today()),
+                    user_id: serverState.userId,
+                },
+            ],
+        ]);
+        expect(queuedCalls("mail.activity", "action_archive").map(({ args }) => args)).toEqual([
+            [[7]],
+        ]);
+        expect(queued()).toHaveLength(2);
+        expect.verifySteps([]);
+        // Mark done needs a server id: a pending activity create (a queue entry) or a missing
+        // activity marks nothing done.
+        const [pendingActivity] = persisted.pendingActivityCreates;
+        expect(pendingActivity.value.args[1].res_id).toBe(1);
+        const afterReference = queueSnapshot();
+        await persisted.onMarkDone(pendingActivity);
+        await persisted.onMarkDone({});
+        await persisted.onMarkDone(undefined);
+        expect(queueSnapshot()).toBe(afterReference);
+        expect(persisted.state.busy).toBe(false);
+        expect.verifySteps([]);
+
+        // A lead record without a server id (a new record not saved yet).
+        const draft = ".o_crm_mobile_lead_card[data-id='draft']";
+        const idless = await mountStandaloneCard({
+            record: {
+                id: "draft",
+                resId: false,
+                resModel: "crm.lead",
+                data: {
+                    display_name: false,
+                    name: "Draft lead",
+                    partner_id: false,
+                    contact_name: false,
+                    expected_revenue: false,
+                    company_currency: { id: CURRENCY_ID },
+                },
+            },
+        });
+        expect(idless.isPending).toBe(false);
+        expect(idless.isPersisted).toBe(false);
+        expect(idless.isPendingSync).toBe(false);
+        expect(idless.leadLabel).toBe("Draft lead");
+        expect(idless.partnerName).toBe("");
+        expect(idless.revenue).toBe("");
+        expect(`${draft} .o_crm_mobile_lead_card_revenue`).toHaveCount(0);
+        // Its activity actions are disabled although a phonecall type is cached ...
+        expect(idless.phonecallType.id).toBe(2);
+        expect(idless.canLogCall).toBe(false);
+        expect(idless.canFollowUp).toBe(false);
+        expect(`${draft} .o_crm_mobile_card_log_call`).toHaveAttribute("disabled");
+        expect(`${draft} .o_crm_mobile_card_follow_up`).toHaveAttribute("disabled");
+        // ... and it reads no activity marker, not even the queued mark done of activity 7.
+        expect(idless.pendingActivityEntries).toEqual([]);
+        expect(idless.pendingArchivedIds.size).toBe(0);
+
+        const before = queueSnapshot();
+        await idless.onLogCall();
+        idless.toggleFollowUp();
+        idless.onFollowUpType({ target: { value: "1" } });
+        await idless.onSaveFollowUp();
+        await idless.onMarkDone(idless.props.activities[1]);
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(queueSnapshot()).toBe(before);
+        expect({ ...idless.state }).toEqual({ ...untouchedCardState(), typeId: 1 });
+        expect(`${draft} .o_crm_mobile_lead_card_follow_up`).toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: a card for a pending lead create, or without any lead, calls none of its callbacks and writes nothing, whatever it is given", async () => {
+        const setOffline = mockOffline();
+        // A card without a record nor a pending create (the pipeline never renders one).
+        const empty = await mountStandaloneCard({});
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        expect(empty.isPending).toBe(false);
+        expect(empty.isPersisted).toBe(false);
+        expect(empty.isPendingSync).toBe(false);
+        expect(empty.leadLabel).toBe("");
+        expect(empty.partnerName).toBe("");
+        expect(empty.revenue).toBe("");
+        expect(empty.canLogCall).toBe(false);
+        expect(empty.canFollowUp).toBe(false);
+        empty.onOpenCard();
+        empty.toggleStageList();
+        await empty.onChooseStage(empty.props.stages[1]);
+        await empty.onLogCall();
+        await empty.onMarkDone(empty.props.activities[0]);
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(queued()).toHaveLength(0);
+        expect({ ...empty.state }).toEqual(untouchedCardState());
+
+        // A pending lead create given a phonecall type, activities and every callback.
+        const key = scheduleCall(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Pending lead", contact_name: "Monica Geller", stage_id: 1 }],
+            { displayName: "Pending lead" }
+        );
+        const pending = await mountStandaloneCard({
+            pendingCall: queued().find((entry) => entry.key === key),
+        });
+        expect(`${pendingCardOf(key)} .o_crm_mobile_lead_card_name`).toHaveText("Pending lead");
+        expect(`${pendingCardOf(key)} .o_crm_mobile_lead_card_partner`).toHaveText("Monica Geller");
+        expect(`${pendingCardOf(key)} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(`${pendingCardOf(key)} .o_crm_mobile_lead_card_controls`).toHaveCount(0);
+        expect(pending.phonecallType.id).toBe(2);
+        expect(pending.canLogCall).toBe(false);
+        expect(pending.canFollowUp).toBe(false);
+        expect(pending.pendingActivityEntries).toEqual([]);
+
+        const before = queueSnapshot();
+        pending.onOpenCard();
+        pending.onOpenCard({
+            target: queryOne(`${pendingCardOf(key)} .o_crm_mobile_lead_card_name`),
+        });
+        pending.toggleStageList();
+        await pending.onChooseStage(pending.props.stages[1]);
+        await pending.onLogCall();
+        pending.toggleFollowUp();
+        pending.onFollowUpType({ target: { value: "1" } });
+        await pending.onSaveFollowUp();
+        await pending.onMarkDone(pending.props.activities[0]);
+        pending.toggleActivities();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(queueSnapshot()).toBe(before);
+        expect({ ...pending.state }).toEqual({ ...untouchedCardState(), typeId: 1 });
+        expect(`${pendingCardOf(key)} .o_crm_mobile_lead_card_controls`).toHaveCount(0);
+
+        // A pending create whose entry carries no values, under a key not in the queue: an empty
+        // name, and no partner, revenue or badge.
+        const bare = await mountStandaloneCard({
+            pendingCall: { key: "bare", value: { model: "crm.lead", method: "web_save" } },
+        });
+        expect(bare.pendingValues).toEqual({});
+        expect(bare.leadLabel).toBe("");
+        expect(bare.partnerName).toBe("");
+        expect(bare.revenue).toBe("");
+        expect(bare.isPendingSync).toBe(false);
+        expect(`${pendingCardOf("bare")} .o_crm_mobile_lead_card_name`).toHaveText("");
+        expect(`${pendingCardOf("bare")} .o_crm_mobile_lead_card_partner`).toHaveCount(0);
+        expect(`${pendingCardOf("bare")} .o_crm_mobile_lead_card_revenue`).toHaveCount(0);
+        expect(`${pendingCardOf("bare")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: while an online activity write is in flight, the card refuses every other write, follow-up and move, and offers no stage", async () => {
+        const [activityId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const save = Promise.withResolvers();
+        onRpc("mail.activity", "web_save", async () => {
+            await save.promise;
+        });
+        watchRpcs(["mail.activity/web_save", "mail.activity/action_done", "crm.lead/web_save"]);
+        watchActivityReads();
+        patchWithCleanup(CrmKanbanDynamicGroupList.prototype, {
+            moveRecords() {
+                expect.step("moveRecords");
+                return super.moveRecords(...arguments);
+            },
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const [renderer] = renderers;
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+        const [activity] = lead1Card.props.activities;
+        expect(activity.id).toBe(activityId);
+
+        // A follow-up is being entered when Log call starts its online write.
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Send the proposal", {
+            confirm: false,
+        });
+        await contains(`${card} .o_crm_mobile_card_log_call`).click();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        expect(lead1Card.state.busy).toBe(true);
+        expect(lead1Card.canLogCall).toBe(false);
+        expect(lead1Card.canFollowUp).toBe(false);
+        expect(`${card} .o_crm_mobile_card_log_call`).toHaveAttribute("disabled");
+        expect(`${card} .o_crm_mobile_card_follow_up`).toHaveAttribute("disabled");
+        expect(`${card} .o_crm_mobile_follow_up_save`).toHaveAttribute("disabled");
+
+        // Direct calls: a second log call, the follow-up save, a mark done and a stage move are
+        // all refused, and the follow-up form is not toggled off.
+        await lead1Card.onLogCall();
+        await lead1Card.onSaveFollowUp();
+        lead1Card.toggleFollowUp();
+        await lead1Card.onMarkDone(activity);
+        await lead1Card.onChooseStage(groupOf(renderer, 2));
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(lead1Card.state.followUpOpen).toBe(true);
+        expect(lead1Card.state.summary).toBe("Send the proposal");
+        expect(queued()).toHaveLength(0);
+        // The read-only panels still open; Mark done and every stage option are disabled.
+        lead1Card.toggleActivities();
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveAttribute("disabled");
+        lead1Card.toggleStageList();
+        await animationFrame();
+        expect(lead1Card.stageOptions.map(({ disabled }) => disabled)).toEqual([
+            true,
+            true,
+            true,
+            true,
+        ]);
+        expect(`${card} .o_crm_mobile_stage_option`).toHaveCount(4);
+        expect(`${card} .o_crm_mobile_stage_option:not(:disabled)`).toHaveCount(0);
+
+        // The write returns: one create on the server, the lead's activities read again, and
+        // the card usable again, its displayed stage alone disabled.
+        save.resolve();
+        await animationFrame();
+        expect.verifySteps(["activities:1"]);
+        expect(lead1Card.state.busy).toBe(false);
+        expect(
+            MockServer.env["mail.activity"].search_read(
+                [
+                    ["res_id", "=", 1],
+                    ["activity_type_id", "=", 2],
+                ],
+                ["summary"]
+            )
+        ).toHaveLength(1);
+        expect(
+            queryAll(`${card} .o_crm_mobile_stage_option:disabled`).map((el) =>
+                Number(el.dataset.stageValue)
+            )
+        ).toEqual([1]);
+        expect(`${card} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+    });
+
+    test.tags("mobile");
+    test("mobile: choosing no stage, the displayed stage or the framework group a queued write displaced the card from moves nothing", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchRpcs(["crm.lead/web_save"]);
+        patchWithCleanup(CrmKanbanDynamicGroupList.prototype, {
+            moveRecords() {
+                expect.step("moveRecords");
+                return super.moveRecords(...arguments);
+            },
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        // A stage write of Lead 1 whose replay the server rejected stays parked in the queue: it
+        // places the card in Qualified while the framework group holding the record is New.
+        scheduleCall("crm.lead", "web_save", [[1], { stage_id: 2 }], {
+            displayName: "Lead 1",
+            error: "ValidationError - The stage is locked",
+        });
+        await animationFrame();
+        await goToStage("Qualified");
+        expect(cardNames()).toEqual(["Lead 3", "Lead 1"]);
+        expectHeader("Qualified", 2, 130);
+        const lead1Card = mountedCardOf(cards, 1);
+        expect(lead1Card.props.displayedStageValue).toBe(2);
+        expect(lead1Card.props.frameworkStageValue).toBe(1);
+        expect(lead1Card.disabledStageValues).toEqual([2, 1]);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_stage`).click();
+        expect(
+            queryAll(`${cardOf("Lead 1")} .o_crm_mobile_stage_option:disabled`).map((el) =>
+                Number(el.dataset.stageValue)
+            )
+        ).toEqual([1, 2]);
+
+        const before = queueSnapshot();
+        await lead1Card.onChooseStage(null);
+        await lead1Card.onChooseStage(undefined);
+        await lead1Card.onChooseStage(groupOf(renderer, 2));
+        await lead1Card.onChooseStage(groupOf(renderer, 1));
+        await animationFrame();
+        // No move and no write; the stage list stays open, the card not busy.
+        expect.verifySteps([]);
+        expect(queueSnapshot()).toBe(before);
+        expect(lead1Card.state.stageListOpen).toBe(true);
+        expect(lead1Card.state.busy).toBe(false);
+        expect(recordOf(renderer, 1).group.serverValue).toBe(1);
+        expect(cardNames()).toEqual(["Lead 3", "Lead 1"]);
+        expectHeader("Qualified", 2, 130);
+    });
+
+    test.tags("mobile");
+    test("mobile: a stage move the server rejects propagates its error, leaves the lead in its stage and the card usable", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", () => {
+            expect.step("crm.lead/web_save");
+            throw makeServerError({ message: "The stage is locked" });
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        const lead1Card = mountedCardOf(cards, 1);
+
+        expect.errors(1);
+        await chooseStage("Lead 1", 2);
+        expect.verifySteps(["crm.lead/web_save"]);
+        expect.verifyErrors(["The stage is locked"]);
+        await contains(".modal .modal-footer .btn-primary").click();
+        // The framework put the record back; the displayed stage and its totals are unchanged.
+        expect(recordOf(renderer, 1).group.serverValue).toBe(1);
+        expectHeader("New", 2, 120);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expect(queued()).toHaveLength(0);
+        expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(1);
+        // The rejection came back before the move was rendered: the card that chose the stage is
+        // still the mounted one, and it is not left busy, its controls and options usable again.
+        expect(status(lead1Card)).toBe("mounted");
+        expect(mountedCardOf(cards, 1)).toBe(lead1Card);
+        expect(lead1Card.state.busy).toBe(false);
+        expect(lead1Card.state.stageListOpen).toBe(false);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_stage`).click();
+        expect(
+            queryAll(`${cardOf("Lead 1")} .o_crm_mobile_stage_option:disabled`).map((el) =>
+                Number(el.dataset.stageValue)
+            )
+        ).toEqual([1]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a follow-up whose selected type stopped being creatable saves nothing, toggling the form off closes it and reopening it selects the first creatable type", async () => {
+        const types = mockActivityTypes(ACTIVITY_TYPES);
+        watchRpcs(["mail.activity/web_save"]);
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+
+        // Opened, the form selects the first creatable type; a selection still offered is kept
+        // when the form is closed and reopened, the summary is not.
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        expect(lead1Card.state.typeId).toBe(1);
+        await contains(`${card} .o_crm_mobile_follow_up_type`).select("2");
+        await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Call back", {
+            confirm: false,
+        });
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        expect(`${card} .o_crm_mobile_lead_card_follow_up`).toHaveCount(0);
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        expect(lead1Card.state.typeId).toBe(2);
+        expect(`${card} .o_crm_mobile_follow_up_type`).toHaveValue("2");
+        expect(`${card} .o_crm_mobile_follow_up_summary`).toHaveValue("");
+
+        // The server stops offering Call: the refreshed types reach the open form.
+        await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Call back", {
+            confirm: false,
+        });
+        types.records = ACTIVITY_TYPES.filter((type) => type.id !== 2);
+        await renderer._loadActivityTypes();
+        await animationFrame();
+        expect(mountedCardOf(cards, 1)).toBe(lead1Card);
+        expect(queryAllTexts(`${card} .o_crm_mobile_follow_up_type option`)).toEqual(["Email"]);
+        expect(lead1Card.state.typeId).toBe(2);
+        // Saving the stale selection writes nothing and leaves the form as entered.
+        await contains(`${card} .o_crm_mobile_follow_up_save`).click();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(queued()).toHaveLength(0);
+        expect(`${card} .o_crm_mobile_lead_card_follow_up`).toHaveCount(1);
+        expect(lead1Card.state.summary).toBe("Call back");
+        expect(lead1Card.state.busy).toBe(false);
+
+        // Follow-up toggles the form off; reopened, it selects the first creatable type again,
+        // with an empty summary and today, and saves with it.
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        expect(`${card} .o_crm_mobile_lead_card_follow_up`).toHaveCount(0);
+        expect(lead1Card.state.followUpOpen).toBe(false);
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        expect(lead1Card.state.typeId).toBe(1);
+        expect(`${card} .o_crm_mobile_follow_up_type`).toHaveValue("1");
+        expect(`${card} .o_crm_mobile_follow_up_summary`).toHaveValue("");
+        expect(queryOne(`${card} .o_crm_mobile_follow_up_date`).value).toBe(serializeDate(today()));
+        await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Send the offer", {
+            confirm: false,
+        });
+        await contains(`${card} .o_crm_mobile_follow_up_save`).click();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/web_save"]);
+        expect(`${card} .o_crm_mobile_lead_card_follow_up`).toHaveCount(0);
+        expect(
+            MockServer.env["mail.activity"]
+                .search_read([["res_id", "=", 1]], ["summary"])
+                .map(({ summary }) => summary)
+        ).toEqual(["Send the offer"]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a log call whose connection drops during the call is queued with its full values, frees the card and reads nothing", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const connection = mockConnectionDrop();
+        watchRpcs(["mail.activity/web_save"]);
+        watchActivityReads();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+        const todayString = serializeDate(today());
+
+        connection.offline = true;
+        await contains(`${card} .o_crm_mobile_card_log_call`).click();
+        await animationFrame();
+        // Attempted online, then queued with exactly the values of the attempt.
+        expect.verifySteps(["mail.activity/web_save"]);
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        const creates = queuedCalls("mail.activity", "web_save");
+        expect(creates).toHaveLength(1);
+        expect(creates[0].args).toEqual([
+            [],
+            {
+                res_model: "crm.lead",
+                res_id: 1,
+                activity_type_id: 2,
+                summary: "Call",
+                date_deadline: todayString,
+                user_id: serverState.userId,
+            },
+        ]);
+        expect(creates[0].kwargs).toEqual({ context: {}, specification: {} });
+        expect(creates[0].extras).toMatchObject({
+            actionId: PIPELINE_ACTION_ID,
+            displayName: "Call: Lead 1",
+            changes: { activity_type_id: "Call", summary: "Call", date_deadline: todayString },
+        });
+        // Not busy any more, and no refresh requested: the write did not reach the server.
+        expect(status(lead1Card)).toBe("mounted");
+        expect(lead1Card.state.busy).toBe(false);
+        expect(`${card} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_activity_type`).toHaveText(
+            "Call"
+        );
+        expect(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`).toHaveText(
+            "Pending sync"
+        );
+        expect.verifySteps([]);
+        expect(MockServer.env["mail.activity"].search_read([["res_id", "=", 1]], ["id"])).toEqual(
+            []
+        );
+    });
+
+    test.tags("mobile");
+    test("mobile: a mark done the server rejects propagates its error and frees the card; one whose connection drops during the call queues action_archive", async () => {
+        const [activityId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("mail.activity", "action_done", () => {
+            throw makeServerError({ message: "This activity is locked" });
+        });
+        const connection = mockConnectionDrop();
+        watchRpcs(["mail.activity/action_done", "mail.activity/action_archive"]);
+        watchActivityReads();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps(["activities:1", "activities:2"]);
+        const card = cardOf("Lead 1");
+        const row = `${card} .o_crm_mobile_activity_row[data-activity-id='${activityId}']`;
+        const lead1Card = mountedCardOf(cards, 1);
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        const typeName = queryOne(`${row} .o_crm_mobile_activity_type`).textContent;
+
+        // Online, the server rejects the call: its error surfaces, nothing is queued or read,
+        // and the card is usable again.
+        expect.errors(1);
+        await contains(`${row} .o_crm_mobile_activity_done`).click();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/action_done"]);
+        expect.verifyErrors(["This activity is locked"]);
+        await contains(".modal .modal-footer .btn-primary").click();
+        expect(queued()).toHaveLength(0);
+        expect(lead1Card.state.busy).toBe(false);
+        expect(`${row} .o_crm_mobile_activity_done`).not.toHaveAttribute("disabled");
+        expect(
+            MockServer.env["mail.activity"].search_read([["id", "=", activityId]], ["id"])
+        ).toHaveLength(1);
+
+        // The connection drops during the call: the mark done is queued as a state change.
+        connection.offline = true;
+        await contains(`${row} .o_crm_mobile_activity_done`).click();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/action_done"]);
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        const archives = queuedCalls("mail.activity", "action_archive");
+        expect(archives.map(({ args, kwargs }) => [args, kwargs])).toEqual([[[[activityId]], {}]]);
+        expect(archives[0].extras).toMatchObject({
+            actionId: PIPELINE_ACTION_ID,
+            displayName: `${typeName}: Lead 1`,
+            changes: {},
+        });
+        expect(queued()).toHaveLength(1);
+        expect(lead1Card.state.busy).toBe(false);
+        expect(`${row} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(`${row} .o_crm_mobile_activity_done`).toHaveCount(0);
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a tap inside the card controls never opens the lead, while a tap elsewhere or a direct call does", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline({ selectRecord: (resId) => expect.step(`open ${resId}`) });
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+        await contains(`${card} .o_crm_mobile_card_stage`).click();
+        expect(`${card} .o_crm_mobile_lead_card_stage_list`).toHaveCount(1);
+        expect.verifySteps([]);
+
+        // The controls stop their clicks in the DOM; a direct call with an event coming from
+        // them is refused too.
+        for (const selector of [
+            ".o_crm_mobile_lead_card_controls",
+            ".o_crm_mobile_lead_card_actions",
+            ".o_crm_mobile_card_stage",
+            ".o_crm_mobile_card_stage i",
+            ".o_crm_mobile_stage_option",
+        ]) {
+            lead1Card.onOpenCard({ target: queryFirst(`${card} ${selector}`) });
+        }
+        await animationFrame();
+        expect.verifySteps([]);
+        // From the card body, without a target element or without an event, the lead opens.
+        lead1Card.onOpenCard({ target: queryOne(`${card} .o_crm_mobile_lead_card_partner`) });
+        expect.verifySteps(["open 1"]);
+        lead1Card.onOpenCard({});
+        expect.verifySteps(["open 1"]);
+        lead1Card.onOpenCard();
+        expect.verifySteps(["open 1"]);
+    });
+
+    test.tags("mobile");
+    test("mobile: an empty or invalid deadline is not displayed, and an invalid follow-up date is queued as today", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+        const todayString = serializeDate(today());
+
+        for (const value of [
+            false,
+            undefined,
+            null,
+            "",
+            "not a date",
+            "2030-02-30",
+            "2030-13-01",
+        ]) {
+            expect(lead1Card.formatDeadline(value)).toBe("", {
+                message: `${JSON.stringify(value)} is not displayed`,
+            });
+        }
+        expect(lead1Card.formatDeadline("2030-01-10")).toBe(
+            formatDate(deserializeDate("2030-01-10"))
+        );
+        expect(lead1Card.formatDeadline("2030-01-10")).not.toBe("");
+
+        // A date input holds a valid date or nothing, but a browser without a date picker lets
+        // any text through, and the input handler copies it as typed.
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Check in", {
+            confirm: false,
+        });
+        lead1Card.onFollowUpDate({ target: { value: "2030-02-30" } });
+        expect(lead1Card.state.date).toBe("2030-02-30");
+        expect(lead1Card._followUpDeadline()).toBe(todayString);
+        await contains(`${card} .o_crm_mobile_follow_up_save`).click();
+        const creates = queuedCalls("mail.activity", "web_save");
+        expect(creates).toHaveLength(1);
+        expect(creates[0].args[1]).toEqual({
+            res_model: "crm.lead",
+            res_id: 1,
+            activity_type_id: 1,
+            summary: "Check in",
+            date_deadline: todayString,
+            user_id: serverState.userId,
+        });
+        expect(creates[0].extras.changes.date_deadline).toBe(todayString);
+        await advanceTime(1000);
+
+        // A queued create carrying an invalid deadline lists no date.
+        scheduleCall("mail.activity", "web_save", [
+            [],
+            {
+                res_model: "crm.lead",
+                res_id: 1,
+                activity_type_id: 1,
+                summary: "Bad date",
+                date_deadline: "2030-02-30",
+                user_id: serverState.userId,
+            },
+        ]);
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        const deadlines = Object.fromEntries(
+            queryAll(`${card} .o_crm_mobile_activity_pending`).map((row) => [
+                row.querySelector(".o_crm_mobile_activity_summary").textContent,
+                row.querySelector(".o_crm_mobile_activity_deadline").textContent,
+            ])
+        );
+        expect(deadlines).toEqual({
+            "Check in": formatDate(deserializeDate(todayString)),
+            "Bad date": "",
+        });
+    });
+
+    test.tags("mobile");
+    test("mobile: a pending lead create shows no revenue without a numeric amount, and formats it in the company currency in a stage holding no loaded lead", async () => {
+        // offline, Won (folded, so not loaded) is displayed through Qualified and Proposition:
+        // the types are read from the cache each time (no activity of their leads is cached)
+        const errors = cachedReadErrors([TYPES, TYPES, TYPES]);
+        expect.errors(errors.length);
+        await makeMockServer();
+        MockServer.env["crm.stage"].write([4], { fold: true });
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        await setOffline(true);
+
+        // Creates queued without an amount (a form saved offline sends only the fields it
+        // changed) or with an empty one: no revenue line. With an amount, the currency of the
+        // stage's first lead.
+        const noAmount = scheduleCall("crm.lead", "web_save", [
+            [],
+            { name: "No amount", stage_id: 1 },
+        ]);
+        const falseAmount = scheduleCall("crm.lead", "web_save", [
+            [],
+            { name: "False amount", expected_revenue: false, stage_id: 1 },
+        ]);
+        const withAmount = scheduleCall("crm.lead", "web_save", [
+            [],
+            { name: "With amount", expected_revenue: 10, stage_id: 1 },
+        ]);
+        await animationFrame();
+        for (const key of [noAmount, falseAmount]) {
+            expect(mountedPendingCardOf(cards, key).revenue).toBe("");
+            expect(`${pendingCardOf(key)} .o_crm_mobile_lead_card_revenue`).toHaveCount(0);
+        }
+        expect(`${pendingCardOf(withAmount)} .o_crm_mobile_lead_card_revenue`).toHaveText(
+            formatCardRevenue(10)
+        );
+
+        // Won is folded: displayed offline it loads nothing, so no lead of its own carries a
+        // currency, and the amount is formatted in the user's company currency.
+        const wonCreate = scheduleCall("crm.lead", "web_save", [
+            [],
+            { name: "Won lead", expected_revenue: 25, stage_id: 4 },
+        ]);
+        await goToStage("Won");
+        const won = groupOf(renderer, 4);
+        expect(won.isFolded).toBe(true);
+        expect(won.list.records).toHaveLength(0);
+        expect(cardNames()).toEqual(["Won lead"]);
+        expect(`${pendingCardOf(wonCreate)} .o_crm_mobile_lead_card_revenue`).toHaveText(
+            formatCardRevenue(25)
+        );
+        expect(serverState.companies[0].currency_id).toBe(CURRENCY_ID);
+        expect.verifyErrors(errors);
     });
 });

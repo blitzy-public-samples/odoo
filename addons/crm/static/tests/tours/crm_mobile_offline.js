@@ -10,7 +10,8 @@
  * sync.
  *
  * Flow:
- * 1. Online: load the pipeline, open the lead's form once (so it is available offline), go back,
+ * 1. Online: load the pipeline, wait until the service worker is active (its first activation
+ *    clears the RPC cache), open the lead's form once (so it is available offline), go back,
  *    and wait until the activity types are cached (Follow-up enabled).
  * 2. Offline: edit the lead in its form, create a lead through the mobile quick create, schedule
  *    a follow-up activity from the card and mark the lead won through the card's stage list.
@@ -60,6 +61,21 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
         {
             content: "the fixture lead is displayed in its stage",
             trigger: LEAD_CARD,
+        },
+        {
+            // The webclient registers the service worker on load. When the worker activates
+            // without controlling the page (its first activation in a browser profile, as in
+            // every test browser), the webclient clears the whole RPC cache and the
+            // offline-availability registry. A lead form read in flight at that moment is never
+            // cached, yet the form is registered as available offline once loaded, so opening it
+            // offline would load nothing. The webclient clears in its own reaction to this same
+            // promise, which has therefore run before the next step starts; the worker activates
+            // once per page.
+            content: "the service worker is active: the RPC cache is no longer cleared",
+            trigger: ".o_crm_mobile_pipeline",
+            async run() {
+                await browser.navigator.serviceWorker?.ready;
+            },
         },
         {
             content: "open the lead online, so its form is cached",

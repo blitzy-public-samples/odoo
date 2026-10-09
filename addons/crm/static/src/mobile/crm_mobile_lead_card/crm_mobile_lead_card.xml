@@ -143,6 +143,8 @@
                         </div>
                         <span class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                     </li>
+                    <!-- The queued mark-done ids, read once for the whole list rather than per row. -->
+                    <t t-set="pendingArchivedIds" t-value="this.pendingArchivedIds"/>
                     <!-- Mark done is offered for every persisted activity, whatever its category. -->
                     <li t-foreach="this.activityRows" t-as="activity" t-key="activity.id"
                         class="o_crm_mobile_activity_row d-flex align-items-center gap-2 py-1"
@@ -152,7 +154,7 @@
                             <span t-if="activity.summary" class="o_crm_mobile_activity_summary text-truncate" t-out="activity.summary"/>
                             <span t-if="activity.date_deadline" class="o_crm_mobile_activity_deadline text-muted small" t-out="this.formatDeadline(activity.date_deadline)"/>
                         </div>
-                        <span t-if="this.pendingArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                        <span t-if="pendingArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                         <button t-else="" type="button"
                             class="btn btn-sm btn-link o_crm_mobile_activity_done ms-auto flex-shrink-0"
                             data-available-offline="1"
@@ -162,6 +164,17 @@
                             t-on-click.stop="() => this.onMarkDone(activity)">
                             <i class="oi oi-fw" data-icon="check" aria-hidden="true"/> Mark done
                         </button>
+                    </li>
+                    <!-- The page of activities is bounded: what it misses is said, never hidden. -->
+                    <li t-if="this.hiddenActivityCount" class="o_crm_mobile_activities_more py-1">
+                        <button t-if="!this.crmOffline.isOffline()" type="button"
+                            class="btn btn-sm btn-link o_crm_mobile_activities_show_all"
+                            data-available-offline="1"
+                            t-att-title="this.showAllActivitiesLabel"
+                            t-att-aria-label="this.showAllActivitiesLabel"
+                            t-on-click.stop="() => this.onShowAllActivities()"
+                            t-out="this.showAllActivitiesLabel"/>
+                        <span t-else="" class="text-muted small" t-out="this.hiddenActivitiesLabel"/>
                     </li>
                     <li t-if="!this.activityCount" class="text-muted small" t-out="this.noActivitiesLabel"/>
                 </ul>
