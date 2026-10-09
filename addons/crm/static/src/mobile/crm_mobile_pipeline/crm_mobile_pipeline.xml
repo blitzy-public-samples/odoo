@@ -109,8 +109,15 @@
                                 displayedStageValue="group.serverValue"
                             />
                         </t>
-                        <!-- Records placed in this stage, queued stage writes included. -->
-                        <t t-foreach="this.cardsFor(group)" t-as="record" t-key="record.id">
+                        <!--
+                            Records placed in this stage, queued stage writes included. The key
+                            carries the stage: component keys are scoped to this template, not to
+                            the stage body's t-key, and a card move renders the moved record in
+                            the old and the new stage body in one patch. With the record id alone
+                            both cards would share one key and the moved card would stop
+                            reacting to its own state (stage list, follow-up, activities).
+                        -->
+                        <t t-foreach="this.cardsFor(group)" t-as="record" t-key="group.id + ':' + record.id">
                             <CrmMobileLeadCard
                                 record="record"
                                 group="group"
