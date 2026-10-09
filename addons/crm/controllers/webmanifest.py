@@ -37,19 +37,25 @@ class WebManifest(webmanifest.WebManifest):
 
         The parent's entries come first and stay untouched, the CRM app entry
         included. The CRM shortcuts follow in the parent's shape, and only
-        when that entry and the pipeline menu are present, so anonymous
-        visitors and users without CRM access get exactly the parent's list.
+        when that entry is present and the user's web client can open the
+        pipeline menu, so anonymous visitors, users without CRM access and
+        users who cannot open the pipeline menu get exactly the parent's list.
         """
         shortcuts = super()._get_shortcuts()
         if not self._crm_app_entry_present(shortcuts):
             return shortcuts
         root = request.env.ref('crm.crm_menu_root')
         # "My Pipeline" opens through the legacy ``menu_id`` URL, which the
-        # webclient resolves to the menu's action. A missing pipeline menu
-        # (removed by a customization) leaves the parent's shortcuts untouched
-        # rather than publishing a partial CRM set.
+        # webclient resolves to the menu's action only among the menus it
+        # loads (``load_menus``), and otherwise falls back to the default app.
+        # A pipeline menu that is removed, archived or not visible to the user
+        # (groups, hidden or archived parent, inaccessible action) leaves the
+        # parent's shortcuts untouched rather than publishing a partial CRM set.
         pipeline_menu = request.env.ref('crm.menu_crm_opportunities', raise_if_not_found=False)
         if not pipeline_menu:
+            return shortcuts
+        user_menus = request.env['ir.ui.menu'].load_menus(request.session.debug)
+        if not user_menus.get(pipeline_menu.id, {}).get('action_id'):
             return shortcuts
         shortcuts.append({
             'name': request.env._("My Pipeline"),

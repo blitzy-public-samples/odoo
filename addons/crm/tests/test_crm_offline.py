@@ -352,6 +352,46 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
                              'A missing pipeline menu leaves the parent shortcuts untouched')
             self.assertEqual(data['icons'], CRM_MANIFEST_ICONS, 'The CRM app entry is still listed')
 
+    def test_webmanifest_crm_shortcuts_pipeline_menu_unavailable(self):
+        """ PART 5: a pipeline menu the user's web client cannot open leaves the parent's shortcuts untouched. """
+        self.authenticate('user_sales_salesman', 'user_sales_salesman')
+        root = self.env.ref('crm.crm_menu_root')
+        pipeline_menu = self.env.ref('crm.menu_crm_opportunities')
+        sales_menu = self.env.ref('crm.crm_menu_sales')
+        pipeline_group_ids = pipeline_menu.group_ids.ids
+        system_group_id = self.env.ref('base.group_system').id
+
+        for case, menu, values, restore in [
+            ('archived pipeline menu', pipeline_menu, {'active': False}, {'active': True}),
+            ('pipeline menu hidden by groups', pipeline_menu,
+             {'group_ids': [(6, 0, [system_group_id])]}, {'group_ids': [(6, 0, pipeline_group_ids)]}),
+            ('archived parent menu', sales_menu, {'active': False}, {'active': True}),
+        ]:
+            with self.subTest(case=case):
+                menu.write(values)
+                try:
+                    self.env.flush_all()
+                    self.assertNotIn(str(pipeline_menu.id), self.url_open('/web/webclient/load_menus').json(),
+                                     'The web client of the user cannot open the pipeline menu')
+                    data = self._get_manifest()
+                    self.assertEqual(data['shortcuts'], self._expected_parent_shortcuts(self.user_sales_salesman),
+                                     'A pipeline menu the user cannot open leaves the parent shortcuts untouched')
+                    self.assertEqual(data['icons'], CRM_MANIFEST_ICONS, 'The CRM app entry is still listed')
+                finally:
+                    menu.write(restore)
+
+        with self.subTest(case='pipeline menu available again'):
+            self.env.flush_all()
+            self.assertIn(str(pipeline_menu.id), self.url_open('/web/webclient/load_menus').json())
+            shortcuts = self._get_manifest()['shortcuts']
+            self.assertEqual(
+                [(shortcut['name'], shortcut['url']) for shortcut in shortcuts[-2:]],
+                [
+                    ('My Pipeline', f'/odoo?menu_id={pipeline_menu.id}'),
+                    ('New Lead', f'/odoo?menu_id={root.id}&action=crm.crm_lead_action_pipeline&view_type=form'),
+                ],
+            )
+
     def test_webmanifest_crm_icon(self):
         """ PART 5, K3: CRM users get the addon's icons; every other manifest key, route and icon stays the parent's. """
         self.authenticate('user_sales_salesman', 'user_sales_salesman')
