@@ -137,6 +137,7 @@ import { ListController } from "@web/views/list/list_controller";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { MultiRecordViewButton } from "@web/views/view_button/multi_record_view_button";
 import { ViewButton } from "@web/views/view_button/view_button";
+import { ShareTargetItem } from "@web/webclient/share_target/share_target_item";
 import { shareTargetService } from "@web/webclient/share_target/share_target_service";
 import { WebClient } from "@web/webclient/webclient";
 
@@ -5581,13 +5582,18 @@ describe("SKIP and remaining DISABLE", () => {
         await offlineItem.updateTeams();
         await animationFrame();
         expect.verifySteps([]);
+        expect(".o_dialog .o_field_widget[name='team']").toHaveCount(0);
 
-        // Online, the item reads the sales teams of the company.
+        // When the connection returns, the item reads the sales teams of the company by itself,
+        // once, and offers the team picker and the default team as a dialog opened online does.
         await setOffline(false);
-        await offlineItem.updateTeams();
-        expect.verifySteps(["crm.team/web_search_read"]);
+        await expect.waitForSteps(["crm.team/web_search_read"]);
+        await mailContains(".o_dialog .o_field_widget[name='team']");
         expect(offlineItem.state.teams.map(({ id }) => id)).toEqual([1, 2]);
         expect(offlineItem.state.selected_team.id).toBe(1);
+        expect(offlineItem.context.default_team_id).toBe(1);
+        await animationFrame();
+        expect.verifySteps([]);
     });
 
     test("share target item: a team read that loses the connection keeps the teams; other errors still raise", async () => {
@@ -5651,6 +5657,79 @@ describe("SKIP and remaining DISABLE", () => {
         await expect(refusedRead).rejects.toThrow(/Team read refused/);
         expect(getService(OfflinePlugin).isOffline()).toBe(false);
         expect(item.state.selected_team.id).toBe(2);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    test("share target item: the lead creation is inert offline through the save hook or a direct call", async () => {
+        const pngFile = new File([new Uint8Array(1)], "text.png", { type: "image/png" });
+        // Online, the server stores the shared file as attachment 666, which the creation links
+        // to the new lead. Registered first, so the offline mock and the watcher run before them.
+        onRpc("/web/binary/upload_attachment", () => [{ id: 666, filename: pngFile.name }]);
+        onRpc("/web/dataset/call_kw/ir.attachment/write", () => true);
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["/web/binary/upload_attachment", "crm.lead/name_create", "ir.attachment/write"]);
+        // Steps every call that reaches the shared share-target flow. The created lead is not
+        // opened, so the dialog stays the only screen.
+        patchWithCleanup(ShareTargetItem.prototype, {
+            async checkAndActiveIfNeededUserCompany() {
+                expect.step("activate company");
+                return super.checkAndActiveIfNeededUserCompany(...arguments);
+            },
+            async process() {
+                expect.step("process");
+                return super.process(...arguments);
+            },
+            async openCreatedRecord(resId) {
+                expect.step(`open crm.lead ${resId}`);
+            },
+        });
+        const items = captureInstances(CrmShareTargetItem);
+        patchWithCleanup(shareTargetService, {
+            _getShareTargetFiles: async () => [pngFile],
+        });
+        const webClient = await mountWithCleanup(WebClient);
+        await animationFrame();
+        expect(".o_dialog").toHaveCount(1);
+        const dialog = findComponent(
+            webClient,
+            (component) => typeof component?.onSelectedApp === "function"
+        );
+        if (!dialog.isSelectedShareTarget("Lead")) {
+            dialog.onSelectedApp("Lead");
+        }
+        await animationFrame();
+        expect(".o_dialog button.active").toHaveText("Lead");
+        const item = items.at(-1);
+        expect(item.state.selected_team.id).toBe(1);
+        const shareTarget = getService("share_target");
+        const sharedLeadIds = () => MockServer.env["crm.lead"].search([["name", "=", "text.png"]]);
+
+        // Offline, the save hook and each of its steps called directly resolve without reaching
+        // the shared flow: no upload, no lead, no attachment link, nothing queued, no error.
+        await setOffline(true);
+        await expect(shareTarget.callHook("save")).resolves.toBe(undefined);
+        await expect(item.checkAndActiveIfNeededUserCompany()).resolves.toBe(undefined);
+        await expect(item.process()).resolves.toBe(undefined);
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(sharedLeadIds()).toEqual([]);
+        expect(".o_dialog").toHaveCount(1);
+
+        // Online, the same hook runs the shared flow, and the lead is created in the selected team.
+        await setOffline(false);
+        await shareTarget.callHook("save");
+        const [leadId] = sharedLeadIds();
+        expect.verifySteps([
+            "activate company",
+            "process",
+            "/web/binary/upload_attachment",
+            "crm.lead/name_create",
+            "ir.attachment/write",
+            `open crm.lead ${leadId}`,
+        ]);
+        expect(MockServer.env["crm.lead"].browse(leadId)[0].team_id).toBe(1);
         expect(queuedEntries()).toHaveLength(0);
     });
 });
