@@ -27,6 +27,12 @@ import { computed, status, untrack, useEffect } from "@odoo/owl";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { patch } from "@web/core/utils/patch";
 
+/**
+ * Set while a lead chatter's record-save callback calls the form's save: the lead save that call
+ * starts synchronously is the chatter's own (see `CrmFormRecord.save`).
+ */
+let chatterSaveInScope = false;
+
 class CrmFormRecord extends formView.Model.Record {
     /**
      * Simulates a real "force_save" on the email and phone when needed. The "force_save"
@@ -63,12 +69,22 @@ class CrmFormRecord extends formView.Model.Record {
     }
 
     /**
-     * override of record _save mechanism intended to affect the main form record
-     * We check if the stage_id field was altered and if we need to display a rainbowman
-     * message.
+     * Marks the lead save a lead chatter starts: the form controller calls this synchronously
+     * from the chatter's record-save callback, and the mark travels in the options to `_save`.
      *
-     * This method also applies the email and phone "force_save" (see
-     * `_applyPartnerSyncChanges`) before saving.
+     * @override
+     */
+    save(options) {
+        if (this.resModel === "crm.lead" && chatterSaveInScope) {
+            chatterSaveInScope = false;
+            return super.save({ ...options, crmChatterSave: true });
+        }
+        return super.save(...arguments);
+    }
+
+    /**
+     * Saves a lead with its email and phone partner-sync copy (`_applyPartnerSyncChanges`) and,
+     * when the stage changed, shows the rainbowman message.
      *
      * The rainbowman lookup is a visual effect: it is skipped when the client is offline once
      * the save returns. Checked after the save, this covers saves made offline and saves whose
@@ -76,9 +92,13 @@ class CrmFormRecord extends formView.Model.Record {
      * the client offline. The queued save is left untouched, and nothing is queued for the
      * lookup.
      *
+     * While the request runs, `_crmChatterSave` tells `_offlineSave` whether a lead chatter
+     * started this save (`options.crmChatterSave`, see `save`). It is restored afterwards, as an
+     * error handler's retry re-enters `_save` with the same options.
+     *
      * @override
      */
-    async _save() {
+    async _save(options) {
         if (this.resModel !== "crm.lead") {
             return super._save(...arguments);
         }
@@ -89,7 +109,14 @@ class CrmFormRecord extends formView.Model.Record {
             changeStage = this._values.stage_id !== this.data.stage_id;
         }
 
-        const res = await super._save(...arguments);
+        const outerChatterSave = this._crmChatterSave;
+        this._crmChatterSave = Boolean(options?.crmChatterSave);
+        let res;
+        try {
+            res = await super._save(...arguments);
+        } finally {
+            this._crmChatterSave = outerChatterSave;
+        }
         if (res && changeStage && !isOfflineModel(this.model)) {
             await checkRainbowmanMessage(this.model.orm, this.model.effect, this.resId);
         }
@@ -99,12 +126,17 @@ class CrmFormRecord extends formView.Model.Record {
     /**
      * Queues a lead save with the email and phone partner-sync copy, whichever path reached the
      * offline queue (a save started offline, a save whose request lost the connection, or any
-     * other caller of `_offlineSave`).
+     * other caller of `_offlineSave`). A save a lead chatter started (see `save`) is refused
+     * instead, as the chatter is read-only offline: it returns `false`, schedules nothing and
+     * leaves the unsaved changes in the form.
      *
      * @override
      */
     _offlineSave() {
         if (this.resModel === "crm.lead") {
+            if (this._crmChatterSave) {
+                return false;
+            }
             this._applyPartnerSyncChanges();
         }
         return super._offlineSave(...arguments);
@@ -131,25 +163,15 @@ registry.category("views").add("crm_form", {
 // -----------------------------------------------------------------------------
 //
 // Chatter support offline is out of scope: the mail components call the server directly and never
-// queue. While the client is offline, the mutation paths patched below for a `crm.lead` thread
-// (composer, including an edit composer's attachments; activities; followers; chatter attachments
-// and file drops; reactions; message actions and the message delete confirmation; scheduled
-// messages) are refused at the handler itself, so a hotkey, a keyboard selection, a direct call or
-// an overlay opened before the connection dropped does nothing. Where the mutation sits in a
-// closure no patch can reach, what that closure calls is refused instead: the chatter's uploader,
-// its record-save callback and its parent reload (file drops), and the composer's post
-// continuation (a confirmation answered after the connection dropped). Overlays whose mutation
-// sits in a closure or a template expression close themselves when the connection drops. Reads
-// of what the chatter already holds (reading messages, opening the attachment panel through its
-// Files toggler) stay available; controls that need the server, such as message search, stay
-// disabled by the framework.
-//
-// Every guard applies only while offline and only when the target model is exactly `crm.lead`:
-// online, and for every other model, each patched method calls `super` with its arguments.
-//
-// The mail dialog forms the lead chatter opens (`mail.activity`, `mail.activity.schedule`,
-// `mail.followers.edit`, `mail.compose.message`) are framework views; their buttons and saves are
-// guarded in `@crm/mobile/crm_offline_hooks`.
+// queue. While offline, no chatter path of a `crm.lead` thread writes or queues. That includes
+// the lead saves the chatter starts, refused whether the client is offline when they are called or
+// their request loses the connection. A mutation is refused at its handler, or, where it sits in a
+// closure no patch can reach, at what that closure calls; overlays holding a mutation in a closure
+// or a template expression close when the connection drops. Reads of what the chatter already
+// holds stay available, and controls that need the server stay disabled by the framework. Every
+// guard acts only while offline and only for a `crm.lead` thread: online, and for every other
+// model, each patched method calls `super`. The mail dialog forms the lead chatter opens are
+// framework views, guarded in `@crm/mobile/crm_offline_hooks`.
 //
 // One path is not patched: removing an attachment from a posted message
 // (`Message.onClickAttachmentUnlink`). It relies on the framework's connection-loss handling
@@ -215,32 +237,73 @@ function useCloseOnCrmOffline(holder, getModel, close, lifecycleOwner = holder) 
 
 /**
  * The chatter's record-save callback as the chatter of an offline lead sees it: it saves nothing.
- * Every caller treats `false` as "not saved" and stops.
+ * Only the file drop and the file selection of an unsaved lead stop on its `false`. The other
+ * callers (the parent reload, `scheduleActivity`, `toggleComposer`) ignore the result: they are
+ * refused at their own entry while offline, and by the recheck of `saveLeadFromChatter` when
+ * their save loses the connection.
  *
  * @returns {Promise<false>}
  */
 const refuseChatterSave = () => Promise.resolve(false);
 
+/**
+ * The rejection of the record-save callback a lead chatter's parent reload awaits, when that save
+ * returns offline: the reload stops before loading the lead, and `reloadParentView` resolves.
+ */
+class ParentReloadSkipped extends Error {}
+
 patch(Chatter.prototype, {
     setup() {
         super.setup(...arguments);
         this.crmOffline = useCrmOffline();
+        /** Set while `reloadParentView` calls the web chatter's parent reload. */
+        this.crmReloadingParent = false;
         // The drop zone's `onDrop` saves an unsaved lead through the record-save callback before
         // uploading, in a closure no patch can reach. For an offline lead this instance's view of
         // the callback refuses, so a drop on an unsaved lead stops before saving, uploading,
         // reloading or switching panel; on a saved lead, the guarded uploader and parent reload
-        // leave it nothing to do but open the read-only attachment panel. Online, and for every
-        // other model, the getter returns the original callback.
+        // leave it nothing to do but open the read-only attachment panel. Online, a lead's view
+        // is `saveLeadFromChatter`; for every other model, the getter returns the original
+        // callback.
         const webChatterProps = this.webChatterProps;
         if (webChatterProps) {
+            // Calls the form's save as the chatter's own, so a save whose request loses the
+            // connection is refused rather than queued (`CrmFormRecord._offlineSave`). Once a
+            // save returns offline, nothing the chatter chains on it runs: the pending
+            // `onThreadCreated` continuation (composer, schedule activity) is dropped, and a
+            // parent reload is rejected with `ParentReloadSkipped` before it loads the lead.
+            // One function per instance, so every read of the callback returns the same one.
+            const saveLeadFromChatter = async (...args) => {
+                const inParentReload = this.crmReloadingParent;
+                const outerScope = chatterSaveInScope;
+                chatterSaveInScope = true;
+                let saving;
+                try {
+                    saving = webChatterProps.saveRecord?.(...args);
+                } finally {
+                    chatterSaveInScope = outerScope;
+                }
+                const saved = await saving;
+                if (isCrmLeadOffline(this, this.threadModel())) {
+                    this.onThreadCreated = null;
+                    if (inParentReload) {
+                        throw new ParentReloadSkipped();
+                    }
+                }
+                return saved;
+            };
             this.webChatterProps = Object.create(webChatterProps, {
                 saveRecord: {
                     enumerable: true,
                     get: () => {
                         const saveRecord = webChatterProps.saveRecord;
-                        return saveRecord && isCrmLeadOffline(this, this.threadModel())
+                        const threadModel = this.threadModel();
+                        if (!saveRecord || threadModel !== CRM_LEAD) {
+                            return saveRecord;
+                        }
+                        return isCrmLeadOffline(this, threadModel)
                             ? refuseChatterSave
-                            : saveRecord;
+                            : saveLeadFromChatter;
                     },
                 },
             });
@@ -287,9 +350,21 @@ patch(Chatter.prototype, {
     },
 
     /**
-     * Loading a lead thread while the connection is lost leaves the chatter showing what it
-     * already holds instead of raising. Any other error, and any error for another model, is
-     * raised as before.
+     * Runs the `onThreadCreated` continuation `toggleComposer` or `scheduleActivity` leaves on an
+     * unsaved lead once its thread exists. For an offline lead it is dropped instead: it would
+     * open the composer or the schedule-activity dialog without passing their guards.
+     */
+    changeThread(threadModel) {
+        if (isCrmLeadOffline(this, threadModel)) {
+            this.onThreadCreated = null;
+        }
+        return super.changeThread(...arguments);
+    },
+
+    /**
+     * A lead thread load that loses the connection leaves the chatter showing what it already
+     * holds instead of raising. Every other error, and any error for another model's thread,
+     * connection loss included, is rethrown.
      */
     async load() {
         try {
@@ -352,13 +427,31 @@ patch(Chatter.prototype, {
      * Saves the lead and reloads it. For an offline lead the save would be queued and the reload
      * would replace the form's unsaved edits, so it is refused. This covers the completion of a
      * file drop and every other chatter callback: the web chatter's `setup` binds
-     * `this.reloadParentView` to this patched method.
+     * `this.reloadParentView` to this patched method. A lead reload whose save returns offline
+     * (its request lost the connection) loads nothing either: the record-save callback rejects
+     * it with `ParentReloadSkipped`, and the reload resolves.
      */
     reloadParentView() {
-        if (isCrmLeadOffline(this, this.threadModel())) {
+        const threadModel = this.threadModel();
+        if (isCrmLeadOffline(this, threadModel)) {
             return;
         }
-        return super.reloadParentView(...arguments);
+        if (threadModel !== CRM_LEAD) {
+            return super.reloadParentView(...arguments);
+        }
+        const outerReload = this.crmReloadingParent;
+        this.crmReloadingParent = true;
+        let reloading;
+        try {
+            reloading = super.reloadParentView(...arguments);
+        } finally {
+            this.crmReloadingParent = outerReload;
+        }
+        return Promise.resolve(reloading).catch((error) => {
+            if (!(error instanceof ParentReloadSkipped)) {
+                throw error;
+            }
+        });
     },
 
     scheduleActivity() {
@@ -689,8 +782,8 @@ patch(Composer.prototype, {
         return super.onDropFile(...arguments);
     },
     /**
-     * Reached from the textarea and from the editor's paste handler. Offline, no file is
-     * uploaded; the event is left to the textarea or the editor, which paste only its text.
+     * Reached from the textarea and from the editor's paste handler. For an offline lead,
+     * attachment upload is skipped and the native or editor paste handling continues.
      */
     onPaste() {
         if (isCrmLeadOffline(this, this.thread?.model)) {
@@ -790,7 +883,7 @@ function messageActionModel(action, params) {
 patch(MessageAction.prototype, {
     /**
      * Attaches the offline source to the action itself, whatever its owner, before the
-     * definition's own setup runs. Actions built later without setup (the "more" dropdown
+     * definition's own setup runs. Actions constructed without setup (the "more" dropdown
      * action) have no source and are never guarded: they only list the guarded actions.
      */
     setup() {

@@ -4550,18 +4550,22 @@ describe("SKIP and remaining DISABLE", () => {
         expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 (unsaved)");
         // Called directly, the parent reload and the record-save callback do nothing.
         expect(chatter.reloadParentView()).toBe(undefined);
-        expect(await chatter.webChatterProps.saveRecord()).toBe(false);
+        const offlineSaveRecord = chatter.webChatterProps.saveRecord;
+        expect(await offlineSaveRecord()).toBe(false);
         await animationFrame();
         expect.verifySteps([]);
         expect(queuedEntries()).toHaveLength(0);
         expect(savedLead.dirty).toBe(true);
 
-        // 2. Online again, the callback is the form's own, and the drop uploads, then saves and
-        // reloads the lead, as before.
+        // 2. Online again, the callback no longer refuses: it is the chatter's stable wrapper of
+        // the form's own save, and the drop uploads, then saves and reloads the lead through it.
         await setOffline(false);
-        expect(chatter.webChatterProps.saveRecord).toBe(
+        const onlineSaveRecord = chatter.webChatterProps.saveRecord;
+        expect(onlineSaveRecord).not.toBe(offlineSaveRecord);
+        expect(onlineSaveRecord).not.toBe(
             Object.getPrototypeOf(chatter.webChatterProps).saveRecord
         );
+        expect(chatter.webChatterProps.saveRecord).toBe(onlineSaveRecord);
         await dropFile();
         await expect.waitForSteps([
             "/mail/attachment/upload",
@@ -4598,6 +4602,270 @@ describe("SKIP and remaining DISABLE", () => {
         ]);
         expect(leadChatter().webChatterProps.record.isNew).toBe(false);
         expect(queuedEntries()).toHaveLength(0);
+    });
+
+    /**
+     * Holds the next `crm.lead/web_save` request in flight once armed, until the test answers it.
+     * Register it before the route watchers: they run first, so they still step the held request.
+     *
+     * @returns {() => PromiseWithResolvers<Response>} arms the hold for the next lead save
+     */
+    function holdLeadSaves() {
+        let held = null;
+        onRpc("/web/dataset/call_kw/crm.lead/web_save", () => {
+            if (held) {
+                const answer = held.promise;
+                held = null;
+                return answer;
+            }
+        });
+        return () => (held = Promise.withResolvers());
+    }
+
+    /**
+     * Answers a held request as a lost connection, and makes every following request fail too
+     * until the test reconnects: the client goes offline on that answer and stays offline.
+     *
+     * @param {{ offline: boolean }} connection the state of `mockConnectionDrop()`
+     * @param {PromiseWithResolvers<Response>} held
+     */
+    function loseConnection(connection, held) {
+        connection.offline = true;
+        held.resolve(new Response("", { status: 502 }));
+    }
+
+    /**
+     * @param {Chatter[]} chatters captured chatter components
+     * @returns {Chatter | undefined} the mounted lead chatter
+     */
+    function mountedLeadChatter(chatters) {
+        return chatters.findLast((c) => c.threadModel() === "crm.lead" && status(c) === "mounted");
+    }
+
+    test("chatter save of a new lead that loses the connection: a file drop and Attach Files save, upload and queue nothing", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const connection = mockConnectionDrop();
+        const holdNextSave = holdLeadSaves();
+        // Every chatter write, the lead saves included, and every reload of the lead is stepped.
+        watchRpcs([...MAIL_WRITES, "crm.lead/web_read"]);
+        const chatters = captureInstances(Chatter);
+        const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
+        await start();
+        await openFormView("crm.lead", undefined, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Chatter");
+        const chatter = mountedLeadChatter(chatters);
+        const record = chatter.webChatterProps.record;
+        expect(record.isNew).toBe(true);
+        await contains(".o_field_widget[name=name] input").edit("Dropped lead");
+        const panel = chatter.state.activePanel;
+
+        // 1. A file drop started online: the save of the new lead loses the connection, so the
+        // drop uploads nothing, switches no panel and queues nothing.
+        let held = holdNextSave();
+        await dragenterFiles(".o-mail-Chatter", [file]);
+        await dropFiles(".o-Dropzone", [file]);
+        await expect.waitForSteps(["crm.lead/web_save"]);
+        loseConnection(connection, held);
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(record.isNew).toBe(true);
+        expect(record.dirty).toBe(true);
+        expect(chatter.state.activePanel).toBe(panel);
+        expect(".o_field_widget[name=name] input").toHaveValue("Dropped lead");
+        expect.verifySteps([]);
+
+        // 2. Attach Files started online: the save loses the connection, so the file selection
+        // stops (`false`) and nothing is queued.
+        connection.offline = false;
+        await setOffline(false);
+        held = holdNextSave();
+        const attaching = chatter.onClickAttachFile();
+        await expect.waitForSteps(["crm.lead/web_save"]);
+        loseConnection(connection, held);
+        await expect(attaching).resolves.toBe(false);
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(record.isNew).toBe(true);
+        expect(record.dirty).toBe(true);
+        expect(chatter.state.activePanel).toBe(panel);
+        expect(".o_field_widget[name=name] input").toHaveValue("Dropped lead");
+        expect.verifySteps([]);
+
+        // 3. The form's own Save, offline now, still queues the new lead with its edits.
+        await contains(".o_form_button_save").click();
+        await animationFrame();
+        expect.verifySteps(["crm.lead/web_save"]);
+        const saves = queuedCalls("crm.lead", "web_save");
+        expect(saves).toHaveLength(1);
+        expect(saves[0].args[0]).toEqual([]);
+        expect(saves[0].args[1]).toMatchObject({ name: "Dropped lead" });
+    });
+
+    test("chatter save of a new lead that loses the connection: Send message, Log note and Schedule Activity queue nothing and open nothing once the lead is saved", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const connection = mockConnectionDrop();
+        const holdNextSave = holdLeadSaves();
+        watchRpcs(MAIL_WRITES);
+        // The schedule-activity dialog opens through the action service: stepped instead.
+        mockService("action", {
+            doAction(action) {
+                if (action?.res_model === "mail.activity.schedule") {
+                    expect.step(`doAction:${action.res_model}`);
+                    return Promise.resolve();
+                }
+                return super.doAction(...arguments);
+            },
+        });
+        const chatters = captureInstances(Chatter);
+        await start();
+        await openFormView("crm.lead", undefined, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Chatter");
+        let chatter = mountedLeadChatter(chatters);
+        const record = chatter.webChatterProps.record;
+        await contains(".o_field_widget[name=name] input").edit("New lead");
+
+        // Each button, clicked online, saves the new lead before opening its composer or dialog;
+        // that save loses the connection, so the pending continuation is dropped.
+        for (const button of [
+            ".o-mail-Chatter-sendMessage",
+            ".o-mail-Chatter-logNote",
+            ".o-mail-Chatter-activity",
+        ]) {
+            const held = holdNextSave();
+            await mailClick(button);
+            await expect.waitForSteps(["crm.lead/web_save"]);
+            expect(typeof chatter.onThreadCreated).toBe("function", { message: button });
+            loseConnection(connection, held);
+            await animationFrame();
+            expect(getService(OfflinePlugin).isOffline()).toBe(true, { message: button });
+            expect(chatter.onThreadCreated).toBe(null, { message: button });
+            expect(chatter.state.composerType).toBe(false, { message: button });
+            expect(".o-mail-Chatter .o-mail-Composer").toHaveCount(0);
+            expect(".modal").toHaveCount(0);
+            expect(record.isNew).toBe(true, { message: button });
+            expect(queuedEntries()).toHaveLength(0, { message: button });
+            expect(".o_field_widget[name=name] input").toHaveValue("New lead");
+            expect.verifySteps([]);
+            connection.offline = false;
+            await setOffline(false);
+        }
+
+        // Online, the form saves the lead: its thread is created, and the dropped continuations
+        // open no composer and no schedule-activity dialog.
+        await contains(".o_form_button_save").click();
+        await expect.waitForSteps(["crm.lead/web_save"]);
+        await mailContains(".o-mail-Message:contains('Creating a new record...')", { count: 0 });
+        await animationFrame();
+        expect(record.isNew).toBe(false);
+        chatter = mountedLeadChatter(chatters);
+        expect(chatter.state.thread.id).toBe(record.resId);
+        expect(chatter.state.composerType).toBe(false);
+        expect(".o-mail-Chatter .o-mail-Composer").toHaveCount(0);
+        expect(".modal").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // A continuation still pending when a lead thread appears offline is dropped; online it
+        // runs.
+        const thread = chatter.state.thread;
+        await setOffline(true);
+        chatter.onThreadCreated = () => expect.step("continuation");
+        chatter.changeThread("crm.lead", thread.id);
+        expect(chatter.onThreadCreated).toBe(null);
+        expect.verifySteps([]);
+        await setOffline(false);
+        chatter.onThreadCreated = () => expect.step("continuation");
+        chatter.changeThread("crm.lead", thread.id);
+        expect.verifySteps(["continuation"]);
+
+        // Online with a connected save, Log note on a new lead saves it and opens the composer.
+        await openFormView("crm.lead", undefined, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Chatter");
+        await contains(".o_field_widget[name=name] input").edit("Connected lead");
+        await mailClick(".o-mail-Chatter-logNote");
+        await expect.waitForSteps(["crm.lead/web_save"]);
+        await mailContains(".o-mail-Chatter .o-mail-Composer");
+        expect(mountedLeadChatter(chatters).state.composerType).toBe("note");
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    test("chatter parent reload of an edited lead whose save loses the connection: nothing queued or reloaded, the edits stay", async () => {
+        // The form's own offline save below carries the email partner-sync copy as well.
+        CrmLead._records[0].partner_email_update = true;
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const connection = mockConnectionDrop();
+        const holdNextSave = holdLeadSaves();
+        // Every chatter write, the lead saves included, and every reload of the lead is stepped.
+        watchRpcs([...MAIL_WRITES, "crm.lead/web_read"]);
+        const chatters = captureInstances(Chatter);
+        await start();
+        await openFormView("crm.lead", 1, {
+            arch: /* xml */ `
+                <form js_class="crm_form">
+                    <sheet>
+                        <field name="name"/>
+                        <field name="email_from"/>
+                        <field name="partner_email_update" invisible="1"/>
+                    </sheet>
+                    <chatter reload_on_post="True"/>
+                </form>`,
+        });
+        await mailContains(".o-mail-Chatter");
+        expect.verifySteps(["crm.lead/web_read"]);
+        const chatter = mountedLeadChatter(chatters);
+        const record = chatter.webChatterProps.record;
+        await contains(".o_field_widget[name=name] input").edit("Lead 1 (unsaved)");
+
+        // 1. A parent reload called online: its save loses the connection, so the reload
+        // resolves without loading the lead, and nothing is queued.
+        let held = holdNextSave();
+        const reloading = chatter.reloadParentView();
+        await expect.waitForSteps(["crm.lead/web_save"]);
+        loseConnection(connection, held);
+        await expect(reloading).resolves.toBe(undefined);
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(record.dirty).toBe(true);
+        expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 (unsaved)");
+        expect.verifySteps([]);
+
+        // 2. A note posted online reloads the lead (`reload_on_post`): the post succeeds, the
+        // reload's save loses the connection, and the edits stay.
+        connection.offline = false;
+        await setOffline(false);
+        await mailClick(".o-mail-Chatter-logNote");
+        await mailContains(".o-mail-Composer-input");
+        await insertText(".o-mail-Composer-input", "Posted online");
+        held = holdNextSave();
+        await mailClick(".o-mail-Composer-send:enabled");
+        await expect.waitForSteps(["/mail/message/post", "crm.lead/web_save"]);
+        loseConnection(connection, held);
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        await mailContains(".o-mail-Message:contains('Posted online')");
+        expect(queuedEntries()).toHaveLength(0);
+        expect(record.dirty).toBe(true);
+        expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 (unsaved)");
+        expect.verifySteps([]);
+
+        // 3. The form's own Save, offline now, still queues the lead write with the edits and
+        // the partner-sync copy.
+        await contains(".o_form_button_save").click();
+        await animationFrame();
+        expect.verifySteps(["crm.lead/web_save"]);
+        const saves = queuedCalls("crm.lead", "web_save");
+        expect(saves).toHaveLength(1);
+        expect(saves[0].args).toEqual([
+            [1],
+            { name: "Lead 1 (unsaved)", email_from: "lead1@example.com" },
+        ]);
+        expect(record.dirty).toBe(false);
     });
 
     test("chatter patches are inert for non-CRM threads", async () => {
