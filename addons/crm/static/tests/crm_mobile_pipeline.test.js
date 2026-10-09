@@ -931,7 +931,6 @@ describe("Mobile pipeline", () => {
         expect(".o_crm_mobile_pipeline_prev").toHaveCount(0);
         expect(".o_crm_mobile_pipeline_next").toHaveCount(1);
 
-        // Header buttons move one stage at a time.
         await contains(".o_crm_mobile_pipeline_next").click();
         expectHeader("Qualified", 1, 30);
         expect(cardNames()).toEqual(["Lead 3"]);
@@ -2933,13 +2932,11 @@ describe("Mobile pipeline", () => {
         expect.verifySteps(["activities:3"]);
         await goToStage("New");
         expect.verifySteps(["activities:1"]);
-        // Filtering (a new root load).
         await toggleSearchBarMenu();
         await toggleMenuItem("With Revenue");
         await toggleSearchBarMenu();
         expect(cardNames()).toEqual(["Lead 1"]);
         expect.verifySteps(["activities:1"]);
-        // Load more.
         await contains(".o_crm_mobile_pipeline_load_more button").click();
         await animationFrame();
         expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
@@ -5841,7 +5838,6 @@ describe("Mobile lead card", () => {
         expectTouchTarget(queryOne(`${card} .o_crm_mobile_activity_done`), "mark done");
         await contains(`${card} .o_crm_mobile_card_activities`).click();
         expect(`${card} .o_crm_mobile_lead_card_activities`).toHaveCount(0);
-        // The pipeline controls.
         await goToStage("Qualified");
         for (const selector of [
             ".o_crm_mobile_pipeline_prev",
@@ -6264,7 +6260,6 @@ describe("Mobile lead card", () => {
         expect(".modal").toHaveCount(0);
         expect(chatter.isDisabled).toBe(true);
 
-        // Chatter.
         chatter.toggleComposer("message");
         chatter.toggleComposer("note");
         await chatter.scheduleActivity();
@@ -6275,7 +6270,6 @@ describe("Mobile lead card", () => {
         chatter.state.selectedAttachmentIds = thread.attachments.map(({ id }) => id);
         chatter.onClickDeleteSelectedAttachments();
         await chatter.unlinkAttachments(thread.attachments);
-        // FollowerList and Follower.
         await followerList.onClickFollow();
         await followerList.onClickUnfollow();
         followerList.onClickAddFollowers();
@@ -6318,7 +6312,6 @@ describe("Mobile lead card", () => {
         const [template] = pyEnv["mail.template"].search_read([["id", "=", mailTemplateId]]);
         mailTemplate.onClickPreview(NO_EVENT, template);
         await mailTemplate.onClickSend(NO_EVENT, template);
-        // ScheduledMessage.
         const scheduledMessage = leadInstance(
             scheduledMessages,
             (s) => s.props.scheduledMessage.thread?.model,
@@ -6669,7 +6662,6 @@ describe("Mobile quick create", () => {
         await contains(`${pending} .o_crm_mobile_lead_card_name`).click();
         expect.verifySteps([]);
 
-        // Discard closes the sheet without queuing anything.
         await contains(".o_crm_mobile_pipeline_add").click();
         await fillQuickCreate({ name: "Not created" });
         await contains(".o_crm_mobile_quick_create_discard").click();
@@ -9983,7 +9975,6 @@ describe("Mobile activities", () => {
         expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(0);
         expect(statusOf("Lead 2")).toHaveText("Lead 2: changes no longer pending sync.");
 
-        // Queued again, then replayed on reconnect.
         await advanceTime(1000);
         await recordOf(renderer, 2).update({ contact_name: "Phoebe Buffay" });
         await animationFrame();
@@ -10030,8 +10021,8 @@ describe("Mobile activities", () => {
             expect(badge).toHaveClass("gap-1");
             expect(badge).toHaveText("Pending sync");
             expect(`${badge} .oi[data-icon=cloud_upload]`).toHaveCount(1);
-            // $spacer (16px) * 0.25: the badge looks as it did with its former 0.25rem gap. Its
-            // inline-flex display computes to flex, as every item of a flex row (blockified).
+            // Bootstrap gap-1 is $spacer * 0.25 (4px with a 16px spacer). Its inline-flex display
+            // computes to flex, as every item of a flex row (blockified).
             const style = getComputedStyle(queryOne(badge));
             expect(style.display).toBe("flex");
             expect(style.alignItems).toBe("center");
