@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Renderer of the `crm_mobile_pipeline` view (CrmMobilePipeline).
+
+        Desktop, and every grouping other than a non-empty grouping by stage on a small screen
+        (`isMobilePipeline` false), renders the standard `web.KanbanRenderer` through `t-call`, so
+        their DOM is exactly the kanban DOM.
+
+        The mobile markup shows one stage at a time:
+        - The root keeps `o_kanban_renderer o_renderer o_kanban_grouped`: the upstream mobile main
+          flow targets `.o_kanban_renderer`, and the base kanban controller restores the scroll of
+          `.o_renderer` without a null guard.
+        - The displayed stage is the only `.o_kanban_group` in the DOM. It carries the group's
+          `data-id` and never `o_column_folded`, so the base controller saves and restores its
+          scroll. It hosts the framework quick create (`.o_kanban_quick_create`, `.o_kanban_add`)
+          when New opened it in this stage, and the cards (`.o_kanban_record`, name in a span).
+        - Placement and totals come from the renderer's derived getters (pending-aware), never from
+          state stored by the template.
+
+        Offline: every button here carries `data-available-offline`, so the framework offline UI
+        leaves navigation, Add, Back and Load more usable; the attribute is inert online.
+    -->
+    <t t-name="crm.CrmMobilePipeline">
+        <t t-if="this.isMobilePipeline">
+            <t t-set="group" t-value="this.currentGroup"/>
+            <div class="o_kanban_renderer o_renderer o_kanban_grouped o_crm_mobile_pipeline d-flex flex-column user-select-none" t-ref="this.rootRef">
+                <div class="o_crm_mobile_pipeline_header d-flex align-items-center gap-1 px-2 py-1 bg-view border-bottom">
+                    <button t-if="this.hasPrevStage" type="button"
+                        class="btn btn-light o_crm_mobile_pipeline_prev"
+                        data-available-offline="1"
+                        aria-label="Previous stage"
+                        title="Previous stage"
+                        t-on-click="() => this.onPrev()">
+                        <i class="oi" data-icon="chevron_backward" aria-hidden="true"/>
+                    </button>
+                    <div class="o_crm_mobile_pipeline_title flex-grow-1 min-w-0 text-center" aria-live="polite">
+                        <div class="o_crm_mobile_pipeline_stage_name fw-bold text-truncate">
+                            <i t-if="group.isFolded" class="oi me-1 o_crm_mobile_pipeline_folded" data-icon="close_fullscreen" role="img" aria-label="Folded" title="Folded"/>
+                            <t t-out="group.displayName"/>
+                        </div>
+                        <div class="o_crm_mobile_pipeline_totals small text-muted text-truncate">
+                            <span class="visually-hidden">Leads:</span>
+                            <span class="o_crm_mobile_pipeline_count" title="Leads" t-out="this.stageCount(group)"/>
+                            <t t-if="this.hasRevenue">
+                                <span class="mx-1" aria-hidden="true">•</span>
+                                <span class="visually-hidden">Expected revenue:</span>
+                                <span class="o_crm_mobile_pipeline_revenue" title="Expected revenue" t-out="this.formatStageRevenue(group)"/>
+                            </t>
+                        </div>
+                    </div>
+                    <button t-if="this.hasNextStage" type="button"
+                        class="btn btn-light o_crm_mobile_pipeline_next"
+                        data-available-offline="1"
+                        aria-label="Next stage"
+                        title="Next stage"
+                        t-on-click="() => this.onNext()">
+                        <i class="oi" data-icon="chevron_forward" aria-hidden="true"/>
+                    </button>
+                    <button t-if="this.canAdd" type="button"
+                        class="btn btn-primary o_crm_mobile_pipeline_add"
+                        data-available-offline="1"
+                        aria-label="New Lead"
+                        title="New Lead"
+                        t-on-click="(ev) => this.onAddClick(ev)">
+                        <i class="oi" data-icon="add_2" aria-hidden="true"/>
+                    </button>
+                </div>
+
+                <div class="o_kanban_group o_crm_mobile_pipeline_body"
+                    role="region"
+                    t-att-aria-label="group.displayName"
+                    t-att-data-id="group.id"
+                    t-key="group.id"
+                    t-on-touchstart="(ev) => this.onTouchStart(ev)"
+                    t-on-touchmove="(ev) => this.onTouchMove(ev)"
+                    t-on-touchend="(ev) => this.onTouchEnd(ev)">
+                    <!-- A lead whose form is not available offline was tapped. -->
+                    <t t-if="this.mobileState.unavailableLeadId">
+                        <OfflineActionHelper/>
+                        <div class="d-flex justify-content-center py-2">
+                            <button type="button"
+                                class="btn btn-secondary o_crm_mobile_pipeline_back"
+                                data-available-offline="1"
+                                aria-label="Back"
+                                title="Back"
+                                t-on-click="() => this.onBackFromHelper()">
+                                <i class="oi me-1" data-icon="arrow_back" aria-hidden="true"/> Back
+                            </button>
+                        </div>
+                    </t>
+                    <t t-else="">
+                        <!-- Framework quick create (New), props as in web.KanbanRenderer. -->
+                        <t t-if="this.props.quickCreateState and group.id === this.props.quickCreateState.id">
+                            <KanbanRecordQuickCreate
+                                quickCreateState="this.props.quickCreateState"
+                                onValidate="(record, mode) => this.validateQuickCreate(record, mode, group)"
+                                resModel="group.resModel"
+                                context="group.context"
+                            />
+                        </t>
+                        <!-- Queued lead creates, keyed by queue key: they leave with their entry. -->
+                        <t t-foreach="this.pendingCreatesFor(group)" t-as="entry" t-key="entry.key">
+                            <CrmMobileLeadCard
+                                pendingCall="entry"
+                                group="group"
+                                stages="this.stageGroups"
+                                displayedStageValue="group.serverValue"
+                            />
+                        </t>
+                        <!-- Records placed in this stage, queued stage writes included. -->
+                        <t t-foreach="this.cardsFor(group)" t-as="record" t-key="record.id">
+                            <CrmMobileLeadCard
+                                record="record"
+                                group="group"
+                                stages="this.stageGroups"
+                                activities="this.mobileState.activitiesByLead[record.resId] ?? null"
+                                activityTypes="this.mobileState.activityTypes"
+                                unavailable="this.isCardUnavailable(record)"
+                                displayedStageValue="group.serverValue"
+                                frameworkStageValue="record.group?.serverValue"
+                                onOpen="(r) => this.onCardOpen(r)"
+                                onMove="(r, targetGroup) => this.onCardMove(r, targetGroup)"
+                                onActivitiesChanged="(resId) => this.onActivitiesChanged(resId)"
+                            />
+                        </t>
+                        <!-- Offline, the stage holds leads none of which was loaded online. -->
+                        <OfflineActionHelper t-if="this.isStageDataMissing(group)"/>
+                        <div t-if="this.unavailableMoreCount(group) > 0"
+                            class="o_crm_mobile_pipeline_unavailable_more text-muted small text-center py-2"
+                            t-out="this.unavailableMoreLabel(group)"/>
+                        <!-- Online only: offline, no uncached read is attempted. -->
+                        <t t-if="!this.crmOffline.isOffline()">
+                            <t t-set="unloadedCount" t-value="this.getGroupUnloadedCount(group)"/>
+                            <div t-if="unloadedCount > 0" class="o_kanban_load_more o_crm_mobile_pipeline_load_more" t-key="unloadedCount">
+                                <button t-if="group.isFolded" type="button"
+                                    class="btn btn-outline-primary w-100 mt-3"
+                                    data-available-offline="1"
+                                    t-on-click="() => this.toggleGroup(group)">Load more... (<t t-out="unloadedCount"/> remaining)</button>
+                                <button t-else="" type="button"
+                                    class="btn btn-outline-primary w-100 mt-3"
+                                    data-available-offline="1"
+                                    t-on-click="() => this.loadMore(group)">Load more... (<t t-out="unloadedCount"/> remaining)</button>
+                            </div>
+                        </t>
+                    </t>
+                </div>
+
+                <t t-if="this.showNoContentHelper">
+                    <ActionHelper noContentHelp="this.props.noContentHelp"/>
+                </t>
+            </div>
+        </t>
+        <t t-else="" t-call="web.KanbanRenderer"/>
+    </t>
+
+</templates>

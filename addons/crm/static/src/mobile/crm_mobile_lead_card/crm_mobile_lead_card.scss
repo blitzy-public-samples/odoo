@@ -1,0 +1,101 @@
+// Mobile lead card of the small-screen CRM pipeline (template `crm.CrmMobileLeadCard`).
+//
+// Layout only: colors, borders and spacing come from the Bootstrap utility classes of the
+// template (`card`, `p-2`, `gap-*`, `text-bg-warning`, `btn-*`, `list-group-*`), so the card
+// follows the active theme and this file holds no palette.
+//
+// Every rule is nested under `.o_crm_mobile_lead_card`: the article also carries
+// `o_kanban_record`, kept only for the upstream kanban selectors, and no other kanban card may be
+// affected by these styles.
+
+// Minimum touch target, in CSS pixels, of the card body and of every card control. File-local on
+// purpose: it is a requirement of this component, not a theme value.
+$o-crm-mobile-touch: 44px;
+
+// Touch targets are set with the physical `min-width`/`min-height` rather than the logical
+// `min-inline-size`/`min-block-size` (logical-property rule): the requirement is a 44x44 CSS-pixel
+// box on both axes, measured as width and height, whatever the writing mode.
+.o_crm_mobile_lead_card {
+    // The card fills the stage body and never shrinks below one touch target, whatever the
+    // inherited kanban record sizing (record width variables, flex shrinking in the column).
+    flex: 0 0 auto;
+    width: 100%;
+    max-width: none;
+    min-height: $o-crm-mobile-touch;
+    cursor: pointer;
+    // Vertical panning stays native; horizontal gestures reach the pipeline's swipe navigation on
+    // the stage body instead of scrolling the page.
+    touch-action: pan-y;
+
+    // Dimming of a lead that is not available offline. It mirrors the framework's offline dimming,
+    // which cannot be used here: the framework strips its own class from elements tagged
+    // `data-available-offline`, as this card is. The card stays tappable: the tap shows the
+    // offline action helper.
+    &.o_crm_mobile_lead_card_unavailable {
+        opacity: 0.5;
+    }
+
+    // A queued lead create has no record to open and no control.
+    &.o_crm_mobile_lead_card_pending {
+        cursor: default;
+    }
+
+    .o_crm_mobile_lead_card_body {
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+    }
+
+    // Single line, truncated with an ellipsis by the template's `text-truncate`; `min-width: 0`
+    // lets the name shrink inside its flex row so the pending badge keeps its room.
+    .o_crm_mobile_lead_card_name {
+        min-width: 0;
+        overflow: hidden;
+    }
+
+    .o_crm_mobile_pending_badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        white-space: nowrap;
+    }
+
+    // The controls stop the click from opening the card: the pointer cursor of the card does
+    // not apply to the area between them.
+    .o_crm_mobile_lead_card_controls {
+        cursor: auto;
+
+        // Action buttons, stage options, follow-up type select and inputs, Save, Cancel and
+        // Mark done: each one is at least one touch target in both directions.
+        button,
+        input,
+        select,
+        .btn,
+        [role="option"] {
+            min-width: $o-crm-mobile-touch;
+            min-height: $o-crm-mobile-touch;
+        }
+
+        .o_crm_mobile_lead_card_actions .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        // Inline follow-up form: each control spans the card width under its label.
+        .o_crm_mobile_lead_card_follow_up {
+            input,
+            select {
+                width: 100%;
+            }
+        }
+    }
+
+    .o_crm_mobile_stage_option {
+        display: flex;
+        align-items: center;
+    }
+
+    .o_crm_mobile_activity_row {
+        min-height: $o-crm-mobile-touch;
+    }
+}

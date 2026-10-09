@@ -501,7 +501,7 @@
             <field name="priority" eval="1"/>
             <field name="arch" type="xml">
                 <kanban  highlight_color="color" default_group_by="stage_id" class="o_kanban_small_column o_opportunity_kanban" on_create="quick_create" quick_create_view="crm.quick_create_opportunity_form"
-                    archivable="false" sample="1" js_class="crm_kanban">
+                    archivable="false" sample="1" js_class="crm_mobile_pipeline">
                     <field name="stage_id" options='{"group_by_tooltip": {"requirements": "Description"}}'/>
                     <field name="probability"/>
                     <field name="active"/>
@@ -514,8 +514,8 @@
                         help="This bar allows to filter the opportunities based on scheduled activities."/>
                     <templates>
                         <t t-name="menu">
-                            <t t-if="widget.editable"><a role="menuitem" type="open" class="dropdown-item">Edit</a></t>
-                            <t t-if="widget.deletable"><a role="menuitem" type="delete" class="dropdown-item">Delete</a></t>
+                            <t t-if="widget.editable"><a role="menuitem" type="open" class="dropdown-item" data-available-offline="1">Edit</a></t>
+                            <t t-if="widget.deletable"><a role="menuitem" type="delete" class="dropdown-item" data-available-offline="1">Delete</a></t>
                             <div role="separator" class="dropdown-divider"></div>
                             <field name="color" widget="kanban_color_picker"/>
                         </t>
