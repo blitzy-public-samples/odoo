@@ -23,7 +23,12 @@
  * - "Inert" always means: no RPC (stepped by a route watcher registered after `mockOffline()`, so
  *   that it sees the requests the offline mock answers with a 502), no record save, no dialog and
  *   no action. Hoot fails a test on any undeclared error, which is how "no uncaught error" is
- *   asserted; only errors the framework itself produces are declared.
+ *   asserted. Two kinds of error are declared: those the framework itself produces offline (a read
+ *   served from the framework RPC cache while offline still tries the server in the background,
+ *   and that refresh rejects with a `ConnectionLostError` nobody awaits; a request in flight when
+ *   the connection drops rejects the same way, and the framework's lost-connection handler
+ *   silences it in production), and server rejections a test simulates on purpose to check that
+ *   they reach the framework unchanged (a group probe and a module lookup the server refuses).
  */
 
 import {
