@@ -1994,7 +1994,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (moved) {
             this.stageState.serverValue = targetGroup.serverValue;
             if (!wasPendingSync && this.crmOffline.isRecordPendingSync(record)) {
-                const lead = leadName(record.data.display_name || record.data.name);
+                const lead = leadName(record.data.name);
                 this._announce([_t("%(lead)s: changes pending sync.", { lead })]);
             }
         }

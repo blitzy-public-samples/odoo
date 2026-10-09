@@ -838,6 +838,37 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
                 else:
                     self.assertTrue(callable(getattr(self.env['res.config.settings'], name, None)))
 
+    def test_mobile_pipeline_arch_fetches_fields_it_reads(self):
+        """ PART 4: the production pipeline arch, as served to a salesman, fetches every lead field the mobile pipeline and its cards read. """
+        pipeline_view = self.env.ref('crm.crm_case_kanban_view_leads')
+        result = self.env['crm.lead'].with_user(self.user_sales_salesman).get_views([(pipeline_view.id, 'kanban')])
+        arch = etree.fromstring(result['views']['kanban']['arch'])
+
+        # the mobile pipeline gate: grouped by stage, rendered by ``crm_mobile_pipeline``
+        self.assertEqual(arch.tag, 'kanban')
+        self.assertEqual(arch.get('js_class'), 'crm_mobile_pipeline')
+        self.assertEqual(arch.get('default_group_by'), 'stage_id')
+        # the stage revenue totals read ``record.data[sum_field]``
+        [progressbar] = arch.xpath('//progressbar')
+        self.assertEqual(progressbar.get('sum_field'), 'expected_revenue')
+
+        # The web client fetches the arch's field nodes and their widgets' declared dependencies;
+        # only relational sub-specs get a ``display_name``, the root record gets none. So the
+        # pipeline must read only fields this arch fetches: root ``display_name`` is not one of them.
+        root_fields = set(arch.xpath('//field[not(ancestor::field)]/@name'))
+        lead_fields = result['models']['crm.lead']['fields']
+        for field_name in (
+            'stage_id',  # pending stage placement, ``CrmKanbanRecord.serverStageId``
+            'expected_revenue',  # stage revenue totals, card revenue
+            'name',  # card name, move and create status announcements
+            'partner_id',  # card partner
+            'contact_name',  # card partner fallback
+            'company_currency',  # card revenue currency
+        ):
+            with self.subTest(field=field_name):
+                self.assertIn(field_name, root_fields)
+                self.assertIn(field_name, lead_fields)
+
     # ------------------------------------------------------------
     # Lane 3: end-to-end offline session on the mobile pipeline
     # ------------------------------------------------------------
