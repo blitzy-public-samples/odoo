@@ -76,6 +76,7 @@ import {
     models,
     mountView,
     MockServer,
+    mountWebClient,
     mountWithCleanup,
     onRpc,
     patchWithCleanup,
@@ -121,11 +122,13 @@ import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import { RottingStatusBarDurationField } from "@mail/js/rotting_mixin/rotting_statusbar";
+import { browser } from "@web/core/browser/browser";
 import { NonSecureContextError } from "@web/core/errors/non_secure_context_error";
 import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
+import { redirect } from "@web/core/utils/urls";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { Many2One } from "@web/views/fields/many2one/many2one";
 import { StatusBarField } from "@web/views/fields/statusbar/statusbar_field";
@@ -2013,6 +2016,127 @@ describe("DISABLE controls and handler enforcement", () => {
         await expect.waitForSteps([`has_group:${SALE_MANAGER_GROUP}`]);
         await expect.waitForErrors(["Group probe refused"]);
         expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(".o_cp_team_switcher").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    /** The browser key under which the CRM search model keeps the selected team. */
+    const SWITCHER_TEAM_KEY = "crm.switcher_team_id";
+
+    /** Asserts that the pipeline shows the cards of the Mushroom Kingdom team: Lead 1 and 3. */
+    function expectMushroomKingdomCards() {
+        expect(".o_kanban_record:not(.o_kanban_ghost)").toHaveCount(2);
+        expect(".o_kanban_record:contains('Lead 1')").toHaveCount(1);
+        expect(".o_kanban_record:contains('Lead 3')").toHaveCount(1);
+    }
+
+    test("team switcher: a pipeline whose switcher data were never cached shows the offline action helper offline, and reads them again once online", async () => {
+        // Offline, the pipeline groups were never cached either: their load fails with a
+        // `ConnectionLostError`, as the framework does, and the kanban shows its offline helper.
+        expect.errors(1);
+        // The team selected in an earlier session.
+        browser.localStorage.setItem(SWITCHER_TEAM_KEY, JSON.stringify(1));
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        onRpc("crm.team", "get_team_switcher_data", () => {
+            expect.step("server:get_team_switcher_data");
+        });
+        // Only a lead form of the pipeline action is opened online, from its URL: the pipeline
+        // itself never loads, so neither its groups nor the team switcher data are cached.
+        redirect(`/odoo/action-${PIPELINE_ACTION_ID}/1`);
+        await mountWebClient();
+        expect(".o_form_view").toHaveCount(1);
+        // The framework's list and kanban controllers probe the export group when they mount. A
+        // server session knows that answer from its session info; the test session asks it here,
+        // online.
+        await user.hasGroup("base.group_allow_export");
+        expect.verifySteps([]);
+
+        await setOffline(true);
+        await visitedReady();
+        await contains(".o_breadcrumb .o_back_button").click();
+        await animationFrame();
+        // The switcher data are asked of the disk cache, which has nothing: the load completes
+        // without the switcher, and the kanban renders the framework's offline action helper for
+        // its uncached groups instead of a blank action.
+        expect.verifySteps([
+            "offline:crm.team/get_team_switcher_data",
+            "offline:crm.lead/read_progress_bar",
+            "offline:crm.lead/web_read_group",
+        ]);
+        await expect.waitForErrors(["crm.lead/web_read_group"]);
+        expect(".o_kanban_view").toHaveCount(1);
+        expect(".o_view_nocontent").toHaveText(/There is no data to display offline/);
+        expect(".o_kanban_record").toHaveCount(0);
+        expect(".o_cp_team_switcher").toHaveCount(0);
+        // The saved team is kept, and nothing is queued.
+        expect(browser.localStorage.getItem(SWITCHER_TEAM_KEY)).toBe("1");
+        expect(queuedEntries()).toHaveLength(0);
+
+        // Back online, a view switch does not restore the empty switcher: the list reads the
+        // switcher data again and selects the saved team.
+        await setOffline(false);
+        await getService("action").switchView("list");
+        expect.verifySteps(["server:get_team_switcher_data"]);
+        expect(".o_list_view").toHaveCount(1);
+        expect(".o_cp_team_switcher").toHaveText("Mushroom Kingdom");
+        // The pipeline restores that switcher from the list's state and loads the team's leads.
+        await getService("action").switchView("kanban");
+        expect(".o_kanban_view").toHaveCount(1);
+        expect(".o_view_nocontent").toHaveCount(0);
+        expect(".o_cp_team_switcher").toHaveText("Mushroom Kingdom");
+        expectMushroomKingdomCards();
+        expect(browser.localStorage.getItem(SWITCHER_TEAM_KEY)).toBe("1");
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test("team switcher: a pipeline whose switcher data were cached online shows the switcher offline, answered by the disk cache", async () => {
+        // Offline, the background refresh of the cached lead form, team switcher data and
+        // pipeline groups fails with a `ConnectionLostError`, as the framework does.
+        expect.errors(3);
+        browser.localStorage.setItem(SWITCHER_TEAM_KEY, JSON.stringify(1));
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await visitPipelineAndLead("Lead 1");
+        expect(".o_cp_team_switcher").toHaveText("Mushroom Kingdom");
+
+        await setOffline(true);
+        await visitedReady();
+        await contains(".o_kanban_record:contains('Lead 1')").click();
+        expect(".o_form_view").toHaveCount(1);
+        await contains(".o_breadcrumb .o_back_button").click();
+        await expect.waitForErrors([
+            "crm.lead/web_read",
+            "crm.team/get_team_switcher_data",
+            "crm.lead/web_read_group",
+        ]);
+        // The pipeline is loaded again from the caches, with the saved team selected and the
+        // switcher disabled.
+        expect(".o_kanban_view").toHaveCount(1);
+        expect(".o_view_nocontent").toHaveCount(0);
+        expect(".o_cp_team_switcher").toHaveText("Mushroom Kingdom");
+        expect(isDisabledOffline(".o_cp_team_switcher")).toBe(true);
+        expectMushroomKingdomCards();
+        expect(browser.localStorage.getItem(SWITCHER_TEAM_KEY)).toBe("1");
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    test("team switcher: a switcher data read the server rejects still fails the pipeline load", async () => {
+        // The server error reaches the framework unchanged: only a lost connection falls back.
+        expect.errors(1);
+        onRpc("crm.team", "get_team_switcher_data", () => {
+            throw makeServerError({ message: "Switcher data refused" });
+        });
+        await mountWithCleanup(WebClient);
+        // Not awaited: the pipeline never finishes loading.
+        getService("action").doAction(PIPELINE_ACTION_ID);
+        await expect.waitForErrors(["Switcher data refused"]);
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(".o_kanban_view").toHaveCount(0);
         expect(".o_cp_team_switcher").toHaveCount(0);
         expect(queuedEntries()).toHaveLength(0);
     });

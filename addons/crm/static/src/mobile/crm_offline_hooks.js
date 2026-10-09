@@ -14,13 +14,16 @@
  *   framework's.
  * - New CRM code queues only `web_save` and `action_archive`: the shared offline systray renders
  *   a status for `web_save`, `unlink`/`web_unlink`, `action_archive` and `action_unarchive` only.
- * - The patches change nothing online and narrow behaviour only offline, for CRM targets, with two
- *   exceptions. The availability registration (`RelationalModel._setAvailableOffline`) never
+ * - The patches change nothing online and narrow behaviour only offline, for CRM targets, with
+ *   three exceptions. The availability registration (`RelationalModel._setAvailableOffline`) never
  *   registers the forecast views or the activity report, online too, while their online loading
- *   and rendering stay as they are. The only widening patch (`Many2One`, `dropdown: false` in its
- *   autocomplete props) applies offline, on small screens, in `crm.lead` views only.
+ *   and rendering stay as they are. Two patches widen behaviour, offline only: `Many2One`
+ *   (`dropdown: false` in its autocomplete props), on small screens in `crm.lead` views, and the
+ *   CRM search model, whose load completes without the team switcher instead of failing when the
+ *   connection is lost and the switcher data were never cached.
  */
 
+import { CrmSearchModel } from "@crm/views/crm_search_model";
 import { computed, untrack, useEffect, usePlugin } from "@odoo/owl";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
@@ -1057,6 +1060,50 @@ patch(StatusBarField.prototype, {
             return;
         }
         return super.selectItem(...arguments);
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Team switcher data never cached
+// -----------------------------------------------------------------------------
+
+patch(CrmSearchModel.prototype, {
+    /**
+     * A CRM view reads the team switcher data when it loads, through the framework RPC disk cache,
+     * which answers that read offline once a view of the action has made it online. Offline with
+     * nothing cached, the read rejects with a `ConnectionLostError`, which would fail the search
+     * model load and leave the whole action blank. The load then completes without the switcher
+     * (unavailable, no teams, no team selected), so the view renders as it does offline, with the
+     * framework's offline action helper for data it has not cached. Selecting a team is
+     * unavailable offline anyway. The team saved in the browser is kept: resolving it against no
+     * teams would clear it. A load that gets the data and every other error are unchanged.
+     */
+    async _initSwitcher(config) {
+        this._crmSwitcherDataMissing = false;
+        try {
+            await super._initSwitcher(...arguments);
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
+            }
+            this._crmSwitcherDataMissing = true;
+            this.state.switcherAvailable = false;
+            this.state.switcherTeams = [];
+        }
+    },
+    /**
+     * A load that completed without the team switcher data exports no team switcher state, so the
+     * next load of the view (a view switch or a breadcrumb return) reads the data again instead of
+     * restoring the empty switcher. Every other export is unchanged.
+     *
+     * @returns {Object}
+     */
+    exportState() {
+        const state = super.exportState(...arguments);
+        if (this._crmSwitcherDataMissing) {
+            delete state.teamSwitcherState;
+        }
+        return state;
     },
 });
 
