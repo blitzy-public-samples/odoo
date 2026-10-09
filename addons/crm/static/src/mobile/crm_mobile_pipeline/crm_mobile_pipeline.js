@@ -11,8 +11,9 @@
  *   create bottom sheet and the offline helpers. Everywhere else its template renders the standard
  *   `web.KanbanRenderer`, so desktop and every other grouping keep exactly the kanban DOM;
  * - `CrmMobilePipelineController`, the controller adapter: it keeps the displayed stage across
- *   reloads and breadcrumbs, restores the mobile scroll of that stage, and opens the framework quick
- *   create (New) in the displayed stage. Outside the mobile pipeline every override calls `super`.
+ *   reloads and breadcrumbs, restores the mobile scroll of that stage, and opens the framework
+ *   quick create (New) in the displayed stage. Outside the mobile pipeline every override calls
+ *   `super`.
  *
  * Model, arch parser, search model, control panel and button template stay the CRM kanban view's:
  * there is no second model.
@@ -1152,9 +1153,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * key). When entries of equal arguments match, the earliest by timestamp still without an id
      * gets it, the order the framework replays them in. The id outlives the spent mark: it lasts
      * while the copy holds the entry and is emptied with the copy. `_pendingCreateFilter` reads
-     * it, so a lead that a load already holds is presented once. This is not id remapping: no queued
-     * call is rewritten and nothing is persisted; the framework's own replay answer only tells the
-     * window's copy that its create is now a loaded server record.
+     * it, so a lead that a load already holds is presented once. This is not id remapping: no
+     * queued call is rewritten and nothing is persisted; the framework's own replay answer only
+     * tells the window's copy that its create is now a loaded server record.
      *
      * Without a copy, neither the listener nor the effect reads anything else, so desktop and
      * every session outside a sync window do no work.

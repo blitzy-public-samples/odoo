@@ -1,56 +1,31 @@
 /**
- * Lead card of the small-screen CRM pipeline (`CrmMobilePipeline`).
+ * Lead card of the small-screen CRM pipeline: only `CrmMobilePipeline` renders it, never desktop,
+ * and its template `crm.CrmMobileLeadCard` is plain HTML, hence no `static components`. It shows a
+ * `crm.lead` framework `record` or a queued lead create (`pendingCall`).
  *
- * Only the mobile pipeline renders it, so desktop never sees it. The template
- * (`crm.CrmMobileLeadCard`, sibling `.xml`) uses plain HTML only, hence no `static components`.
- *
- * The card shows one lead, either a framework record of `crm.lead` (`record`) or a queued lead
- * create that has not reached the server yet (`pendingCall`), and offers, for a persisted lead:
- * - a stage list: choosing a stage asks the pipeline to move the card through the framework
- *   kanban move (choosing the won stage is mark-won); the framework queues the stage write offline;
- * - Log call and Follow-up: `mail.activity` creates (`web_save`), queued offline;
- * - an activity list with Mark done: `action_done` online, `action_archive` (state only) offline.
- *   The pipeline loads a bounded page of activities with their total count; the count shows the
- *   total, and when the page misses some the list ends with "Show all (N)" online or "N more
- *   activities are not available offline" offline, so no activity is hidden silently.
- *
- * Offline rules:
- * - All offline state is read through `useCrmOffline()`. The card keeps no dirty flag and persists
- *   nothing: the pending-sync badge and the pending activity rows are derived from the live
- *   framework offline queue, memoized and recomputed on every queue change, so they clear when
- *   replay or a systray discard removes the entry. A pending lead create stays on screen as long
- *   as the pipeline holds it (through a sync window, until the reconciliation reload), but its
- *   badge follows the live queue: it clears as soon as its own entry has been replayed.
- * - The card queues only `mail.activity` `web_save` and `mail.activity` `action_archive`, the two
- *   families the shared offline systray renders, through `runOrQueue`.
- * - Activities need the lead's server id, so a pending lead create offers no action at all, and an
- *   activity that is itself a pending create offers no Mark done (it has no server id either).
- * - Meeting and upload activity types are never offered for creation (a meeting needs a calendar
- *   round-trip, an upload a file transfer). Marking any persisted activity done is offered whatever
- *   its category, because archiving only writes `active`.
- * - The activity owner is always the session user: no assignee picker is offered.
- * - The handlers that open the lead, toggle a panel, move the card or write an activity
- *   (`onOpenCard`, `toggleStageList`, `onChooseStage`, `onLogCall`, `toggleFollowUp`,
- *   `onSaveFollowUp`, `onMarkDone`, `toggleActivities`) re-check their own predicate first, so a
- *   direct call, without a DOM event or on a control the template renders disabled, does nothing
- *   while that predicate fails. The follow-up input handlers (`onFollowUpType`,
- *   `onFollowUpSummary`, `onFollowUpDate`) only copy their event's value into the card's local
- *   state, and need that event; `onCancelFollowUp` only resets the follow-up form.
- * - A call that completes after the card was destroyed (stage navigation, a filter, a move or a
- *   reload re-keyed or removed it) writes no card state. After an online activity write that
- *   succeeded, the card still asks the pipeline to read the lead's activities again; the pipeline
- *   reads them only while it is alive and displays the lead.
- *
- * Status region: a polite, atomic `role="status"` element, empty at mount, announces what changes
- * while the card stays mounted (lead write pending sync or no longer, activity create or mark done
- * queued or no longer pending), and the Activities count only when the user's own activity call on
- * this card changed it. The changes are compared between two snapshots of the same queue-derived
- * getters the template renders, so nothing is stored but the last snapshot and, in memory, whether
- * an online activity call of this card awaits its re-read. A change that creates, remounts or
- * destroys a card (a stage move, a pending create appearing or leaving) is the pipeline's status
- * region's to announce: the card's region would take it as its mount state, or be gone. A pending
- * lead create's card stays silent: the pipeline's region alone tells a queued create appearing
- * and leaving the queue, also when a sync window keeps the card on screen after its replay.
+ * - All offline state is read through `useCrmOffline()`: no dirty flag, nothing persisted. Pending
+ *   badges and rows are derived from the live framework queue (memoized), so they clear on replay
+ *   or a systray discard. A pending lead create stays on screen while the pipeline holds it, but
+ *   its badge follows the live queue.
+ * - Through `runOrQueue` it queues only `mail.activity` `web_save` and `mail.activity`
+ *   `action_archive`, the two families the shared offline systray renders.
+ * - Activities need server ids: a pending lead create offers no action, a pending activity create
+ *   no Mark done. Meeting and upload types are never offered for creation; Mark done is offered
+ *   for every persisted activity, as archiving writes only `active`. The activity owner is always
+ *   the session user: no assignee picker.
+ * - Activities are a bounded page with the server total: the list ends with "Show all (N)" online
+ *   or "N more activities are not available offline" offline, so nothing is hidden silently.
+ * - The guarded handlers (`onOpenCard`, `toggleStageList`, `onChooseStage`, `onLogCall`,
+ *   `toggleFollowUp`, `onSaveFollowUp`, `onMarkDone`, `toggleActivities`) re-check their
+ *   predicate, so a direct call is inert while it fails. The follow-up input handlers only copy
+ *   their event's value; `onCancelFollowUp` resets and closes the form, and gives the focus back
+ *   to Follow-up unless it was moved out of the form (see `_focusAfterFollowUp`).
+ * - A call ending after the card was destroyed writes no card state; a successful online activity
+ *   write still asks the pipeline to re-read (it reads only if alive and showing the lead).
+ * - Status region (polite, atomic `role="status"`, empty at mount): it announces queue changes
+ *   while the card stays mounted, and the Activities count only after the user's own activity
+ *   call (see `_announceSyncChanges`). Card creation, remount and destruction, and pending lead
+ *   creates, are the pipeline's status region's to announce.
  */
 
 import {
@@ -150,15 +125,29 @@ export class CrmMobileLeadCard extends Component {
     stageButtonRef = signal.ref();
     /** The stage listbox, while it is open. */
     stageListRef = signal.ref();
+    /** The Follow-up button, which gets the focus back when Cancel or a Save closes the form. */
+    followUpButtonRef = signal.ref();
+    /** The follow-up form, while it is open. */
+    followUpFormRef = signal.ref();
 
     setup() {
         this.crmOffline = useCrmOffline();
         /** Whether the next patch moves the focus into the stage list just opened. */
         this.focusStageListOnPatch = false;
+        /**
+         * Whether the next patch gives the focus back to Follow-up: Cancel or a Save closed the
+         * follow-up form while it held the focus (see `onCancelFollowUp`).
+         */
+        this.focusFollowUpOnPatch = false;
         onPatched(() => {
             if (this.focusStageListOnPatch) {
                 this.focusStageListOnPatch = false;
                 this._focusActiveStageOption();
+            }
+            // Only on the patch that removed the form: a render started earlier may patch first.
+            if (this.focusFollowUpOnPatch && !this.followUpFormRef()) {
+                this.focusFollowUpOnPatch = false;
+                this._focusAfterFollowUp();
             }
         });
         this.state = proxy({
@@ -203,7 +192,6 @@ export class CrmMobileLeadCard extends Component {
     // Getters: lead
     // -------------------------------------------------------------------------
 
-    /** Whether the card shows a queued lead create rather than a record. */
     get isPending() {
         return !!this.props.pendingCall;
     }
@@ -213,7 +201,6 @@ export class CrmMobileLeadCard extends Component {
         return !this.isPending && !!this.props.record?.resId;
     }
 
-    /** Values of the queued create (the quick-create values), or an empty object. */
     get pendingValues() {
         return this.props.pendingCall?.value?.args?.[1] ?? {};
     }
@@ -263,8 +250,9 @@ export class CrmMobileLeadCard extends Component {
      *
      * A pending create counts only while its own key is still queued. The pipeline keeps showing a
      * replayed create from its sync-window copy until the reconciliation reload; that card stays,
-     * without the badge. A create parked with an error is re-queued under the same key and keeps it.
-     * The card's status region never announces a pending create's badge (see `_readSyncSnapshot`).
+     * without the badge. A create parked with an error is re-queued under the same key and keeps
+     * it. The card's status region never announces a pending create's badge (see
+     * `_readSyncSnapshot`).
      *
      * Memoized (as every queue projection of the card): the queue is read again only when the
      * queue signal or the props change, not on every access.
@@ -346,7 +334,6 @@ export class CrmMobileLeadCard extends Component {
             )
     );
 
-    /** Cached activities of the lead, as read by the pipeline (a bounded page). */
     get activityRows() {
         return this.props.activities ?? [];
     }
@@ -663,7 +650,6 @@ export class CrmMobileLeadCard extends Component {
         }
     }
 
-    /** Logs a call for today with the first cached `phonecall` type. */
     async onLogCall() {
         if (!this.canLogCall) {
             return;
@@ -689,7 +675,6 @@ export class CrmMobileLeadCard extends Component {
         this.state.followUpOpen = open;
     }
 
-    /** Schedules the follow-up entered in the inline form, then closes the form. */
     async onSaveFollowUp() {
         if (!this.canFollowUp) {
             return;
@@ -704,7 +689,17 @@ export class CrmMobileLeadCard extends Component {
         }
     }
 
+    /**
+     * Closes and resets the follow-up form: Cancel, and a Save that completed. When the form held
+     * the focus, or the focus had already fallen to the page (Save is disabled while it saves),
+     * the patch that removes the form gives it back to Follow-up (see `_focusAfterFollowUp`). A
+     * focus put anywhere else is left where it is, and a call while the form is not rendered (a
+     * pending create's card has none) moves no focus. Closing the form with the Follow-up toggle
+     * or by opening another panel (`_closePanels`) moves no focus either.
+     */
     onCancelFollowUp() {
+        // Read before the patch that removes the form and, with it, the focus it holds.
+        this.focusFollowUpOnPatch = this._followUpFormHasFocus();
         this.state.followUpOpen = false;
         this.state.summary = "";
         this.state.date = serializeDate(today());
@@ -801,8 +796,9 @@ export class CrmMobileLeadCard extends Component {
     // Private
     // -------------------------------------------------------------------------
 
-    /** Closes the stage list, the follow-up form and the activity list. */
     _closePanels() {
+        // A panel toggled since the follow-up form closed keeps the focus where the user put it.
+        this.focusFollowUpOnPatch = false;
         this.state.stageListOpen = false;
         this.state.followUpOpen = false;
         this.state.activitiesOpen = false;
@@ -822,6 +818,42 @@ export class CrmMobileLeadCard extends Component {
         }
         const index = this.stageOptions.findIndex((option) => option.key === active.key);
         list.querySelectorAll("[role=option]")[index]?.focus();
+    }
+
+    /**
+     * @private
+     * @returns {boolean} whether the follow-up form is rendered and holds the focus, or the focus
+     *   has fallen to the page (the document body, or no element)
+     */
+    _followUpFormHasFocus() {
+        const form = this.followUpFormRef();
+        if (!form) {
+            return false;
+        }
+        const doc = form.ownerDocument;
+        const active = doc.activeElement;
+        return !active || active === doc.body || form.contains(active);
+    }
+
+    /**
+     * Gives the focus back to the Follow-up button once the patch has removed the follow-up form
+     * (see `onCancelFollowUp`). While Follow-up is disabled (a call of the card is in flight, or
+     * no creatable type is cached any more), the Stage button of the same row, which is never
+     * disabled, takes it instead. Nothing when a control took the focus since the form closed.
+     *
+     * @private
+     */
+    _focusAfterFollowUp() {
+        const button = this.followUpButtonRef();
+        if (!button) {
+            return;
+        }
+        const doc = button.ownerDocument;
+        const active = doc.activeElement;
+        if (active && active !== doc.body) {
+            return;
+        }
+        (button.disabled ? this.stageButtonRef() : button)?.focus();
     }
 
     /**
@@ -880,8 +912,8 @@ export class CrmMobileLeadCard extends Component {
      * The Activities count is announced only for a change the user made on this card:
      * - together with an activity create it queued, which raises the visible count at once;
      * - at the first change of the persisted rows (or of their server total) after one of its
-     *   online creates or mark dones succeeded (`_expectActivityChange`): the re-read that call asked for. The expectation
-     *   ends with that change.
+     *   online creates or mark dones succeeded (`_expectActivityChange`): the re-read that call
+     *   asked for. The expectation ends with that change.
      * No other count change is announced. A create or mark done leaving the queue (replay or
      * discard) is told by "no longer pending sync" alone, and a background re-read (activity
      * revalidation, the reconciliation reload after a sync, on this card or on one remounted by

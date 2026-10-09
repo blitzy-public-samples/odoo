@@ -16,7 +16,8 @@
  * - It never sends `partner_id`: the contact is captured as `contact_name` (char), so no contact is
  *   created offline. No user or assignee is chosen either: the server applies the session user.
  * - It has no offline machinery of its own and registers nothing. It is opened only by the mobile
- *   pipeline, through `usePopover(CrmMobileQuickCreate, { useBottomSheet: true, withScope: true })`.
+ *   pipeline, through
+ *   `usePopover(CrmMobileQuickCreate, { useBottomSheet: true, withScope: true })`.
  *   `withScope` makes the sheet share the pipeline's plugin manager, hence its env and action
  *   config: the queued call is listed in the systray under the pipeline's action.
  * - Focus: the sheet focuses its lead name input as it opens; the pipeline moves the focus back

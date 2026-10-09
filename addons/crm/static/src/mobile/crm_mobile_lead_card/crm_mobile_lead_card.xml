@@ -2,42 +2,31 @@
 <templates xml:space="preserve">
 
     <!--
-        Lead card of the small-screen CRM pipeline (CrmMobileLeadCard).
+        Every interactive element is tagged data-available-offline. A control that must stay
+        unusable renders an explicit `disabled` the framework never removes, and its handler
+        re-checks the same predicate. An unavailable card is dimmed with
+        o_crm_mobile_lead_card_unavailable only, because the framework strips its own
+        offline-disabled class from data-available-offline elements.
 
-        Offline rules carried by this markup:
-        - Every interactive element is tagged data-available-offline, so the framework offline UI
-          leaves it usable. Controls that must stay unusable (Log call or Follow-up without a cached
-          activity type, the stages the card cannot move to) render an explicit `disabled` that the
-          framework never removes, and their handlers re-check the same predicate.
-        - An unavailable card is dimmed with o_crm_mobile_lead_card_unavailable only: the framework
-          strips its own offline-disabled class from data-available-offline elements.
-        - The article has no tabindex and no role, so the inherited kanban renderer hotkeys never
-          act on it (Space on a focused .o_kanban_record would toggle record selection). Keyboard
-          users open the lead with the native open button that wraps the name (Tab to it, then
-          Enter or Space); its accessible name is the visible lead name. A tap anywhere on the card
-          outside the controls opens the lead too.
-        - Space keydowns from any control of the card stop at the article (onCardKeydown): the
-          inherited kanban Space hotkey listens on the window and would otherwise cancel the
-          native activation of the focused button.
-        - The stage list is a listbox with a roving tabindex over its enabled options: opening it
-          focuses the active option, ArrowDown/ArrowUp/Home/End move among the enabled options,
-          Escape closes it and focuses Stage again, and Enter or Space chooses the focused option.
-          The arrow, Home, End and Escape keys stop at the list, so the inherited kanban arrow
-          hotkeys never run inside it.
-        - The lead name is the first span of the article and a leaf: the upstream mobile main flow
-          opens the lead by clicking `.o_kanban_record span:contains(name)`, and the click bubbles
-          through the open button to onOpenCard, which therefore runs once. Clicks inside the
-          controls never open the card.
-        - A pending lead create shows its queued values and the badge, with no control at all: its
-          name stays a plain span, as there is nothing to open.
-        - The visually hidden status region (role=status, polite, atomic) is rendered, empty, from
-          mount so assistive technologies register it, outside every control and after the name.
-          It announces, naming the lead, the queue changes seen while the card stays mounted, and
-          the Activities count only when the user's own activity call on this card changed it
-          (_announceSyncChanges); the article itself is no live region. A pending lead create's
-          card keeps it silent: the pipeline's status region alone tells a queued create
-          appearing and leaving the queue. Its message is a div, never a span, so the name stays
-          the only span with the lead name.
+        The article has no tabindex and no role, so the inherited kanban hotkeys never act on it
+        (Space on a focused .o_kanban_record would toggle record selection). Keyboard users open
+        the lead with the native open button wrapping the name (Enter or Space), whose accessible
+        name is the visible lead name; a tap outside the controls opens it too. Space keydowns stop
+        at the article (onCardKeydown): the window-level kanban Space hotkey would otherwise cancel
+        the native button activation. The stage list is a listbox with a roving tabindex:
+        ArrowDown/ArrowUp/Home/End move among the enabled options, Escape closes it and focuses
+        Stage again, Enter or Space chooses; the arrow, Home, End and Escape keys stop at the list.
+        Cancel, or a completed Save, closing the follow-up form gives the focus back to Follow-up
+        (to Stage while Follow-up is disabled), unless the focus was moved out of the form.
+
+        The lead name is the first span of the article and a leaf: the upstream mobile main flow
+        clicks `.o_kanban_record span:contains(name)`, and the click bubbles through the open button
+        to onOpenCard, once. A pending create's name is a plain span with no controls.
+
+        The visually hidden status region is rendered empty from mount, so assistive technologies
+        register it, outside every control and after the name. Its message is a div, never a span,
+        so the name stays the only span with the lead name. In-place queue changes are the card's to
+        announce, pending creates the pipeline's status region's (see _announceSyncChanges).
     -->
     <t t-name="crm.CrmMobileLeadCard">
         <article class="o_kanban_record o_crm_mobile_lead_card card mb-2 p-2 w-100"
@@ -96,6 +85,7 @@
                         aria-label="Follow-up"
                         t-att-disabled="!this.canFollowUp"
                         t-att-aria-expanded="this.state.followUpOpen ? 'true' : 'false'"
+                        t-ref="this.followUpButtonRef"
                         t-on-click.stop="() => this.toggleFollowUp()">
                         <i class="oi oi-fw" data-icon="schedule" aria-hidden="true"/> Follow-up
                     </button>
@@ -134,7 +124,8 @@
                 </div>
 
                 <!-- No assignee picker (the owner is the session user), no upload, no meeting type. -->
-                <div t-if="this.state.followUpOpen" class="o_crm_mobile_lead_card_follow_up d-flex flex-column gap-2 mt-2">
+                <div t-if="this.state.followUpOpen" class="o_crm_mobile_lead_card_follow_up d-flex flex-column gap-2 mt-2"
+                    t-ref="this.followUpFormRef">
                     <label class="form-label mb-0">Activity type
                         <select class="form-select o_crm_mobile_follow_up_type"
                             data-available-offline="1"

@@ -29,8 +29,9 @@ export class LeadGenerationDropdown extends Component {
         this.dialogs = useService("dialog");
         this.action = useService("action");
         // Lead generation (module lookup, access probe, install, import, access request) needs
-        // the server, so every entry point below returns at once while offline. Online
-        // behaviour is unchanged.
+        // the server, so its server-backed entry points (`toggleDropdown`, `onClickAction`, the
+        // Install confirmation's `confirm`, `redirectToImport`, `requestAccess`) return at once
+        // while offline. Online behaviour is unchanged.
         this.crmOffline = useCrmOffline();
         this.newContentText = {
             FAILED_TO_INSTALL: _t('Failed to install "%(module_name)s"'),
@@ -124,8 +125,8 @@ export class LeadGenerationDropdown extends Component {
     }
 
     async toggleDropdown() {
-        // Offline: no module lookup and no access probe. The "already opened" flag stays unset,
-        // so the first online open still loads `modulesInfo`.
+        // Offline: no module lookup and no access probe. Toggling leaves the initialization state
+        // unchanged, so an uninitialized dropdown loads `modulesInfo` on its first online open.
         if (this.crmOffline.isOffline()) {
             return;
         }

@@ -26,7 +26,7 @@ patch(ActivityMenu.prototype, {
     },
 
     openActivityGroup(group, filter = "all", newWindow) {
-        // fetch the data from the button otherwise fetch the ones from the parent (.o_ActivityMenuView_activityGroup).
+        // CRM leads open the CRM activity action filtered by `filter`; others use the mail default.
         const context = {};
         if (group.model === "crm.lead") {
             // The CRM activity views cannot be loaded offline: the entry and its Late/Today/Future
@@ -47,7 +47,8 @@ patch(ActivityMenu.prototype, {
             } else {
                 context["search_default_activities_upcoming_all"] = 1;
             }
-            // Force a search_count for activity-filtered results even when the current page is not full.
+            // Force a search_count for activity-filtered results
+            // even when the current page is not full.
             context["force_search_count"] = 1;
             this.action.loadAction("crm.crm_lead_action_my_activities").then((action) => {
                 // The connection may have dropped while the action was loading: open nothing.

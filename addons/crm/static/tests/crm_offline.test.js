@@ -666,10 +666,10 @@ const LEAD_CHATTER_FORM_ARCH = /* xml */ `
     </form>`;
 
 /**
- * Pipeline kanban mirroring `crm_case_kanban_view_leads` (card menu, color, priority). The card-menu
- * Edit and Delete anchors repeat the production arch's offline attribute, so the tests prove only
- * that the card compiler copies it onto the rendered anchors; the production arch's values are
- * asserted by the lane-1 `test_offline_availability_view_wiring`.
+ * Pipeline kanban mirroring `crm_case_kanban_view_leads` (card menu, color, priority). The
+ * card-menu Edit and Delete anchors repeat the production arch's offline attribute, so the tests
+ * prove only that the card compiler copies it onto the rendered anchors; the production arch's
+ * values are asserted by the lane-1 `test_offline_availability_view_wiring`.
  */
 const LEAD_KANBAN_ARCH = /* xml */ `
     <kanban js_class="crm_kanban" highlight_color="color" default_group_by="stage_id"
@@ -4002,7 +4002,8 @@ describe("SKIP and remaining DISABLE", () => {
     /**
      * @param {ScheduledMessage[]} instances captured scheduled message components
      * @param {string} model
-     * @returns {ScheduledMessage | undefined} the mounted one showing a scheduled message of `model`
+     * @returns {ScheduledMessage | undefined} the mounted one showing a scheduled message of
+     *  `model`
      */
     function mountedScheduledMessage(instances, model) {
         return instances.findLast(

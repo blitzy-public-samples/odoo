@@ -352,7 +352,8 @@ export async function loadLeadActivities(orm, resId, onUpdate, options = {}) {
 // -----------------------------------------------------------------------------
 
 /**
- * @typedef {{ model: string, method: string, args: any[], kwargs: Object, extras: Object }} QueuedCall
+ * @typedef {{ model: string, method: string, args: any[], kwargs: Object,
+ *   extras: Object }} QueuedCall
  * @typedef {{ key: string | number, value: QueuedCall }} QueueEntry an entry of the framework
  *   offline queue, exactly as `OfflinePlugin._ormToSync()` stores it
  */

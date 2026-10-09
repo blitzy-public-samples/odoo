@@ -7738,6 +7738,239 @@ describe("Mobile quick create", () => {
     });
 
     test.tags("mobile");
+    test("mobile: follow-up Cancel, tapped or from the keyboard, gives the focus back to Follow-up, or to Stage while Follow-up is disabled; the toggle and another panel move no focus", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const logCall = Promise.withResolvers();
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await logCall.promise;
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        const card = cardOf("Lead 1");
+        const lead1Card = cards.find(
+            (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
+        );
+        const followUp = `${card} .o_crm_mobile_card_follow_up`;
+        const form = `${card} .o_crm_mobile_lead_card_follow_up`;
+        const cancel = `${card} .o_crm_mobile_follow_up_cancel`;
+        const summary = `${card} .o_crm_mobile_follow_up_summary`;
+        queryOne(followUp).addEventListener("focus", () => expect.step("Follow-up focused"));
+
+        // A tap on Cancel: the form leaves with the focus, and Follow-up takes it back.
+        await contains(followUp).click();
+        expect.verifySteps(["Follow-up focused"]);
+        expect(form).toHaveCount(1);
+        await contains(cancel).click();
+        expect(form).toHaveCount(0);
+        expect(followUp).toBeFocused();
+        expect(followUp).toHaveAttribute("aria-expanded", "false");
+        expect.verifySteps(["Follow-up focused"]);
+
+        // From the keyboard: Enter on Follow-up opens the form, Enter on its Cancel closes it.
+        await press("Enter");
+        await animationFrame();
+        expect(form).toHaveCount(1);
+        queryOne(cancel).focus();
+        await press("Enter");
+        await animationFrame();
+        expect(form).toHaveCount(0);
+        expect(followUp).toBeFocused();
+        expect.verifySteps(["Follow-up focused"]);
+        expect(queued()).toHaveLength(0);
+
+        // Another panel opened from the form keeps the focus it takes: the stage list its first
+        // enabled option, the Activities toggle its own.
+        await contains(followUp).click();
+        expect(form).toHaveCount(1);
+        queryOne(summary).focus();
+        await contains(`${card} .o_crm_mobile_card_stage`).click();
+        expect(form).toHaveCount(0);
+        expect(`${card} .o_crm_mobile_stage_option[data-stage-value='2']`).toBeFocused();
+        await contains(followUp).click();
+        expect.verifySteps(["Follow-up focused"]);
+        queryOne(summary).focus();
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(form).toHaveCount(0);
+        expect(`${card} .o_crm_mobile_card_activities`).toBeFocused();
+        // The Follow-up toggle closing the form moves no focus either.
+        await contains(followUp).click();
+        expect.verifySteps(["Follow-up focused"]);
+        queryOne(summary).focus();
+        lead1Card.toggleFollowUp();
+        await animationFrame();
+        expect(form).toHaveCount(0);
+        expect(document.activeElement).toBe(document.body);
+        expect.verifySteps([]);
+
+        // While a Log call is in flight Follow-up is disabled: Cancel focuses Stage instead, and
+        // the completed call moves no focus.
+        await contains(followUp).click();
+        expect.verifySteps(["Follow-up focused"]);
+        await contains(`${card} .o_crm_mobile_card_log_call`).click();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        expect(followUp).toHaveAttribute("disabled");
+        await contains(cancel).click();
+        expect(form).toHaveCount(0);
+        expect(`${card} .o_crm_mobile_card_stage`).toBeFocused();
+        logCall.resolve();
+        await animationFrame();
+        expect(lead1Card.state.busy).toBe(false);
+        expect(followUp).not.toHaveAttribute("disabled");
+        expect(`${card} .o_crm_mobile_card_stage`).toBeFocused();
+        expect.verifySteps([]);
+
+        // Called directly, without a DOM event, while the form is closed: no focus moves, on a
+        // lead card as on a pending create's card, which renders no form.
+        lead1Card.onCancelFollowUp();
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_card_stage`).toBeFocused();
+        const pending = await mountStandaloneCard({
+            pendingCall: { key: "bare", value: { model: "crm.lead", method: "web_save" } },
+        });
+        queryOne(`${card} .o_crm_mobile_card_stage`).focus();
+        pending.onCancelFollowUp();
+        await animationFrame();
+        expect({ ...pending.state }).toEqual(untouchedCardState());
+        expect(`${card} .o_crm_mobile_card_stage`).toBeFocused();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a completed follow-up Save, online or queued offline, gives the focus back to Follow-up as it closes the form", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        let save = null;
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await save?.promise;
+        });
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const card = cardOf("Lead 1");
+        const followUp = `${card} .o_crm_mobile_card_follow_up`;
+        const form = `${card} .o_crm_mobile_lead_card_follow_up`;
+        const saveButton = `${card} .o_crm_mobile_follow_up_save`;
+        const summary = `${card} .o_crm_mobile_follow_up_summary`;
+        const serverSummaries = () =>
+            MockServer.env["mail.activity"]
+                .search_read(
+                    [
+                        ["res_model", "=", "crm.lead"],
+                        ["res_id", "=", 1],
+                    ],
+                    ["summary"]
+                )
+                .map((activity) => activity.summary);
+
+        // Online: Save is disabled while its call runs, and the completed call closes the form
+        // and focuses Follow-up.
+        save = Promise.withResolvers();
+        await contains(followUp).click();
+        await contains(summary).edit("Send the proposal", { confirm: false });
+        await contains(saveButton).click();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        expect(saveButton).toHaveAttribute("disabled");
+        expect(followUp).toHaveAttribute("disabled");
+        save.resolve();
+        await animationFrame();
+        expect(form).toHaveCount(0);
+        expect(followUp).toBeFocused();
+        expect(serverSummaries()).toEqual(["Send the proposal"]);
+
+        // Online, with the focus moved to the summary while the call runs: still in the form, so
+        // it goes back to Follow-up as well.
+        save = Promise.withResolvers();
+        await contains(followUp).click();
+        await contains(summary).edit("Check in", { confirm: false });
+        await contains(saveButton).click();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        queryOne(summary).focus();
+        save.resolve();
+        await animationFrame();
+        expect(form).toHaveCount(0);
+        expect(followUp).toBeFocused();
+        expect(serverSummaries()).toEqual(["Send the proposal", "Check in"]);
+
+        // Offline: the queued create closes the form, and Follow-up has the focus.
+        await setOffline(true);
+        await contains(followUp).click();
+        await contains(summary).edit("Call back", { confirm: false });
+        await contains(saveButton).click();
+        expect(form).toHaveCount(0);
+        const queuedSummaries = queuedCalls("mail.activity", "web_save").map(
+            ({ args }) => args[1].summary
+        );
+        expect(queuedSummaries).toEqual(["Call back"]);
+        expect(followUp).toBeFocused();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a focus moved out of the follow-up form before its Save completes stays where it was put, and a Save completing after its card was destroyed moves no focus", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        let save = null;
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await save.promise;
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        const card = cardOf("Lead 1");
+        const followUp = `${card} .o_crm_mobile_card_follow_up`;
+        const form = `${card} .o_crm_mobile_lead_card_follow_up`;
+        const saveButton = `${card} .o_crm_mobile_follow_up_save`;
+        const startSave = async () => {
+            save = Promise.withResolvers();
+            await contains(followUp).click();
+            await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Send the proposal", {
+                confirm: false,
+            });
+            await contains(saveButton).click();
+            await expect.waitForSteps(["mail.activity/web_save"]);
+        };
+
+        // Moved to a pipeline control while the call runs: the focus stays there.
+        await startSave();
+        queryOne(".o_crm_mobile_pipeline_next").focus();
+        save.resolve();
+        await animationFrame();
+        expect(form).toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_next").toBeFocused();
+
+        // Moved to another control of the same card: it stays there too.
+        await startSave();
+        queryOne(`${card} .o_crm_mobile_card_activities`).focus();
+        save.resolve();
+        await animationFrame();
+        expect(form).toHaveCount(0);
+        expect(`${card} .o_crm_mobile_card_activities`).toBeFocused();
+
+        // Stage navigation destroys the card while its call runs: the completion writes no state
+        // on it and moves no focus.
+        await startSave();
+        const lead1Card = cards.find(
+            (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
+        );
+        await goToStage("Qualified");
+        expect(status(lead1Card)).toBe("destroyed");
+        const focused = document.activeElement;
+        save.resolve();
+        await animationFrame();
+        expect(lead1Card.state.followUpOpen).toBe(true);
+        expect(document.activeElement).toBe(focused);
+        expect(
+            MockServer.env["mail.activity"].search_read(
+                [
+                    ["res_model", "=", "crm.lead"],
+                    ["res_id", "=", 1],
+                ],
+                ["summary"]
+            )
+        ).toHaveLength(3);
+    });
+
+    test.tags("mobile");
     test("mobile: quick create on a sample-data pipeline leaves sample mode like the framework quick create", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         await makeMockServer();

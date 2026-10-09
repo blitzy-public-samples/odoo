@@ -65,8 +65,8 @@
 
     <!--
         Form variants are primary templates built from their parent as it stood in the `web`
-        block, so the `web.EmailField` / `web.UrlField` extensions above do not reach them: each
-        form variant marks its own link(s) and input.
+        block, so the extensions to those parent templates (`web.EmailField`, `web.UrlField`) do
+        not reach them: each form variant marks its own link(s) and input.
     -->
     <t t-inherit="web.FormEmailField" t-inherit-mode="extension">
         <xpath expr="//a[hasclass('o_form_uri')]" position="attributes">
