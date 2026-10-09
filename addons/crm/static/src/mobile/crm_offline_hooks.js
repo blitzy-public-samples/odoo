@@ -2,33 +2,10 @@
  * Shared CRM offline hooks, queue readers, constants and DISABLE enforcement.
  *
  * This module is the single place where production CRM code reads the offline state of the web
- * client. The mobile pipeline, lead card and quick create, `team_switcher.js`,
- * `lead_generation_dropdown.js`, `crm_column_progress.js`, `crm_pls_tooltip_button.js`,
- * `activity_menu_patch.js`, `crm_share_target_item.js`, `crm_form.js` and `crm_kanban_model.js`
- * import it as `@crm/mobile/crm_offline_hooks`; none of them resolves the offline plugin by
- * itself. Tests may inspect the framework plugin and its queue directly. It provides:
- *
- * - `useCrmOffline()`: a component hook exposing the offline signals, the small-screen signal,
- *   readers over the framework's offline queue and `runOrQueue`, the one helper through which new
- *   CRM code schedules a write;
- * - plain helpers for code that holds a framework model or record (`isOfflineModel`,
- *   `targetsCrmLead`) and two bounded, disk-cached loaders for the mobile pipeline
- *   (`loadActivityTypes`, `loadLeadActivities`);
- * - the constants naming the CRM models, buttons, selectors and mail dialog forms the offline
- *   rules apply to;
- * - module-level patches that make the shared DISABLE entry points of the offline inventory
- *   (`static/src/mobile/offline_inventory.md`) inert while offline (view buttons, list and kanban
- *   header buttons, the Actions and Cog menus, saves of mail dialog forms targeting a lead, the
- *   team dashboard card and activity report rows), that render the DISABLE anchors drawn by view
- *   buttons disabled while offline (wherever they are rendered, overlays such as the team card
- *   menu included), that keep the forecast views and the activity report unreachable offline, and
- *   that let phones search cached partners offline.
- *
- * Component-owned DISABLE paths and SKIP probes are guarded in their own files, not patched here.
- * The team switcher, the recurring-revenue probe, lead generation (its Install confirmation
- * callback included), the PLS tooltip button, the activity-menu entry, the share-target team read
- * and the lead-form chatter check the hook's `isOffline()`; the mobile lead card's activity
- * handlers check their own predicates over the cached activity types and the queue readers.
+ * client: CRM code that needs it imports this module rather than resolve the offline plugin
+ * itself, while tests may inspect the framework plugin and its queue directly. Component-owned
+ * DISABLE paths and SKIP probes are guarded in their own files with the hook's `isOffline()`, not
+ * patched here.
  *
  * Design constraints:
  * - No offline machinery of its own. Reads go through the ORM plugin and the framework RPC disk
@@ -37,13 +14,11 @@
  *   framework's.
  * - New CRM code queues only `web_save` and `action_archive`: the shared offline systray renders
  *   a status for `web_save`, `unlink`/`web_unlink`, `action_archive` and `action_unarchive` only.
- * - Online behaviour never changes. One patch skips its parent online too: the availability
- *   registration (`RelationalModel._setAvailableOffline`) never registers the forecast views or
- *   the activity report, online or offline, while their online loading and rendering stay as
- *   before. Every event-handler and save patch calls `super` with the original arguments unless
- *   the client is offline and the target is a CRM model, a listed CRM button or a mail dialog form
- *   targeting a lead. The only widening patch (`Many2One`, `dropdown: false` in its autocomplete
- *   props) applies offline, on small screens, in `crm.lead` views only.
+ * - The patches change nothing online and narrow behaviour only offline, for CRM targets, with two
+ *   exceptions. The availability registration (`RelationalModel._setAvailableOffline`) never
+ *   registers the forecast views or the activity report, online too, while their online loading
+ *   and rendering stay as they are. The only widening patch (`Many2One`, `dropdown: false` in its
+ *   autocomplete props) applies offline, on small screens, in `crm.lead` views only.
  */
 
 import { computed, untrack, useEffect, usePlugin } from "@odoo/owl";
@@ -56,7 +31,9 @@ import { Record as RelationalRecord } from "@web/model/relational_model/record";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
 import { useEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
+import { Field } from "@web/views/fields/field";
 import { Many2One } from "@web/views/fields/many2one/many2one";
+import { StatusBarField } from "@web/views/fields/statusbar/statusbar_field";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { ListController } from "@web/views/list/list_controller";
 import { MultiRecordViewButton } from "@web/views/view_button/multi_record_view_button";
@@ -67,10 +44,12 @@ import { ViewButton } from "@web/views/view_button/view_button";
 // -----------------------------------------------------------------------------
 
 /**
- * Models whose server-backed (`object`/`action`) buttons and Actions-menu actions are DISABLE
- * offline. Every such button that `addons/crm` renders for them is a DISABLE row of the offline
- * inventory; buttons other addons add to these models' views get the same guard, which takes
- * nothing away offline because object and action buttons have no offline path.
+ * Models whose server-backed (`object`/`action`) buttons are DISABLE offline, as are their
+ * Actions-menu bound, server and print actions, Duplicate and Export; the menu's Archive,
+ * Unarchive and Delete callbacks stay queueable. Every such button that `addons/crm` renders for
+ * them is a DISABLE row of the offline inventory; buttons other addons add to these models' views
+ * get the same guard, which takes nothing away offline because object and action buttons have no
+ * offline path.
  *
  * @type {readonly string[]}
  */
@@ -356,6 +335,22 @@ export async function loadLeadActivities(orm, resId, onUpdate, options = {}) {
  *   extras: Object }} QueuedCall
  * @typedef {{ key: string | number, value: QueuedCall }} QueueEntry an entry of the framework
  *   offline queue, exactly as `OfflinePlugin._ormToSync()` stores it
+ * @typedef {Object} CrmOffline what `useCrmOffline()` returns; the hook's functions of the same
+ *   names document the queue readers and `runOrQueue` in full
+ * @property {ORM} orm the ORM plugin
+ * @property {() => boolean} isOffline the framework's offline signal
+ * @property {() => boolean} syncingORM whether the framework is replaying its offline queue
+ * @property {() => boolean} isSmall the small-screen signal
+ * @property {(actionId: number, viewType?: string, resId?: number) => boolean} isAvailableOffline
+ *   whether the framework registered the action, its view or its record as available offline
+ * @property {() => QueueEntry[]} queuedEntries the entries of the live queue
+ * @property {(record: RelationalRecord | undefined | null) => boolean} isRecordPendingSync
+ * @property {(stageValue: number | false, entries?: QueueEntry[]) =>
+ *   QueueEntry[]} pendingLeadCreates
+ * @property {(resId: number) => QueueEntry[]} pendingActivityCalls
+ * @property {(resId: number, entries?: QueueEntry[]) => QueueEntry | undefined} latestStageWrite
+ * @property {(params: { online: () => Promise<any>, queue: Object }) =>
+ *   Promise<{ queued: true, key: string | number } | { queued: false, result: any }>} runOrQueue
  */
 
 /** The greatest array index: a property name that is a canonical integer up to it is an index. */
@@ -374,17 +369,20 @@ function arrayIndexOf(key) {
 }
 
 /**
- * Orders two queue entries as `OfflinePlugin._syncORM` replays them. The replay first rebuilds the
- * queue from IndexedDB (`Object.fromEntries` over the stored entries), then stable-sorts
- * `Object.values` of it by `extras.timeStamp`. Entries with equal timestamps therefore replay in
- * the enumeration order of their keys: keys that are array indices first, in ascending numeric
- * order, then the other keys in IndexedDB key order, numbers ascending before strings compared by
- * UTF-16 code unit. Of two tied writes, the one ranked later is applied later and is the one the
- * server keeps. The order of any array holding the entries plays no part.
+ * Ranks two queue entries in the order `OfflinePlugin._syncORM` replays them. The replay first
+ * rebuilds the queue from IndexedDB (`Object.fromEntries` over the stored entries), then
+ * stable-sorts `Object.values` of it by `extras.timeStamp`. Entries with equal timestamps therefore
+ * replay in the enumeration order of their keys, which need not be their scheduling order: keys
+ * that are array indices first, in ascending numeric order, then the other keys in IndexedDB key
+ * order, numbers ascending before strings compared by UTF-16 code unit. A parked entry
+ * (`extras.error`) is ranked like the others, although the replay skips it. Of two writes of one
+ * field that both replay successfully, the one ranked later is applied later and is the one the
+ * server keeps; the server may reject either, which parks it. The order of any array holding the
+ * entries plays no part.
  *
  * @param {QueueEntry} entryA
  * @param {QueueEntry} entryB
- * @returns {number} negative when `entryA` replays before `entryB`, positive when after, `0` when
+ * @returns {number} negative when `entryA` ranks before `entryB`, positive when after, `0` when
  *   both have the same timestamp and key
  */
 function compareReplayOrder(entryA, entryB) {
@@ -523,15 +521,19 @@ function frozenStageIndex(entries) {
  * Component hook giving CRM code its offline state. Call it from a component `setup` (or from a
  * patched `setup`, or while a component's setup runs), like any hook.
  *
- * Every queue reader reads the `_ormToSync` signal, so a component that calls one while rendering
- * re-renders whenever the queue changes: a call is scheduled, replayed or discarded from the
- * systray. Readers return the framework's `{key, value}` entries as stored, never a copy and never
- * mutated, so each result carries its queue key (for `t-key`) next to its value.
+ * A read of the live queue (`queuedEntries`, `isRecordPendingSync`, `pendingActivityCalls`, and the
+ * stage readers without an `entries` argument) reads the `_ormToSync` signal, so a component that
+ * makes one while rendering re-renders whenever the queue changes: a call is scheduled, replayed
+ * or discarded from the systray. Given an explicit `entries` array, the stage readers
+ * (`pendingLeadCreates`, `latestStageWrite`) read only that array, and a frozen one may be
+ * answered from its index without reading any entry, so the caller owns that array's reactivity
+ * and lifetime. Readers return the framework's `{key, value}` entries as stored, never a copy and
+ * never mutated, so each result carries its queue key (for `t-key`) next to its value.
  *
- * The stage readers (`pendingLeadCreates`, `latestStageWrite`) index a frozen `entries` array in
- * one traversal on its first use and answer every later call on that array from the index, so a
- * caller looking up many leads and stages in one frozen array reads each entry once. Any other
- * array, the live queue included, is scanned on each call.
+ * The stage readers index a frozen `entries` array in one traversal on its first use and answer
+ * every later call on that array from the index, so a caller looking up many leads and stages in
+ * one frozen array reads each entry once. Any other array, the live queue included, is scanned on
+ * each call.
  *
  * @example
  * setup() {
@@ -540,6 +542,8 @@ function frozenStageIndex(entries) {
  * get isPendingSync() {
  *     return this.crmOffline.isRecordPendingSync(this.props.record);
  * }
+ *
+ * @returns {CrmOffline}
  */
 export function useCrmOffline() {
     const env = useEnv();
@@ -589,9 +593,9 @@ export function useCrmOffline() {
      * @param {number | false} stageValue the stage id (a group's `serverValue`)
      * @param {QueueEntry[]} [entries] defaults to the live queue; a frozen array is indexed once
      *   (see `frozenStageIndex`)
-     * @returns {QueueEntry[]} a new array on every call, in replay order (see
-     *   `compareReplayOrder`): the order the leads were created in, whatever the order of `entries`
-     *   and the enumeration order of their queue keys
+     * @returns {QueueEntry[]} a new array on every call, parked entries included, in replay rank
+     *   (see `compareReplayOrder`): by `extras.timeStamp`, ties by the enumeration order of their
+     *   queue keys rather than the leads' creation order, whatever the order of `entries`
      */
     function pendingLeadCreates(stageValue, entries = queuedEntries()) {
         const index = frozenStageIndex(entries);
@@ -619,9 +623,9 @@ export function useCrmOffline() {
      * `mail.activity` archive (mark done), which callers match to an activity by `args[0][0]`.
      *
      * @param {number} resId the lead id
-     * @returns {QueueEntry[]} a new array, in replay order (see `compareReplayOrder`): the order
-     *   the calls were made in, which is the order the framework replays them in, whatever the
-     *   enumeration order of their queue keys
+     * @returns {QueueEntry[]} a new array, parked entries included, in replay rank (see
+     *   `compareReplayOrder`): by `extras.timeStamp`, ties by the enumeration order of their queue
+     *   keys rather than the order of the calls
      */
     function pendingActivityCalls(resId) {
         return queuedEntries()
@@ -643,10 +647,13 @@ export function useCrmOffline() {
     }
 
     /**
-     * The queued `crm.lead` write of `stage_id` for a lead that comes last in the framework replay
-     * order, hence the stage the server ends with: the greatest `extras.timeStamp`, ties resolved
-     * in replay order (see `compareReplayOrder`). A parked entry (`extras.error`) counts like the
-     * others. The result does not depend on the order of `entries`.
+     * The latest pending intended stage of a lead: among the queued `crm.lead` writes of `stage_id`
+     * for it, the one ranked last for replay (see `compareReplayOrder`), the greatest
+     * `extras.timeStamp` with ties by the enumeration order of their queue keys. A parked entry
+     * (`extras.error`) counts like the others, although `OfflinePlugin._syncORM` skips it on
+     * replay, so its stage need not reach the server; the server ends with the returned write's
+     * stage only if that write replays successfully. The result does not depend on the order of
+     * `entries`.
      *
      * @param {number} resId the lead id
      * @param {QueueEntry[]} [entries] defaults to the live queue; a frozen array is indexed once
@@ -771,13 +778,10 @@ export function useCrmOffline() {
 // DISABLE presentation
 // -----------------------------------------------------------------------------
 
-// The framework dims, while offline, every element matching one of these selectors (and re-applies
-// it to elements added later). Appending the CRM selectors dims the non-button DISABLE controls
-// exactly like buttons; the base selector stays first and unchanged. DISABLE anchors rendered by
-// view buttons, wherever they are rendered (overlays such as the team dashboard card menu, the UTM
-// campaign card), also render the same `disabled` attribute and `o_disabled_offline` class while
-// offline, unless already disabled, through the `ViewButton` patch below and the same predicate as
-// its click guard.
+// CRM's non-button DISABLE selectors are appended after the base selector, so the framework dims
+// them offline like buttons. The DISABLE anchors drawn by view buttons get the same disabled state
+// from the `ViewButton` patch below, keyed on its click guard's predicate, wherever they are
+// rendered (overlays included).
 patch(OfflinePlugin, {
     SELECTORS_TO_DISABLE: [
         ...OfflinePlugin.SELECTORS_TO_DISABLE,
@@ -790,10 +794,12 @@ patch(OfflinePlugin, {
 // -----------------------------------------------------------------------------
 //
 // Visual disabling alone does not make a control inert: a hotkey, a keyboard selection, an overlay
-// left open at disconnection or a direct call reaches the handler anyway. Each patch below returns
-// before doing any work (no preventDefault, save, RPC, dialog or action), with or without a DOM
-// event, while offline and only for a CRM target; in every other case it calls the original
-// handler with the original arguments.
+// left open at disconnection or a direct call reaches the handler anyway. Each patch in this
+// section returns early only from the branch its handler would take to a server effect, before
+// doing any work (no preventDefault, save, RPC, dialog or action), with or without a DOM event,
+// while offline and only for a CRM target. The Actions menu's queueable Archive, Unarchive and
+// Delete callbacks pass through, and the team dashboard card handles its client-only selection
+// branch directly; every other case calls the original handler with the original arguments.
 
 /**
  * Whether a view button is a DISABLE button: a server button (`object`/`action`) of a CRM model, a
@@ -848,21 +854,12 @@ patch(ViewButton.prototype, {
         }
         return this.crmOffline ? this.crmOffline.isOffline() : isOfflineModel(record?.model);
     },
-    /**
-     * A DISABLE anchor renders the `disabled` attribute offline, as the framework sets it on the
-     * elements its offline selectors match. Otherwise the base value is unchanged.
-     */
     get disabled() {
         if (this.crmDisabledOffline) {
             return true;
         }
         return super.disabled;
     },
-    /**
-     * A DISABLE anchor renders the framework's `o_disabled_offline` class offline, so it is
-     * dimmed like the elements the offline selectors match; the framework strips the class on
-     * reconnection and the re-render leaves it out. Otherwise the base classes are unchanged.
-     */
     getClassName() {
         const className = super.getClassName(...arguments);
         if (!this.crmDisabledOffline) {
@@ -1014,6 +1011,51 @@ patch(ListController.prototype, {
             return;
         }
         return super.openRecord(...arguments);
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Form stage widget
+// -----------------------------------------------------------------------------
+
+patch(Field.prototype, {
+    /**
+     * A `crm.lead` stage widget stays unavailable offline: offline stage moves, the won stage
+     * included, go through the kanban move or the mobile card's stage list. Offline, the
+     * statusbar of a `crm.lead` record (`StatusBarField` or a subclass, such as the lead form's
+     * `rotting_statusbar_duration`) gets `isDisabled`, which keeps its rendered controls disabled
+     * across re-renders and its "Move to" commands unavailable. The offline signal is read last,
+     * for those fields only. Online and for every other field the props are unchanged.
+     *
+     * @returns {Object}
+     */
+    get fieldComponentProps() {
+        const props = super.fieldComponentProps;
+        const { component } = this.field;
+        if (
+            (component === StatusBarField || component?.prototype instanceof StatusBarField) &&
+            props.record?.resModel === "crm.lead" &&
+            this.offlinePlugin.isOffline()
+        ) {
+            return { ...props, isDisabled: true };
+        }
+        return props;
+    },
+});
+
+patch(StatusBarField.prototype, {
+    /**
+     * Every stage selection of a `crm.lead` statusbar is refused offline, before `record.update`:
+     * its buttons, its dropdown items and command palette entries (including those opened before
+     * disconnection), its "Move to" commands and direct calls. Online and for every other model
+     * the selection is unchanged.
+     */
+    async selectItem(item) {
+        const { record } = this.props;
+        if (record?.resModel === "crm.lead" && isOfflineModel(record.model)) {
+            return;
+        }
+        return super.selectItem(...arguments);
     },
 });
 

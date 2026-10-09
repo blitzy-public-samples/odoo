@@ -1,15 +1,17 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 import mimetypes
+import os
 from datetime import timedelta
+from unittest import TestCase
 
 from lxml import etree
 
 from odoo import fields
-from odoo.exceptions import AccessError
+from odoo.exceptions import AccessError, ValidationError
 from odoo.service.model import call_kw
 from odoo.tests import HttpCase, tagged
-from odoo.tools import mute_logger
+from odoo.tools import SQL, config, mute_logger
 from odoo.tools.safe_eval import safe_eval
 
 from odoo.addons.crm.tests.common import TestCrmCommon
@@ -195,7 +197,7 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         return shortcuts
 
     def _create_opportunity(self, name, **values):
-        """ Create an opportunity of ``user_sales_leads`` in the first stage of ``sales_team_1``. """
+        """ Create an opportunity named ``name`` with default type ``opportunity``, salesperson ``user_sales_leads``, team ``sales_team_1`` and stage ``stage_team1_1``; ``values`` overrides these defaults and sets any further field. """
         return self.env['crm.lead'].create({
             'name': name,
             'type': 'opportunity',
@@ -221,6 +223,56 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             'user_id': self.user_sales_leads.id,
             'date_deadline': fields.Date.today() + timedelta(days=2),
         })
+
+    def _activity_rpc(self, method, args, kwargs=None):
+        """ Send a ``mail.activity`` call as the web client does: a JSON-RPC request on
+        ``/web/dataset/call_kw`` carrying the session of the last ``authenticate``.
+
+        :param str method: ``mail.activity`` method to call
+        :param list args: positional arguments of the call
+        :param dict kwargs: keyword arguments of the call; defaults to none
+        :return: decoded JSON-RPC response, holding either ``result`` or ``error``
+        :rtype: dict
+        """
+        response = self.url_open(f'/web/dataset/call_kw/mail.activity/{method}', json={
+            'jsonrpc': '2.0',
+            'method': 'call',
+            'id': 1,
+            'params': {
+                'model': 'mail.activity',
+                'method': method,
+                'args': args,
+                'kwargs': kwargs if kwargs is not None else {},
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _count_activities(self, lead):
+        """ Numbers of activities, archived ones included, linked to ``lead`` and in total, read from the database. """
+        self.env.invalidate_all()
+        activities = self.env['mail.activity'].with_context(active_test=False)
+        return (
+            activities.search_count([('res_model', '=', 'crm.lead'), ('res_id', '=', lead.id)]),
+            activities.search_count([]),
+        )
+
+    def _assert_concealed_error(self, response, exception_name):
+        """ Assert that a JSON-RPC ``response`` reports an ``exception_name`` error whose
+        debug data holds no stack trace and no path of the server's code.
+
+        :param dict response: decoded JSON-RPC response
+        :param str exception_name: dotted name of the expected exception class
+        :return: ``data`` of the reported error
+        :rtype: dict
+        """
+        self.assertNotIn('result', response)
+        data = response['error']['data']
+        self.assertEqual(data['name'], exception_name)
+        self.assertNotIn('Traceback', data['debug'])
+        self.assertNotIn('File "', data['debug'])
+        self.assertNotIn(os.path.dirname(config.root_path), data['debug'])
+        return data
 
     def _action_context(self, xmlid, **group_defaults):
         """ Context the views of a window action store with the calls they queue.
@@ -736,6 +788,231 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             self.assertEqual(self.env['ir.attachment'].search_count(attachment_domain), attachment_count,
                              'No document is uploaded')
             self.assertEqual(self._count_lead_messages(lead), message_count, 'No feedback message')
+
+    def test_offline_activity_create_rpc(self):
+        """ PART 3b, N3: the queued follow-up create, sent over JSON-RPC by a user allowed on the lead, links the activity to it. """
+        lead = self._create_opportunity('Offline RPC Activity Lead')
+        self.authenticate('user_sales_leads', 'user_sales_leads')
+
+        response = self._activity_rpc('web_save', [[], {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Offline RPC follow-up',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }], {'context': {}, 'specification': {}})
+
+        self.assertNotIn('error', response)
+        self.env.invalidate_all()
+        activity = self.env['mail.activity'].browse(response['result'][0]['id'])
+        self.assertIn(activity, lead.activity_ids)
+        self.assertEqual(activity.res_model_id, self.env['ir.model']._get('crm.lead'))
+        self.assertEqual(activity.summary, 'Offline RPC follow-up')
+
+    def test_offline_activity_create_context_res_id_rpc(self):
+        """ PART 3b: an activity create on ``crm.lead`` without ``res_id``, sent over JSON-RPC with the lead id as the context's ``default_res_id``, links the activity to the lead. """
+        lead = self._create_opportunity('Offline Context Activity Lead')
+        self.authenticate('user_sales_leads', 'user_sales_leads')
+
+        response = self._activity_rpc('create', [{
+            'res_model': 'crm.lead',
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Context follow-up',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }], {'context': {'default_res_id': lead.id}})
+
+        self.assertNotIn('error', response)
+        self.env.invalidate_all()
+        activity = self.env['mail.activity'].browse(response['result'])
+        self.assertIn(activity, lead.activity_ids)
+        self.assertEqual(activity.res_id, lead.id)
+        self.assertEqual(activity.res_model_id, self.env['ir.model']._get('crm.lead'))
+        self.assertEqual(activity.summary, 'Context follow-up')
+
+    def test_offline_activity_create_invalid_values_rpc(self):
+        """ PART 3b: malformed activity creates sent over JSON-RPC get a neutral error without trace and create nothing. """
+        lead = self._create_opportunity('Offline Invalid Activity Lead')
+        lead_vals = {
+            'res_model': 'crm.lead',
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Invalid follow-up',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }
+        not_a_list = "Invalid activity values: a list of field values is expected."
+        no_lead_id = "Invalid activity values: an activity on a lead requires the id of that lead."
+        self.authenticate('user_sales_leads', 'user_sales_leads')
+
+        for case, args, message in (
+            ('values list holding null', [[None]], not_a_list),
+            ('null values', [None], not_a_list),
+            ('string values', ['abc'], not_a_list),
+            ('number values', [5], not_a_list),
+            ('values list holding a string', [['x']], not_a_list),
+            ('lead activity without res_id', [lead_vals], no_lead_id),
+            ('lead activity with a false res_id', [{**lead_vals, 'res_id': False}], no_lead_id),
+            ('lead activity with a true res_id', [{**lead_vals, 'res_id': True}], no_lead_id),
+            ('lead activity with a zero res_id', [{**lead_vals, 'res_id': 0}], no_lead_id),
+            ('lead activity with a string res_id', [{**lead_vals, 'res_id': 'abc'}], no_lead_id),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+
+                with mute_logger('odoo.http'):
+                    response = self._activity_rpc('create', args)
+
+                data = self._assert_concealed_error(response, 'odoo.exceptions.ValidationError')
+                self.assertEqual(data['message'], message)
+                self.assertEqual(self._count_activities(lead), counts)
+
+        # without a res_id key, the res_id the create would use is the context's default_res_id
+        for case, default_res_id in (
+            ('lead activity with a string default_res_id', 'abc'),
+            ('lead activity with a zero default_res_id', 0),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+
+                with mute_logger('odoo.http'):
+                    response = self._activity_rpc('create', [lead_vals], {'context': {'default_res_id': default_res_id}})
+
+                data = self._assert_concealed_error(response, 'odoo.exceptions.ValidationError')
+                self.assertEqual(data['message'], no_lead_id)
+                self.assertEqual(self._count_activities(lead), counts)
+
+    def test_offline_activity_create_forbidden_lead_rpc(self):
+        """ PART 3b: an activity create on a lead the user may not write keeps the standard access error, without trace, and creates nothing. """
+        # ``group_sale_salesman`` only reaches its own and unassigned leads
+        lead = self._create_opportunity('Offline Forbidden Activity Lead')
+        lead_model_id = self.env['ir.model']._get_id('crm.lead')
+        queued_vals = {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Forbidden follow-up',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_salesman.id,
+        }
+        document_vals = {key: value for key, value in queued_vals.items() if key != 'res_model'}
+        self.authenticate('user_sales_salesman', 'user_sales_salesman')
+
+        for case, method, args, kwargs in (
+            ('queued values through create', 'create', [queued_vals], {}),
+            ('queued call', 'web_save', [[], queued_vals], {'context': {}, 'specification': {}}),
+            ('explicit model id', 'create', [{**document_vals, 'res_model_id': lead_model_id}], {}),
+            ('model from the context', 'create', [document_vals], {'context': {'default_res_model': 'crm.lead'}}),
+            ('model id from the context', 'create', [document_vals], {'context': {'default_res_model_id': lead_model_id}}),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+
+                with mute_logger('odoo.http'):
+                    response = self._activity_rpc(method, args, kwargs)
+
+                data = self._assert_concealed_error(response, 'odoo.exceptions.AccessError')
+                self.assertIn('security restrictions', data['message'])
+                self.assertEqual(self._count_activities(lead), counts)
+
+    def test_offline_activity_create_lead_model_invalid_values_rpc(self):
+        """ PART 3b: activity creates on ``crm.lead`` sent over JSON-RPC with an explicit or context model but no lead id, or with a model id that is not an integer, get a neutral error without trace and create nothing. """
+        lead = self._create_opportunity('Offline Lead Model Activity Lead')
+        lead_model_id = self.env['ir.model']._get_id('crm.lead')
+        lead_vals = {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Invalid model follow-up',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }
+        # neither the model name nor the lead id: the model comes from the model id or the context
+        document_vals = {key: value for key, value in lead_vals.items() if key not in ('res_model', 'res_id')}
+        no_lead_id = "Invalid activity values: an activity on a lead requires the id of that lead."
+        no_model_id = "Invalid activity values: the document model of an activity on a lead must be given by its id."
+        self.authenticate('user_sales_leads', 'user_sales_leads')
+
+        for case, args, kwargs, message in (
+            ('explicit lead model id without res_id', [{**document_vals, 'res_model_id': lead_model_id}], {}, no_lead_id),
+            ('model from the context without res_id', [document_vals], {'context': {'default_res_model': 'crm.lead'}}, no_lead_id),
+            ('model id from the context without res_id', [document_vals], {'context': {'default_res_model_id': lead_model_id}}, no_lead_id),
+            ('string model id and string res_id', [{**lead_vals, 'res_model_id': str(lead_model_id), 'res_id': 'abc'}], {}, no_model_id),
+            ('string model id and the lead id', [{**lead_vals, 'res_model_id': str(lead_model_id)}], {}, no_model_id),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+
+                with mute_logger('odoo.http'):
+                    response = self._activity_rpc('create', args, kwargs)
+
+                data = self._assert_concealed_error(response, 'odoo.exceptions.ValidationError')
+                self.assertEqual(data['message'], message)
+                self.assertEqual(self._count_activities(lead), counts)
+
+    def test_offline_activity_create_integrity_error_rpc(self):
+        """ PART 3b: lead activity creates the database rejects, sent over JSON-RPC, get the standard integrity error message without trace and create nothing. """
+        lead = self._create_opportunity('Offline Integrity Activity Lead')
+        queued_vals = {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Rejected follow-up',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }
+        self.authenticate('user_sales_leads', 'user_sales_leads')
+
+        for case, method, args, kwargs, detail in (
+            ('queued call assigned to a missing user', 'web_save', [[], {**queued_vals, 'user_id': 99999999}],
+             {'context': {}, 'specification': {}}, "'Assigned to' (user_id)"),
+            ('queued values without due date', 'create', [{**queued_vals, 'date_deadline': False}], {},
+             "Missing required field 'Due Date' (date_deadline)"),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+
+                with mute_logger('odoo.http', 'odoo.sql_db'):
+                    response = self._activity_rpc(method, args, kwargs)
+
+                data = self._assert_concealed_error(response, 'odoo.exceptions.ValidationError')
+                self.assertTrue(data['message'].startswith("The operation cannot be completed: "), data['message'])
+                self.assertIn(detail, data['message'])
+                self.assertEqual(self._count_activities(lead), counts)
+
+    def test_offline_activity_create_integrity_error_keeps_pending_writes(self):
+        """ PART 3b: a lead activity create the database rejects is rolled back alone: a write pending before it is kept, the transaction stays usable and a valid create follows. """
+        lead = self._create_opportunity('Offline Pending Write Lead')
+        counts = self._count_activities(lead)
+        vals = {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Follow-up after a rejected one',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }
+        activities = self.env['mail.activity'].with_user(self.user_sales_leads)
+        lead_name_query = SQL("SELECT name FROM crm_lead WHERE id = %s", lead.id)
+
+        lead.name = 'Offline Pending Write Lead Renamed'
+        self.env.cr.execute(lead_name_query)
+        self.assertEqual(self.env.cr.fetchone()[0], 'Offline Pending Write Lead', 'The write is still pending when the create starts')
+
+        # not ``self.assertRaises``: it would flush the pending write itself, in a savepoint of its own
+        with TestCase.assertRaises(self, ValidationError) as caught, mute_logger('odoo.sql_db'):
+            call_kw(activities, 'create', [{**vals, 'user_id': 99999999}], {})
+        self.assertTrue(str(caught.exception).startswith("The operation cannot be completed: "), str(caught.exception))
+
+        self.env.cr.execute(lead_name_query)
+        self.assertEqual(self.env.cr.fetchone()[0], 'Offline Pending Write Lead Renamed', 'The rejected create drops no earlier write')
+        self.assertEqual(self.env['crm.lead'].search_count([('name', '=', 'Offline Pending Write Lead Renamed')]), 1)
+        self.assertEqual(self._count_activities(lead), counts)
+
+        activity = self.env['mail.activity'].browse(call_kw(activities, 'create', [vals], {}))
+        self.assertIn(activity, lead.activity_ids)
+        self.assertEqual(activity.summary, 'Follow-up after a rejected one')
+        self.assertEqual(self._count_activities(lead), (counts[0] + 1, counts[1] + 1))
 
     # ------------------------------------------------------------
     # PART 4, N1: replay of the mobile quick create

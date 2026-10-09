@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
+from collections.abc import Mapping
+
+import psycopg2
+
 from odoo import api, models
+from odoo.exceptions import ValidationError
+from odoo.http.dispatcher import conceal_debug_traceback
 
 
 class MailActivity(models.Model):
@@ -23,11 +29,89 @@ class MailActivity(models.Model):
         ``web_save([], {'res_model': 'crm.lead', 'res_id': lead.id, ...})``,
         the client only knowing the model name, never the ``ir.model`` id.
         An explicit ``res_model_id`` is never overwritten and other models are
-        left untouched. No sudo: access checks apply exactly as online. """
+        left untouched. No sudo: access checks apply exactly as online.
+
+        RPC callers choose these values freely, so they are checked before being
+        read. ``vals_list`` must be a list of mappings. Values targeting
+        ``crm.lead``, through ``res_model``, ``res_model_id`` or, without a
+        ``res_model_id`` key, the context's ``default_res_model`` or
+        ``default_res_model_id``, must give a ``res_model_id``, if any, as an
+        integer or an ``ir.model`` record, and a positive integer ``res_id``, in
+        the values or, without a ``res_id`` key, as the context's
+        ``default_res_id``. These checks raise a ``ValidationError`` that does
+        not repeat the input.
+
+        When the batch holds values targeting ``crm.lead``, every error it
+        raises, the standard create's own (access rights, missing records,
+        invalid values) included, keeps its type and message but has its
+        traceback concealed from the HTTP response; the server log still
+        records it. The create then runs in a savepoint: the HTTP layer turns a
+        database integrity error into a new error outside this method, out of
+        reach of that concealment, so such an error is rolled back to the
+        savepoint here and raised as the same standard ``ValidationError``.
+        Pending ORM writes are flushed before the savepoint, so that its
+        rollback only drops this create. Batches on other models are created
+        as standard. """
+        if not isinstance(vals_list, (list, tuple)) or not all(isinstance(vals, Mapping) for vals in vals_list):
+            with conceal_debug_traceback():
+                raise ValidationError(self.env._("Invalid activity values: a list of field values is expected."))
+        lead_model_id = self.env['ir.model']._get_id('crm.lead')
+        context = self.env.context
+        on_lead = False
         for vals in vals_list:
-            if vals.get('res_model') == 'crm.lead' and not vals.get('res_model_id'):
-                vals['res_model_id'] = self.env['ir.model']._get_id('crm.lead')
-        return super().create(vals_list)
+            res_model_id = vals.get('res_model_id')
+            # a model id is an integer or a single ``ir.model`` record: the ORM stores a string as empty
+            if type(res_model_id) is int:
+                model_id = res_model_id
+            elif isinstance(res_model_id, models.BaseModel) and res_model_id._name == 'ir.model' and len(res_model_id) == 1:
+                model_id = res_model_id.id
+            else:
+                model_id = None
+            if not (
+                vals.get('res_model') == 'crm.lead'
+                or model_id == lead_model_id
+                or ('res_model_id' not in vals and (
+                    context.get('default_res_model') == 'crm.lead'
+                    or context.get('default_res_model_id') == lead_model_id
+                ))
+            ):
+                continue
+            on_lead = True
+            if res_model_id and model_id is None:
+                with conceal_debug_traceback():
+                    raise ValidationError(self.env._("Invalid activity values: the document model of an activity on a lead must be given by its id."))
+            res_id = vals['res_id'] if 'res_id' in vals else context.get('default_res_id')
+            if isinstance(res_id, bool) or not isinstance(res_id, int) or res_id <= 0:
+                with conceal_debug_traceback():
+                    raise ValidationError(self.env._("Invalid activity values: an activity on a lead requires the id of that lead."))
+            if vals.get('res_model') == 'crm.lead' and not res_model_id:
+                vals['res_model_id'] = lead_model_id
+        if not on_lead:
+            return super().create(vals_list)
+        with conceal_debug_traceback():
+            # pending ORM writes reach the database before the savepoint, so that its rollback
+            # drops nothing else; precommit hooks, mail tracking included, still run at commit
+            self.env.flush_all()
+            try:
+                with self.env.cr.savepoint(flush=False):
+                    return super().create(vals_list)
+            except psycopg2.IntegrityError as error:
+                # the savepoint is rolled back: drop what the failed create left in the caches
+                self.env.transaction.clear()
+                # the error the HTTP layer would raise (odoo.http.retrying), concealed here
+                model = self.env['base']
+                for model_class in self.env.registry.values():
+                    if model_class._table == error.diag.table_name:
+                        model = self.env[model_class._name]
+                        break
+                raise ValidationError(self.env._(
+                    "The operation cannot be completed: %s",
+                    model._sql_error_to_message(error),
+                )) from None
+            except Exception:
+                # the savepoint is rolled back: drop what the failed create left in the caches
+                self.env.transaction.clear()
+                raise
 
     def action_create_calendar_event(self):
         """ Small override of the action that creates a calendar.

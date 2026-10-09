@@ -1074,7 +1074,7 @@
             <!-- Ensure that only records with at least one activity, "done" (archived) or not, are fetched. -->
             <field name="domain">[("active", "in", [True, False]), ("activity_ids.active", "in", [True, False])]</field>
             <field name="search_view_id" ref="crm.view_crm_case_my_activities_filter"/>
-            <!-- force_search_count because activity_ids has auto_join so duplicates are faking the count and "Load more". -->
+            <!-- Force search_count for activity-filtered results even when the current page is not full. -->
             <field name="context">
             {
                 'default_type': 'opportunity',

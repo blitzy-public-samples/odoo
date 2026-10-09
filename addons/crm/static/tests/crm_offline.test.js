@@ -115,6 +115,7 @@ import { ActivityMarkAsDone } from "@mail/core/web/activity_markasdone_popover";
 import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
+import { RottingStatusBarDurationField } from "@mail/js/rotting_mixin/rotting_statusbar";
 import { NonSecureContextError } from "@web/core/errors/non_secure_context_error";
 import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
@@ -122,6 +123,7 @@ import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { Many2One } from "@web/views/fields/many2one/many2one";
+import { StatusBarField } from "@web/views/fields/statusbar/statusbar_field";
 import { FormController } from "@web/views/form/form_controller";
 import { KanbanController } from "@web/views/kanban/kanban_controller";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
@@ -1699,6 +1701,46 @@ const TEAM_DASHBOARD_MENU_ARCH = /* xml */ `
         </templates>
     </kanban>`;
 
+/**
+ * Lead form header with the production stage widget, its options and its readonly expression,
+ * which covers lost and archived leads only.
+ */
+const LEAD_STAGE_WIDGET_FORM_ARCH = /* xml */ `
+    <form js_class="crm_form">
+        <header>
+            <field name="stage_id" widget="rotting_statusbar_duration"
+                options="{'clickable': '1', 'fold_field': 'fold'}"
+                readonly="won_status == 'lost' or not active"/>
+        </header>
+        <sheet>
+            <field name="won_status" invisible="1"/>
+            <field name="active" invisible="1"/>
+            <field name="is_rotting" invisible="1"/>
+            <field name="rotting_days" invisible="1"/>
+            <field name="name"/>
+        </sheet>
+    </form>`;
+
+/**
+ * Gives the lead mock, for the current test only, the fields the production stage widget reads,
+ * and folds the won stage, so that its option is in the widget's "More..." dropdown on desktop.
+ */
+function setUpLeadStageWidget() {
+    CrmLead._fields.duration_tracking = fields.Json();
+    CrmLead._fields.is_rotting = fields.Boolean();
+    CrmLead._fields.rotting_days = fields.Integer();
+    CrmStage._records[2].fold = true;
+}
+
+/**
+ * @param {StatusBarField} statusbar
+ * @param {string} label
+ * @returns {Object | undefined} the statusbar item of the stage labelled `label`
+ */
+function stageItem(statusbar, label) {
+    return statusbar.getAllItems().find((item) => item.label === label);
+}
+
 describe("DISABLE controls and handler enforcement", () => {
     test.tags("desktop");
     test("team switcher: online mount, disconnect, reconnect", async () => {
@@ -2342,7 +2384,6 @@ describe("DISABLE controls and handler enforcement", () => {
         await mountView({ type: "form", resModel: "crm.lead", resId: 1, arch: LEAD_FORM_ARCH });
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
 
-        // Online, the buttons run their action.
         await contains("button[name='action_set_won_rainbowman']").click();
         await contains("a[name='action_set_automated_probability']:first").click();
         expect.verifySteps([
@@ -2409,7 +2450,6 @@ describe("DISABLE controls and handler enforcement", () => {
             await pressEnterAndSpace();
         }
 
-        // Direct calls of every server button handler, without any DOM event.
         const serverButtons = buttons.filter(({ clickParams }) =>
             ["object", "action"].includes(clickParams.type)
         );
@@ -2440,6 +2480,275 @@ describe("DISABLE controls and handler enforcement", () => {
         await press(["alt", "w"]);
         await animationFrame();
         expect.verifySteps(["crm.lead/web_save", "doActionButton:action_set_won_rainbowman"]);
+    });
+
+    test.tags("desktop");
+    test("lead form stage widget of an active lead in a non-final stage: disabled offline, inert by command, overlay left open, direct call and re-render, re-enabled online", async () => {
+        setUpLeadStageWidget();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["crm.lead/web_save"]);
+        watchOfflineRpcs();
+        const statusbars = captureInstances(StatusBarField);
+        await mountView({
+            type: "form",
+            resModel: "crm.lead",
+            resId: 1,
+            arch: LEAD_STAGE_WIDGET_FORM_ARCH,
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        const statusbar = () => statusbars.at(-1);
+        const stageId = () => statusbar().props.record.data.stage_id.id;
+        const stageControls = () => queryAll(".o_statusbar_status button");
+        const moreToggle = ".o_statusbar_status button.dropdown-toggle:visible";
+        const moreOption = (label) => `.o-dropdown--menu .dropdown-item:contains('${label}')`;
+        const moveCommands = ".o_command:contains('Move to')";
+        // The production widget is a statusbar subclass; the lead is active, pending and in the
+        // first of three stages, so its readonly expression leaves the widget editable.
+        expect(statusbar()).toBeInstanceOf(RottingStatusBarDurationField);
+        expect(statusbar().props.record.data.active).toBe(true);
+        expect(statusbar().props.record.data.won_status).toBe("pending");
+        expect(stageId()).toBe(1);
+
+        // Online, the commands, the buttons and the "More..." dropdown move the stage.
+        await press(["control", "k"]);
+        await animationFrame();
+        expect(queryAllTexts(moveCommands)).toEqual([
+            "Move to Stage...\nALT + SHIFT + X",
+            "Move to next Stage\nALT + X",
+        ]);
+        await press("Escape");
+        await animationFrame();
+        await press(["alt", "x"]);
+        await animationFrame();
+        expect(stageId()).toBe(2);
+        await press(["alt", "shift", "x"]);
+        await animationFrame();
+        expect(queryAllTexts(".o_command")).toEqual(["New", "Qualified", "Won"]);
+        await contains(".o_command:contains('New')").click();
+        expect(stageId()).toBe(1);
+        await contains(moreToggle).click();
+        await contains(moreOption("Won")).click();
+        expect(stageId()).toBe(3);
+        await contains(".o_statusbar_status button[data-value='2']").click();
+        expect(stageId()).toBe(2);
+        await contains(".o_form_button_cancel").click();
+        expect(stageId()).toBe(1);
+        expect.verifySteps([]);
+
+        // The command palette and the "More..." dropdown, opened online and left open at
+        // disconnection, still list the stages: choosing one, by keyboard or click, changes nothing.
+        await press(["alt", "shift", "x"]);
+        await animationFrame();
+        expect(queryAllTexts(".o_command")).toEqual(["New", "Qualified", "Won"]);
+        await setOffline(true);
+        await press("ArrowDown");
+        await animationFrame();
+        expect(".o_command.focused").toHaveText("Qualified");
+        await press("Enter");
+        await animationFrame();
+        expect(".o_command_palette").toHaveCount(0);
+        expect(stageId()).toBe(1);
+        await setOffline(false);
+        await press(["alt", "shift", "x"]);
+        await animationFrame();
+        await setOffline(true);
+        await contains(".o_command:contains('Won')").click();
+        expect(".o_command_palette").toHaveCount(0);
+        expect(stageId()).toBe(1);
+        await setOffline(false);
+        await contains(moreToggle).click();
+        await setOffline(true);
+        expect(moreOption("Won")).toHaveClass("disabled");
+        queryOne(moreOption("Won")).click();
+        await animationFrame();
+        expect(stageId()).toBe(1);
+        expect(statusbar().props.record.dirty).toBe(false);
+
+        // Offline, the widget is disabled through its own props: every stage button and dropdown
+        // toggle renders `disabled`, and neither command is available, by hotkey or palette.
+        expect(statusbar().props.isDisabled).toBe(true);
+        expect(stageControls()).toHaveLength(5);
+        for (const control of stageControls()) {
+            expect(control).toHaveAttribute("disabled");
+        }
+        // Keyboard: a disabled stage button cannot take the keyboard focus.
+        queryOne(".o_statusbar_status button[data-value='2']").focus();
+        expect(".o_statusbar_status button[data-value='2']").not.toBeFocused();
+        await pressEnterAndSpace();
+        await press(["alt", "x"]);
+        await animationFrame();
+        await press(["alt", "shift", "x"]);
+        await animationFrame();
+        expect(".o_command_palette").toHaveCount(0);
+        await press(["control", "k"]);
+        await animationFrame();
+        expect(".o_command_palette").toHaveCount(1);
+        expect(moveCommands).toHaveCount(0);
+        await press("Escape");
+        await animationFrame();
+        // Direct calls, without any DOM event.
+        await statusbar().selectItem(stageItem(statusbar(), "Qualified"));
+        await statusbar().selectItem(stageItem(statusbar(), "Won"));
+        statusbar().onDropdownItemSelected({ detail: { payload: stageItem(statusbar(), "Won") } });
+        await animationFrame();
+        expect(stageId()).toBe(1);
+        expect(statusbar().props.record.dirty).toBe(false);
+        expect(".modal").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Re-renders after disconnection (an edit of another field, a resize) keep every control
+        // disabled and the commands unavailable.
+        await contains(".o_field_widget[name=name] input").edit("Lead 1 (edited)");
+        window.dispatchEvent(new Event("resize"));
+        await animationFrame();
+        expect(statusbar().props.isDisabled).toBe(true);
+        expect(stageControls()).toHaveLength(5);
+        for (const control of stageControls()) {
+            expect(control).toHaveAttribute("disabled");
+        }
+        await press(["alt", "x"]);
+        await animationFrame();
+        expect(stageId()).toBe(1);
+
+        // Saved, the edit is queued without any stage.
+        await contains(".o_form_button_save").click();
+        await animationFrame();
+        expect.verifySteps(["offline:crm.lead/web_save", "crm.lead/web_save"]);
+        expect(queuedEntries()).toHaveLength(1);
+        const [save] = queuedCalls("crm.lead", "web_save");
+        expect(save.args).toEqual([[1], { name: "Lead 1 (edited)" }]);
+        expect(stageId()).toBe(1);
+        expect(".modal").toHaveCount(0);
+
+        // Back online, the edit replays, and the widget is enabled and moves the stage again.
+        await setOffline(false);
+        await letQueueReplay(1);
+        expect.verifySteps(["crm.lead/web_save"]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(statusbar().props.isDisabled).toBe(false);
+        expect(".o_statusbar_status button[data-value='2']").toBeEnabled();
+        expect(".o_statusbar_status button[data-value='2']").not.toHaveClass("o_disabled_offline");
+        expect(moreToggle).toBeEnabled();
+        await press(["alt", "x"]);
+        await animationFrame();
+        expect(stageId()).toBe(2);
+    });
+
+    test.tags("mobile");
+    test("mobile: lead form stage dropdown: disabled offline, an option of a dropdown opened online is inert, re-enabled online", async () => {
+        setUpLeadStageWidget();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        const statusbars = captureInstances(StatusBarField);
+        await mountView({
+            type: "form",
+            resModel: "crm.lead",
+            resId: 1,
+            arch: LEAD_STAGE_WIDGET_FORM_ARCH,
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        const statusbar = () => statusbars.at(-1);
+        const stageId = () => statusbar().props.record.data.stage_id.id;
+        const stageControls = () => queryAll(".o_statusbar_status button");
+        const toggle = ".o_statusbar_status button.dropdown-toggle:visible";
+        const option = (label) => `.o-dropdown--menu .dropdown-item:contains('${label}')`;
+        expect(statusbar()).toBeInstanceOf(RottingStatusBarDurationField);
+
+        // Online, the small-screen dropdown, the widget's only visible control, moves the stage.
+        expect(queryAll(toggle)).toHaveLength(1);
+        await contains(toggle).click();
+        await contains(option("Qualified")).click();
+        expect(stageId()).toBe(2);
+        await contains(".o_form_button_cancel").click();
+        expect(stageId()).toBe(1);
+
+        // Opened online and left open at disconnection, the dropdown's options are dimmed, and a
+        // click that still reaches one changes nothing.
+        await contains(toggle).click();
+        await setOffline(true);
+        expect(statusbar().props.isDisabled).toBe(true);
+        expect(option("Qualified")).toHaveClass("disabled");
+        expect(option("Won")).toHaveClass("disabled");
+        queryOne(option("Won")).click();
+        await animationFrame();
+        expect(stageId()).toBe(1);
+
+        // Every control renders disabled, also after a re-render, and a direct call is inert.
+        for (const control of stageControls()) {
+            expect(control).toHaveAttribute("disabled");
+        }
+        await statusbar().selectItem(stageItem(statusbar(), "Qualified"));
+        await contains(".o_field_widget[name=name] input").edit("Lead 1 (edited)");
+        expect(statusbar().props.isDisabled).toBe(true);
+        for (const control of stageControls()) {
+            expect(control).toHaveAttribute("disabled");
+        }
+        expect(stageId()).toBe(1);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Back online, the dropdown moves the stage again.
+        await setOffline(false);
+        expect(statusbar().props.isDisabled).toBe(false);
+        expect(toggle).toBeEnabled();
+        await contains(toggle).click();
+        await contains(option("Qualified")).click();
+        expect(stageId()).toBe(2);
+    });
+
+    test.tags("desktop");
+    test("lead form stage widget guard is CRM-scoped: a statusbar of another model still changes offline", async () => {
+        class UtmStage extends models.Model {
+            _name = "utm.stage";
+            _order = "sequence, id";
+
+            name = fields.Char();
+            sequence = fields.Integer();
+
+            _records = [
+                { id: 1, name: "New", sequence: 1 },
+                { id: 2, name: "Schedule", sequence: 2 },
+                { id: 3, name: "Sent", sequence: 3 },
+            ];
+        }
+        defineModels([UtmStage]);
+        UtmCampaign._fields.stage_id = fields.Many2one({ string: "Stage", relation: "utm.stage" });
+        UtmCampaign._records[0].stage_id = 1;
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const statusbars = captureInstances(StatusBarField);
+        await mountView({
+            type: "form",
+            resModel: "utm.campaign",
+            resId: 1,
+            arch: /* xml */ `
+                <form>
+                    <header>
+                        <field name="stage_id" widget="statusbar" options="{'clickable': '1'}"/>
+                    </header>
+                    <sheet>
+                        <field name="name"/>
+                    </sheet>
+                </form>`,
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [statusbar] = statusbars;
+        const stageId = () => statusbar.props.record.data.stage_id.id;
+
+        await setOffline(true);
+        // The widget keeps its own props, and its command and handler still move the stage.
+        expect(statusbar.props.isDisabled).toBe(false);
+        await press(["alt", "x"]);
+        await animationFrame();
+        expect(stageId()).toBe(2);
+        await statusbar.selectItem(stageItem(statusbar, "Sent"));
+        await animationFrame();
+        expect(stageId()).toBe(3);
     });
 
     test.tags("desktop");
@@ -3267,7 +3576,6 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(lockingButton().props.disabled).toBe(false);
         expect(unlockingButton().props.disabled).toBe(true);
 
-        // Online.
         expect(locking).not.toHaveAttribute("disabled");
         expect(unlocking).toHaveAttribute("disabled");
         for (const anchor of [locking, unlocking]) {
@@ -3587,7 +3895,6 @@ describe("DISABLE controls and handler enforcement", () => {
         });
         const crmButton = "button[name='action_view_opportunity']";
         const customButton = "button[name='action_partner_custom']";
-        // Online, Enter on the focused CRM button runs it.
         queryOne(crmButton).focus();
         expect(crmButton).toBeFocused();
         await press("Enter");
@@ -5891,13 +6198,11 @@ describe("Stage and team coverage", () => {
 
             await setOffline(true);
             await visitedReady();
-            // Create.
             await contains(".o_list_button_add").click();
             await contains(".o_field_widget[name=name] input").edit(created);
             await contains(".o_form_button_save").click();
             expect(".o_field_widget[name=name] input").toHaveValue(created);
             await contains(".o_breadcrumb .o_back_button").click();
-            // Edit.
             await contains(`.o_data_row .o_data_cell:contains('${existing.name}')`).click();
             await contains(".o_field_widget[name=name] input").edit(renamed);
             await contains(".o_form_button_save").click();
@@ -7302,7 +7607,6 @@ describe("Shared hooks contract", () => {
         };
         const defaultExtras = { ...HARNESS_CONFIG, displayName: "", changes: {} };
 
-        // Online: the live call's result; nothing queued.
         const result = [{ id: 9, name: "Quick" }];
         const done = await crmOffline.runOrQueue({
             online: async () => {
@@ -7405,7 +7709,6 @@ describe("Shared hooks contract", () => {
         ).rejects.toBe(securityError);
         expect.verifySteps(["online call", "scheduleORM"]);
 
-        // Offline.
         await setOffline(true);
         const error = await crmOffline
             .runOrQueue({ online: async () => expect.step("online call"), queue })
