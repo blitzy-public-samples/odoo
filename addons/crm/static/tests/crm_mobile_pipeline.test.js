@@ -4126,7 +4126,7 @@ function activityBadgeOf(name) {
 
 describe("Mobile activity pages", () => {
     test.tags("mobile");
-    test("mobile: activity reads are bounded: 40 activities per lead and 80 activity types, in a fixed order", async () => {
+    test("mobile: activity reads: 40 activities per lead in a fixed order; activity types with no order and no limit", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         const typeReads = [];
         onRpc("/web/dataset/call_kw/mail.activity.type/web_search_read", async (request) => {
@@ -4149,8 +4149,8 @@ describe("Mobile activity pages", () => {
         expect(typeReads).toHaveLength(1);
         expect(typeReads[0].domain).toEqual([["res_model", "in", [false, "crm.lead"]]]);
         expect(typeReads[0].specification).toEqual({ display_name: {}, category: {} });
-        expect(typeReads[0].order).toBe("sequence ASC, id ASC");
-        expect(typeReads[0].limit).toBe(80);
+        // Only the domain and the specification (plus the ORM's context): no order, no limit.
+        expect(Object.keys(typeReads[0]).sort()).toEqual(["context", "domain", "specification"]);
     });
 
     test.tags("mobile");

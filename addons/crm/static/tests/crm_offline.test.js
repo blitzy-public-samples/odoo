@@ -1189,7 +1189,7 @@ describe("Rainbowman", () => {
 // PART 2.2: email/phone partner-sync copy (QUEUE)
 // -----------------------------------------------------------------------------
 
-describe("Email/phone copy", () => {
+describe("Email and phone copy", () => {
     test("offline form save queues the email and phone partner-sync copy", async () => {
         CrmLead._records[0].partner_email_update = true;
         CrmLead._records[0].partner_phone_update = true;
@@ -6625,7 +6625,7 @@ describe("Remaining hook branches", () => {
         expect(crmOffline.isRecordPendingSync(createdOffline)).toBe(false);
     });
 
-    test("runOrQueue rejects a call without a live function, or whose queued method the systray cannot render, before any live call or queue entry", async () => {
+    test("runOrQueue rejects a call without a live function, without a model, or whose queued method the systray cannot render, before any live call or queue entry", async () => {
         const setOffline = mockOffline();
         keepPingsFailing();
         watchOfflineRpcs();
@@ -6638,13 +6638,15 @@ describe("Remaining hook branches", () => {
         const onlineError = "runOrQueue: `online` must be a function performing the live call";
         const methodError = (method) =>
             `runOrQueue: only web_save and action_archive can be queued, got "${method}"`;
+        const modelError = "runOrQueue: `queue.model` is required";
         const rename = { model: "crm.lead", method: "write", args: [[1], { name: "Renamed" }] };
         const invalidCalls = [
             [{ queue: markDone }, onlineError],
             [{ online: Promise.resolve(true), queue: markDone }, onlineError],
             [{ online, queue: { ...markDone, method: "action_done" } }, methodError("action_done")],
             [{ online, queue: rename }, methodError("write")],
-            [{ online, queue: { ...markDone, model: undefined } }, methodError("action_archive")],
+            [{ online, queue: { ...markDone, model: undefined } }, modelError],
+            [{ online, queue: { ...markDone, model: "" } }, modelError],
             [{ online }, methodError("undefined")],
         ];
         const expectEveryInvalidCallRejected = async () => {
@@ -7198,7 +7200,7 @@ describe("Shared hooks contract", () => {
         expect(targetsCrmLead(record("mail.activity", { model: "crm.lead" }))).toBe(false);
     });
 
-    test("loadActivityTypes: bounded request, cached list first, onUpdate on a changed answer only, errors", async () => {
+    test("loadActivityTypes: domain and specification only, cached list first, onUpdate on a changed answer only, errors", async () => {
         let answer = {
             length: 4,
             records: [
@@ -7246,8 +7248,6 @@ describe("Shared hooks contract", () => {
         expect(searchKwargs(requests.at(-1))).toEqual({
             domain: [["res_model", "in", [false, "crm.lead"]]],
             specification: { display_name: {}, category: {} },
-            order: "sequence ASC, id ASC",
-            limit: 80,
         });
 
         // The same answer: the cached list first; the refresh changes nothing, so no onUpdate.
@@ -7558,8 +7558,13 @@ describe("Shared hooks contract", () => {
             [{ queue }, /`online` must be a function/],
             [{ online: "crm.lead/web_save", queue }, /`online` must be a function/],
             [{ online }, /only web_save and action_archive can be queued, got "undefined"/],
-            [{ online, queue: { ...queue, model: undefined } }, /can be queued, got "web_save"/],
-            [{ online, queue: { ...queue, model: "" } }, /can be queued, got "web_save"/],
+            [{ online, queue: { ...queue, model: undefined } }, /`queue.model` is required/],
+            [{ online, queue: { ...queue, model: "" } }, /`queue.model` is required/],
+            // The method is checked first: an unqueueable call without a model names the method.
+            [
+                { online, queue: { ...queue, model: undefined, method: "write" } },
+                /can be queued, got "write"/,
+            ],
             [{ online, queue: { ...queue, method: "write" } }, /can be queued, got "write"/],
             [{ online, queue: { ...queue, method: "unlink" } }, /can be queued, got "unlink"/],
             [{ online, queue: { ...queue, method: undefined } }, /got "undefined"/],

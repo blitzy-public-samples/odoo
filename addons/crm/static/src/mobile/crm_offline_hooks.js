@@ -142,9 +142,6 @@ const NON_CREATABLE_ACTIVITY_CATEGORIES = ["meeting", "upload_file"];
 /** Activities read per lead by default: Odoo's default kanban and x2many page size. */
 const LEAD_ACTIVITIES_LIMIT = 40;
 
-/** Activity types read at most: Odoo's default list page size. */
-const ACTIVITY_TYPES_LIMIT = 80;
-
 // -----------------------------------------------------------------------------
 // Plain helpers
 // -----------------------------------------------------------------------------
@@ -198,9 +195,9 @@ function creatableActivityTypes(result) {
  * categories excluded. The request is identical on every call, so it is a stable cache key: the
  * cached list answers offline, and every online call refreshes it.
  *
- * The read is bounded to the first `ACTIVITY_TYPES_LIMIT` (80) types in the model's own order
- * (`sequence ASC, id ASC`, made explicit so the bound is deterministic), so a database with an
- * unusual number of types never buffers, caches and decrypts all of them on every refresh.
+ * The read is unbounded: it carries only the domain and the specification, so every type usable
+ * on leads is read, in the model's own order, and only the meeting and upload exclusion narrows
+ * what is offered.
  *
  * The promise resolves with the first available value: the cached list when one exists, otherwise
  * the server's. When the server answer later differs from the cached list, `onUpdate` receives
@@ -226,8 +223,6 @@ export async function loadActivityTypes(orm, onUpdate) {
             })
             .webSearchRead("mail.activity.type", [["res_model", "in", [false, "crm.lead"]]], {
                 specification: { display_name: {}, category: {} },
-                order: "sequence ASC, id ASC",
-                limit: ACTIVITY_TYPES_LIMIT,
             });
         return creatableActivityTypes(result);
     } catch (error) {
@@ -698,6 +693,9 @@ export function useCrmOffline() {
      * A `NonSecureContextError` raised by the framework (offline features need a secure context)
      * propagates, as it does for framework record saves.
      *
+     * It throws before anything runs, is requested or is queued when `online` is not a function,
+     * the method cannot be queued, or `queue.model` is missing.
+     *
      * @example
      * await crmOffline.runOrQueue({
      *     online: () => crmOffline.orm.call("mail.activity", "action_done", [[id]]),
@@ -708,7 +706,7 @@ export function useCrmOffline() {
      * @param {Object} params
      * @param {() => Promise<any>} params.online the live call
      * @param {Object} params.queue the call to schedule instead
-     * @param {string} params.queue.model
+     * @param {string} params.queue.model required, a non-empty model name
      * @param {"web_save" | "action_archive"} params.queue.method
      * @param {any[]} params.queue.args
      * @param {Object} [params.queue.kwargs]
@@ -719,12 +717,15 @@ export function useCrmOffline() {
         if (typeof online !== "function") {
             throw new Error("runOrQueue: `online` must be a function performing the live call");
         }
-        if (!queue?.model || !CRM_QUEUEABLE_METHODS.includes(queue.method)) {
+        if (!CRM_QUEUEABLE_METHODS.includes(queue?.method)) {
             throw new Error(
                 `runOrQueue: only ${CRM_QUEUEABLE_METHODS.join(" and ")} can be queued, got "${
                     queue?.method
                 }"`
             );
+        }
+        if (!queue.model) {
+            throw new Error("runOrQueue: `queue.model` is required");
         }
         const schedule = () => {
             const extras = {
