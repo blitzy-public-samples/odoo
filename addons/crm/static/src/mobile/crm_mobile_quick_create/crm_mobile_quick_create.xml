@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Mobile lead quick create, rendered inside the bottom sheet the small-screen CRM pipeline
+        opens (`usePopover(CrmMobileQuickCreate, {useBottomSheet: true, withScope: true})`).
+
+        - Exactly six labelled controls, in this order: lead name, contact name, phone, email,
+          expected revenue and stage. There is deliberately no partner control: the contact is
+          captured as a char (`contact_name`), so no contact can be created offline.
+        - Every interactive element carries `data-available-offline`: the framework offline UI
+          disables each `<button>` without it, and the sheet must stay fully usable offline, where
+          `save()` queues the create.
+        - Values are bound with `t-model.proxy`, because the component state is a `proxy`; a plain
+          `t-model` expects a signal. The stage options' values are group datapoint ids (strings),
+          as `state.stageGroupId` is, so the select's strict comparison selects the right option.
+        - Comments stay outside the template: Owl renders a comment inside a template into the DOM.
+        - No `<form>` wrapper and only `type="button"` buttons, so the sole path that creates a lead
+          is `save()`. The framework quick-create classes (`o_kanban_quick_create`, `o_kanban_add`)
+          are not used: they belong to the framework kanban quick create.
+    -->
+    <t t-name="crm.CrmMobileQuickCreate">
+        <div class="o_crm_mobile_quick_create d-flex flex-column gap-3 p-3">
+            <h4 class="mb-0">New Lead</h4>
+
+            <div class="o_crm_mobile_quick_create_field">
+                <label class="form-label" for="o_crm_mobile_quick_create_name">Lead Name</label>
+                <input id="o_crm_mobile_quick_create_name"
+                    type="text"
+                    name="name"
+                    class="form-control"
+                    required="1"
+                    t-model.proxy="this.state.name"
+                    t-att-aria-invalid="this.state.error ? 'true' : false"
+                    t-att-aria-describedby="this.state.error ? 'o_crm_mobile_quick_create_name_error' : false"
+                    data-available-offline="1"/>
+                <div t-if="this.state.error"
+                    id="o_crm_mobile_quick_create_name_error"
+                    class="text-danger small"
+                    role="alert"
+                    t-out="this.state.error"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_field">
+                <label class="form-label" for="o_crm_mobile_quick_create_contact_name">Contact Name</label>
+                <input id="o_crm_mobile_quick_create_contact_name"
+                    type="text"
+                    name="contact_name"
+                    class="form-control"
+                    t-model.proxy="this.state.contact_name"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_field">
+                <label class="form-label" for="o_crm_mobile_quick_create_phone">Phone</label>
+                <input id="o_crm_mobile_quick_create_phone"
+                    type="tel"
+                    name="phone"
+                    class="form-control"
+                    t-model.proxy="this.state.phone"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_field">
+                <label class="form-label" for="o_crm_mobile_quick_create_email_from">Email</label>
+                <input id="o_crm_mobile_quick_create_email_from"
+                    type="email"
+                    name="email_from"
+                    class="form-control"
+                    t-model.proxy="this.state.email_from"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_field">
+                <label class="form-label" for="o_crm_mobile_quick_create_expected_revenue">Expected Revenue</label>
+                <input id="o_crm_mobile_quick_create_expected_revenue"
+                    type="number"
+                    inputmode="decimal"
+                    step="any"
+                    min="0"
+                    name="expected_revenue"
+                    class="form-control"
+                    t-model.proxy="this.state.expected_revenue"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_field">
+                <label class="form-label" for="o_crm_mobile_quick_create_stage_id">Stage</label>
+                <select id="o_crm_mobile_quick_create_stage_id"
+                    name="stage_id"
+                    class="form-select"
+                    t-model.proxy="this.state.stageGroupId"
+                    data-available-offline="1">
+                    <option t-foreach="this.stageGroups" t-as="group" t-key="group.id"
+                        t-att-value="group.id"
+                        t-out="group.displayName"/>
+                </select>
+            </div>
+
+            <div class="d-flex gap-2">
+                <button type="button"
+                    class="btn btn-primary flex-grow-1 o_crm_mobile_quick_create_save"
+                    data-available-offline="1"
+                    t-att-disabled="this.state.saving"
+                    t-on-click="() => this.save()">
+                    Save
+                </button>
+                <button type="button"
+                    class="btn btn-secondary flex-grow-1 o_crm_mobile_quick_create_discard"
+                    data-available-offline="1"
+                    t-on-click="() => this.discard()">
+                    Discard
+                </button>
+            </div>
+        </div>
+    </t>
+
+</templates>
