@@ -19,8 +19,10 @@
  * - module-level patches that make the shared DISABLE entry points of the offline inventory
  *   (`static/src/mobile/offline_inventory.md`) inert while offline (view buttons, list and kanban
  *   header buttons, the Actions and Cog menus, saves of mail dialog forms targeting a lead, the
- *   team dashboard card and activity report rows), that keep the forecast views and the activity
- *   report unreachable offline, and that let phones search cached partners offline.
+ *   team dashboard card and activity report rows), that render the DISABLE anchors drawn by view
+ *   buttons disabled while offline (wherever they are rendered, overlays such as the team card
+ *   menu included), that keep the forecast views and the activity report unreachable offline, and
+ *   that let phones search cached partners offline.
  *
  * Component-owned DISABLE paths and SKIP probes are guarded in their own files, not patched here.
  * The team switcher, the recurring-revenue probe, lead generation (its Install confirmation
@@ -105,7 +107,11 @@ export const CRM_FOREIGN_DISABLED_BUTTONS = Object.freeze(
  * DISABLE controls that are not `<button>` elements, so the framework's offline selector does not
  * dim them: the automated-probability anchors of the lead form, the team dashboard anchors and
  * cards, and the CRM entry of the activity menu. They are appended to
- * `OfflinePlugin.SELECTORS_TO_DISABLE` below.
+ * `OfflinePlugin.SELECTORS_TO_DISABLE` below. The selectors reach only the elements they describe:
+ * the `.o_crm_team_kanban` descendants miss the team dashboard card menu, whose overlay is rendered
+ * outside the dashboard, and no selector describes the UTM campaign card's leads/opportunities
+ * anchor. The DISABLE anchors drawn by view buttons therefore also get the same disabled state from
+ * the `ViewButton` patch, keyed on its click guard's predicate, wherever they are rendered.
  *
  * @type {readonly string[]}
  */
@@ -766,7 +772,11 @@ export function useCrmOffline() {
 
 // The framework dims, while offline, every element matching one of these selectors (and re-applies
 // it to elements added later). Appending the CRM selectors dims the non-button DISABLE controls
-// exactly like buttons; the base selector stays first and unchanged.
+// exactly like buttons; the base selector stays first and unchanged. DISABLE anchors rendered by
+// view buttons, wherever they are rendered (overlays such as the team dashboard card menu, the UTM
+// campaign card), also render the same `disabled` attribute and `o_disabled_offline` class while
+// offline, unless already disabled, through the `ViewButton` patch below and the same predicate as
+// its click guard.
 patch(OfflinePlugin, {
     SELECTORS_TO_DISABLE: [
         ...OfflinePlugin.SELECTORS_TO_DISABLE,
@@ -812,6 +822,52 @@ patch(ViewButton.prototype, {
         // Assigned after the base setup, which may wrap `onClick` in a debounced bound function:
         // that function calls this patched `onClick`, which reads `crmOffline` at click time.
         this.crmOffline = useCrmOffline();
+    },
+    /**
+     * Whether this view button is a DISABLE anchor (any tag other than `<button>`) that is
+     * otherwise enabled, while offline, under the same predicate as the click guard of `onClick`:
+     * the anchor is rendered disabled whenever its click is inert. `<button>` tags are left to the
+     * framework's offline selector. An anchor already disabled by its own state is never marked,
+     * as the framework's selector skips elements that are already disabled: the framework strips
+     * the `disabled` attribute from every marked element on reconnection, which would leave such
+     * an anchor rendered enabled while it is still disabled. The tag, the predicate and the
+     * anchor's own state are checked before the offline signal is read, so only enabled CRM
+     * DISABLE anchors re-render when the connection drops or returns; that re-render also updates
+     * an anchor shown in an overlay opened before the change (the team dashboard card menu).
+     *
+     * @returns {boolean}
+     */
+    get crmDisabledOffline() {
+        const { record, tag } = this.props;
+        if (tag === "button" || !isCrmDisabledButton(record?.resModel, this.clickParams, record)) {
+            return false;
+        }
+        if (super.disabled) {
+            return false;
+        }
+        return this.crmOffline ? this.crmOffline.isOffline() : isOfflineModel(record?.model);
+    },
+    /**
+     * A DISABLE anchor renders the `disabled` attribute offline, as the framework sets it on the
+     * elements its offline selectors match. Otherwise the base value is unchanged.
+     */
+    get disabled() {
+        if (this.crmDisabledOffline) {
+            return true;
+        }
+        return super.disabled;
+    },
+    /**
+     * A DISABLE anchor renders the framework's `o_disabled_offline` class offline, so it is
+     * dimmed like the elements the offline selectors match; the framework strips the class on
+     * reconnection and the re-render leaves it out. Otherwise the base classes are unchanged.
+     */
+    getClassName() {
+        const className = super.getClassName(...arguments);
+        if (!this.crmDisabledOffline) {
+            return className;
+        }
+        return className ? `${className} o_disabled_offline` : "o_disabled_offline";
     },
     /**
      * Form header and smart buttons, probability anchors, team dashboard anchors, wizard confirm
