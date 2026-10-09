@@ -98,11 +98,11 @@ The rules apply in this order, and every entry point gets exactly one class.
 | A2 | `static/src/views/crm_form/crm_form.js` | 51 | `checkRainbowmanMessage()` after a form save that changed the stage | SKIP | Same visual-effect lookup; the save itself is A4. |
 | A3 | `static/src/views/crm_kanban/crm_kanban_model.js` | 29 | `checkRainbowmanMessage()` after a kanban stage move | SKIP | Same visual-effect lookup; the move itself is A5. |
 | A4 | `static/src/views/crm_form/crm_form.js` | 49 | `super._save()` → `crm.lead` `web_save`, including the partner-sync `email_from`/`phone` copy | QUEUE | Every value is user-entered or already loaded on the record; the framework's offline save queues it. |
-| A5 | `static/src/views/crm_kanban/crm_kanban_model.js` | 25 | `super.moveRecords()` → `web_save([[id]], {stage_id})`, won stage included | QUEUE | The stage id comes from the target group; the server derives won and probability from the stage (K4). |
+| A5 | `static/src/views/crm_kanban/crm_kanban_model.js` | 25 | `super.moveRecords()` → `web_save` with args `[[id], {stage_id}]`, won stage included | QUEUE | The stage id comes from the target group; the server derives won and probability from the stage (K4). |
 | A6 | `static/src/views/crm_kanban/crm_column_progress.js` | 14 | `user.hasGroup("crm.group_use_recurring_revenues")` | SKIP | Group probe that only toggles the recurring-revenue aggregate. |
 | A7 | `static/src/components/team_switcher/team_switcher.js` | 21 | `user.hasGroup("sales_team.group_sale_manager")` | SKIP | Group probe that only toggles the Manage Teams item. |
 | A8 | `static/src/components/team_switcher/team_switcher.js` | 46 | `actionService.doAction("sales_team.crm_team_action_config")` | DISABLE | Navigation to the team configuration action, unavailable offline. |
-| A9 | `static/src/components/team_switcher/team_switcher.js` | 60 | `searchModel._updateSwitcherSelection(teamId)`, from the toggle at `team_switcher.xml:6-9` | DISABLE | The selection reloads the view under a team domain the client cannot serve offline (K6). |
+| A9 | `static/src/components/team_switcher/team_switcher.js` | 60 | `searchModel._updateSwitcherSelection(teamId)`, from the toggle at `team_switcher.xml:6-9` | DISABLE | Selection is locked offline because the reload may need a team domain that was never cached; the disk-cached load-time data (A10) and the current-team facet stay (K6). |
 | A10 | `static/src/views/crm_search_model.js` | 130 | `orm.cache({type: "disk", update: "always"}).call("crm.team", "get_team_switcher_data")` | DISABLE | Non-decorative read feeding the disabled selection (K6); the disk cache still answers it at load. |
 | A11 | `static/src/activity_menu_patch.js` | 39 | `action.loadAction("crm.crm_lead_action_my_activities")` | DISABLE | Loads an action only to navigate to it; unavailable offline. |
 | A12 | `static/src/activity_menu_patch.js` | 45 | `action.doAction(action, {clearBreadcrumbs: true})` | DISABLE | Navigation to the CRM activity views, unavailable offline. |
@@ -136,7 +136,7 @@ The rules apply in this order, and every entry point gets exactly one class.
 | B12 | `views/crm_lead_views.xml` | 323 | Leads list header "Convert to Opportunities" `%(action_crm_send_mass_convert)d` | DISABLE | Transient mass-convert wizard. |
 | B13 | `views/crm_lead_views.xml` | 324 | Leads list header "Mark Lost" `%(crm.crm_lead_lost_action)d` | DISABLE | Transient-model wizard. |
 | B14 | `views/crm_lead_views.xml` | 518 | Kanban card menu `<a role="menuitem" type="delete">` → `web_unlink([[id]])` → `unlink` (`models/crm_lead.py:971`) | QUEUE | The id is known on the client; framework queue, systray "Deleted". |
-| B15 | `views/crm_lead_views.xml` | 520 | Kanban card menu `kanban_color_picker` → `web_save([[id]], {color})` | QUEUE | The color index is chosen on the client. |
+| B15 | `views/crm_lead_views.xml` | 520 | Kanban card menu `kanban_color_picker` → `web_save` with args `[[id], {color}]` | QUEUE | The color index is chosen on the client. |
 | B16 | `views/crm_lead_views.xml` | 710 | Opportunities list header "Mark Lost" `%(crm.crm_lead_lost_action)d` | DISABLE | Transient-model wizard. |
 | B17 | `views/crm_lead_views.xml` | 711 | Opportunities list header "Email" `%(crm.action_lead_mass_mail)d` | DISABLE | Mail composer wizard (mass mail). |
 | B18 | `views/crm_lead_views.xml` | 760 | Opportunities list row "Email" `%(crm.action_lead_mail_compose)d` | DISABLE | Mail composer wizard. |
@@ -193,7 +193,7 @@ record's opening tag.
 | D10 | `list/list_controller.js` | 454 | `crm.lead` Export | DISABLE | Server-computed file. |
 | D11 | `list/list_controller.js` | 454 | `crm.team` Export | DISABLE | Server-computed file. |
 | D12 | `list/list_controller.js` | 454 | `crm.stage` Export | DISABLE | Server-computed file. |
-| D13 | `wizard/crm_lead_lost_views.xml` | 22 | Bound "Mark Lost" `crm_lead_lost_action` (all lead views) → `crm.lead.lost` | DISABLE | Transient-model wizard, out of scope offline. |
+| D13 | `wizard/crm_lead_lost_views.xml` | 22 | Bound "Mark Lost" `crm_lead_lost_action` (form, list: default `binding_view_types`) → `crm.lead.lost` | DISABLE | Transient-model wizard, out of scope offline. |
 | D14 | `wizard/crm_merge_opportunities_views.xml` | 41 | Bound "Merge Leads/Opportunities" `action_merge_opportunities` (list, kanban) → `crm.merge.opportunity` | DISABLE | Transient-model wizard, out of scope offline. |
 | D15 | `views/crm_lead_views.xml` | 674 | Bound "Send email" `action_lead_mail_compose` (form) → `mail.compose.message` | DISABLE | Mail composer wizard. |
 | D16 | `views/crm_lead_views.xml` | 686 | Bound "Send email" `action_lead_mass_mail` (list, kanban) → `mail.compose.message` in mass-mail mode | DISABLE | Mail composer wizard. |
@@ -220,6 +220,10 @@ carry no class and are not counted.
   offline-editable field type (`addons/web/static/src/views/fields/field.js:19-39`).
 - `action_reschedule_meeting`, `get_empty_list_help` and `get_import_templates`: no CRM button
   reaches them.
+- Local functions matched by the Python sweep, not model methods and not entry points:
+  `models/crm_lead.py:584` `return_if_relevant`, nested in `_compute_potential_lead_duplicates`,
+  and `models/crm_lead.py:1938` `opps_key`, the sort key nested in `_sort_by_confidence_level`.
+  Only their enclosing methods call them.
 - `static/src/js/tours/**`: onboarding tours, excluded from the sweep.
 - `static/src/views/crm_search_model.js:47`, `super.load(config)`: the framework search-model load
   shared by every view; the CRM-specific read of this file is A10.
@@ -251,7 +255,7 @@ Every public method found by sweep 3, with the rows that reach it.
 |-------|---------------|------------|
 | `crm.lead` | `create` (729) | A4 on a new record, the framework kanban quick create, N1 |
 | `crm.lead` | `write` (760) | A4, A5, B15 and every framework save of a lead |
-| `crm.lead` | `search_fetch` (825) | Framework reads of every lead view; no button |
+| `crm.lead` | `search_fetch` (825) | Search-backed lead reads such as list and kanban `web_search_read`, the records of open `web_read_group` groups and `name_search`; not the form's `web_read`, which reads by id; no button |
 | `crm.lead` | `copy_data` (954) | D7 |
 | `crm.lead` | `unlink` (971) | B14, D4 |
 | `crm.lead` | `action_unarchive` (1031) | C1 |
@@ -294,10 +298,10 @@ existing-code rows above.
 | Id | Entry point | Class |
 |----|-------------|-------|
 | N1 | Mobile quick create: `crm.lead` `web_save([], vals)` | QUEUE |
-| N2 | Mobile card stage move, Won included: `web_save([[id]], {stage_id})` | QUEUE |
+| N2 | Mobile card stage move, Won included: `web_save` with args `[[id], {stage_id}]` | QUEUE |
 | N3 | Log call and follow-up: `mail.activity` `web_save([], {res_model, res_id, activity_type_id, summary, date_deadline, user_id})` | QUEUE |
 | N4 | Mark done of any persisted, cached activity, whatever its category: `mail.activity` `action_archive([[id]])` | QUEUE (state only) |
-| N5 | Activity controls when no activity type is cached; Log call when no `phonecall` type is cached | DISABLE |
+| N5 | Log call and Follow-up creation controls when no creatable (non-meeting, non-upload) activity type is cached; Log call alone when no `phonecall` type is cached. The activity list and mark-done (N4) do not depend on the type cache | DISABLE |
 | N6 | Activity actions on a pending lead, and mark-done on a pending activity | DISABLE (needs another call's id) |
 | N7 | Creating a calendar event from an activity, meeting-type activity creation, and upload launchers | DISABLE (unreachable: calendar round-trip or file upload) |
 

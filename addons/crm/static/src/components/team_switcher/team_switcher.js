@@ -128,8 +128,9 @@ export class TeamSwitcher extends Component {
      * @param {Number} teamId Id of the new selected team, "undefined" fallbacks on "All Sales Team".
      */
     onSelect(teamId) {
-        // Switching teams is not available offline: the switcher data and the records of another
-        // team cannot be loaded. The current selection (and its facet) is kept as it is.
+        // Switching teams is locked offline: the reload would query another team's domain,
+        // which may never have been cached. The switcher data itself still comes from the search
+        // model's disk cache at load, and the current selection and its facet are kept as they are.
         if (this.crmOffline.isOffline()) {
             return;
         }
