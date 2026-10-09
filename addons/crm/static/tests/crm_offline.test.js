@@ -28,7 +28,6 @@ import {
     beforeEach,
     describe,
     expect,
-    press,
     queryAll,
     queryAllTexts,
     queryFirst,
@@ -36,10 +35,11 @@ import {
     runAllTimers,
     test,
 } from "@odoo/hoot";
+import { press } from "@odoo/hoot-dom";
+import { defineCrmModels } from "@crm/../tests/crm_test_helpers";
 import {
     click as mailClick,
     contains as mailContains,
-    defineMailModels,
     hover,
     insertText,
     listenStoreFetch,
@@ -68,6 +68,8 @@ import {
     onRpc,
     patchWithCleanup,
     serverState,
+    swipeLeft,
+    swipeRight,
     toggleActionMenu,
     toggleMenuItem,
 } from "@web/../tests/web_test_helpers";
@@ -83,6 +85,8 @@ import { TeamSwitcher } from "@crm/components/team_switcher/team_switcher";
 import { CrmPlsTooltipButton } from "@crm/views/crm_form/crm_pls_tooltip_button";
 import { CrmColumnProgress } from "@crm/views/crm_kanban/crm_column_progress";
 import { CrmShareTargetItem } from "@crm/webclient/share_target/crm_share_target_item";
+import { HtmlField } from "@html_editor/fields/html_field";
+import { ScheduledMessage } from "@mail/chatter/web/scheduled_message";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
 import { MessageAction } from "@mail/core/common/message_actions";
@@ -908,6 +912,9 @@ mailModels.MailActivity._views = {
         </form>`,
 };
 
+// Registers the mail models and the CRM lead server model beneath the local fixtures below, which
+// is why `defineMailModels` is not called too.
+defineCrmModels();
 defineModels([
     CrmStage,
     CrmTeam,
@@ -924,7 +931,6 @@ defineModels([
     MailFollowersEdit,
     CrmLead,
 ]);
-defineMailModels();
 
 const PIPELINE_ACTION_ID = 1;
 const FORECAST_ACTION_ID = 2;
@@ -1310,6 +1316,128 @@ describe("Kanban moves", () => {
         expect.verifySteps(["crm.lead/web_save", "crm.lead/get_rainbowman_message"]);
         expect(".o_kanban_group:eq(2) .o_kanban_record").toHaveCount(2);
         expect(queuedEntries()).toHaveLength(0);
+    });
+
+    // On small screens the pipeline is the stage-at-a-time `crm_mobile_pipeline` view: stages are
+    // reached by swiping the stage body, and a lead is moved through its card's stage list instead
+    // of being dragged. That move goes through the same CRM kanban model `moveRecords` whose
+    // rainbowman lookup is skipped offline.
+    test.tags("mobile");
+    test("mobile: offline pipeline stage move to the won stage, reached by swipe: queued, no rainbowman lookup", async () => {
+        // The background refresh of each read served from the RPC cache offline rejects with a
+        // connection loss nobody awaits: the activities of every displayed lead visited online,
+        // then the activity types, each time the displayed leads change. Lead 5 (Won) was never
+        // displayed online, so its uncached read is answered by the caught connection loss.
+        const ACTIVITIES = "mail.activity/web_search_read";
+        const TYPES = "mail.activity.type/web_search_read";
+        const errors = [
+            // offline swipe to Qualified (Lead 3), then back to New (Lead 1, Lead 2)
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+            TYPES,
+            // the move: New loses Lead 1 (Lead 2), then Won is displayed (Lead 1)
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+            // swipes back to New through Qualified (Lead 3, then Lead 2), then to Won again through
+            // Qualified (Lead 3, then Lead 1)
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+        ].map((route) => `Connection to "/web/dataset/call_kw/${route}"`);
+        expect.errors(errors.length);
+        const setOffline = mockOffline();
+        watchRpcs([
+            "crm.lead/web_save",
+            "crm.lead/get_rainbowman_message",
+            "crm.lead/web_search_read",
+            "crm.lead/web_read_group",
+        ]);
+        keepPingsFailing();
+        const header = ".o_crm_mobile_pipeline_header";
+        const cardNames = () =>
+            queryAllTexts(".o_crm_mobile_pipeline_body .o_crm_mobile_lead_card_name");
+        const cardOf = (name) =>
+            `.o_crm_mobile_pipeline_body .o_crm_mobile_lead_card:has(.o_crm_mobile_lead_card_name:text(${name}))`;
+        const expectStage = (name, count, names) => {
+            expect(`${header} .o_crm_mobile_pipeline_stage_name`).toHaveText(name);
+            expect(`${header} .o_crm_mobile_pipeline_count`).toHaveText(String(count));
+            expect(cardNames()).toEqual(names);
+        };
+
+        await mountView({
+            type: "kanban",
+            resModel: "crm.lead",
+            arch: LEAD_KANBAN_ARCH.replace(
+                'js_class="crm_kanban"',
+                'js_class="crm_mobile_pipeline"'
+            ),
+            config: { actionId: PIPELINE_ACTION_ID, cache: true },
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps(["crm.lead/web_read_group"]);
+        expect(".o_crm_mobile_pipeline .o_crm_mobile_pipeline_body").toHaveCount(1);
+        expectStage("New", 2, ["Lead 1", "Lead 2"]);
+
+        // Online, a swipe to the left displays the next stage and one to the right the previous.
+        await swipeLeft(".o_crm_mobile_pipeline_body");
+        expectStage("Qualified", 1, ["Lead 3"]);
+        await swipeRight(".o_crm_mobile_pipeline_body");
+        expectStage("New", 2, ["Lead 1", "Lead 2"]);
+        expect.verifySteps([]);
+
+        // Offline, the swipes still navigate between the loaded stages, with no lead read.
+        await setOffline(true);
+        await swipeLeft(".o_crm_mobile_pipeline_body");
+        expectStage("Qualified", 1, ["Lead 3"]);
+        await swipeRight(".o_crm_mobile_pipeline_body");
+        expectStage("New", 2, ["Lead 1", "Lead 2"]);
+        expect.verifySteps([]);
+
+        // Offline, choosing the won stage in Lead 1's card stage list is mark-won: the framework
+        // queues the stage write and the rainbowman lookup is skipped.
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_stage`).click();
+        await contains(
+            `${cardOf("Lead 1")} .o_crm_mobile_stage_option[data-stage-value='3']`
+        ).click();
+        await animationFrame();
+        expect.verifySteps(["crm.lead/web_save"]);
+        const saves = queuedCalls("crm.lead", "web_save");
+        expect(saves).toHaveLength(1);
+        expect(saves[0].args[0]).toEqual([1]);
+        expect(saves[0].args[1]).toMatchObject({ stage_id: 3 });
+        expect(saves[0].extras.viewType).toBe("kanban");
+        expect(".o_reward").toHaveCount(0);
+        expect(".modal").toHaveCount(0);
+
+        // The won stage is displayed with the moved card and its pending-sync badge.
+        expectStage("Won", 2, ["Lead 1", "Lead 5"]);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(`${cardOf("Lead 5")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+
+        // Swiped back to New, Lead 1 is no longer there; swiped on to Won, it still is.
+        await swipeRight(".o_crm_mobile_pipeline_body");
+        expectStage("Qualified", 1, ["Lead 3"]);
+        await swipeRight(".o_crm_mobile_pipeline_body");
+        expectStage("New", 1, ["Lead 2"]);
+        await swipeLeft(".o_crm_mobile_pipeline_body");
+        await swipeLeft(".o_crm_mobile_pipeline_body");
+        expectStage("Won", 2, ["Lead 1", "Lead 5"]);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+
+        await runAllTimers();
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(1);
+        expect(".o_reward").toHaveCount(0);
+        expect.verifyErrors(errors);
     });
 });
 
@@ -2239,6 +2367,8 @@ describe("SKIP and remaining DISABLE", () => {
         /\/action_feedback_schedule_next$/,
         /\/action_done$/,
         /\/activity_send_mail$/,
+        /\/open_edit_form$/,
+        /\/post_message$/,
         /\/unlink$/,
         /\/write$/,
         /\/web_save$/,
@@ -2297,6 +2427,44 @@ describe("SKIP and remaining DISABLE", () => {
         return { pyEnv, activityId, attachmentId, messageId, mailTemplateId };
     }
 
+    /**
+     * Seeds a scheduled message of the current user, carrying one attachment, on a thread.
+     *
+     * @param {Object} pyEnv
+     * @param {string} resModel
+     * @param {number} resId
+     * @returns {{ scheduledMessageId: number, attachmentId: number }}
+     */
+    function seedScheduledMessage(pyEnv, resModel, resId) {
+        const attachmentId = pyEnv["ir.attachment"].create({
+            mimetype: "text/plain",
+            name: "agenda.txt",
+            res_id: resId,
+            res_model: resModel,
+        });
+        const scheduledMessageId = pyEnv["mail.scheduled.message"].create({
+            attachment_ids: [attachmentId],
+            body: "<p>Quote reminder</p>",
+            model: resModel,
+            res_id: resId,
+            scheduled_date: "2030-01-01 10:00:00",
+        });
+        return { scheduledMessageId, attachmentId };
+    }
+
+    /**
+     * @param {ScheduledMessage[]} instances captured scheduled message components
+     * @param {string} model
+     * @returns {ScheduledMessage | undefined} the mounted one showing a scheduled message of `model`
+     */
+    function mountedScheduledMessage(instances, model) {
+        return instances.findLast(
+            (instance) =>
+                status(instance) === "mounted" &&
+                instance.props.scheduledMessage.thread?.model === model
+        );
+    }
+
     /** Collects the instances of every patched mail component of the chatter. */
     function captureChatterComponents() {
         return {
@@ -2350,6 +2518,10 @@ describe("SKIP and remaining DISABLE", () => {
         // error handler does (asserted below: nothing is retried, queued or shown).
         expect.errors(1);
         const { pyEnv, mailTemplateId } = await seedLeadThread();
+        // As on the server, the lead model is a mail thread: its messages accept reactions, so
+        // their actions render the quick reaction menu (the local fixture omits the mixin).
+        const leadModel = pyEnv["crm.lead"];
+        leadModel._inherit = [leadModel._inherit, "mail.thread"].filter(Boolean).join(",");
         const setOffline = mockOffline();
         keepPingsFailing();
         // Route listeners run last-registered first: the connection drop of the post is
@@ -2452,19 +2624,39 @@ describe("SKIP and remaining DISABLE", () => {
         expect(".o-mail-ActivityAssignPopover").toHaveCount(0);
         expect(".modal").toHaveCount(0);
 
-        // Reactions and message actions.
-        for (const quickReactionMenu of components.quickReactionMenus) {
+        // Reactions and message actions, each present for a lead message before it is called.
+        const leadQuickReactionMenus = components.quickReactionMenus.filter(
+            (quickReactionMenu) => quickReactionMenu.props.message.thread?.model === "crm.lead"
+        );
+        expect(leadQuickReactionMenus.length).toBeGreaterThan(0, {
+            message: "a quick reaction menu of a lead message",
+        });
+        for (const quickReactionMenu of leadQuickReactionMenus) {
             quickReactionMenu.toggleReaction("👍");
             quickReactionMenu.toggleReaction("🤣");
             quickReactionMenu.onClick();
         }
-        for (const reactionList of components.reactionLists) {
+        const leadReactionLists = components.reactionLists.filter(
+            (reactionList) => reactionList.message().thread?.model === "crm.lead"
+        );
+        expect(leadReactionLists.length).toBeGreaterThan(0, {
+            message: "a reaction list of a lead message",
+        });
+        for (const reactionList of leadReactionLists) {
             reactionList.onClickReaction(NO_EVENT, {
                 messageAtRender: reactionList.message(),
                 reactionAtRender: reactionList.reaction(),
             });
         }
         const ownersOffline = messageActionsByOwner(messageActions, "crm.lead");
+        for (const ownerName of ["Message", "MessageContextMenu"]) {
+            const ownerActions = [...ownersOffline]
+                .filter(([owner]) => owner.constructor.name === ownerName)
+                .flatMap(([, actions]) => actions);
+            expect(ownerActions.length).toBeGreaterThan(0, {
+                message: `${ownerName} of a lead message holds actions offline`,
+            });
+        }
         for (const [owner, actions] of ownersOffline) {
             if (["Message", "MessageContextMenu"].includes(owner.constructor.name)) {
                 expect(owner.messageActions.actions).toHaveLength(0, {
@@ -2477,6 +2669,25 @@ describe("SKIP and remaining DISABLE", () => {
         }
         await animationFrame();
         expect(".o-mail-MessageReaction:contains('🤣')").toHaveCount(0);
+        expect(".modal").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // A mark-done popover opened online closes on disconnect, and its done handlers, called
+        // directly afterwards, issue no `action_feedback` or `action_feedback_schedule_next`.
+        await setOffline(false);
+        await mailClick(".o-mail-Activity-markDone");
+        await mailContains(".o-mail-ActivityMarkAsDone");
+        const markDonePopover = components.markDonePopovers.at(-1);
+        expect(markDonePopover.activity().res_model).toBe("crm.lead");
+        expect(status(markDonePopover)).toBe("mounted");
+        await setOffline(true);
+        await animationFrame();
+        expect(".o-mail-ActivityMarkAsDone").toHaveCount(0);
+        await markDonePopover.onClickDone();
+        await markDonePopover.onClickDoneAndScheduleNext();
+        await animationFrame();
+        expect(".o-mail-Activity:contains('Follow the lead up')").toHaveCount(1);
         expect(".modal").toHaveCount(0);
         expect(queuedEntries()).toHaveLength(0);
         expect.verifySteps([]);
@@ -2495,6 +2706,100 @@ describe("SKIP and remaining DISABLE", () => {
         expect(queuedEntries()).toHaveLength(0);
         expect(".o-mail-Message:contains('Lost in transit')").toHaveCount(0);
         await mailContains(".o-mail-Message:contains('Hello lead')");
+    });
+
+    test("chatter scheduled message on a lead: cancel, attachment removal, edit and send now inert offline", async () => {
+        const pyEnv = await startServer();
+        const { scheduledMessageId, attachmentId } = seedScheduledMessage(pyEnv, "crm.lead", 1);
+        // Online, "Send Now" and "Edit" are answered as the server does for a message still
+        // scheduled: it stays in the list.
+        onRpc("mail.scheduled.message", "post_message", ({ args }) => {
+            expect(args).toEqual([scheduledMessageId]);
+            return true;
+        });
+        onRpc("mail.scheduled.message", "open_edit_form", ({ args }) => {
+            expect(args).toEqual([scheduledMessageId]);
+            return { name: "Edit Scheduled Message" };
+        });
+        mockService("action", {
+            doAction(action, options) {
+                if (action?.name === "Edit Scheduled Message") {
+                    expect.step(`doAction:${action.name}`);
+                    return options.onClose();
+                }
+                return super.doAction(...arguments);
+            },
+        });
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        // Every chatter write is stepped, online or offline.
+        watchRpcs(MAIL_WRITES);
+        const scheduledMessages = captureInstances(ScheduledMessage);
+        await start();
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        const shown =
+            ".o-mail-ScheduledMessagesList .o-mail-Scheduled-Message:contains('Quote reminder')";
+        const shownAttachment = `${shown} .o-mail-AttachmentCard:contains('agenda.txt')`;
+        await mailContains(shown);
+        await mailContains(shownAttachment);
+        const scheduledMessage = mountedScheduledMessage(scheduledMessages, "crm.lead");
+        expect(scheduledMessage.props.scheduledMessage.id).toBe(scheduledMessageId);
+        expect(scheduledMessage.props.scheduledMessage.thread.id).toBe(1);
+        const attachments = [...scheduledMessage.props.scheduledMessage.attachment_ids];
+        expect(attachments.map(({ id }) => id)).toEqual([attachmentId]);
+
+        // Online, the cancellation asks for confirmation.
+        await mailClick(".o-mail-Scheduled-Message-buttons .btn:contains('Cancel')");
+        await mailContains(".modal-footer button:contains('Cancel Message')");
+
+        // The confirmation opened online, confirmed once offline, cancels nothing.
+        await setOffline(true);
+        await animationFrame();
+        await contains(".modal-footer button:contains('Cancel Message')").click();
+        await animationFrame();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps([]);
+
+        // Offline, every handler is inert, called directly or through its button.
+        const offlineScheduledMessage = mountedScheduledMessage(scheduledMessages, "crm.lead");
+        await offlineScheduledMessage.cancel();
+        await offlineScheduledMessage.onClickAttachmentUnlink(attachments);
+        offlineScheduledMessage.onClickCancel();
+        await offlineScheduledMessage.onClickEdit();
+        await offlineScheduledMessage.onClickSendNow();
+        for (const label of ["Send Now", "Edit", "Cancel"]) {
+            await contains(`.o-mail-Scheduled-Message-buttons .btn:contains('${label}')`).click();
+        }
+        await animationFrame();
+        expect(".modal").toHaveCount(0);
+        expect(shown).toHaveCount(1);
+        expect(shownAttachment).toHaveCount(1);
+        expect(pyEnv["mail.scheduled.message"].browse(scheduledMessageId)).toHaveLength(1);
+        expect(pyEnv["ir.attachment"].browse(attachmentId)).toHaveLength(1);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Back online, the same handlers reach the server again.
+        await setOffline(false);
+        await mailClick(".o-mail-Scheduled-Message-buttons .btn:contains('Send Now')");
+        await expect.waitForSteps(["mail.scheduled.message/post_message"]);
+        await mailClick(".o-mail-Scheduled-Message-buttons .btn:contains('Edit')");
+        await expect.waitForSteps([
+            "mail.scheduled.message/open_edit_form",
+            "doAction:Edit Scheduled Message",
+        ]);
+        await mountedScheduledMessage(scheduledMessages, "crm.lead").onClickAttachmentUnlink(
+            attachments
+        );
+        expect.verifySteps(["/mail/attachment/delete"]);
+        await mailContains(shownAttachment, { count: 0 });
+        await mailClick(".o-mail-Scheduled-Message-buttons .btn:contains('Cancel')");
+        await mailClick(".modal-footer button:contains('Cancel Message')");
+        await expect.waitForSteps(["mail.scheduled.message/unlink"]);
+        await mailContains(shown, { count: 0 });
+        expect(pyEnv["mail.scheduled.message"].browse(scheduledMessageId)).toEqual([]);
+        expect(queuedEntries()).toHaveLength(0);
     });
 
     test("chatter overlays opened online are closed or inert after disconnection", async () => {
@@ -2670,6 +2975,7 @@ describe("SKIP and remaining DISABLE", () => {
             res_model: "res.partner",
             summary: "Partner activity",
         });
+        seedScheduledMessage(pyEnv, "res.partner", partnerId);
         const setOffline = mockOffline();
         keepPingsFailing();
         mockService("action", {
@@ -2683,6 +2989,7 @@ describe("SKIP and remaining DISABLE", () => {
         });
         const components = captureChatterComponents();
         const viewButtons = captureInstances(ViewButton);
+        const scheduledMessages = captureInstances(ScheduledMessage);
         await start();
         await openFormView("res.partner", partnerId, {
             arch: /* xml */ `
@@ -2692,6 +2999,7 @@ describe("SKIP and remaining DISABLE", () => {
                 </form>`,
         });
         await mailContains(".o-mail-Activity");
+        await mailContains(".o-mail-Scheduled-Message:contains('Quote reminder')");
         // The follower list is rendered by its dropdown, opened online.
         await mailClick(".o-mail-Followers-button");
         await mailContains(".o-mail-Followers-dropdown");
@@ -2720,6 +3028,11 @@ describe("SKIP and remaining DISABLE", () => {
         const saves = queuedCalls("mail.activity", "web_save");
         expect(saves).toHaveLength(1);
         expect(saves[0].args[1]).toMatchObject({ summary: "Edited offline" });
+        // A partner scheduled message still asks to confirm its cancellation.
+        const partnerScheduledMessage = mountedScheduledMessage(scheduledMessages, "res.partner");
+        expect(partnerScheduledMessage.props.scheduledMessage.thread.id).toBe(partnerId);
+        partnerScheduledMessage.onClickCancel();
+        await mailContains(".modal-footer button:contains('Cancel Message')");
     });
 
     test("share target item issues no team read offline", async () => {
@@ -2966,6 +3279,76 @@ describe("K9 attributes", () => {
         if (isSmall()) {
             expect(".o_field_widget[name=parent_id] input").toHaveAttribute("readonly");
         }
+    });
+
+    test("html field editor: the lead notes editable is marked usable offline, other models' are not", async () => {
+        const pyEnv = await startServer();
+        pyEnv["crm.lead"].write([1], { description: "<p>Met at the fair</p>" });
+        pyEnv["res.partner"].write([serverState.partnerId], { comment: "<p>Prefers email</p>" });
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const htmlFields = captureInstances(HtmlField);
+        await mountWithCleanup(WebClient);
+        /**
+         * @param {string} resModel
+         * @param {string} fieldName
+         * @returns {HTMLElement} the editable of the one mounted html field `resModel.fieldName`
+         */
+        const editableOf = (resModel, fieldName) => {
+            const mounted = htmlFields.filter(
+                (field) => field.props.record.resModel === resModel && status(field) === "mounted"
+            );
+            expect(mounted).toHaveLength(1, { message: `one mounted ${resModel} html field` });
+            const rendered = queryOne(
+                `.o_field_widget[name=${fieldName}] [contenteditable='true']`
+            );
+            expect(mounted[0].editor.editable).toBe(rendered, {
+                message: `${resModel}: the editor's editable is the rendered one`,
+            });
+            return rendered;
+        };
+
+        // A lead's notes: marked once the editor is loaded, and still editable offline.
+        await openView({
+            res_model: "crm.lead",
+            res_id: 1,
+            views: [[false, "form"]],
+            arch: /* xml */ `
+                <form>
+                    <sheet>
+                        <field name="name"/>
+                        <field name="description"/>
+                    </sheet>
+                </form>`,
+        });
+        await mailContains(".o_field_widget[name=description] [contenteditable='true']");
+        const leadEditable = editableOf("crm.lead", "description");
+        expect(leadEditable).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
+        await setOffline(true);
+        expect(leadEditable).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
+        expect(leadEditable).toHaveAttribute("contenteditable", "true");
+        expect(leadEditable).toHaveText("Met at the fair");
+        await setOffline(false);
+
+        // A partner's notes: the same html field, never marked.
+        await openView({
+            res_model: "res.partner",
+            res_id: serverState.partnerId,
+            views: [[false, "form"]],
+            arch: /* xml */ `
+                <form>
+                    <sheet>
+                        <field name="name"/>
+                        <field name="comment"/>
+                    </sheet>
+                </form>`,
+        });
+        await mailContains(".o_field_widget[name=comment] [contenteditable='true']");
+        const partnerEditable = editableOf("res.partner", "comment");
+        expect(partnerEditable).toHaveText("Prefers email");
+        expect(partnerEditable).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
+        await setOffline(true);
+        expect(partnerEditable).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
     });
 });
 
