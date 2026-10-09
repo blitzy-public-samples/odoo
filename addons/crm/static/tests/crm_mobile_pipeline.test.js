@@ -4894,7 +4894,7 @@ describe("Mobile pipeline branches", () => {
     });
 
     test.tags("mobile");
-    test("mobile: with sample data, no activity is read and reconnecting reloads nothing", async () => {
+    test("mobile: with sample data, no activity is read, and reconnecting reloads once and leaves sample mode", async () => {
         await makeMockServer();
         MockServer.env["crm.lead"].unlink(MockServer.env["crm.lead"].search([]));
         // The server expands the stage grouping to every stage, empty ones included (the CRM
@@ -4949,13 +4949,120 @@ describe("Mobile pipeline branches", () => {
         await animationFrame();
         expect.verifySteps([]);
 
-        // Reconnecting does not reload the sample pipeline.
+        // Going offline reads nothing. Reconnecting reloads the pipeline once, through the
+        // framework model: the server still holds no lead, so sample mode ends on the empty
+        // stages and the framework no-content helper. The reloaded stage then revalidates the
+        // activity types (it shows no lead to read activities for).
         await setOffline(true);
+        await animationFrame();
+        expect.verifySteps([]);
         await setOffline(false);
         await runAllTimers();
-        expect.verifySteps([]);
-        expect(renderer.props.list.model.useSampleModel).toBe(true);
+        expect.verifySteps([LEAD_GROUPS, "types"]);
+        expect(renderer.props.list.model.useSampleModel).toBe(false);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(renderer.isMobilePipeline).toBe(true);
+        expect(".o_view_sample_data").toHaveCount(0);
         expect(".o_crm_mobile_pipeline").toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_stage_name").toHaveText("New");
+        expect(".o_crm_mobile_pipeline_count").toHaveText("0");
+        expect(".o_crm_mobile_lead_card").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline .o_view_nocontent").toHaveCount(1);
+    });
+
+    test.tags("mobile");
+    test("mobile: with sample data, a lead create queued outside the pipeline shows as a server card after replay", async () => {
+        await makeMockServer();
+        MockServer.env["crm.lead"].unlink(MockServer.env["crm.lead"].search([]));
+        // No lead: the stages are still listed, empty, as the stage group expansion lists them,
+        // each aggregate with the server's empty value (`_read_group_empty_value`). Once a lead
+        // exists, the server answers as it is.
+        onRpc("crm.lead", "web_read_group", async ({ kwargs, parent }) => {
+            const result = await parent();
+            if (result.groups.length) {
+                return result;
+            }
+            const emptyValue = (spec) => {
+                if (/:array_agg(_distinct)?$/.test(spec)) {
+                    return [];
+                }
+                return /:count(_distinct)?$/.test(spec) ? 0 : false;
+            };
+            const groups = MockServer.env["crm.stage"]
+                .search_read([], ["display_name"])
+                .map((stage) => ({
+                    ...Object.fromEntries(
+                        kwargs.aggregates.map((spec) => [spec, emptyValue(spec)])
+                    ),
+                    stage_id: [stage.id, stage.display_name],
+                    __count: 0,
+                    __extra_domain: [["stage_id", "=", stage.id]],
+                    __records: [],
+                }));
+            return { groups, length: groups.length };
+        });
+        mockActivityTypes(ACTIVITY_TYPES);
+        // Registered before the offline mock: it only holds the reload sent online.
+        const reloads = holdRequests("/web/dataset/call_kw/crm.lead/web_read_group", "reload");
+        const setOffline = mockOffline();
+        watchRpcs(["crm.lead/web_save", LEAD_GROUPS, ACTIVITIES, TYPES]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline({
+            arch: PIPELINE_ARCH.replace('archivable="false"', 'archivable="false" sample="1"'),
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        expect(renderer.props.list.model.useSampleModel).toBe(true);
+        expect(".o_view_sample_data .o_crm_mobile_pipeline").toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_stage_name").toHaveText("New");
+        const sampleCount = renderer.cardsFor(renderer.currentGroup).length;
+        expect(sampleCount).toBeGreaterThan(0);
+        expect.verifySteps([LEAD_GROUPS]);
+
+        // Offline, a lead create of New enters the shared queue from the lead form of the action
+        // (its offline save): the pending card shows among the sample cards, and is counted.
+        await setOffline(true);
+        const key = queueLeadSave([], { name: "Offline lead", stage_id: 1, expected_revenue: 25 });
+        await animationFrame();
+        const pending = `.o_crm_mobile_pipeline_body .o_crm_mobile_lead_card[data-pending-key='${key}']`;
+        expect(pending).toHaveCount(1);
+        expect(`${pending} .o_crm_mobile_lead_card_name`).toHaveText("Offline lead");
+        expect(".o_crm_mobile_pipeline_count").toHaveText(String(sampleCount + 1));
+        expect.verifySteps([]);
+
+        // Reconnect: the create is replayed, then the pipeline reloads by itself through the
+        // framework model. Until that reload lands, the sync window's copy keeps the pending card
+        // and its count among the sample cards.
+        reloads.active = true;
+        await setOffline(false);
+        await letQueueReplay(1);
+        expect.verifySteps(["crm.lead/web_save", LEAD_GROUPS, "held reload"]);
+        expect(queued()).toHaveLength(0);
+        expect(renderer.mobileState.syncEntries).toHaveLength(1);
+        expect(renderer.props.list.model.useSampleModel).toBe(true);
+        expect(pending).toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_count").toHaveText(String(sampleCount + 1));
+
+        // The reload lands: sample mode ends and the window closes. The created lead is a server
+        // card, the only one and counted once, and its activities and the types are read.
+        reloads.release();
+        await animationFrame();
+        await animationFrame();
+        const created = MockServer.env["crm.lead"].search_read([["name", "=", "Offline lead"]]);
+        expect(created).toHaveLength(1);
+        expect.verifySteps([ACTIVITIES, TYPES]);
+        expect(renderer.props.list.model.useSampleModel).toBe(false);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(".o_view_sample_data").toHaveCount(0);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardNames()).toEqual(["Offline lead"]);
+        expect(cardOf("Offline lead")).toHaveAttribute("data-id");
+        expect(`${cardOf("Offline lead")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(renderer.allLoadedRecords().map((record) => record.resId)).toEqual([created[0].id]);
+        expectHeader("New", 1, 25);
+        expect(".o_view_nocontent").toHaveCount(0);
+        await runAllTimers();
+        expect.verifySteps([]);
     });
 
     test.tags("mobile");
@@ -12476,7 +12583,7 @@ describe("Remaining branches", () => {
     });
 
     test.tags("mobile");
-    test("mobile: with sample data, no activity is read or refreshed and a reconnection reloads nothing", async () => {
+    test("mobile: with sample data, no activity is read or refreshed; a reconnection whose reload loses the connection keeps the sample data, and the next one reloads once and leaves sample mode", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         // A pipeline without any lead: the server still returns every stage, empty (stage
         // `group_expand`), and the kanban fills them with sample data.
@@ -12489,6 +12596,17 @@ describe("Remaining branches", () => {
             return result;
         });
         const setOffline = mockOffline();
+        let dropNextReload = false;
+        onRpc("/*", (request) => {
+            const match = new URL(request.url).pathname.match(R_CALL_KW);
+            if (dropNextReload && match?.groups.model === "crm.lead") {
+                // The connection drops again as the pipeline reloads: its first request (the
+                // progress bar read) loses it, so its grouped read does too.
+                dropNextReload = false;
+                setOffline(true);
+                return new Response("", { status: 502 });
+            }
+        });
         watchRpcs([LEAD_GROUPS, ACTIVITIES, TYPES]);
         const renderers = captureInstances(CrmMobilePipeline);
         await mountPipeline({
@@ -12505,15 +12623,31 @@ describe("Remaining branches", () => {
 
         // A refresh request for a sample lead reads nothing.
         await renderer.onActivitiesChanged(sampleLead.resId);
-        // Offline and back online with nothing queued: the sample pipeline is not reloaded.
-        await setOffline(true);
-        await setOffline(false);
-        await runAllTimers();
         expect.verifySteps([]);
-        expect(renderer.mobileState.syncEntries).toBe(null);
-        expect(renderer.mobileState.activitiesByLead).toEqual({});
+        // Offline and back online with nothing queued: the pipeline reloads at once, and the
+        // reload loses the connection. The sample data stay, and nothing is read for them.
+        await setOffline(true);
+        dropNextReload = true;
+        await setOffline(false);
+        await expect.waitForSteps([LEAD_GROUPS]);
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
         expect(renderer.props.list.model.useSampleModel).toBe(true);
         expect(".o_view_sample_data").toHaveCount(1);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        // Back online with nothing queued: the pipeline is reloaded once, at once, and leaves
+        // sample mode on the server's empty stages; the reloaded stage revalidates the activity
+        // types, and no activity is read (no lead is displayed).
+        await setOffline(false);
+        await runAllTimers();
+        expect.verifySteps([LEAD_GROUPS, TYPES]);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(renderer.mobileState.activitiesByLead).toEqual({});
+        expect(renderer.props.list.model.useSampleModel).toBe(false);
+        expect(".o_view_sample_data").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline").toHaveCount(1);
+        expect(".o_crm_mobile_lead_card").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_count").toHaveText("0");
     });
 
     test.tags("mobile");

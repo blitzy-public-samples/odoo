@@ -595,14 +595,16 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * is the one the framework's own replay answer gave (`replayedCreateIds`, recorded by
      * `_setupSyncWindowDiscards`). This is not id remapping: no queued call is rewritten and
      * nothing is persisted; the answer only tells the window's copy that its create is now a
-     * loaded server record. An entry still in the live queue is always pending.
+     * loaded server record. An entry still in the live queue is always pending. Sample records
+     * hold no server record, whatever their fake ids.
      *
      * @private
      * @returns {((entry: QueueEntry) => boolean) | null} the filter, `null` when no created id is
-     *   recorded (as outside every sync window): every queued create is then pending
+     *   recorded (as outside every sync window) or the pipeline shows sample data: every queued
+     *   create is then pending
      */
     _pendingCreateFilter() {
-        if (!this.replayedCreateIds.size) {
+        if (!this.replayedCreateIds.size || this.props.list.model.useSampleModel) {
             return null;
         }
         const loadedIds = new Set(this.allLoadedRecords().map((record) => record.resId));
@@ -885,7 +887,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * again on reconnect, so a cold offline cache miss clears without a manual reload. Each read
      * carries the lead's total count, so a truncated page is shown as such. The connection
      * dropping alone triggers no read (what is in memory is what the cache would answer), and
-     * sample records, whose ids are fake, are never read for.
+     * sample records, whose ids are fake, are never read for. Sample mode suspends the effect:
+     * it forgets the previous dependencies, and leaving sample mode (the reconciliation reload,
+     * the quick create) re-runs it, so the first run on loaded data reads every displayed lead
+     * and the types.
      *
      * The activities kept in memory are limited to the loaded leads by `_setupActivityPruning`.
      *
@@ -898,6 +903,12 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         let previous = null;
         useEffect(() => {
             const gated = this.isMobilePipeline;
+            // Sample records carry fake ids: nothing is read for them. The flag is tracked, so
+            // leaving sample mode re-runs the effect, which then reads everything.
+            if (gated && this.props.list.model.useSampleModel) {
+                previous = null;
+                return;
+            }
             const group = gated ? this.currentGroup : null;
             const leadIds = gated
                 ? this.cardsFor(group)
@@ -914,10 +925,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             untrack(() => {
                 const offline = dependencies[3];
                 if (!gated) {
-                    return;
-                }
-                // Sample records carry fake ids: nothing is read for them.
-                if (this.props.list.model.useSampleModel) {
                     return;
                 }
                 // The connection dropping, with nothing else changed, is not a revalidation
@@ -1273,8 +1280,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /**
      * Reloads the pipeline through the framework model after a sync, then ends the sync window by
      * dropping the copy. Only in the stage pipeline: outside it nothing is reloaded and the copy is
-     * left to the reconciliation effect, which owes the reload until the gate holds again. Sample
-     * data has nothing to reconcile.
+     * left to the reconciliation effect, which owes the reload until the gate holds again. A
+     * pipeline showing sample data is reloaded too, and leaves sample mode once the reload has
+     * landed, as the framework kanban controller does after its own reload: a lead created
+     * outside the pipeline and replayed then shows as a server card. A reload rejected for a lost
+     * connection keeps the sample data.
      *
      * The copy is kept when the reload does not reconcile it:
      * - the reload lost the connection, or the connection dropped while it ran (the disk cache may
@@ -1296,10 +1306,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      */
     async _reconcile() {
         const list = this.props.list;
-        if (list.model.useSampleModel) {
-            this.mobileState.syncEntries = null;
-            return;
-        }
         if (!this.isMobilePipeline) {
             return;
         }
@@ -1317,6 +1323,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             if (this.reconciliation === reconciliation) {
                 this.reconciliation = null;
             }
+        }
+        // The root now holds loaded data (server or disk cache), whatever happens next.
+        if (list.model.useSampleModel) {
+            list.model.useSampleModel = false;
         }
         if (
             status(this) === "destroyed" ||
