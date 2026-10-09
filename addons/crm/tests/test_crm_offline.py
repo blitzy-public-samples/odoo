@@ -68,11 +68,18 @@ QUICK_CREATE_FIELDS = {'name', 'contact_name', 'phone', 'email_from', 'expected_
 class TestCrmOffline(HttpCase, TestCrmCommon):
     """ Server side of the CRM offline and mobile feature.
 
-    Lane 1: the PWA manifest served to CRM users (shortcuts and icons), and the
+    Lane 1: the PWA manifest served to CRM users (shortcuts and icons); the
     server replay of the calls the framework offline queue stores for CRM
-    records (lead edits, stage moves and mark-won, stage and team creates and
-    edits, activity creates and mark-done), in the exact shape the queue keeps
-    them and in the order its synchronisation replays them.
+    records, in the exact shape the queue keeps them and in the order its
+    synchronisation replays them: lead edits (card partner and color edits
+    included), stage moves and mark-won, last-write-wins ordering, stage and
+    team creates and edits, archives and unarchives, deletes (rejected ones
+    included), the mobile quick create, activity creates and mark-done;
+    activity creates as RPC callers send them, over JSON-RPC or through
+    ``call_kw`` in the server process (accepted id forms, value validation,
+    access and integrity errors); and the checks that the production views
+    keep the offline wiring and that the pipeline arch fetches the fields it
+    reads.
 
     Lane 3: the launcher of the ``crm_mobile_offline`` tour, an end-to-end
     offline session on the small-screen pipeline, whose replayed writes are
@@ -831,6 +838,71 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(activity.res_model_id, self.env['ir.model']._get('crm.lead'))
         self.assertEqual(activity.summary, 'Context follow-up')
 
+    def test_offline_activity_create_convertible_res_id(self):
+        """ PART 3b: a lead activity create whose ``res_id`` the standard create converts to the lead id, a numeric string or number over JSON-RPC or a lead record in Python, in the values or as the context's ``default_res_id``, links the activity to the lead; one it cannot convert to a single lead id gets the neutral error and creates nothing. """
+        lead = self._create_opportunity('Offline Convertible Id Lead')
+        other_lead = self._create_opportunity('Offline Convertible Id Other Lead')
+        crm_lead_model = self.env['ir.model']._get('crm.lead')
+        document_vals = {
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }
+        no_lead_id = "Invalid activity values: an activity on a lead requires the id of that lead."
+        activities = self.env['mail.activity'].with_user(self.user_sales_leads)
+
+        def assert_linked(activity_id, summary, counts):
+            self.assertEqual(self._count_activities(lead), (counts[0] + 1, counts[1] + 1))
+            activity = self.env['mail.activity'].browse(activity_id)
+            self.assertIn(activity, lead.activity_ids)
+            self.assertEqual(activity.res_id, lead.id)
+            self.assertEqual(activity.res_model_id, crm_lead_model)
+            self.assertEqual(activity.summary, summary)
+
+        self.authenticate('user_sales_leads', 'user_sales_leads')
+        for case, vals, context in (
+            ('explicit lead model id and string res_id', {'res_model_id': crm_lead_model.id, 'res_id': str(lead.id)}, {}),
+            ('lead model name and float res_id', {'res_model': 'crm.lead', 'res_id': float(lead.id)}, {}),
+            ('lead model name and string default_res_id', {'res_model': 'crm.lead'}, {'default_res_id': str(lead.id)}),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+                summary = f'Follow-up with {case}'
+
+                response = self._activity_rpc('create', [{**document_vals, **vals, 'summary': summary}], {'context': context})
+
+                self.assertNotIn('error', response)
+                assert_linked(response['result'], summary, counts)
+
+        for case, vals, context in (
+            ('lead record res_id', {'res_model': 'crm.lead', 'res_id': lead}, {}),
+            ('lead record default_res_id', {'res_model': 'crm.lead'}, {'default_res_id': lead}),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+                summary = f'Follow-up with {case}'
+
+                activity_id = call_kw(activities, 'create', [{**document_vals, **vals, 'summary': summary}], {'context': context})
+
+                assert_linked(activity_id, summary, counts)
+
+        for case, res_id in (
+            ('several lead records', lead | other_lead),
+            ('no lead record', self.env['crm.lead']),
+            ('infinite number', float('inf')),
+            ('not a number', float('nan')),
+        ):
+            with self.subTest(case=case):
+                counts = self._count_activities(lead)
+
+                with self.assertRaises(ValidationError) as caught:
+                    call_kw(activities, 'create', [{
+                        **document_vals, 'res_model': 'crm.lead', 'res_id': res_id, 'summary': 'Refused follow-up',
+                    }], {})
+
+                self.assertEqual(str(caught.exception), no_lead_id)
+                self.assertEqual(self._count_activities(lead), counts)
+
     def test_offline_activity_create_invalid_values_rpc(self):
         """ PART 3b: malformed activity creates sent over JSON-RPC get a neutral error without trace and create nothing. """
         lead = self._create_opportunity('Offline Invalid Activity Lead')
@@ -856,6 +928,9 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             ('lead activity with a true res_id', [{**lead_vals, 'res_id': True}], no_lead_id),
             ('lead activity with a zero res_id', [{**lead_vals, 'res_id': 0}], no_lead_id),
             ('lead activity with a string res_id', [{**lead_vals, 'res_id': 'abc'}], no_lead_id),
+            ('lead activity with a zero string res_id', [{**lead_vals, 'res_id': '0'}], no_lead_id),
+            ('lead activity with a negative res_id', [{**lead_vals, 'res_id': -1}], no_lead_id),
+            ('lead activity with a decimal string res_id', [{**lead_vals, 'res_id': '4.2'}], no_lead_id),
         ):
             with self.subTest(case=case):
                 counts = self._count_activities(lead)
@@ -871,6 +946,9 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         for case, default_res_id in (
             ('lead activity with a string default_res_id', 'abc'),
             ('lead activity with a zero default_res_id', 0),
+            ('lead activity with a zero string default_res_id', '0'),
+            ('lead activity with a negative default_res_id', -1),
+            ('lead activity with a decimal string default_res_id', '4.2'),
         ):
             with self.subTest(case=case):
                 counts = self._count_activities(lead)

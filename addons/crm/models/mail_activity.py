@@ -36,10 +36,11 @@ class MailActivity(models.Model):
         ``crm.lead``, through ``res_model``, ``res_model_id`` or, without a
         ``res_model_id`` key, the context's ``default_res_model`` or
         ``default_res_model_id``, must give a ``res_model_id``, if any, as an
-        integer or an ``ir.model`` record, and a positive integer ``res_id``, in
-        the values or, without a ``res_id`` key, as the context's
-        ``default_res_id``. These checks raise a ``ValidationError`` that does
-        not repeat the input.
+        integer or an ``ir.model`` record, and a ``res_id`` the standard create
+        converts to a positive id (an integer, a numeric string or number, a
+        record; never a boolean), in the values or, without a ``res_id`` key, as
+        the context's ``default_res_id``. These checks raise a
+        ``ValidationError`` that does not repeat the input.
 
         When the batch holds values targeting ``crm.lead``, every error it
         raises, the standard create's own (access rights, missing records,
@@ -56,6 +57,7 @@ class MailActivity(models.Model):
             with conceal_debug_traceback():
                 raise ValidationError(self.env._("Invalid activity values: a list of field values is expected."))
         lead_model_id = self.env['ir.model']._get_id('crm.lead')
+        res_id_field = self._fields['res_id']
         context = self.env.context
         on_lead = False
         for vals in vals_list:
@@ -81,7 +83,18 @@ class MailActivity(models.Model):
                 with conceal_debug_traceback():
                     raise ValidationError(self.env._("Invalid activity values: the document model of an activity on a lead must be given by its id."))
             res_id = vals['res_id'] if 'res_id' in vals else context.get('default_res_id')
-            if isinstance(res_id, bool) or not isinstance(res_id, int) or res_id <= 0:
+            # the id the standard create would store, converted as it converts it: a context
+            # default through the field's cache format first (default_get), then as a column
+            # value (a record gives its id); a boolean is never taken as an id
+            lead_id = 0
+            if not isinstance(res_id, bool):
+                try:
+                    if 'res_id' not in vals:
+                        res_id = res_id_field.convert_to_cache(res_id, self)
+                    lead_id = res_id_field.convert_to_column(res_id, self)
+                except (TypeError, ValueError, OverflowError):
+                    lead_id = 0
+            if lead_id <= 0:
                 with conceal_debug_traceback():
                     raise ValidationError(self.env._("Invalid activity values: an activity on a lead requires the id of that lead."))
             if vals.get('res_model') == 'crm.lead' and not res_model_id:
