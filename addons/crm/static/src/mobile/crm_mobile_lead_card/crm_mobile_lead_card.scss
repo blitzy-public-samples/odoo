@@ -45,6 +45,20 @@ $o-crm-mobile-touch: 44px;
         min-height: $o-crm-mobile-touch;
     }
 
+    // Keyboard open control wrapping the name. The template's utilities strip the button chrome
+    // (no padding, border or background, inherited color, start-aligned text), so the name keeps
+    // its look. It is one touch target at least, and the explicit `min-width` also lets it shrink
+    // in its flex row so the name truncates. Keyboard focus shows the theme's focus ring.
+    .o_crm_mobile_lead_card_open {
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+
+        &:focus-visible {
+            outline: none;
+            box-shadow: $focus-ring-box-shadow;
+        }
+    }
+
     // Single line, truncated with an ellipsis by the template's `text-truncate`; `min-width: 0`
     // lets the name shrink inside its flex row so the pending badge keeps its room.
     .o_crm_mobile_lead_card_name {
@@ -52,10 +66,10 @@ $o-crm-mobile-touch: 44px;
         overflow: hidden;
     }
 
+    // The gap between icon and label is the template's `gap-1` (Bootstrap spacing scale).
     .o_crm_mobile_pending_badge {
         display: inline-flex;
         align-items: center;
-        gap: 0.25rem;
         white-space: nowrap;
     }
 

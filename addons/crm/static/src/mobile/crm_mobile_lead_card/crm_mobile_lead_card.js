@@ -40,10 +40,32 @@
  *   reload re-keyed or removed it) writes no card state. After an online activity write that
  *   succeeded, the card still asks the pipeline to read the lead's activities again; the pipeline
  *   reads them only while it is alive and displays the lead.
+ *
+ * Status region: a polite, atomic `role="status"` element, empty at mount, announces what changes
+ * while the card stays mounted (lead write pending sync or no longer, activity create or mark done
+ * queued or no longer pending), and the Activities count only when the user's own activity call on
+ * this card changed it. The changes are compared between two snapshots of the same queue-derived
+ * getters the template renders, so nothing is stored but the last snapshot and, in memory, whether
+ * an online activity call of this card awaits its re-read. A change that creates, remounts or
+ * destroys a card (a stage move, a pending create appearing or leaving) is the pipeline's status
+ * region's to announce: the card's region would take it as its mount state, or be gone. A pending
+ * lead create's card stays silent: the pipeline's region alone tells a queued create appearing
+ * and leaving the queue, also when a sync window keeps the card on screen after its replay.
  */
 
-import { Component, computed, proxy, status, t, useProps } from "@odoo/owl";
+import {
+    Component,
+    computed,
+    onPatched,
+    proxy,
+    signal,
+    status,
+    t,
+    useOnChange,
+    useProps,
+} from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
+import { formatList } from "@web/core/l10n/utils";
 import { deserializeDate, formatDate, serializeDate, today } from "@web/core/l10n/dates";
 import { formatMonetary } from "@web/views/fields/formatters";
 import { user } from "@web/core/user";
@@ -59,6 +81,24 @@ const NON_CREATABLE_CATEGORIES = ["meeting", "upload_file"];
 function activityCreateKwargs() {
     return { context: {}, specification: {} };
 }
+
+/**
+ * Keeps a Space keydown (with or without Shift) away from the inherited kanban renderer's Space
+ * hotkeys (record selection). They listen on the window and, once dispatched, prevent the default
+ * action of the keydown, which cancels the native activation of the focused button. Stopping the
+ * propagation keeps that activation and the kanban selection untouched; the default action itself
+ * is never prevented, and no other key is affected.
+ *
+ * @param {KeyboardEvent} ev
+ */
+export function stopKanbanSpaceHotkey(ev) {
+    if (ev.key === " " && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
+        ev.stopPropagation();
+    }
+}
+
+/** Keys the stage listbox handles itself (see `onStageListKeydown`). */
+const STAGE_LIST_KEYS = ["ArrowDown", "ArrowUp", "Home", "End", "Escape"];
 
 /**
  * @typedef {{ key: string | number, value: { model: string, method: string, args: any[],
@@ -106,10 +146,25 @@ export class CrmMobileLeadCard extends Component {
         onActivitiesChanged: t.function().optional(),
     });
 
+    /** The Stage button, which gets the focus back when Escape closes the stage list. */
+    stageButtonRef = signal.ref();
+    /** The stage listbox, while it is open. */
+    stageListRef = signal.ref();
+
     setup() {
         this.crmOffline = useCrmOffline();
+        /** Whether the next patch moves the focus into the stage list just opened. */
+        this.focusStageListOnPatch = false;
+        onPatched(() => {
+            if (this.focusStageListOnPatch) {
+                this.focusStageListOnPatch = false;
+                this._focusActiveStageOption();
+            }
+        });
         this.state = proxy({
             stageListOpen: false,
+            // stage (`serverValue`) of the stage list's roving tab stop, `null` before any move
+            activeStageValue: null,
             followUpOpen: false,
             activitiesOpen: false,
             typeId: null,
@@ -117,7 +172,31 @@ export class CrmMobileLeadCard extends Component {
             date: serializeDate(today()),
             // blocks double submission while a call (or a move) is in flight
             busy: false,
+            // last message of the status region; a new `sequence` renders it in a new node, so a
+            // message equal to the previous one is announced again
+            announcement: { message: "", sequence: 0 },
         });
+        /**
+         * Snapshot the status region last compared (see `_readSyncSnapshot`), or `null` before the
+         * first one, taken at setup: the state the card mounts with is never announced.
+         *
+         * @type {Object | null}
+         */
+        this._syncBaseline = null;
+        /**
+         * Whether an online activity create or mark done of this card succeeded and the re-read
+         * it asked for has not changed the persisted rows yet: the next change of those rows is
+         * the user's own, and its Activities count is announced (see `_announceSyncChanges`).
+         * A plain in-memory field, never persisted and never rendered.
+         *
+         * @type {boolean}
+         */
+        this._expectActivityChange = false;
+        // Serialized: the dependencies are compared shallowly, and equal snapshots must be equal.
+        useOnChange(
+            () => [JSON.stringify(this._readSyncSnapshot())],
+            (snapshot) => this._announceSyncChanges(JSON.parse(snapshot))
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -185,6 +264,7 @@ export class CrmMobileLeadCard extends Component {
      * A pending create counts only while its own key is still queued. The pipeline keeps showing a
      * replayed create from its sync-window copy until the reconciliation reload; that card stays,
      * without the badge. A create parked with an error is re-queued under the same key and keeps it.
+     * The card's status region never announces a pending create's badge (see `_readSyncSnapshot`).
      *
      * Memoized (as every queue projection of the card): the queue is read again only when the
      * queue signal or the props change, not on every access.
@@ -332,6 +412,20 @@ export class CrmMobileLeadCard extends Component {
         }));
     }
 
+    /**
+     * The option holding the stage list's single tab stop (roving tabindex): the remembered one
+     * while it is enabled, else the first enabled option; `null` when none is enabled (a call is
+     * in flight). Disabled options are never focusable.
+     */
+    get activeStageOption() {
+        const enabled = this.stageOptions.filter((option) => !option.disabled);
+        return (
+            enabled.find((option) => option.group.serverValue === this.state.activeStageValue) ??
+            enabled[0] ??
+            null
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Display helpers
     // -------------------------------------------------------------------------
@@ -381,8 +475,11 @@ export class CrmMobileLeadCard extends Component {
     // -------------------------------------------------------------------------
 
     /**
-     * Opens the lead (the pipeline decides between the form and the offline helper). A tap on the
-     * name opens it too, as the upstream mobile main flow expects. Taps on the controls never do.
+     * Opens the lead (the pipeline decides between the form and the offline helper). Bound to the
+     * article's click, so a tap on the card body opens it, and so does a tap on the name, as the
+     * upstream mobile main flow expects. The keyboard path is the open button wrapping the name:
+     * its native activation (Enter or Space) clicks it, and that click bubbles here, once. Taps on
+     * the controls never open the lead.
      *
      * @param {MouseEvent} [ev]
      */
@@ -396,6 +493,16 @@ export class CrmMobileLeadCard extends Component {
         this.props.onOpen?.(this.props.record);
     }
 
+    /**
+     * Keeps Space inside the card (see `stopKanbanSpaceHotkey`), so the focused open button, Stage
+     * button, stage option or Mark done keeps its native Space activation.
+     *
+     * @param {KeyboardEvent} ev
+     */
+    onCardKeydown(ev) {
+        stopKanbanSpaceHotkey(ev);
+    }
+
     toggleStageList() {
         if (this.isPending || !this.props.record) {
             return;
@@ -403,6 +510,63 @@ export class CrmMobileLeadCard extends Component {
         const open = !this.state.stageListOpen;
         this._closePanels();
         this.state.stageListOpen = open;
+        // Once rendered, an opened list takes the focus on its active option.
+        this.focusStageListOnPatch = open;
+    }
+
+    /**
+     * Keyboard model of the stage listbox, a roving tabindex over its enabled options:
+     * ArrowDown/ArrowUp move the focus to the next/previous enabled option (no wrap), Home/End to
+     * the first/last one, and Escape closes the list and gives the focus back to the Stage button.
+     * Disabled options are skipped. The handled keys are prevented and stopped here, so the
+     * inherited kanban arrow hotkeys (card navigation, search focus) never run inside the list.
+     * Enter and Space keep the native activation of the focused option, which chooses it through
+     * its click handler (and its guards).
+     *
+     * @param {KeyboardEvent} ev
+     */
+    onStageListKeydown(ev) {
+        if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) {
+            return;
+        }
+        if (!STAGE_LIST_KEYS.includes(ev.key)) {
+            return;
+        }
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ev.key === "Escape") {
+            this.state.stageListOpen = false;
+            this.stageButtonRef()?.focus();
+            return;
+        }
+        const list = this.stageListRef();
+        if (!list) {
+            return;
+        }
+        const options = this.stageOptions;
+        const elements = [...list.querySelectorAll("[role=option]")];
+        const enabled = options.flatMap((option, index) => (option.disabled ? [] : [index]));
+        const current = elements.indexOf(ev.target?.closest?.("[role=option]"));
+        let next;
+        switch (ev.key) {
+            case "ArrowDown":
+                next = enabled.find((index) => index > current);
+                break;
+            case "ArrowUp":
+                next = enabled.findLast((index) => index < current);
+                break;
+            case "Home":
+                next = enabled[0];
+                break;
+            case "End":
+                next = enabled.at(-1);
+                break;
+        }
+        if (next === undefined || !elements[next]) {
+            return;
+        }
+        this.state.activeStageValue = options[next].group.serverValue;
+        elements[next].focus();
     }
 
     /**
@@ -484,6 +648,7 @@ export class CrmMobileLeadCard extends Component {
                 },
             });
             if (!res.queued) {
+                this._expectActivityChange = true;
                 // Requested even when this card was destroyed meanwhile: a reload re-keys the card
                 // of a lead that stays displayed, and its new card would keep the activities read
                 // before this write. The pipeline drops the request when it was destroyed itself
@@ -595,6 +760,7 @@ export class CrmMobileLeadCard extends Component {
                 },
             });
             if (!res.queued) {
+                this._expectActivityChange = true;
                 // Requested even when this card was destroyed meanwhile, as in `_createActivity`.
                 this.props.onActivitiesChanged?.(resId);
             }
@@ -643,6 +809,22 @@ export class CrmMobileLeadCard extends Component {
     }
 
     /**
+     * Focuses the active option of the open stage list (see `activeStageOption`). Nothing when the
+     * list is not rendered or no option is enabled: the focus then stays on the Stage button.
+     *
+     * @private
+     */
+    _focusActiveStageOption() {
+        const list = this.stageListRef();
+        const active = this.activeStageOption;
+        if (!list || !active) {
+            return;
+        }
+        const index = this.stageOptions.findIndex((option) => option.key === active.key);
+        list.querySelectorAll("[role=option]")[index]?.focus();
+    }
+
+    /**
      * @private
      * @returns {string} the follow-up deadline entered (a `YYYY-MM-DD` date input value), or
      *   today when the field was cleared or holds no valid date
@@ -653,5 +835,145 @@ export class CrmMobileLeadCard extends Component {
             return value;
         }
         return serializeDate(today());
+    }
+
+    /**
+     * What the status region describes, read from the getters the template renders, as plain
+     * values: queue entries are identified by their key, never copied.
+     *
+     * @private
+     * @returns {{ pendingSync: boolean, createKeys: string[], activityIds: number[],
+     *   total: number | null, doneIds: number[], count: number, activitiesKnown: boolean }} the
+     *   lead badge (always false on a pending lead create, whose badge the card never announces),
+     *   the keys of the pending create rows, the ids of the lead's persisted (cached)
+     *   activity rows, the server's total of them (the rows are a bounded page), the ids of those
+     *   whose mark done is queued (other leads' queued archives left out), the Activities count,
+     *   and whether the lead's activities are loaded
+     */
+    _readSyncSnapshot() {
+        const archivedIds = this.pendingArchivedIds;
+        const activityIds = this.activityRows.map((activity) => activity.id);
+        return {
+            // A pending create's badge is the pipeline's to announce (see `_announceSyncChanges`).
+            pendingSync: !this.isPending && this.isPendingSync,
+            createKeys: this.pendingActivityCreates.map((entry) => String(entry.key)),
+            activityIds,
+            total: this.props.activityTotal,
+            doneIds: activityIds.filter((id) => archivedIds.has(id)),
+            count: this.activityCount,
+            activitiesKnown: Array.isArray(this.props.activities),
+        };
+    }
+
+    /**
+     * Announces the changes between the last snapshot and this one, in one sentence naming the
+     * lead. The first snapshot (the state at mount) only becomes the baseline. When the lead's
+     * activities were loaded (or dropped) in between, the activity-derived parts are not
+     * compared: their arrival is no change of the lead. "No longer pending sync" holds whatever
+     * removed the entry, a replay or a systray discard.
+     *
+     * A pending lead create announces nothing: the pipeline's status region alone tells a queued
+     * create appearing and leaving ("new lead pending sync", "new lead no longer pending sync").
+     * Its badge is therefore left out of the snapshot, also while a sync window keeps the card on
+     * screen after its replay, and the card has no activity to compare.
+     *
+     * The Activities count is announced only for a change the user made on this card:
+     * - together with an activity create it queued, which raises the visible count at once;
+     * - at the first change of the persisted rows (or of their server total) after one of its
+     *   online creates or mark dones succeeded (`_expectActivityChange`): the re-read that call asked for. The expectation
+     *   ends with that change.
+     * No other count change is announced. A create or mark done leaving the queue (replay or
+     * discard) is told by "no longer pending sync" alone, and a background re-read (activity
+     * revalidation, the reconciliation reload after a sync, on this card or on one remounted by
+     * that reload) is no change the user made, so its count never replaces the sync confirmation
+     * in the atomic region. A newly queued activity call also ends a pending expectation: the
+     * connection dropped before that re-read could land, and the rows that change next are the
+     * reconnection's.
+     *
+     * @private
+     * @param {ReturnType<CrmMobileLeadCard["_readSyncSnapshot"]>} snapshot
+     */
+    _announceSyncChanges(snapshot) {
+        const previous = this._syncBaseline;
+        this._syncBaseline = snapshot;
+        if (!previous) {
+            return;
+        }
+        const countAdded = (values, before) => values.filter((v) => !before.includes(v)).length;
+        const changes = [];
+        if (snapshot.pendingSync !== previous.pendingSync) {
+            changes.push(
+                snapshot.pendingSync
+                    ? _t("changes pending sync")
+                    : _t("changes no longer pending sync")
+            );
+        }
+        const queuedCreates = countAdded(snapshot.createKeys, previous.createKeys);
+        if (queuedCreates) {
+            changes.push(
+                queuedCreates === 1
+                    ? _t("new activity pending sync")
+                    : _t("%s new activities pending sync", queuedCreates)
+            );
+        }
+        const clearedCreates = countAdded(previous.createKeys, snapshot.createKeys);
+        if (clearedCreates) {
+            changes.push(
+                clearedCreates === 1
+                    ? _t("new activity no longer pending sync")
+                    : _t("%s new activities no longer pending sync", clearedCreates)
+            );
+        }
+        if (snapshot.activitiesKnown === previous.activitiesKnown) {
+            const queuedDone = countAdded(snapshot.doneIds, previous.doneIds);
+            if (queuedDone) {
+                changes.push(
+                    queuedDone === 1
+                        ? _t("completed activity pending sync")
+                        : _t("%s completed activities pending sync", queuedDone)
+                );
+            }
+            const clearedDone = countAdded(previous.doneIds, snapshot.doneIds);
+            if (clearedDone) {
+                changes.push(
+                    clearedDone === 1
+                        ? _t("completed activity no longer pending sync")
+                        : _t("%s completed activities no longer pending sync", clearedDone)
+                );
+            }
+            // The rows are a bounded page: a re-read can change the server total alone.
+            const rowsChanged =
+                countAdded(snapshot.activityIds, previous.activityIds) > 0 ||
+                countAdded(previous.activityIds, snapshot.activityIds) > 0 ||
+                snapshot.total !== previous.total;
+            if (queuedCreates || (rowsChanged && this._expectActivityChange)) {
+                changes.push(this._activityCountLabel(snapshot.count));
+            }
+            if (rowsChanged || queuedCreates || queuedDone) {
+                this._expectActivityChange = false;
+            }
+        }
+        if (!changes.length) {
+            return;
+        }
+        this.state.announcement = {
+            message: _t("%(lead)s: %(changes)s.", {
+                lead: this.leadLabel,
+                changes: formatList(changes, { style: "unit" }),
+            }),
+            sequence: this.state.announcement.sequence + 1,
+        };
+    }
+
+    /**
+     * @private
+     * @param {number} count
+     * @returns {string} the Activities count, as announced
+     */
+    _activityCountLabel(count) {
+        if (!count) {
+            return _t("no activities");
+        }
+        return count === 1 ? _t("1 activity") : _t("%s activities", count);
     }
 }

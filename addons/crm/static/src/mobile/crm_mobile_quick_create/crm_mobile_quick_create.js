@@ -4,8 +4,9 @@
  * The sheet captures exactly six values (lead name, contact name, phone, email, expected revenue
  * and stage) and creates a `crm.lead` through `runOrQueue` from the shared CRM offline hooks:
  *
- * - online, it calls `web_save` and hands the created id to the pipeline (`onCreated`), which adds
- *   the card to the chosen stage exactly as the framework kanban quick create does;
+ * - online, it calls `web_save` and hands the created id, with the live group of the chosen stage,
+ *   to the pipeline (`onCreated`), which adds the card to that stage exactly as the framework
+ *   kanban quick create does;
  * - offline, or when the connection drops during the call, the same `web_save` is scheduled in the
  *   framework offline queue. No server id exists then, so the pipeline renders the pending card
  *   from the queue (`pendingLeadCreates`) and the framework replays the call on reconnect.
@@ -18,21 +19,31 @@
  *   pipeline, through `usePopover(CrmMobileQuickCreate, { useBottomSheet: true, withScope: true })`.
  *   `withScope` makes the sheet share the pipeline's plugin manager, hence its env and action
  *   config: the queued call is listed in the systray under the pipeline's action.
+ * - Focus: the sheet focuses its lead name input as it opens; the pipeline moves the focus back
+ *   to its Add button as the sheet closes (`onClose`).
  *
  * @example
  * this.quickCreatePopover = usePopover(CrmMobileQuickCreate, {
  *     useBottomSheet: true,
  *     withScope: true,
+ *     // the sheet body, so that a focus inside the closing sheet is recognised
+ *     ref: this.quickCreateSheetRef,
+ *     // moves a focus inside the closing sheet, or fallen to the body, back to Add
+ *     onClose: () => this._focusAfterQuickCreate(),
  * });
  * this.quickCreatePopover.open(ev.currentTarget, {
  *     list: this.props.list,
  *     group: this.currentGroup,
- *     onCreated: (resId, group) => this.validateQuickCreate(resId, "close", group),
+ *     // adds the lead with `validateQuickCreate(resId, "close", group)`, or reloads the list when
+ *     // `group` is undefined (its stage is gone); nothing when the lead is already loaded
+ *     onCreated: (resId, group) => this.onQuickCreated(resId, group),
  * });
  */
 
-import { Component, proxy, status, t, useOnChange, useProps } from "@odoo/owl";
+import { Component, proxy, signal, status, t, untrack, useEffect, useProps } from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
+import { useAutofocus } from "@web/core/utils/hooks";
+import { isEmail } from "@web/core/utils/strings";
 import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
 
 /**
@@ -53,6 +64,31 @@ function toText(value) {
         return "";
     }
     return String(value).trim();
+}
+
+/**
+ * A valid floating-point number as HTML defines it for `<input type="number">`: an optional minus
+ * sign, digits with an optional fraction (or a fraction alone), and an optional exponent. The whole
+ * text must match, so a partly numeric text such as `12junk` is rejected.
+ */
+const R_FLOAT = /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?$/;
+
+/**
+ * @param {string} text the expected revenue as typed, trimmed
+ * @param {boolean} badInput whether the revenue input holds a text the browser cannot parse: a
+ *   number input then reports an empty value
+ * @returns {number | null} the amount, 0 when nothing is typed; `null` when the text is not a
+ *   finite number of 0 or more
+ */
+function toRevenue(text, badInput) {
+    if (!text) {
+        return badInput ? null : 0;
+    }
+    if (!R_FLOAT.test(text)) {
+        return null;
+    }
+    const value = Number(text);
+    return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 /**
@@ -95,11 +131,25 @@ export class CrmMobileQuickCreate extends Component {
         group: t.object(),
         /** Injected by the bottom sheet: removes the sheet. */
         close: t.function(),
-        /** `(resId, group) => Promise`: adds a lead created online to its stage group. */
+        /**
+         * `(resId, group) => Promise`: adds a lead created online to its stage. `group` is the
+         * live group of the stage written, resolved once the call has returned, or `undefined`
+         * when that stage is no longer listed. Called even if the sheet was dismissed meanwhile.
+         */
         onCreated: t.function(),
     });
 
+    /** The expected revenue input, read for the browser's own parse failure (`badInput`). */
+    revenueRef = signal.ref();
+
+    /** The lead name input, the sheet's first field. */
+    nameRef = signal.ref();
+
     setup() {
+        // The sheet is modal: as it opens, the focus moves from the pipeline's Add button to the
+        // first field, once, so later renders leave the user's focus alone. `mobile` focuses it
+        // on touch screens too, where the sheet is shown.
+        useAutofocus({ ref: this.nameRef, mobile: true });
         this.crmOffline = useCrmOffline();
         this.state = proxy({
             name: "",
@@ -109,24 +159,30 @@ export class CrmMobileQuickCreate extends Component {
             expected_revenue: "",
             /** Datapoint id of the selected stage group (the stage `<select>` value). */
             stageGroupId: this.props.group.id,
-            error: "",
+            /** Inline error of each validated field, empty when the field is valid. */
+            errors: { name: "", email_from: "", expected_revenue: "" },
             saving: false,
         });
 
         /**
-         * Stage id of every group datapoint id the sheet has listed. A reload of the pipeline
-         * (the reconciliation that follows a reconnection, for instance) rebuilds the groups
-         * with new datapoint ids, while the stage ids stay the same: this map lets the selection
-         * follow its stage across reloads.
+         * Stage id of the selected group. A reload of the pipeline (the reconciliation that
+         * follows a reconnection, for instance) rebuilds the groups with new datapoint ids, while
+         * the stage ids stay the same: this one value lets the selection follow its stage across
+         * any number of reloads.
          *
-         * @type {Map<string, number | false>}
+         * @type {number | false}
          */
-        this.stageValueById = new Map();
-        this.rememberStageGroups();
-        useOnChange(
-            () => [this.stageGroups.map((group) => group.id).join(","), this.state.stageGroupId],
-            () => this.syncSelectedStage()
-        );
+        this.selectedStageValue = this.props.group.serverValue;
+        // Re-syncs the selection whenever the listed groups or the selected id change. The effect
+        // reads these dependencies itself and runs the sync untracked, because the sync may write
+        // the selected id: `useOnChange` observes its dependencies through an intermediate
+        // computed, which a write made from its own callback leaves stale, so that no later
+        // change (a second reload, for instance) would reach it.
+        useEffect(() => {
+            const groups = this.stageGroups;
+            const selectedId = this.state.stageGroupId;
+            untrack(() => this.syncSelectedStage(groups, selectedId));
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -150,10 +206,12 @@ export class CrmMobileQuickCreate extends Component {
      * @returns {Object}
      */
     get targetGroup() {
+        const groups = this.stageGroups;
         const initialStage = this.props.group.serverValue;
         return (
-            this.resolveStageGroup(this.state.stageGroupId) ??
-            this.stageGroups.find((group) => group.serverValue === initialStage) ??
+            groups.find((group) => group.id === this.state.stageGroupId) ??
+            groups.find((group) => group.serverValue === this.selectedStageValue) ??
+            groups.find((group) => group.serverValue === initialStage) ??
             this.props.group
         );
     }
@@ -162,37 +220,24 @@ export class CrmMobileQuickCreate extends Component {
     // Stage selection
     // -------------------------------------------------------------------------
 
-    /** Records the stage id of every group currently listed. */
-    rememberStageGroups() {
-        for (const group of this.stageGroups) {
-            this.stageValueById.set(group.id, group.serverValue);
-        }
-    }
-
     /**
-     * @param {string} groupId a group datapoint id, current or from before a reload
-     * @returns {Object | undefined} the live group with that id, or else the live group of the
-     *   stage that id stood for
+     * Keeps the `<select>` value on a listed group when the groups are rebuilt or the selection
+     * changes: the selection moves to the new group of the same stage, or to the first stage if
+     * that stage is gone, and the stage of the selected group is remembered.
+     *
+     * @param {Object[]} groups the stage groups listed
+     * @param {string} selectedId the selected group datapoint id
      */
-    resolveStageGroup(groupId) {
-        const groups = this.stageGroups;
-        const group = groups.find((candidate) => candidate.id === groupId);
-        if (group || !this.stageValueById.has(groupId)) {
-            return group;
+    syncSelectedStage(groups, selectedId) {
+        const group =
+            groups.find((candidate) => candidate.id === selectedId) ??
+            groups.find((candidate) => candidate.serverValue === this.selectedStageValue) ??
+            groups[0];
+        if (!group) {
+            return;
         }
-        const stageValue = this.stageValueById.get(groupId);
-        return groups.find((candidate) => candidate.serverValue === stageValue);
-    }
-
-    /**
-     * Keeps the `<select>` value on a listed group when the groups are rebuilt: the selection
-     * moves to the new group of the same stage, or to the first stage if that stage is gone.
-     */
-    syncSelectedStage() {
-        this.rememberStageGroups();
-        const selectedId = this.state.stageGroupId;
-        const group = this.resolveStageGroup(selectedId) ?? this.stageGroups[0];
-        if (group && group.id !== selectedId) {
+        this.selectedStageValue = group.serverValue;
+        if (group.id !== selectedId) {
             this.state.stageGroupId = group.id;
         }
     }
@@ -202,25 +247,52 @@ export class CrmMobileQuickCreate extends Component {
     // -------------------------------------------------------------------------
 
     /**
+     * Stores the expected revenue as the input reports it, without writing it back: for a text the
+     * browser cannot parse (`1e`, typed on the way to `1e3`), a number input reports an empty value
+     * and flags `validity.badInput`. Rendering that empty value into the input would erase the
+     * text and the flag, and `save()` would then take the field for empty instead of invalid.
+     *
+     * @param {InputEvent} ev input in the expected revenue field
+     */
+    onRevenueInput(ev) {
+        this.state.expected_revenue = ev.target.value;
+    }
+
+    /**
      * Creates the lead online, or queues its creation when offline or when the connection drops
-     * during the call (planned entry point N1 of the offline inventory). An empty name shows an
-     * inline error and sends nothing. Any other error (e.g. a server validation error) propagates
-     * to the framework error handling and leaves the sheet open with its values.
+     * during the call (planned entry point N1 of the offline inventory).
+     * - Invalid fields (an empty name, a malformed email, an expected revenue that is not a finite
+     *   number of 0 or more) each show an inline error, and nothing is sent or queued.
+     * - An error of the call itself (a server validation error, `NonSecureContextError`)
+     *   propagates to the framework error handling and leaves the sheet open with its values.
+     * - Once the lead exists (created or queued), the sheet closes even if adding its card fails;
+     *   that failure propagates after the sheet is closed.
+     * - A lead created online is handed to the pipeline (`onCreated`) with the live group of its
+     *   stage, even when the sheet was dismissed during the call.
      */
     async save() {
         if (this.state.saving) {
             return;
         }
         const name = toText(this.state.name);
-        if (!name) {
-            this.state.error = _t("The lead name is required.");
+        const email = toText(this.state.email_from);
+        const revenueText = toText(this.state.expected_revenue);
+        const revenue = toRevenue(revenueText, Boolean(this.revenueRef()?.validity?.badInput));
+        // Checked here rather than by the inputs' native constraints, which nothing invokes (no
+        // form is submitted), so that a direct call is held to the same rules. Every invalid
+        // field shows its own error at once, and nothing is sent or queued.
+        const errors = {
+            name: name ? "" : _t("The lead name is required."),
+            email_from: !email || isEmail(email) ? "" : _t("The email address is not valid."),
+            expected_revenue:
+                revenue === null ? _t("The expected revenue must be a number of 0 or more.") : "",
+        };
+        this.state.errors = errors;
+        if (Object.values(errors).some(Boolean)) {
             return;
         }
-        this.state.error = "";
 
         const targetGroup = this.targetGroup;
-        const revenueText = toText(this.state.expected_revenue);
-        const revenue = Number.parseFloat(revenueText);
         // Exactly the six captured values. Empty chars are written as `false`, as the framework
         // serializes empty char fields; the stage is the group's stage id, which is also what the
         // pipeline matches to place a pending create.
@@ -228,8 +300,8 @@ export class CrmMobileQuickCreate extends Component {
             name,
             contact_name: toText(this.state.contact_name) || false,
             phone: toText(this.state.phone) || false,
-            email_from: toText(this.state.email_from) || false,
-            expected_revenue: Number.isFinite(revenue) ? revenue : 0,
+            email_from: email || false,
+            expected_revenue: revenue,
             stage_id: targetGroup.serverValue,
         };
         // The group context carries the defaults of the framework quick create (`default_type`,
@@ -241,11 +313,19 @@ export class CrmMobileQuickCreate extends Component {
             changes: this.getQueuedChanges(vals, targetGroup, revenueText),
         };
 
+        // Captured before the call: the sheet may be dismissed while it runs, and a reload of the
+        // pipeline replaces its group datapoints. The stage is kept by its id (the value written),
+        // never as a group, and the selection is not read again afterwards.
+        const stageValue = targetGroup.serverValue;
+        const { list, onCreated } = this.props;
+
         this.state.saving = true;
         let outcome;
         try {
             outcome = await this.crmOffline.runOrQueue({
-                online: () => this.crmOffline.orm.webSave("crm.lead", [], vals, kwargs),
+                // Unscoped: the component's ORM would abort the answer if the sheet were
+                // dismissed during the call, and the lead created would never reach the pipeline.
+                online: () => this.crmOffline.orm.unscoped.webSave("crm.lead", [], vals, kwargs),
                 queue: { model: "crm.lead", method: "web_save", args: [[], vals], kwargs, extras },
             });
         } catch (error) {
@@ -254,17 +334,20 @@ export class CrmMobileQuickCreate extends Component {
             }
             throw error;
         }
-        if (status(this) === "destroyed") {
-            return;
-        }
         // From here the lead exists (on the server or in the queue): the sheet closes even if
-        // adding the card fails, so that a second tap cannot create it twice.
+        // adding the card fails, so that a second tap cannot create it twice. A lead created
+        // online reaches the pipeline even when the sheet was dismissed during the call.
         try {
             if (!outcome.queued) {
                 // `web_save` answers with the saved records, not with an id.
                 const resId = outcome.result?.[0]?.id;
                 if (resId) {
-                    await this.props.onCreated(resId, targetGroup);
+                    // The live group of the stage written, resolved now: `undefined` when that
+                    // stage is no longer listed, and the pipeline then reloads instead.
+                    const liveGroup = list.groups?.find(
+                        (group) => group.serverValue === stageValue
+                    );
+                    await onCreated(resId, liveGroup);
                 }
             }
         } finally {

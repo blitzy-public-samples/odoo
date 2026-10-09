@@ -21,6 +21,17 @@
         - Previous is not rendered on the first stage, nor Next on the last one. When the one that
           disappears held the focus, the renderer moves the focus to the first header control
           (the remaining navigation button, else Add), never to the document body.
+        - Space keydowns from any control inside the root stop at the root (onPipelineKeydown):
+          the inherited kanban Space hotkey listens on the window and would otherwise cancel the
+          native activation of the focused button (header, Back, Load more, helpers, quick create).
+        - One visually hidden status region (role=status, polite, atomic), the root's last child,
+          outside the stage body and every control, is rendered, empty, from mount, so it outlives
+          stage changes and card remounts. It announces, naming the lead, the queue changes that
+          create, remount or destroy a card, which no card region can tell: a card move the
+          framework made that left the lead pending sync, and a queued lead create appearing in
+          or leaving the live queue (replay or systray discard). Changes a mounted card sees stay
+          on that card's own region. Its message is a div, never a span, and lies outside every
+          .o_kanban_group and .o_kanban_record, so no card or stage selector matches it.
 
         Offline: every button here carries `data-available-offline`, so the framework offline UI
         leaves navigation (prev/next), Add and Back usable. Load more is rendered online only, so
@@ -29,7 +40,8 @@
     <t t-name="crm.CrmMobilePipeline">
         <t t-if="this.isMobilePipeline">
             <t t-set="group" t-value="this.currentGroup"/>
-            <div class="o_kanban_renderer o_renderer o_kanban_grouped o_crm_mobile_pipeline d-flex flex-column user-select-none" t-ref="this.rootRef">
+            <div class="o_kanban_renderer o_renderer o_kanban_grouped o_crm_mobile_pipeline d-flex flex-column user-select-none" t-ref="this.rootRef"
+                t-on-keydown="(ev) => this.onPipelineKeydown(ev)">
                 <div class="o_crm_mobile_pipeline_header d-flex align-items-center gap-1 px-2 py-1 bg-view border-bottom">
                     <button t-if="this.hasPrevStage" type="button"
                         class="btn btn-light o_crm_mobile_pipeline_prev"
@@ -190,6 +202,11 @@
                 <t t-if="this.showNoContentHelper">
                     <ActionHelper noContentHelp="this.props.noContentHelp"/>
                 </t>
+
+                <!-- Polite status region (see _announce); a new inner node per announcement. -->
+                <div class="o_crm_mobile_pipeline_status visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+                    <div t-if="this.mobileState.announcement.message" t-key="this.mobileState.announcement.sequence" t-out="this.mobileState.announcement.message"/>
+                </div>
             </div>
         </t>
         <t t-else="" t-call="web.KanbanRenderer"/>

@@ -11,13 +11,33 @@
           framework never removes, and their handlers re-check the same predicate.
         - An unavailable card is dimmed with o_crm_mobile_lead_card_unavailable only: the framework
           strips its own offline-disabled class from data-available-offline elements.
-        - The article has no tabindex, so the inherited kanban renderer hotkeys never act on it
-          (Space on a focused .o_kanban_record would toggle record selection). The card controls
-          stay keyboard-operable buttons; opening the lead is a tap on the card.
+        - The article has no tabindex and no role, so the inherited kanban renderer hotkeys never
+          act on it (Space on a focused .o_kanban_record would toggle record selection). Keyboard
+          users open the lead with the native open button that wraps the name (Tab to it, then
+          Enter or Space); its accessible name is the visible lead name. A tap anywhere on the card
+          outside the controls opens the lead too.
+        - Space keydowns from any control of the card stop at the article (onCardKeydown): the
+          inherited kanban Space hotkey listens on the window and would otherwise cancel the
+          native activation of the focused button.
+        - The stage list is a listbox with a roving tabindex over its enabled options: opening it
+          focuses the active option, ArrowDown/ArrowUp/Home/End move among the enabled options,
+          Escape closes it and focuses Stage again, and Enter or Space chooses the focused option.
+          The arrow, Home, End and Escape keys stop at the list, so the inherited kanban arrow
+          hotkeys never run inside it.
         - The lead name is the first span of the article and a leaf: the upstream mobile main flow
           opens the lead by clicking `.o_kanban_record span:contains(name)`, and the click bubbles
-          to onOpenCard. Clicks inside the controls never open the card.
-        - A pending lead create shows its queued values and the badge, with no control at all.
+          through the open button to onOpenCard, which therefore runs once. Clicks inside the
+          controls never open the card.
+        - A pending lead create shows its queued values and the badge, with no control at all: its
+          name stays a plain span, as there is nothing to open.
+        - The visually hidden status region (role=status, polite, atomic) is rendered, empty, from
+          mount so assistive technologies register it, outside every control and after the name.
+          It announces, naming the lead, the queue changes seen while the card stays mounted, and
+          the Activities count only when the user's own activity call on this card changed it
+          (_announceSyncChanges); the article itself is no live region. A pending lead create's
+          card keeps it silent: the pipeline's status region alone tells a queued create
+          appearing and leaving the queue. Its message is a div, never a span, so the name stays
+          the only span with the lead name.
     -->
     <t t-name="crm.CrmMobileLeadCard">
         <article class="o_kanban_record o_crm_mobile_lead_card card mb-2 p-2 w-100"
@@ -25,14 +45,27 @@
             t-att-class="{ o_crm_mobile_lead_card_unavailable: this.props.unavailable, o_crm_mobile_lead_card_pending: this.isPending }"
             t-att-data-id="this.props.record?.id"
             t-att-data-pending-key="this.props.pendingCall?.key"
-            t-on-click="this.onOpenCard">
+            t-on-click="this.onOpenCard"
+            t-on-keydown="this.onCardKeydown">
             <div class="o_crm_mobile_lead_card_body d-flex flex-column gap-1">
-                <div class="d-flex align-items-start gap-2">
-                    <span class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-out="this.leadLabel"/>
-                    <span t-if="this.isPendingSync" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                <div class="d-flex align-items-center gap-2">
+                    <!-- No click handler of its own: its click bubbles to the article's onOpenCard. -->
+                    <button t-if="!this.isPending" type="button"
+                        class="o_crm_mobile_lead_card_open d-flex align-items-center flex-grow-1 p-0 border-0 rounded bg-transparent text-reset text-start"
+                        data-available-offline="1">
+                        <span class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-out="this.leadLabel"/>
+                        <span t-if="this.props.unavailable" class="visually-hidden"> (not available offline)</span>
+                    </button>
+                    <span t-else="" class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-out="this.leadLabel"/>
+                    <span t-if="this.isPendingSync" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                 </div>
                 <span t-if="this.partnerName" class="o_crm_mobile_lead_card_partner text-muted text-truncate" t-out="this.partnerName"/>
                 <span t-if="this.revenue" class="o_crm_mobile_lead_card_revenue" t-out="this.revenue"/>
+            </div>
+
+            <!-- Polite status region (see _announceSyncChanges); a new inner node per announcement. -->
+            <div class="o_crm_mobile_lead_card_status visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+                <div t-if="this.state.announcement.message" t-key="this.state.announcement.sequence" t-out="this.state.announcement.message"/>
             </div>
 
             <div t-if="!this.isPending" class="o_crm_mobile_lead_card_controls mt-2" t-on-click.stop="">
@@ -43,6 +76,7 @@
                         title="Move to another stage"
                         aria-label="Stage"
                         t-att-aria-expanded="this.state.stageListOpen ? 'true' : 'false'"
+                        t-ref="this.stageButtonRef"
                         t-on-click.stop="() => this.toggleStageList()">
                         <i class="oi oi-fw" data-icon="swap_vert" aria-hidden="true"/> Stage
                     </button>
@@ -76,14 +110,21 @@
                     </button>
                 </div>
 
-                <!-- Choosing the won stage is mark-won: the server turns that stage write into won. -->
-                <div t-if="this.state.stageListOpen" class="o_crm_mobile_lead_card_stage_list list-group mt-2" role="listbox" aria-label="Stages">
+                <!--
+                    Choosing the won stage is mark-won: the server turns that stage write into won.
+                    Roving tabindex: only the active enabled option is a Tab stop (onStageListKeydown).
+                -->
+                <div t-if="this.state.stageListOpen" class="o_crm_mobile_lead_card_stage_list list-group mt-2" role="listbox" aria-label="Stages"
+                    t-ref="this.stageListRef"
+                    t-on-keydown="this.onStageListKeydown">
+                    <t t-set="activeOption" t-value="this.activeStageOption"/>
                     <t t-foreach="this.stageOptions" t-as="option" t-key="option.key">
                         <button type="button"
                             role="option"
                             class="list-group-item list-group-item-action o_crm_mobile_stage_option"
                             t-att-class="{ active: option.selected }"
                             t-att-aria-selected="option.selected ? 'true' : 'false'"
+                            t-att-tabindex="option.key === activeOption?.key ? '0' : '-1'"
                             t-att-disabled="option.disabled"
                             t-att-data-stage-value="option.group.serverValue"
                             data-available-offline="1"
@@ -141,7 +182,7 @@
                             <span t-if="entry.value.args[1].summary" class="o_crm_mobile_activity_summary text-truncate" t-out="entry.value.args[1].summary"/>
                             <span t-if="entry.value.args[1].date_deadline" class="o_crm_mobile_activity_deadline text-muted small" t-out="this.formatDeadline(entry.value.args[1].date_deadline)"/>
                         </div>
-                        <span class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                        <span class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                     </li>
                     <!-- The queued mark-done ids, read once for the whole list rather than per row. -->
                     <t t-set="pendingArchivedIds" t-value="this.pendingArchivedIds"/>
@@ -154,7 +195,7 @@
                             <span t-if="activity.summary" class="o_crm_mobile_activity_summary text-truncate" t-out="activity.summary"/>
                             <span t-if="activity.date_deadline" class="o_crm_mobile_activity_deadline text-muted small" t-out="this.formatDeadline(activity.date_deadline)"/>
                         </div>
-                        <span t-if="pendingArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                        <span t-if="pendingArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                         <button t-else="" type="button"
                             class="btn btn-sm btn-link o_crm_mobile_activity_done ms-auto flex-shrink-0"
                             data-available-offline="1"

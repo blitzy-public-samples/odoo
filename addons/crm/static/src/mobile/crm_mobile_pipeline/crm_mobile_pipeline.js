@@ -30,12 +30,20 @@
  *   every reader shares one derivation per change. No correction is stored.
  * - Every read (activities, activity types, reconciliation reload) is issued only on small screens
  *   in the stage pipeline, so desktop RPC sequences are unchanged.
+ *
+ * Status region: the mobile root holds one polite, atomic `role="status"` element, empty at mount,
+ * that outlives stage changes and card remounts. It announces the queue changes that create,
+ * remount or destroy a card, which the card's own region cannot tell: a card move the framework
+ * made that left the lead pending sync, and a queued lead create appearing in or leaving the live
+ * queue (replay or systray discard). The changes are read from the framework queue only; nothing
+ * is stored but the last announcement and the keys and names of the creates last compared.
  */
 
 import {
     computed,
     onPatched,
     onWillPatch,
+    onWillUnmount,
     proxy,
     signal,
     status,
@@ -52,7 +60,10 @@ import { onWillRender, useSubEnv } from "@web/owl2/utils";
 import { useSetupAction } from "@web/search/action_hook";
 import { formatInteger, formatMonetary } from "@web/views/fields/formatters";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
-import { CrmMobileLeadCard } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
+import {
+    CrmMobileLeadCard,
+    stopKanbanSpaceHotkey,
+} from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
 import { CrmMobileQuickCreate } from "@crm/mobile/crm_mobile_quick_create/crm_mobile_quick_create";
 import {
     loadActivityTypes,
@@ -144,6 +155,17 @@ export function resolveDisplayedGroup(list, serverValue) {
     return groups.find((candidate) => !candidate.isFolded) ?? groups[0];
 }
 
+/**
+ * The name the status region gives a lead: the name its card shows, or a generic label when it
+ * has none.
+ *
+ * @param {string | false | undefined | null} name
+ * @returns {string}
+ */
+function leadName(name) {
+    return name || _t("Unnamed lead");
+}
+
 // -----------------------------------------------------------------------------
 // Renderer
 // -----------------------------------------------------------------------------
@@ -159,9 +181,21 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     setup() {
         super.setup();
         this.crmOffline = useCrmOffline();
+        /** Body of the open quick-create sheet, filled by the bottom sheet. */
+        this.quickCreateSheetRef = signal.ref();
         this.quickCreatePopover = usePopover(CrmMobileQuickCreate, {
             useBottomSheet: true,
             withScope: true,
+            ref: this.quickCreateSheetRef,
+            onClose: () => this._focusAfterQuickCreate(),
+        });
+        /**
+         * True once the pipeline starts unmounting. Registered after `usePopover`, so it runs
+         * before that hook closes the open sheet: the closing it then reports moves no focus.
+         */
+        this._isUnmounting = false;
+        onWillUnmount(() => {
+            this._isUnmounting = true;
         });
         this.mobileState = proxy({
             /** Lead whose form is not available offline: the stage body shows the helper. */
@@ -190,6 +224,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
              * the reconciliation reload that incorporates it has landed.
              */
             syncEntries: null,
+            /**
+             * Last message of the status region (see `_announce`); a new `sequence` renders it in
+             * a new node, so a message equal to the previous one is announced again.
+             */
+            announcement: { message: "", sequence: 0 },
         });
         /**
          * Ids of the stage groups whose Load more is in flight (`onLoadMoreClick`), each mapped to
@@ -202,6 +241,22 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this.stageState = this.env.crmMobileStage ?? proxy({ serverValue: null });
         /** Touch gesture in progress on the stage body (swipe navigation). */
         this.touch = null;
+        /**
+         * Keyboard focus to move once the stage body is patched: the Stage button of the lead's
+         * card after a stage was chosen from its stage list (`{ leadId, control: "stage" }`);
+         * `null` when none is requested. The unavailable-lead helper's focus (Back, then the
+         * card's open control) is `helperFocus`'s.
+         */
+        this.pendingFocus = null;
+        onPatched(() => this._applyPendingFocus());
+        /**
+         * `[key, name]` of the queued lead creates the status region last compared (see
+         * `_readPendingLeadCreates`), or `null` before the first comparison in the mobile
+         * pipeline: the queue the pipeline mounts (or enters the gate) with is never announced.
+         *
+         * @type {Array<[string, string]> | null}
+         */
+        this._pendingCreatesBaseline = null;
         /**
          * Placement of every loaded record and summary of every stage, derived in one pass (see
          * `_computeStageProjection`). Lazy: derived on the first read after a change of the
@@ -239,6 +294,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this._setupHelperFocus();
         // After the helper focus: on a patch both handle, the helper's focus move comes first.
         this._setupNavFocus();
+        this._setupPendingCreateAnnouncements();
     }
 
     // -------------------------------------------------------------------------
@@ -315,6 +371,29 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /** Whether the header offers the mobile quick create. */
     get canAdd() {
         return Boolean(this.props.archInfo.activeActions?.create);
+    }
+
+    /**
+     * Whether the no-content helper is rendered over the pipeline. The framework rule counts
+     * server records only (`!model.hasData()`), and a queued lead create raises no group count:
+     * on a pipeline without any lead, the helper would cover the pending card of a lead just
+     * created offline. So, in the stage pipeline, it is not rendered while a stage has a pending
+     * create, and comes back by itself once the entry leaves the queue (replayed and reconciled,
+     * or discarded from the systray) and the pipeline is empty again. Sample data keeps the
+     * framework helper, which labels the sample cards. Everywhere else, the framework rule.
+     *
+     * @override
+     * @returns {boolean}
+     */
+    get showNoContentHelper() {
+        if (
+            this.isMobilePipeline &&
+            !this.props.list.model.useSampleModel &&
+            this.stageGroups.some((group) => this.pendingCreatesFor(group).length > 0)
+        ) {
+            return false;
+        }
+        return super.showNoContentHelper;
     }
 
     // -------------------------------------------------------------------------
@@ -912,6 +991,117 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
+     * Reloads the pipeline through the framework model for a lead created online that no live
+     * group received (see `onQuickCreated`). A lost connection leaves the pipeline as it is: the
+     * lead exists on the server, and the next load shows it.
+     *
+     * @private
+     * @returns {Promise<void>}
+     */
+    async _reloadAfterQuickCreate() {
+        try {
+            await this.props.list.load();
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
+            }
+        }
+    }
+
+    /**
+     * Status-region announcements of the queued lead creates.
+     *
+     * A queued `crm.lead` create (`web_save` without id) is shown as a pending card, created when
+     * its entry appears, so no card can announce that. The card leaves with its entry or, after a
+     * replay, at the reconciliation reload, and its own status region stays silent throughout,
+     * also while the sync window keeps it on screen (see `CrmMobileLeadCard._readSyncSnapshot`).
+     * The pipeline compares the creates of the live queue by queue key and announces each one that
+     * appeared ("new lead pending sync") or left ("new lead no longer pending sync", after a replay
+     * or a systray discard), whatever stage it targets. The live queue is read, never the
+     * sync-window copy, so a replay is announced as it happens, before the reconciliation reload;
+     * the key survives the framework re-reading the queue from its storage, and a parked replay
+     * keeps its key, hence stays pending.
+     *
+     * The first comparison in the mobile pipeline is the baseline: the queue at mount, and again
+     * after a remount (form → back), is never announced. Outside the gate the queue is not read
+     * (desktop reads nothing here), and entering the gate again takes a new baseline.
+     *
+     * @private
+     */
+    _setupPendingCreateAnnouncements() {
+        // Serialized: the dependencies are compared shallowly, and equal snapshots must be equal.
+        useOnChange(
+            () => [JSON.stringify(this._readPendingLeadCreates())],
+            (snapshot) => this._announcePendingLeadCreates(JSON.parse(snapshot))
+        );
+    }
+
+    /**
+     * @private
+     * @returns {Array<[string, string]> | null} `[key, name]` of every `crm.lead` create of the
+     *   live queue, sorted by key; `null` outside the mobile pipeline
+     */
+    _readPendingLeadCreates() {
+        if (!this.isMobilePipeline) {
+            return null;
+        }
+        return this.crmOffline
+            .queuedEntries()
+            .filter(
+                ({ value }) =>
+                    value?.model === "crm.lead" &&
+                    value.method === "web_save" &&
+                    Array.isArray(value.args?.[0]) &&
+                    value.args[0].length === 0
+            )
+            .map(({ key, value }) => [String(key), leadName(value.args[1]?.name)])
+            .sort(([keyA], [keyB]) => (keyA < keyB ? -1 : keyA > keyB ? 1 : 0));
+    }
+
+    /**
+     * Announces, in one message, the queued lead creates that appeared and those that left since
+     * the last comparison. The first comparison in the mobile pipeline only becomes the baseline,
+     * and leaving the gate drops it.
+     *
+     * @private
+     * @param {Array<[string, string]> | null} creates see `_readPendingLeadCreates`
+     */
+    _announcePendingLeadCreates(creates) {
+        const previous = this._pendingCreatesBaseline;
+        this._pendingCreatesBaseline = creates;
+        if (!previous || !creates) {
+            return;
+        }
+        const previousKeys = new Set(previous.map(([key]) => key));
+        const keys = new Set(creates.map(([key]) => key));
+        this._announce([
+            ...creates
+                .filter(([key]) => !previousKeys.has(key))
+                .map(([, lead]) => _t("%(lead)s: new lead pending sync.", { lead })),
+            ...previous
+                .filter(([key]) => !keys.has(key))
+                .map(([, lead]) => _t("%(lead)s: new lead no longer pending sync.", { lead })),
+        ]);
+    }
+
+    /**
+     * Shows sentences in the status region as one message, in a new node, so it is announced even
+     * when equal to the previous one. Nothing without a sentence, or once destroyed.
+     *
+     * @private
+     * @param {string[]} sentences
+     */
+    _announce(sentences) {
+        if (!sentences.length || status(this) === "destroyed") {
+            return;
+        }
+        this.mobileState.announcement = {
+            message: sentences.join(" "),
+            sequence: this.mobileState.announcement.sequence + 1,
+        };
+    }
+
+    /**
      * Reads a lead's activities through the disk cache, with their total count; the first value
      * and any changed refresh are both applied. The request is the loader's default bounded one,
      * or the expanded one an online "Show all" chose for this lead. A value of a request whose
@@ -1029,7 +1219,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *   re-render never takes the focus back to Back from another control.
      * - When the helper is left through Back, or while Back holds the focus (stage navigation,
      *   reconnection), the focus moves, after the patch that removes the helper, to the tapped
-     *   card's first control, else a header control (see `_focusAfterHelper`), instead of
+     *   card's open control, else a header control (see `_focusAfterHelper`), instead of
      *   dropping to the document body. A later reload, such as the reconciliation reload after
      *   reconnecting, re-creates the cards, whose keys carry the group datapoint id it renews,
      *   and so drops that focus, as it does for any focused card control.
@@ -1070,10 +1260,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Focuses, once the unavailable-lead helper is left, the first control of the tapped lead's
-     * card when the displayed stage shows it (the card itself has no tabindex), else the first
-     * header control (previous, next, Add), else the first control of the pipeline. Nothing is
-     * focused outside the mobile pipeline.
+     * Focuses, once the unavailable-lead helper is left, the open control of the tapped lead's
+     * card, its first control, when the displayed stage shows it (the card itself has no
+     * tabindex), else the first header control (previous, next, Add), else the first control of
+     * the pipeline. Nothing is focused outside the mobile pipeline.
      *
      * @private
      * @param {number} resId the lead whose card opened the helper
@@ -1091,6 +1281,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             );
         const headerEl = root.querySelector(".o_crm_mobile_pipeline_header");
         const target =
+            cardEl?.querySelector(".o_crm_mobile_lead_card_open") ||
             (cardEl && getTabableElements(cardEl)[0]) ||
             (headerEl && getTabableElements(headerEl)[0]) ||
             getTabableElements(root)[0];
@@ -1141,6 +1332,37 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 (headerEl && getTabableElements(headerEl)[0]) || getTabableElements(root)[0];
             target?.focus();
         });
+    }
+
+    /**
+     * Focus as the quick-create sheet closes, whatever closes it: a save (created or queued),
+     * Discard, or a dismissal (Escape, the backdrop, the handle, a swipe). The sheet reports its
+     * closing before it is removed, so a focus inside it, or one already fallen to the document
+     * body (Save is disabled while it saves), moves at once to Add, else to the first header
+     * control, else to the first control of the pipeline, instead of dropping to the body with the
+     * sheet. A focus the user or the framework put on any other control is left where it is.
+     * Nothing is focused outside the mobile pipeline, nor once the pipeline is unmounting.
+     *
+     * @private
+     */
+    _focusAfterQuickCreate() {
+        const root = this.rootRef();
+        if (this._isUnmounting || status(this) !== "mounted" || !root || !this.isMobilePipeline) {
+            return;
+        }
+        const doc = root.ownerDocument;
+        const active = doc.activeElement;
+        const sheetEl = this.quickCreateSheetRef()?.closest(".o_bottom_sheet");
+        if (active && active !== doc.body && !sheetEl?.contains(active)) {
+            return;
+        }
+        const headerEl = root.querySelector(".o_crm_mobile_pipeline_header");
+        const headerControls = headerEl ? getTabableElements(headerEl) : [];
+        const target =
+            headerControls.find((el) => el.matches(".o_crm_mobile_pipeline_add")) ??
+            headerControls[0] ??
+            getTabableElements(root)[0];
+        target?.focus();
     }
 
     // -------------------------------------------------------------------------
@@ -1280,7 +1502,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Opens a lead: its form online, or offline when the form was visited online. Otherwise the
-     * stage body shows the offline action helper with a Back button, which takes the focus.
+     * stage body shows the offline action helper with a Back button, which takes the focus (the
+     * card's focused open control is no longer rendered; see `_setupHelperFocus`).
      *
      * @param {RelationalRecord} record
      */
@@ -1298,13 +1521,53 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Leaves the offline helper of an unavailable lead. The focus then moves to the lead's card
-     * (or a header control), as Back disappears with the helper.
+     * Leaves the offline helper of an unavailable lead. As Back disappears with the helper, the
+     * focus returns to the open control of that lead's card when the displayed stage renders it,
+     * else to a header control (see `_focusAfterHelper`).
      */
     onBackFromHelper() {
         const resId = this.mobileState.unavailableLeadId;
         this.helperFocus = resId ? { resId, focus: "return" } : null;
         this.mobileState.unavailableLeadId = null;
+    }
+
+    /**
+     * Keeps the native Space activation of every control of the mobile pipeline (header
+     * navigation and Add, the offline helpers and Back, Load more, the framework quick create):
+     * the inherited kanban Space hotkeys, scoped to this root, would cancel it. Bound on the
+     * mobile root only, so the desktop kanban keeps its Space record selection.
+     *
+     * @param {KeyboardEvent} ev
+     */
+    onPipelineKeydown(ev) {
+        stopKanbanSpaceHotkey(ev);
+    }
+
+    /**
+     * Moves the focus requested by `onCardMove` (see `pendingFocus`) once the stage body is
+     * patched, or at once when the move leaves the stage body as it is: the Stage button of the
+     * lead's card, looked up in the displayed stage. Only in the mobile pipeline; a request whose
+     * element is not rendered (another stage displayed, a reload that dropped the card) is
+     * dropped, and the focus stays where it is.
+     *
+     * @private
+     */
+    _applyPendingFocus() {
+        const request = this.pendingFocus;
+        if (!request) {
+            return;
+        }
+        this.pendingFocus = null;
+        const root = this.rootRef();
+        if (!root || !this.isMobilePipeline) {
+            return;
+        }
+        const record = this.cardsFor(this.currentGroup).find(
+            (candidate) => candidate.resId === request.leadId
+        );
+        const cards = [...root.querySelectorAll(".o_crm_mobile_lead_card")];
+        const card = record && cards.find((el) => el.dataset.id === record.id);
+        card?.querySelector(".o_crm_mobile_card_stage")?.focus();
     }
 
     /**
@@ -1317,6 +1580,18 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * did make the move, the target stage becomes the displayed one, so the moved card and its
      * pending badge are visible at once; a move it did not make changes nothing.
      *
+     * The moved card is a new card in the target stage, which takes its badge as its mount state
+     * and announces nothing. So when the framework made the move and it left a lead that was not
+     * pending sync with a queued write (offline, mark-won included, or a connection that dropped
+     * during the save), the pipeline's status region announces it. An online move leaves nothing
+     * queued, and the live stage title already announces the new stage.
+     *
+     * When the focus was in the record's card as the move started (the stage was chosen from its
+     * stage list with the keyboard, or with a tap that focused the option), it goes to that
+     * card's Stage button once the move is over: in the target stage when the framework made the
+     * move, in the displayed stage otherwise. The chosen option is no longer rendered, so the
+     * focus would otherwise fall to the page. A focus elsewhere is left where it is.
+     *
      * @param {RelationalRecord} record
      * @param {Group} targetGroup
      * @returns {Promise<void>}
@@ -1325,6 +1600,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!record || !targetGroup || record.group === targetGroup) {
             return;
         }
+        // Read before the move re-renders the cards, while the chosen option still has the focus.
+        const root = this.rootRef();
+        const focusedCard = root?.ownerDocument.activeElement?.closest(".o_crm_mobile_lead_card");
+        const keepCardFocus = Boolean(
+            focusedCard && root.contains(focusedCard) && focusedCard.dataset.id === record.id
+        );
+        const wasPendingSync = this.crmOffline.isRecordPendingSync(record);
         try {
             await this.props.list.moveRecords([record.id], null, targetGroup.id);
         } catch (error) {
@@ -1332,15 +1614,36 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 throw error;
             }
         }
-        if (status(this) !== "destroyed" && record.group === targetGroup) {
+        if (status(this) === "destroyed") {
+            return;
+        }
+        const moved = record.group === targetGroup;
+        // Only a change of the displayed stage is certain to patch the stage body from here on;
+        // otherwise the card stays rendered where it is and its Stage button is focused at once.
+        const displayChanges = moved && this.stageState.serverValue !== targetGroup.serverValue;
+        if (moved) {
             this.stageState.serverValue = targetGroup.serverValue;
+            if (!wasPendingSync && this.crmOffline.isRecordPendingSync(record)) {
+                const lead = leadName(record.data.display_name || record.data.name);
+                this._announce([_t("%(lead)s: changes pending sync.", { lead })]);
+            }
+        }
+        if (keepCardFocus) {
+            this.pendingFocus = { leadId: record.resId, control: "stage" };
+            if (!displayChanges) {
+                this._applyPendingFocus();
+            }
         }
     }
 
     /**
      * Opens the mobile quick create in a bottom sheet, on the displayed stage. A lead created
      * online is added to its stage as the framework quick create does; a queued one appears as a
-     * pending card as soon as it is queued.
+     * pending card as soon as it is queued. A pipeline showing sample data leaves sample mode as
+     * the sheet opens, as the framework kanban controller does when its quick create opens: the
+     * lead created never shows among sample cards nor counts with them, and a Discard does not
+     * bring them back. The sheet focuses its lead name input, and its closing hands the focus back
+     * to Add (see `_focusAfterQuickCreate`).
      *
      * @param {MouseEvent} [ev]
      */
@@ -1349,12 +1652,69 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!this.isMobilePipeline || !group || !this.canAdd) {
             return;
         }
+        const { model } = this.props.list;
+        if (model.useSampleModel) {
+            model.removeSampleDataInGroups();
+            model.useSampleModel = false;
+        }
         this.quickCreatePopover.open(ev?.currentTarget ?? this.rootRef(), {
             list: this.props.list,
             group,
-            onCreated: (resId, targetGroup) =>
-                this.validateQuickCreate(resId, "close", targetGroup),
+            onCreated: (resId, targetGroup) => this.onQuickCreated(resId, targetGroup),
         });
+    }
+
+    /**
+     * Adds a lead the mobile quick create made online to its stage, as the framework quick create
+     * does (inherited `validateQuickCreate`). The sheet resolves the group when the call returns:
+     * the live group of the stage written at that moment, or `undefined` when that stage is no
+     * longer listed.
+     * - Model work queued before (a reload still loading, such as the reconciliation that follows
+     *   a reconnection) lands first: the lead is handled once the model mutex is idle, on the list
+     *   as that work left it. The insertion queues on the same mutex, so a reload queued before it
+     *   would otherwise rebuild the groups first and leave the lead in a detached group.
+     * - Destroyed, or outside the stage pipeline, before or after that wait: nothing to do, the
+     *   next load shows the lead.
+     * - Already loaded, by a reload that ran after the server created it: nothing is added, so
+     *   the card and the count are not doubled.
+     * - A group a reload has replaced gives way to the live group of the same stage. When no
+     *   group of that stage is listed, or the sheet found none, the list is reloaded instead.
+     * - A reload queued after the wait but before the insertion detaches the group the lead was
+     *   added to: when that reload did not load the lead either, the list is reloaded once more.
+     * Nothing is created again; a lost connection during a reload leaves the pipeline as it is.
+     *
+     * @param {number} resId the created lead
+     * @param {Group | undefined} group the live group of the lead's stage when the call returned
+     * @returns {Promise<void>}
+     */
+    async onQuickCreated(resId, group) {
+        if (status(this) === "destroyed" || !this.isMobilePipeline) {
+            return;
+        }
+        await this.props.list.model.mutex.getUnlockedDef();
+        const isLoaded = () => this.allLoadedRecords().some((record) => record.resId === resId);
+        if (status(this) === "destroyed" || !this.isMobilePipeline || isLoaded()) {
+            return;
+        }
+        const groups = this.props.list.groups;
+        const liveGroup =
+            group &&
+            (groups.includes(group)
+                ? group
+                : groups.find((candidate) => candidate.serverValue === group.serverValue));
+        if (!liveGroup) {
+            await this._reloadAfterQuickCreate();
+            return;
+        }
+        await this.validateQuickCreate(resId, "close", liveGroup);
+        if (
+            status(this) !== "destroyed" &&
+            this.isMobilePipeline &&
+            !this.props.list.groups.includes(liveGroup) &&
+            !isLoaded()
+        ) {
+            await this._reloadAfterQuickCreate();
+        }
     }
 
     /**

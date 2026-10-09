@@ -168,6 +168,18 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
             trigger: ".o_crm_mobile_quick_create",
         },
         {
+            // Checked once the slide-in animation has ended (`o_bottom_sheet_snapping`), so a
+            // focus the sheet's mount or animation took back would fail here.
+            content: "the open sheet has focused its lead name input",
+            trigger:
+                ".o_bottom_sheet.o_bottom_sheet_snapping .o_crm_mobile_quick_create [name=name]",
+            run() {
+                if (this.anchor.ownerDocument.activeElement !== this.anchor) {
+                    throw new Error("The quick-create sheet did not focus its lead name input.");
+                }
+            },
+        },
+        {
             content: "enter the lead name",
             trigger: ".o_crm_mobile_quick_create [name=name]",
             run: "edit Offline Tour New Lead",
@@ -202,6 +214,17 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
             content: "the queued lead is shown as a pending card",
             trigger:
                 ".o_crm_mobile_lead_card:contains('Offline Tour New Lead') .o_crm_mobile_pending_badge",
+        },
+        {
+            content: "the closed sheet has handed the focus back to Add",
+            trigger: "body:not(:has(.o_crm_mobile_quick_create)) .o_crm_mobile_pipeline_add",
+            run() {
+                if (this.anchor.ownerDocument.activeElement !== this.anchor) {
+                    throw new Error(
+                        "The closed quick-create sheet did not return the focus to Add."
+                    );
+                }
+            },
         },
 
         // ---------------------------------------------------------------------

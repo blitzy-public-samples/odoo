@@ -29,10 +29,12 @@
 
 import {
     advanceTime,
+    after,
     animationFrame,
     beforeEach,
     describe,
     expect,
+    getFixture,
     press,
     queryAll,
     queryAllTexts,
@@ -40,6 +42,7 @@ import {
     queryOne,
     runAllTimers,
     test,
+    waitUntil,
 } from "@odoo/hoot";
 import { status } from "@odoo/owl";
 import { defineMailModels } from "@mail/../tests/mail_test_helpers";
@@ -80,6 +83,7 @@ import { CrmMobileQuickCreate } from "@crm/mobile/crm_mobile_quick_create/crm_mo
 import { CrmKanbanDynamicGroupList } from "@crm/views/crm_kanban/crm_kanban_model";
 import { crmKanbanView } from "@crm/views/crm_kanban/crm_kanban_view";
 import { deserializeDate, formatDate, serializeDate, today } from "@web/core/l10n/dates";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { formatInteger, formatMonetary } from "@web/views/fields/formatters";
@@ -1551,11 +1555,11 @@ describe("Mobile pipeline", () => {
         expect(".o_crm_mobile_pipeline_back").toHaveCount(1);
         expect(".o_crm_mobile_pipeline_next").toBeFocused();
 
-        // Back hands the focus to the tapped lead's card (its first control), never to the body.
+        // Back hands the focus to the open control of the tapped lead's card, never to the body.
         await contains(".o_crm_mobile_pipeline_back").click();
         expect(".o_crm_mobile_pipeline_back").toHaveCount(0);
         expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
-        expect(`${cardOf("Lead 2")} .o_crm_mobile_card_stage`).toBeFocused();
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_lead_card_open`).toBeFocused();
 
         // Leaving the helper by a stage navigation (a swipe) while Back holds the focus: the
         // displayed stage does not show the lead, so the first header control takes the focus.
@@ -2491,8 +2495,9 @@ describe("Mobile pipeline", () => {
         };
         const noCall = { queuedEntries: 0, latestStageWrite: 0, pendingLeadCreates: 0 };
         // One derivation: the queue read once, each loaded lead's latest stage write looked up
-        // once (5 leads) and each stage's queued creates once (4 stages).
-        const onePass = { queuedEntries: 1, latestStageWrite: 5, pendingLeadCreates: 4 };
+        // once (5 leads) and each stage's queued creates once (4 stages). The pipeline status
+        // region reads the live queue once more per queue change, for its queued lead creates.
+        const onePass = { queuedEntries: 2, latestStageWrite: 5, pendingLeadCreates: 4 };
 
         // A render that changes nothing the placement reads (new activity types) derives
         // nothing again and hands every card the same stages array.
@@ -2628,7 +2633,10 @@ describe("Mobile pipeline", () => {
         expect(entryCount).toBe(9);
         const loadedLeads = renderer.allLoadedRecords().length;
         expect(loadedLeads).toBe(5);
-        expect({ passes, visits }).toEqual({ passes: 1, visits: entryCount + 3 + 2 });
+        // Plus the pipeline status region's own pass over the live queue: each entry once, and
+        // the name of each of the 2 queued creates.
+        const onePass = { passes: 1 + 1, visits: entryCount + 3 + 2 + (entryCount + 2) };
+        expect({ passes, visits }).toEqual(onePass);
         expect(visits).toBeLessThan(loadedLeads * entryCount);
 
         // The pass placed and counted as the queue says, and every reader shares it.
@@ -2652,7 +2660,7 @@ describe("Mobile pipeline", () => {
         expect(renderer.pendingCreatesFor(groupOf(renderer, 2)).map(({ key }) => key)).toEqual([
             queued().find(({ value }) => value.args[1]?.name === "Pending Q").key,
         ]);
-        expect({ passes, visits }).toEqual({ passes: 1, visits: entryCount + 3 + 2 });
+        expect({ passes, visits }).toEqual(onePass);
 
         // The readers answer a frozen array (indexed once) exactly as any other array (scanned on
         // each call): the same entries, in the same order.
@@ -5432,6 +5440,1551 @@ describe("Mobile quick create", () => {
         expectHeader("New", 3, 145);
         expect(MockServer.env["crm.lead"].search_read([["name", "=", "Dropped lead"]])).toEqual([]);
     });
+
+    const EMAIL_ERROR = "The email address is not valid.";
+    const REVENUE_ERROR = "The expected revenue must be a number of 0 or more.";
+
+    /**
+     * Asserts the inline error of a quick-create field and its association with the input.
+     *
+     * @param {string} name the control name
+     * @param {string} message
+     */
+    function expectFieldError(name, message) {
+        const errorId = `o_crm_mobile_quick_create_${name}_error`;
+        const input = `.o_crm_mobile_quick_create [name=${name}]`;
+        expect(`.o_crm_mobile_quick_create #${errorId}`).toHaveText(message);
+        expect(`.o_crm_mobile_quick_create #${errorId}`).toHaveAttribute("role", "alert");
+        expect(input).toHaveAttribute("aria-invalid", "true");
+        expect(input).toHaveAttribute("aria-describedby", errorId);
+    }
+
+    /** @param {string} name the control name of a field shown without an error */
+    function expectNoFieldError(name) {
+        const input = `.o_crm_mobile_quick_create [name=${name}]`;
+        expect(`#o_crm_mobile_quick_create_${name}_error`).toHaveCount(0);
+        expect(input).not.toHaveAttribute("aria-invalid");
+        expect(input).not.toHaveAttribute("aria-describedby");
+    }
+
+    /**
+     * @param {CrmMobilePipeline} renderer
+     * @returns {Array<number | false>} the stage id of each group of the renderer's list
+     */
+    function stageValues(renderer) {
+        return renderer.props.list.groups.map((group) => group.serverValue);
+    }
+
+    /**
+     * @param {string} name
+     * @returns {Object[]} the leads of that name on the server
+     */
+    function leadsNamed(name) {
+        return MockServer.env["crm.lead"].search_read([["name", "=", name]]);
+    }
+
+    /**
+     * @param {Object} values the values a quick create writes besides its name
+     * @returns {Object} the six values written, empty ones as the sheet sends them
+     */
+    function leadVals(values) {
+        return {
+            contact_name: false,
+            phone: false,
+            email_from: false,
+            expected_revenue: 0,
+            stage_id: 1,
+            ...values,
+        };
+    }
+
+    /**
+     * Holds every `crm.lead` `web_save` until `release()`, stepping `{ web_save: vals }` when
+     * the request arrives. With `afterCreate`, the lead is created on the server at once and only
+     * the answer is held. With `answer`, the released request is answered by what it returns (a
+     * `Response` included) or fails with what it throws, and no lead is created.
+     *
+     * @param {{ afterCreate?: boolean, answer?: () => unknown }} [options]
+     * @returns {{ release: () => void }}
+     */
+    function holdLeadSaves({ afterCreate = false, answer } = {}) {
+        const held = Promise.withResolvers();
+        onRpc("crm.lead", "web_save", async ({ args, parent }) => {
+            expect.step({ web_save: args[1] });
+            if (afterCreate) {
+                const result = await parent();
+                await held.promise;
+                return result;
+            }
+            await held.promise;
+            return answer?.();
+        });
+        return { release: () => held.resolve() };
+    }
+
+    /**
+     * Steps every `validateQuickCreate` call of the pipeline as `{ validateQuickCreate: [id,
+     * mode, stage id] }`, and collects the groups it receives.
+     *
+     * @param {{ error?: Error }} [options] an error each call throws after stepping
+     * @returns {Object[]} the groups received, in call order
+     */
+    function watchValidateQuickCreate({ error } = {}) {
+        const groups = [];
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            validateQuickCreate(recordId, mode, group) {
+                expect.step({ validateQuickCreate: [recordId, mode, group.serverValue] });
+                groups.push(group);
+                if (error) {
+                    throw error;
+                }
+                return super.validateQuickCreate(...arguments);
+            },
+        });
+        return groups;
+    }
+
+    test.tags("mobile");
+    test("mobile: quick create rejects a malformed email or expected revenue with associated inline errors and sends nothing", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        // Online, a malformed email and a negative revenue: both errors at once, nothing sent.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        const [sheet] = sheets;
+        await fillQuickCreate({ name: "Checked lead", email_from: "not-an-email" });
+        sheet.state.expected_revenue = "-5";
+        await animationFrame();
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
+        expectFieldError("email_from", EMAIL_ERROR);
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+        expectNoFieldError("name");
+        expect(".o_crm_mobile_quick_create").toHaveCount(1);
+        expect(".o_crm_mobile_quick_create_save").not.toHaveAttribute("disabled");
+
+        // A partly numeric text, through a direct call (a number input never holds one).
+        sheet.state.expected_revenue = "12junk";
+        await sheet.save();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+
+        // A valid email clears its own error only; an overflowing number is still rejected.
+        await fillQuickCreate({ email_from: "checked@example.com" });
+        sheet.state.expected_revenue = "1e400";
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
+        expectNoFieldError("email_from");
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+
+        // A text the browser cannot parse: the number input reports an empty value.
+        sheet.state.expected_revenue = "";
+        await animationFrame();
+        const revenueInput = queryOne(".o_crm_mobile_quick_create [name=expected_revenue]");
+        Object.defineProperty(revenueInput, "validity", {
+            configurable: true,
+            value: { badInput: true },
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+        delete revenueInput.validity;
+        expect.verifySteps([]);
+        expect(leadsNamed("Checked lead")).toEqual([]);
+
+        // An empty email and an empty revenue are valid: false and 0 are written.
+        await fillQuickCreate({ email_from: "" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps([{ web_save: leadVals({ name: "Checked lead" }) }]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(sheet.state.errors).toEqual({ name: "", email_from: "", expected_revenue: "" });
+
+        // A complete number in exponent notation is accepted.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Exponent lead", email_from: "exp@example.com" });
+        sheets.at(-1).state.expected_revenue = "1.5e2";
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps([
+            {
+                web_save: leadVals({
+                    name: "Exponent lead",
+                    email_from: "exp@example.com",
+                    expected_revenue: 150,
+                }),
+            },
+        ]);
+
+        // Offline, the same rules: nothing is queued and the sheet stays open.
+        await setOffline(true);
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Offline checked", email_from: "still wrong" });
+        sheets.at(-1).state.expected_revenue = "-0.5";
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
+        expectFieldError("email_from", EMAIL_ERROR);
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+        expect(".o_crm_mobile_quick_create").toHaveCount(1);
+        expect(queued()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: quick create keeps a revenue text the browser cannot parse and rejects it on Save", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        const [sheet] = sheets;
+        await fillQuickCreate({ name: "Typed lead", expected_revenue: "1" });
+        expect(sheet.state.expected_revenue).toBe("1");
+
+        // "e" typed next: the browser keeps "1e" in the input, reports an empty value and flags
+        // `badInput`. A script cannot put a number input in that state, so the element stands in
+        // for it; any value the component writes into the input is stepped.
+        const revenueInput = queryOne(".o_crm_mobile_quick_create [name=expected_revenue]");
+        Object.defineProperty(revenueInput, "value", {
+            configurable: true,
+            get: () => "",
+            set: () => {
+                expect.step("value written");
+            },
+        });
+        Object.defineProperty(revenueInput, "validity", {
+            configurable: true,
+            value: { badInput: true },
+        });
+        try {
+            revenueInput.dispatchEvent(new Event("input", { bubbles: true }));
+            await animationFrame();
+            expect(sheet.state.expected_revenue).toBe("");
+            // The text is kept (nothing is written back), so Save sees it as invalid, not empty.
+            await contains(".o_crm_mobile_quick_create_save").click();
+            expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
+            expectFieldError("expected_revenue", REVENUE_ERROR);
+            expect(".o_crm_mobile_quick_create").toHaveCount(1);
+            expect(".o_crm_mobile_quick_create_save").not.toHaveAttribute("disabled");
+            expect.verifySteps([]);
+        } finally {
+            delete revenueInput.value;
+            delete revenueInput.validity;
+        }
+        expect(leadsNamed("Typed lead")).toEqual([]);
+
+        // The complete exponent, entered through the input, is a number: 1e3 is saved as 1000.
+        await contains(".o_crm_mobile_quick_create [name=expected_revenue]").edit("1e3", {
+            confirm: false,
+            instantly: true,
+        });
+        expect(sheet.state.expected_revenue).toBe("1e3");
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Typed lead", expected_revenue: 1000 }) },
+        ]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(sheet.state.errors).toEqual({ name: "", email_from: "", expected_revenue: "" });
+    });
+
+    test.tags("mobile");
+    test("mobile: quick create sends a single web_save while a save is pending", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves();
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Single lead", expected_revenue: "5" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([{ web_save: leadVals({ name: "Single lead", expected_revenue: 5 }) }]);
+        expect(".o_crm_mobile_quick_create_save").toHaveAttribute("disabled");
+        // A second save while the first is pending (a direct call: the button is disabled).
+        await sheets[0].save();
+        await animationFrame();
+        expect.verifySteps([]);
+
+        saves.release();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(leadsNamed("Single lead")).toHaveLength(1);
+        expect(cardOf("Single lead")).toHaveCount(1);
+        expectHeader("New", 3, 125);
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a lead created online while its sheet is dismissed still reaches the pipeline", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves();
+        watchValidateQuickCreate();
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Dismissed lead", expected_revenue: "7" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Dismissed lead", expected_revenue: 7 }) },
+        ]);
+        await contains(".o_crm_mobile_quick_create_discard").click();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(cardOf("Dismissed lead")).toHaveCount(0);
+
+        // The answer arrives after the dismissal: the card shows without a manual reload.
+        saves.release();
+        await animationFrame();
+        const [created] = leadsNamed("Dismissed lead");
+        expect.verifySteps([{ validateQuickCreate: [created.id, "close", 1] }]);
+        expect(leadsNamed("Dismissed lead")).toHaveLength(1);
+        expect(cardOf("Dismissed lead")).toHaveCount(1);
+        expectHeader("New", 3, 127);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: a pipeline reload during a pending quick create adds the lead to the live group of its stage", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves();
+        const validatedGroups = watchValidateQuickCreate();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({
+            name: "Reloaded lead",
+            expected_revenue: "10",
+            stage_id: "Qualified",
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Reloaded lead", expected_revenue: 10, stage_id: 2 }) },
+        ]);
+        // The groups are rebuilt while the call runs.
+        const qualifiedBefore = groupOf(renderer, 2);
+        await renderer.props.list.load();
+        await animationFrame();
+        expect(groupOf(renderer, 2)).not.toBe(qualifiedBefore);
+
+        saves.release();
+        await animationFrame();
+        const [created] = leadsNamed("Reloaded lead");
+        expect.verifySteps([{ validateQuickCreate: [created.id, "close", 2] }]);
+        expect(validatedGroups).toHaveLength(1);
+        expect(validatedGroups[0] === groupOf(renderer, 2)).toBe(true, {
+            message: "validateQuickCreate receives the live Qualified group",
+        });
+        expect(validatedGroups[0].id).not.toBe(qualifiedBefore.id);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        await goToStage("Qualified");
+        expect(cardOf("Reloaded lead")).toHaveCount(1);
+        expectHeader("Qualified", 2, 40);
+    });
+
+    test.tags("mobile");
+    test("mobile: a lead that a reload loaded during the call is not added twice", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves({ afterCreate: true });
+        watchValidateQuickCreate();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Preloaded lead", expected_revenue: "15" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Preloaded lead", expected_revenue: 15 }) },
+        ]);
+        // The lead exists on the server, and a reload brings it in before the answer arrives.
+        expect(leadsNamed("Preloaded lead")).toHaveLength(1);
+        await renderers[0].props.list.load();
+        await animationFrame();
+        expect(cardOf("Preloaded lead")).toHaveCount(1);
+        expectHeader("New", 3, 135);
+
+        saves.release();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(cardOf("Preloaded lead")).toHaveCount(1);
+        expect(groupOf(renderers[0], 1).count).toBe(3);
+        expectHeader("New", 3, 135);
+    });
+
+    test.tags("mobile");
+    test("mobile: a lead whose stage is no longer listed when the call returns reloads the pipeline instead of being added", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves();
+        watchValidateQuickCreate();
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_read"]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        expect.verifySteps([LEAD_GROUPS]);
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({
+            name: "Orphan lead",
+            expected_revenue: "12",
+            stage_id: "Qualified",
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Orphan lead", expected_revenue: 12, stage_id: 2 }) },
+        ]);
+        // While the call runs, a reload with a domain that leaves Qualified empty drops its group
+        // (the framework keeps an emptied group only for a reload with the same parameters).
+        await renderer.props.list.load({ domain: [["name", "!=", "Lead 3"]] });
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS]);
+        expect(stageValues(renderer)).toEqual([1, 3, 4]);
+
+        // No live group for the stage written: the list is reloaded, nothing is created again.
+        saves.release();
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(leadsNamed("Orphan lead")).toHaveLength(1);
+        // The reload, with the same domain, lists the stage again with the lead created.
+        expect(stageValues(renderer)).toEqual([1, 2, 3, 4]);
+        expect(groupOf(renderer, 2).count).toBe(1);
+        await goToStage("Qualified");
+        expect(cardNames()).toEqual(["Orphan lead"]);
+        expectHeader("Qualified", 1, 12);
+    });
+
+    test.tags("mobile");
+    test("mobile: when adding the created lead to the pipeline fails, the sheet still closes and nothing is created twice", async () => {
+        expect.errors(1);
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        watchValidateQuickCreate({ error: new Error("The card could not be added") });
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Failing card" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        const [created] = leadsNamed("Failing card");
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Failing card" }) },
+            { validateQuickCreate: [created.id, "close", 1] },
+        ]);
+        expect.verifyErrors(["The card could not be added"]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(leadsNamed("Failing card")).toHaveLength(1);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: quick create sends missing values as false, and a web_save answer without an id adds nothing and closes the sheet", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+            return [];
+        });
+        watchValidateQuickCreate();
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        const [sheet] = sheets;
+        sheet.state.name = "Answer without id";
+        sheet.state.contact_name = null;
+        sheet.state.phone = undefined;
+        sheet.state.email_from = null;
+        await sheet.save();
+        await animationFrame();
+        expect.verifySteps([{ web_save: leadVals({ name: "Answer without id" }) }]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(cardOf("Answer without id")).toHaveCount(0);
+        expectHeader("New", 2, 120);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: quick create stage selection falls back to the remembered stage, the initial stage, then the first stage", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+        const [renderer] = renderers;
+        const selectedStage = () =>
+            queryOne(".o_crm_mobile_quick_create select[name=stage_id]").selectedOptions[0];
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        const [sheet] = sheets;
+        await fillQuickCreate({ name: "Staged lead", stage_id: "Qualified" });
+        expect(sheet.targetGroup.id).toBe(groupOf(renderer, 2).id);
+
+        // An unknown selected id: the remembered stage, then the selection is re-synced.
+        sheet.state.stageGroupId = "unknown";
+        expect(sheet.targetGroup.id).toBe(groupOf(renderer, 2).id);
+        await animationFrame();
+        expect(sheet.state.stageGroupId).toBe(groupOf(renderer, 2).id);
+        expect(selectedStage()).toHaveText("Qualified");
+
+        // Consecutive reloads: the selection follows its stage each time.
+        for (let reload = 0; reload < 2; reload++) {
+            const before = groupOf(renderer, 2).id;
+            await renderer.props.list.load();
+            await animationFrame();
+            expect(groupOf(renderer, 2).id).not.toBe(before);
+            expect(sheet.state.stageGroupId).toBe(groupOf(renderer, 2).id);
+            expect(selectedStage()).toHaveText("Qualified");
+            expect(sheet.targetGroup.id).toBe(groupOf(renderer, 2).id);
+        }
+
+        // Neither the selected id nor the remembered stage is listed: the initial stage.
+        sheet.state.stageGroupId = "unknown";
+        sheet.selectedStageValue = 99;
+        expect(sheet.targetGroup.id).toBe(groupOf(renderer, 1).id);
+        await animationFrame();
+        expect(selectedStage()).toHaveText("New");
+
+        // The selected stage disappears in a reload (a domain without its only lead): the
+        // selection moves to the first stage.
+        await fillQuickCreate({ stage_id: "Qualified" });
+        await renderer.props.list.load({ domain: [["stage_id", "!=", 2]] });
+        await animationFrame();
+        expect(stageValues(renderer)).toEqual([1, 3, 4]);
+        expect(queryAllTexts(".o_crm_mobile_quick_create select[name=stage_id] option")).toEqual([
+            "New",
+            "Proposition",
+            "Won",
+        ]);
+        expect(selectedStage()).toHaveText("New");
+        expect(sheet.targetGroup.id).toBe(groupOf(renderer, 1).id);
+
+        // The initial stage disappears too: the initial group itself is the last resort.
+        await renderer.props.list.load({ domain: [["stage_id", "not in", [1, 2]]] });
+        await animationFrame();
+        expect(stageValues(renderer)).toEqual([3, 4]);
+        expect(selectedStage()).toHaveText("Proposition");
+        sheet.state.stageGroupId = "unknown";
+        sheet.selectedStageValue = 99;
+        expect(sheet.targetGroup.id).toBe(sheet.props.group.id);
+        expect(sheet.targetGroup.serverValue).toBe(1);
+        await animationFrame();
+        expect(selectedStage()).toHaveText("Proposition");
+
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps([{ web_save: leadVals({ name: "Staged lead", stage_id: 3 }) }]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a queued quick create keeps its own copy of the stage context", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Detached lead" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        const groupContext = groupOf(renderers[0], 1).context;
+        const [save] = queuedCalls("crm.lead", "web_save");
+        expect(save.kwargs.context).not.toBe(groupContext);
+        expect(save.kwargs.context).toEqual(JSON.parse(JSON.stringify(groupContext)));
+        expect(save.kwargs.context.default_stage_id).toBe(1);
+        const queuedContext = JSON.stringify(save.kwargs.context);
+
+        // A later change of the group context does not reach the call already queued.
+        groupContext.default_stage_id = 3;
+        groupContext.default_type = "lead";
+        const [after] = queuedCalls("crm.lead", "web_save");
+        expect(JSON.stringify(after.kwargs.context)).toBe(queuedContext);
+        expect(after.kwargs.context.default_stage_id).toBe(1);
+
+        // A group without a context: the call is queued without any group default (the
+        // framework queue adds the user context only).
+        groupOf(renderers[0], 1).config.context = undefined;
+        expect(groupOf(renderers[0], 1).context).toBe(undefined);
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Contextless lead" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        const contextless = queuedCalls("crm.lead", "web_save").find(
+            (call) => call.args[1].name === "Contextless lead"
+        );
+        expect(contextless.args).toEqual([[], leadVals({ name: "Contextless lead" })]);
+        expect(contextless.kwargs.context.default_stage_id).toBe(undefined);
+        expect(queuedCalls("crm.lead", "web_save")).toHaveLength(2);
+    });
+
+    test.tags("mobile");
+    test("mobile: quick create lists the stage-less group first, in the pipeline's stage order", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        await makeMockServer();
+        MockServer.env["crm.lead"].create({ name: "Lead without stage", stage_id: false });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        const options = queryAllTexts(".o_crm_mobile_quick_create select[name=stage_id] option");
+        expect(options).toEqual(renderer.stageGroups.map((group) => group.displayName));
+        expect(options).toEqual([
+            groupOf(renderer, false).displayName,
+            "New",
+            "Qualified",
+            "Proposition",
+            "Won",
+        ]);
+    });
+
+    test.tags("mobile");
+    test("mobile: card open control is a labelled button reached by Tab, opened by Enter once; Space keeps its native activation", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline({
+            selectRecord: (resId) => expect.step(`open ${resId}`),
+        });
+        const [renderer] = renderers;
+        const card = cardOf("Lead 1");
+        const open = `${card} .o_crm_mobile_lead_card_open`;
+
+        // A native button around the name, named by it, outside the action row, usable offline.
+        expect(open).toHaveCount(1);
+        expect(open).toHaveAttribute("type", "button");
+        expect(open).toHaveAttribute("data-available-offline", "1");
+        expect(open).toHaveText("Lead 1");
+        expect(`${open} > .o_crm_mobile_lead_card_name`).toHaveCount(1);
+        const actionRow = `${card} .o_crm_mobile_lead_card_actions`;
+        expect(`${actionRow} .o_crm_mobile_lead_card_open`).toHaveCount(0);
+        expectTouchTarget(queryOne(open), "open control");
+        // The article stays out of the Tab order (the kanban Space hotkey selects a focused
+        // record), and the name stays the first span of the card.
+        expect(card).not.toHaveAttribute("tabindex");
+        expect(card).not.toHaveAttribute("role");
+        expect(queryFirst(`${card} span`)).toHaveClass("o_crm_mobile_lead_card_name");
+
+        // Tab from the header reaches the first card's open control; Enter opens the lead, once.
+        queryOne(".o_crm_mobile_pipeline_add").focus();
+        await press("Tab");
+        expect(open).toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps(["open 1"]);
+
+        // Space and Shift+Space from the card's controls keep their default action (the native
+        // button activation) and select no kanban record.
+        let events = await press(" ");
+        expect(events.get("keydown").defaultPrevented).toBe(false);
+        events = await press(["Shift", " "]);
+        const shiftSpace = events.get((ev) => ev.type === "keydown" && ev.key === " ");
+        expect(shiftSpace.shiftKey).toBe(true);
+        expect(shiftSpace.defaultPrevented).toBe(false);
+        queryOne(`${card} .o_crm_mobile_card_stage`).focus();
+        events = await press(" ");
+        expect(events.get("keydown").defaultPrevented).toBe(false);
+        expect(renderer.props.list.selection).toHaveLength(0);
+        // The header controls keep it too: Space and Shift+Space stop at the pipeline root, so the
+        // inherited kanban Space hotkey neither cancels their activation nor selects a record.
+        for (const control of [".o_crm_mobile_pipeline_next", ".o_crm_mobile_pipeline_add"]) {
+            queryOne(control).focus();
+            events = await press(" ");
+            expect(events.get("keydown").defaultPrevented).toBe(false);
+            events = await press(["Shift", " "]);
+            const shifted = events.get((ev) => ev.type === "keydown" && ev.key === " ");
+            expect(shifted.shiftKey).toBe(true);
+            expect(shifted.defaultPrevented).toBe(false);
+        }
+        expect(renderer.props.list.selection).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Taps open the lead once, on the name and anywhere else on the card body.
+        await contains(`${card} .o_crm_mobile_lead_card_name`).click();
+        expect.verifySteps(["open 1"]);
+        await contains(`${card} .o_crm_mobile_lead_card_partner`).click();
+        expect.verifySteps(["open 1"]);
+    });
+
+    test.tags("mobile");
+    test("mobile: offline, an uncached lead opened from the keyboard focuses the helper's Back, and Back returns the focus to its card; a pending create has no open control", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Lead 1's form was visited online, Lead 2's was not.
+        patchWithCleanup(OfflinePlugin.prototype, {
+            isAvailableOffline(actionId, viewType, resId) {
+                if (viewType === "form") {
+                    return resId === 1;
+                }
+                return actionId === PIPELINE_ACTION_ID;
+            },
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline({
+            selectRecord: (resId) => expect.step(`open ${resId}`),
+        });
+        const [renderer] = renderers;
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        const open = `${cardOf("Lead 2")} .o_crm_mobile_lead_card_open`;
+
+        // The unavailable state is announced inside the open control, after the visible name.
+        expect(cardOf("Lead 2")).toHaveClass("o_crm_mobile_lead_card_unavailable");
+        expect(`${open} .o_crm_mobile_lead_card_name + .visually-hidden`).toHaveText(
+            /not available offline/
+        );
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_open .visually-hidden`).toHaveCount(0);
+        expect(open).not.toHaveAttribute("disabled");
+
+        queryOne(open).focus();
+        await press("Enter");
+        await animationFrame();
+        expect(".o_crm_mobile_pipeline_body .o_view_nocontent").toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_back").toBeFocused();
+        // Space and Shift+Space on Back keep their native activation and select no record: they
+        // stop at the pipeline root, before the inherited kanban Space hotkey.
+        let events = await press(" ");
+        expect(events.get("keydown").defaultPrevented).toBe(false);
+        events = await press(["Shift", " "]);
+        const shiftSpace = events.get((ev) => ev.type === "keydown" && ev.key === " ");
+        expect(shiftSpace.shiftKey).toBe(true);
+        expect(shiftSpace.defaultPrevented).toBe(false);
+        expect(renderer.props.list.selection).toHaveLength(0);
+        expect(".o_crm_mobile_pipeline_back").toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        expect(".o_view_nocontent").toHaveCount(0);
+        expect(open).toBeFocused();
+        expect.verifySteps([]);
+
+        // A queued lead create has nothing to open: its name stays a plain span, no control.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Pending A" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect(".o_crm_mobile_lead_card_pending .o_crm_mobile_lead_card_name").toHaveText(
+            "Pending A"
+        );
+        expect(".o_crm_mobile_lead_card_pending button").toHaveCount(0);
+        expect(".o_crm_mobile_lead_card_open").toHaveCount(2);
+    });
+
+    test.tags("mobile");
+    test("mobile: stage listbox keyboard model: focus on open, roving tabindex over enabled options, Escape back to Stage, Enter moves the card, no kanban navigation", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            focusNextCard() {
+                expect.step("focusNextCard");
+                return super.focusNextCard(...arguments);
+            },
+        });
+        patchWithCleanup(CrmKanbanDynamicGroupList.prototype, {
+            moveRecords(recordIds, refId, targetGroupId) {
+                expect.step({ moveRecords: [recordIds, refId, targetGroupId] });
+                return super.moveRecords(...arguments);
+            },
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        await goToStage("Qualified");
+        const card = cardOf("Lead 3");
+        const stageButton = `${card} .o_crm_mobile_card_stage`;
+        const option = (stageId) =>
+            `${card} .o_crm_mobile_stage_option[data-stage-value='${stageId}']`;
+        const tabIndexes = () =>
+            queryAll(`${card} .o_crm_mobile_stage_option`).map((el) => el.getAttribute("tabindex"));
+
+        // Opened from the keyboard, the list focuses its first enabled option; the displayed
+        // stage stays selected and disabled, and only the active option is a Tab stop.
+        queryOne(stageButton).focus();
+        await press("Enter");
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_lead_card_stage_list`).toHaveAttribute("role", "listbox");
+        expect(stageButton).toHaveAttribute("aria-expanded", "true");
+        expect(option(2)).toHaveAttribute("aria-selected", "true");
+        expect(option(2)).toHaveAttribute("disabled");
+        expect(option(1)).toBeFocused();
+        expect(tabIndexes()).toEqual(["0", "-1", "-1", "-1"]);
+
+        // ArrowDown skips the disabled displayed stage, and the Tab stop follows the focus.
+        const events = await press("ArrowDown");
+        expect(events.get("keydown").defaultPrevented).toBe(true);
+        await animationFrame();
+        expect(option(3)).toBeFocused();
+        expect(tabIndexes()).toEqual(["-1", "-1", "0", "-1"]);
+        await press("ArrowDown");
+        expect(option(4)).toBeFocused();
+        // No wrap at either end; ArrowUp from the first option does not focus the search.
+        await press("ArrowDown");
+        expect(option(4)).toBeFocused();
+        await press("ArrowUp");
+        expect(option(3)).toBeFocused();
+        await press("ArrowUp");
+        expect(option(1)).toBeFocused();
+        await press("ArrowUp");
+        expect(option(1)).toBeFocused();
+        await press("End");
+        expect(option(4)).toBeFocused();
+        await press("Home");
+        expect(option(1)).toBeFocused();
+        // A modified arrow is not the list's: the focus stays.
+        const shifted = await press(["Shift", "ArrowDown"]);
+        const shiftedArrow = shifted.get((ev) => ev.type === "keydown" && ev.key === "ArrowDown");
+        expect(shiftedArrow.defaultPrevented).toBe(false);
+        expect(option(1)).toBeFocused();
+        // The inherited kanban arrow hotkeys never ran inside the list.
+        expect.verifySteps([]);
+
+        // Escape closes the list and gives the focus back to Stage.
+        await press("ArrowDown");
+        await animationFrame();
+        await press("Escape");
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_lead_card_stage_list`).toHaveCount(0);
+        expect(stageButton).toBeFocused();
+        expect(stageButton).toHaveAttribute("aria-expanded", "false");
+        // Outside the list, the card's other keys still reach the inherited kanban hotkeys.
+        await press("ArrowDown");
+        expect.verifySteps(["focusNextCard"]);
+
+        // Reopened with a tap, the list focuses the option it left active.
+        await contains(stageButton).click();
+        expect(option(3)).toBeFocused();
+        expect(tabIndexes()).toEqual(["-1", "-1", "0", "-1"]);
+
+        // Enter chooses the focused option through the framework kanban move. The focus follows
+        // the moved card: its Stage button, in the target stage now displayed.
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps([
+            { moveRecords: [[recordOf(renderer, 3).id], null, groupOf(renderer, 3).id] },
+        ]);
+        expectHeader("Proposition", 2, 70);
+        expect(cardNames()).toEqual(["Lead 3", "Lead 4"]);
+        expect(`${card} .o_crm_mobile_lead_card_stage_list`).toHaveCount(0);
+        expect(stageButton).toBeFocused();
+        expect(stageButton).toHaveAttribute("aria-expanded", "false");
+    });
+
+    test.tags("mobile");
+    test("mobile: a stage chosen from the keyboard leaves the focus on the card's Stage button when the move is not made or ends in a connection loss; a focus outside the card stays", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        let outcome = "not made";
+        patchWithCleanup(CrmKanbanDynamicGroupList.prototype, {
+            async moveRecords() {
+                expect.step(`moveRecords: ${outcome}`);
+                if (outcome === "not made") {
+                    return;
+                }
+                await super.moveRecords(...arguments);
+                if (outcome === "connection lost") {
+                    // as the framework's reload of a truncated source stage, after the save
+                    throw new ConnectionLostError("/web/dataset/call_kw/crm.lead/web_search_read");
+                }
+            },
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        const stageButton = `${cardOf("Lead 1")} .o_crm_mobile_card_stage`;
+        const stageList = `${cardOf("Lead 1")} .o_crm_mobile_lead_card_stage_list`;
+        const option = (stageId) =>
+            `${cardOf("Lead 1")} .o_crm_mobile_stage_option[data-stage-value='${stageId}']`;
+
+        // A move the framework does not make: the displayed stage and the card stay, and the
+        // focus goes back to the card's Stage button.
+        queryOne(stageButton).focus();
+        await press("Enter");
+        await animationFrame();
+        expect(option(2)).toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps(["moveRecords: not made"]);
+        expectHeader("New", 2, 120);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expect(stageList).toHaveCount(0);
+        expect(stageButton).toBeFocused();
+        expect(stageButton).toHaveAttribute("aria-expanded", "false");
+
+        // A move made whose source reload then loses the connection: the card is placed in the
+        // target stage, now displayed, and its Stage button there has the focus.
+        outcome = "connection lost";
+        await press("Enter");
+        await animationFrame();
+        expect(option(2)).toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps(["moveRecords: connection lost"]);
+        expectHeader("Qualified", 2, 130);
+        expect(recordOf(renderer, 1).group.serverValue).toBe(2);
+        expect(stageList).toHaveCount(0);
+        expect(stageButton).toBeFocused();
+
+        // A move started while the focus is outside the card leaves the focus where it is.
+        outcome = "made";
+        queryOne(".o_crm_mobile_pipeline_add").focus();
+        await renderer.onCardMove(recordOf(renderer, 3), groupOf(renderer, 3));
+        await animationFrame();
+        expect.verifySteps(["moveRecords: made"]);
+        expectHeader("Proposition", 2, 70);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+    });
+
+    test.tags("mobile");
+    test("mobile: stage listbox with no enabled option (a call in flight) keeps the focus on Stage and handles its keys without error", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipeline();
+        const card = cardOf("Lead 1");
+        const cardComponent = cards.findLast((instance) => instance.props.record?.resId === 1);
+        const list = `${card} .o_crm_mobile_lead_card_stage_list`;
+
+        // A call is in flight: every option is disabled, so none is focusable.
+        cardComponent.state.busy = true;
+        await animationFrame();
+        await contains(`${card} .o_crm_mobile_card_stage`).click();
+        expect(`${card} .o_crm_mobile_stage_option:not(:disabled)`).toHaveCount(0);
+        expect(
+            queryAll(`${card} .o_crm_mobile_stage_option`).map((el) => el.getAttribute("tabindex"))
+        ).toEqual(["-1", "-1", "-1", "-1"]);
+        expect(cardComponent.activeStageOption).toBe(null);
+        expect(`${card} .o_crm_mobile_card_stage`).toBeFocused();
+        for (const key of ["ArrowDown", "ArrowUp", "Home", "End"]) {
+            const keydown = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+            queryOne(list).dispatchEvent(keydown);
+            expect(keydown.defaultPrevented).toBe(true);
+        }
+        expect(`${card} .o_crm_mobile_card_stage`).toBeFocused();
+
+        // The call ends: the enabled options are back, the first one holds the Tab stop.
+        cardComponent.state.busy = false;
+        await animationFrame();
+        expect(
+            queryAll(`${card} .o_crm_mobile_stage_option`).map((el) => el.getAttribute("tabindex"))
+        ).toEqual(["-1", "0", "-1", "-1"]);
+        // A direct call while the list is closed does nothing.
+        await contains(`${card} .o_crm_mobile_card_stage`).click();
+        expect(list).toHaveCount(0);
+        cardComponent.onStageListKeydown(new KeyboardEvent("keydown", { key: "ArrowDown" }));
+        expect(`${card} .o_crm_mobile_card_stage`).toBeFocused();
+    });
+
+    test.tags("mobile");
+    test("mobile: quick create on a sample-data pipeline leaves sample mode like the framework quick create", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        await makeMockServer();
+        MockServer.env["crm.lead"].unlink(MockServer.env["crm.lead"].search([]));
+        // No lead: the stages are still listed, empty, as the stage group expansion lists them,
+        // each aggregate with the server's empty value (`_read_group_empty_value`).
+        onRpc("crm.lead", "web_read_group", async ({ kwargs, parent }) => {
+            const result = await parent();
+            if (result.groups.length) {
+                return result;
+            }
+            const emptyValue = (spec) => {
+                if (/:array_agg(_distinct)?$/.test(spec)) {
+                    return [];
+                }
+                return /:count(_distinct)?$/.test(spec) ? 0 : false;
+            };
+            const groups = MockServer.env["crm.stage"]
+                .search_read([], ["display_name"])
+                .map((stage) => ({
+                    ...Object.fromEntries(
+                        kwargs.aggregates.map((spec) => [spec, emptyValue(spec)])
+                    ),
+                    stage_id: [stage.id, stage.display_name],
+                    __count: 0,
+                    __extra_domain: [["stage_id", "=", stage.id]],
+                    __records: [],
+                }));
+            return { groups, length: groups.length };
+        });
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        watchValidateQuickCreate();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline({
+            arch: PIPELINE_ARCH.replace('archivable="false"', 'archivable="false" sample="1"'),
+        });
+        const [renderer] = renderers;
+        const { model } = renderer.props.list;
+        const expectEmptyHeader = () => {
+            expect(".o_crm_mobile_pipeline_stage_name").toHaveText("New");
+            expect(".o_crm_mobile_pipeline_count").toHaveText("0");
+            // An empty stage aggregates no currency: its sum shows as a plain number.
+            expect(".o_crm_mobile_pipeline_revenue").toHaveText("0");
+        };
+
+        // Sample data: faded sample cards, counted in the header.
+        expect(stageValues(renderer)).toEqual([1, 2, 3, 4]);
+        expect(model.useSampleModel).toBe(true);
+        expect(".o_view_sample_data .o_crm_mobile_pipeline").toHaveCount(1);
+        const sampleCards = queryAll(".o_crm_mobile_pipeline_body .o_crm_mobile_lead_card").length;
+        expect(sampleCards > 0).toBe(true, { message: "the displayed stage shows sample cards" });
+        expect(".o_crm_mobile_pipeline_count").toHaveText(String(sampleCards));
+
+        // Opening the sheet leaves sample mode, and a Discard does not bring it back.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        expect(".o_crm_mobile_quick_create").toHaveCount(1);
+        expect(model.useSampleModel).toBe(false);
+        expect(".o_view_sample_data").toHaveCount(0);
+        expect(".o_crm_mobile_lead_card").toHaveCount(0);
+        expect(renderer.allLoadedRecords()).toEqual([]);
+        expect(renderer.props.list.groups.map((group) => group.count)).toEqual([0, 0, 0, 0]);
+        expectEmptyHeader();
+        await contains(".o_crm_mobile_quick_create_discard").click();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(model.useSampleModel).toBe(false);
+        expect(".o_view_sample_data").toHaveCount(0);
+        expect(".o_crm_mobile_lead_card").toHaveCount(0);
+        expectEmptyHeader();
+
+        // A lead created online is the only card, a real one, and the only lead counted.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "First real lead", expected_revenue: "25" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        const [created] = leadsNamed("First real lead");
+        expect.verifySteps([
+            { web_save: leadVals({ name: "First real lead", expected_revenue: 25 }) },
+            { validateQuickCreate: [created.id, "close", 1] },
+        ]);
+        expect(leadsNamed("First real lead")).toHaveLength(1);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(".o_view_sample_data").toHaveCount(0);
+        expect(cardNames()).toEqual(["First real lead"]);
+        expect(cardOf("First real lead")).toHaveAttribute("data-id");
+        expect(renderer.allLoadedRecords().map((record) => record.resId)).toEqual([created.id]);
+        expectHeader("New", 1, 25);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: an offline quick create on an empty pipeline shows its pending card without the no-content helper", async () => {
+        const errors = cachedReadErrors([
+            // the types revalidated on each stage displayed offline: Qualified, then New again
+            // (there is no lead, so no activity read)
+            TYPES,
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        await makeMockServer();
+        MockServer.env["crm.lead"].unlink(MockServer.env["crm.lead"].search([]));
+        // No lead: the stages are still listed, empty, as the stage group expansion lists them,
+        // each aggregate with the server's empty value (`_read_group_empty_value`).
+        onRpc("crm.lead", "web_read_group", async ({ kwargs, parent }) => {
+            const result = await parent();
+            if (result.groups.length) {
+                return result;
+            }
+            const emptyValue = (spec) => {
+                if (/:array_agg(_distinct)?$/.test(spec)) {
+                    return [];
+                }
+                return /:count(_distinct)?$/.test(spec) ? 0 : false;
+            };
+            const groups = MockServer.env["crm.stage"]
+                .search_read([], ["display_name"])
+                .map((stage) => ({
+                    ...Object.fromEntries(
+                        kwargs.aggregates.map((spec) => [spec, emptyValue(spec)])
+                    ),
+                    stage_id: [stage.id, stage.display_name],
+                    __count: 0,
+                    __extra_domain: [["stage_id", "=", stage.id]],
+                    __records: [],
+                }));
+            return { groups, length: groups.length };
+        });
+        const setOffline = mockOffline();
+        watchRpcs(["crm.lead/web_save"]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const { model } = renderer.props.list;
+
+        // No lead and no sample data: the framework no-content helper.
+        expect(stageValues(renderer)).toEqual([1, 2, 3, 4]);
+        expect(model.useSampleModel).toBe(false);
+        expect(".o_crm_mobile_lead_card").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline .o_view_nocontent").toHaveCount(1);
+
+        // An offline save: the pending card shows in the chosen stage at once, uncovered.
+        await setOffline(true);
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "First offline lead" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(queued()).toHaveLength(1);
+        const [{ key }] = queued();
+        const pending = `.o_crm_mobile_pipeline_body .o_crm_mobile_lead_card[data-pending-key='${key}']`;
+        expect(pending).toBeVisible();
+        expect(`${pending} .o_crm_mobile_lead_card_name`).toHaveText("First offline lead");
+        expect(".o_crm_mobile_pipeline_count").toHaveText("1");
+        expect(".o_view_nocontent").toHaveCount(0);
+        // The pipeline holds data, so another, empty, stage shows no helper either.
+        await goToStage("Qualified");
+        expect(".o_crm_mobile_lead_card").toHaveCount(0);
+        expect(".o_view_nocontent").toHaveCount(0);
+        await goToStage("New");
+        expect(pending).toBeVisible();
+        expect(".o_view_nocontent").toHaveCount(0);
+
+        // Sample data keeps the framework helper, which labels the sample cards.
+        model.useSampleModel = true;
+        expect(renderer.showNoContentHelper).toBe(true);
+        model.useSampleModel = false;
+
+        // The entry leaves the queue (as a systray discard does): no pending card, and the
+        // helper of the empty pipeline is back.
+        getService(OfflinePlugin).removeScheduledORM(key);
+        await animationFrame();
+        expect(queued()).toHaveLength(0);
+        expect(".o_crm_mobile_lead_card").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_count").toHaveText("0");
+        expect(".o_crm_mobile_pipeline .o_view_nocontent").toHaveCount(1);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: a quick create answered while a pipeline reload is still pending adds the lead to the reloaded live group", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves();
+        const validatedGroups = watchValidateQuickCreate();
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_read"]);
+        // A held reload answers with the data of the moment its request arrived (the lead does
+        // not exist yet), once `reloadAnswer` resolves.
+        const reloadAnswer = Promise.withResolvers();
+        let holdReload = false;
+        onRpc("crm.lead", "web_read_group", async ({ parent }) => {
+            const result = await parent();
+            if (holdReload) {
+                expect.step("reload answer held");
+                await reloadAnswer.promise;
+            }
+            return result;
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        expect.verifySteps([LEAD_GROUPS]);
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({
+            name: "Pending reload lead",
+            expected_revenue: "10",
+            stage_id: "Qualified",
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([
+            {
+                web_save: leadVals({
+                    name: "Pending reload lead",
+                    expected_revenue: 10,
+                    stage_id: 2,
+                }),
+            },
+        ]);
+
+        // A reload of the pipeline starts while the call runs (the reconciliation that follows a
+        // reconnection, for instance), and its answer is held.
+        const qualifiedBefore = groupOf(renderer, 2);
+        holdReload = true;
+        const reloading = renderer.props.list.load();
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS, "reload answer held"]);
+
+        // The create is answered first: the lead waits for the reload, nothing is added yet and
+        // the sheet stays open, its Save disabled.
+        saves.release();
+        await animationFrame();
+        expect(leadsNamed("Pending reload lead")).toHaveLength(1);
+        expect.verifySteps([]);
+        expect(groupOf(renderer, 2) === qualifiedBefore).toBe(true, {
+            message: "the reload has not landed yet",
+        });
+        expect(".o_crm_mobile_quick_create_save").toHaveAttribute("disabled");
+
+        // The reload lands and rebuilds the groups; the lead is then added to the live one.
+        reloadAnswer.resolve();
+        await reloading;
+        await animationFrame();
+        const [created] = leadsNamed("Pending reload lead");
+        expect.verifySteps([
+            { validateQuickCreate: [created.id, "close", 2] },
+            "crm.lead/web_read",
+        ]);
+        expect(validatedGroups).toHaveLength(1);
+        expect(validatedGroups[0] === groupOf(renderer, 2)).toBe(true, {
+            message: "validateQuickCreate receives the live Qualified group",
+        });
+        expect(validatedGroups[0] === qualifiedBefore).toBe(false, {
+            message: "validateQuickCreate does not receive the detached Qualified group",
+        });
+        expect(groupOf(renderer, 2).list.records.map((record) => record.resId)).toEqual([
+            created.id,
+            3,
+        ]);
+        // The detached group of before the reload is left as it was.
+        expect(qualifiedBefore.count).toBe(1);
+        expect(qualifiedBefore.list.records.map((record) => record.resId)).toEqual([3]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        await goToStage("Qualified");
+        expect(cardOf("Pending reload lead")).toHaveCount(1);
+        expect(cardNames()).toEqual(["Pending reload lead", "Lead 3"]);
+        expectHeader("Qualified", 2, 40);
+        expect(queued()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a reload queued just before a quick-created lead is inserted, answered without it, is followed by a reload that shows it", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_read"]);
+        // The answer of the mount, from before the lead existed (an answer the framework RPC
+        // cache could serve), is served once more to the reload that `serveStale` marks.
+        let staleAnswer = null;
+        let serveStale = false;
+        onRpc("crm.lead", "web_read_group", async ({ parent }) => {
+            const result = await parent();
+            staleAnswer ??= JSON.parse(JSON.stringify(result));
+            if (serveStale) {
+                serveStale = false;
+                expect.step("stale answer");
+                return staleAnswer;
+            }
+            return result;
+        });
+        // A reload queued on the model once the pipeline has waited for it, just before the
+        // insertion, which then queues behind it.
+        const validatedGroups = [];
+        let queuedReload = null;
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            validateQuickCreate(recordId, mode, group) {
+                expect.step({ validateQuickCreate: [recordId, mode, group.serverValue] });
+                validatedGroups.push(group);
+                serveStale = true;
+                queuedReload = this.props.list.load();
+                return super.validateQuickCreate(...arguments);
+            },
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        expect.verifySteps([LEAD_GROUPS]);
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({
+            name: "Safety net lead",
+            expected_revenue: "5",
+            stage_id: "Qualified",
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        await queuedReload;
+        await animationFrame();
+        const [created] = leadsNamed("Safety net lead");
+        // The stale reload lands first and detaches the group the lead is then added to: the
+        // pipeline reloads once more, and nothing is created again.
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Safety net lead", expected_revenue: 5, stage_id: 2 }) },
+            { validateQuickCreate: [created.id, "close", 2] },
+            LEAD_GROUPS,
+            "stale answer",
+            "crm.lead/web_read",
+            LEAD_GROUPS,
+        ]);
+        expect(leadsNamed("Safety net lead")).toHaveLength(1);
+        expect(validatedGroups).toHaveLength(1);
+        expect(validatedGroups[0] === groupOf(renderer, 2)).toBe(false, {
+            message: "the group the lead was added to is detached",
+        });
+        expect(
+            groupOf(renderer, 2).list.records.some((record) => record.resId === created.id)
+        ).toBe(true, { message: "the live Qualified group holds the lead" });
+        expect(groupOf(renderer, 2).count).toBe(2);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        await goToStage("Qualified");
+        expect(cardOf("Safety net lead")).toHaveCount(1);
+        expectHeader("Qualified", 2, 35);
+        expect(queued()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a pending quick create that the server rejects after its sheet was dismissed raises the error once and adds nothing", async () => {
+        expect.errors(1);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves({
+            answer: () => {
+                throw makeServerError({ message: "This lead name is reserved" });
+            },
+        });
+        watchValidateQuickCreate();
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_read"]);
+        await mountPipeline();
+        expect.verifySteps([LEAD_GROUPS]);
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Refused lead", expected_revenue: "9" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([{ web_save: leadVals({ name: "Refused lead", expected_revenue: 9 }) }]);
+        await contains(".o_crm_mobile_quick_create_discard").click();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+
+        // The refusal arrives after the dismissal: its error is raised once, and nothing else
+        // (the dismissed sheet is not written to). No lead, no card, nothing queued or reloaded.
+        saves.release();
+        await animationFrame();
+        expect.verifyErrors(["This lead name is reserved"]);
+        expect.verifySteps([]);
+        expect(leadsNamed("Refused lead")).toEqual([]);
+        expect(cardOf("Refused lead")).toHaveCount(0);
+        expect(queued()).toHaveLength(0);
+        expectHeader("New", 2, 120);
+    });
+
+    test.tags("mobile");
+    test("mobile: a pending quick create whose connection drops after its sheet was dismissed is queued and shows its pending card", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const connection = mockConnectionDrop();
+        const saves = holdLeadSaves({ answer: () => new Response("", { status: 502 }) });
+        watchValidateQuickCreate();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Dropped after dismissal", expected_revenue: "8" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        const vals = leadVals({ name: "Dropped after dismissal", expected_revenue: 8 });
+        expect.verifySteps([{ web_save: vals }]);
+        await contains(".o_crm_mobile_quick_create_discard").click();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+
+        // The connection drops before the answer: the call fails as lost, and the create is
+        // queued and shown pending although its sheet is gone.
+        connection.offline = true;
+        saves.release();
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        const queuedSaves = queuedCalls("crm.lead", "web_save");
+        expect(queuedSaves).toHaveLength(1);
+        expect(queuedSaves[0].args).toEqual([[], vals]);
+        expect(queuedSaves[0].extras.viewType).toBe("kanban");
+        expect.verifySteps([]);
+        expect(leadsNamed("Dropped after dismissal")).toEqual([]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(1);
+        expect(".o_crm_mobile_lead_card_pending .o_crm_mobile_lead_card_name").toHaveText(
+            "Dropped after dismissal"
+        );
+        expect(".o_crm_mobile_lead_card_pending .o_crm_mobile_pending_badge").toHaveCount(1);
+        expectHeader("New", 3, 128);
+    });
+
+    test.tags("mobile");
+    test("mobile: while a created lead is being added, a second save sends nothing and Discard closes the sheet; a later failure is raised once", async () => {
+        expect.errors(1);
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        // Adding the card stays pending until `adding` settles.
+        const adding = Promise.withResolvers();
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            async validateQuickCreate(recordId, mode, group) {
+                expect.step({ validateQuickCreate: [recordId, mode, group.serverValue] });
+                await adding.promise;
+            },
+        });
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Slow card", expected_revenue: "6" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        const [created] = leadsNamed("Slow card");
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Slow card", expected_revenue: 6 }) },
+            { validateQuickCreate: [created.id, "close", 1] },
+        ]);
+        // The lead exists and its card is being added: the sheet is open, its Save disabled.
+        expect(".o_crm_mobile_quick_create").toHaveCount(1);
+        expect(".o_crm_mobile_quick_create_save").toHaveAttribute("disabled");
+        // A second save (a direct call: the button is disabled) sends nothing.
+        await sheets[0].save();
+        await animationFrame();
+        expect.verifySteps([]);
+        // Discard closes the sheet while the card is still being added.
+        await contains(".o_crm_mobile_quick_create_discard").click();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+
+        // Adding the card then fails: the error is raised once, and nothing else (closing the
+        // dismissed sheet again is skipped). One lead, nothing queued.
+        adding.reject(new Error("The card could not be added"));
+        await animationFrame();
+        expect.verifyErrors(["The card could not be added"]);
+        expect.verifySteps([]);
+        expect(leadsNamed("Slow card")).toHaveLength(1);
+        expect(cardOf("Slow card")).toHaveCount(0);
+        expect(queued()).toHaveLength(0);
+        expectHeader("New", 2, 120);
+    });
+
+    test.tags("mobile");
+    test("mobile: the quick-create sheet focuses its lead name input as it opens, and a later render keeps the user's focus", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(1);
+        expect(".o_crm_mobile_quick_create [name=name]").toBeFocused();
+
+        // A render of the open sheet (an inline error) leaves the focus on the control holding it.
+        await contains(".o_crm_mobile_quick_create [name=email_from]").edit("not-an-email", {
+            confirm: false,
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
+        expect(".o_crm_mobile_quick_create_save").toBeFocused();
+    });
+
+    test.tags("mobile");
+    test("mobile: an offline (queued) quick create returns the focus to Add as its sheet closes", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Queued focus lead" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(queuedCalls("crm.lead", "web_save")).toHaveLength(1);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+    });
+
+    test.tags("mobile");
+    test("mobile: Discard and a dismissal of the quick-create sheet return the focus to Add", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        await mountPipeline();
+
+        // Discard: the focus was on Discard, in the sheet.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Discarded lead" });
+        await contains(".o_crm_mobile_quick_create_discard").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+
+        // Escape: the focus was on the lead name input, in the sheet.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create [name=name]").toBeFocused();
+        await press("Escape");
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+
+        // A tap on the backdrop: the focus had already fallen to the document body.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await animationFrame();
+        await contains(".o_bottom_sheet_backdrop").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+        expect(queued()).toHaveLength(0);
+        expect(leadsNamed("Discarded lead")).toEqual([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: an online quick create leaves the focus on a pipeline control, never on the document body", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchValidateQuickCreate();
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Online focus lead" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        const [created] = leadsNamed("Online focus lead");
+        expect.verifySteps([{ validateQuickCreate: [created.id, "close", 1] }]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(cardOf("Online focus lead")).toHaveCount(1);
+        const active = document.activeElement;
+        expect(active).not.toBe(document.body);
+        expect(queryOne(".o_crm_mobile_pipeline").contains(active)).toBe(true);
+        // Adding the card focuses nothing, so the focus is back on the control that opened it.
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+    });
+
+    test.tags("mobile");
+    test("mobile: a focus moved out of the quick-create sheet before it closes stays where it was put", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves({ afterCreate: true });
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Elsewhere lead" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps([{ web_save: leadVals({ name: "Elsewhere lead" }) }]);
+        // While the call runs, the user moves the focus to another pipeline control.
+        queryOne(".o_crm_mobile_pipeline_next").focus();
+        saves.release();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(cardOf("Elsewhere lead")).toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_next").toBeFocused();
+    });
+
+    test.tags("mobile");
+    test("mobile: a quick-create sheet closed because the pipeline is destroyed moves no focus", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create [name=name]").toBeFocused();
+        const add = queryOne(".o_crm_mobile_pipeline_add");
+        add.addEventListener("focus", () => expect.step("Add focused"));
+        destroyApp();
+        await animationFrame();
+        expect(status(renderers[0])).toBe("destroyed");
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect.verifySteps([]);
+    });
 });
 
 // -----------------------------------------------------------------------------
@@ -6073,6 +7626,485 @@ describe("Mobile activities", () => {
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_stage`).not.toHaveAttribute("disabled");
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
     });
+
+    /**
+     * @param {string} name the lead name
+     * @returns {string} selector of the status region of the mobile card showing that lead
+     */
+    function statusOf(name) {
+        return `${cardOf(name)} .o_crm_mobile_lead_card_status`;
+    }
+
+    /**
+     * Holds every `crm.lead` `web_read_group` while `hold.promise` is set: the reconciliation
+     * reload that follows a replay rebuilds the groups, and so remounts the cards. Holding it keeps
+     * the cards the replay updated mounted while they are asserted.
+     *
+     * @returns {{ promise: Promise<void> | null }}
+     */
+    function holdGroupReads() {
+        const hold = { promise: null };
+        onRpc("crm.lead", "web_read_group", async () => {
+            await hold.promise;
+        });
+        return hold;
+    }
+
+    test.tags("mobile");
+    test("mobile: card status region announces queued activity creates and mark done, their sync and count changes, never the mount state", async () => {
+        const [sendOfferId, callBackId, qualifyId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Call back" },
+            { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Qualify" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const hold = holdGroupReads();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        // Every card has one polite, atomic, visually hidden status region, empty at mount,
+        // outside its controls; neither the card nor any other element is a live region of its
+        // own, and the lead name stays the only span carrying the name.
+        const cards = queryAll(".o_crm_mobile_pipeline_body .o_crm_mobile_lead_card");
+        expect(cards).toHaveLength(2);
+        for (const card of cards) {
+            const regions = card.querySelectorAll(".o_crm_mobile_lead_card_status");
+            expect(regions).toHaveLength(1);
+            const [region] = regions;
+            expect(region).toHaveAttribute("role", "status");
+            expect(region).toHaveAttribute("aria-live", "polite");
+            expect(region).toHaveAttribute("aria-atomic", "true");
+            expect(region).toHaveClass("visually-hidden");
+            expect(region.closest("button, .o_crm_mobile_lead_card_controls")).toBe(null);
+            expect(region.textContent).toBe("");
+            expect(card.querySelectorAll("[aria-live]")).toHaveLength(1);
+        }
+        expect(".o_crm_mobile_lead_card[aria-live], .o_crm_mobile_lead_card[role]").toHaveCount(0);
+
+        // Offline Log call: a pending row, and one more activity.
+        await setOffline(true);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).click();
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity pending sync, 3 activities.");
+        expect(queryOne(statusOf("Lead 2")).textContent).toBe("");
+        expect(".o_kanban_group .o_kanban_record span:contains(Lead 1)").toHaveCount(1);
+        await advanceTime(1000);
+
+        // Offline Mark done, twice: the same message is rendered in a new node, so it is
+        // announced again.
+        // (activity ids are unique on the page: the row selector needs no card)
+        const markDone = (activityId) =>
+            contains(
+                `.o_crm_mobile_activity_row[data-activity-id='${activityId}'] .o_crm_mobile_activity_done`
+            ).click();
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
+        await markDone(sendOfferId);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity pending sync.");
+        const firstNode = queryOne(`${statusOf("Lead 1")} > div`);
+        await advanceTime(1000);
+        await markDone(callBackId);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity pending sync.");
+        expect(queryOne(`${statusOf("Lead 1")} > div`)).not.toBe(firstNode);
+        await advanceTime(1000);
+
+        // Another lead's queued create and its systray discard are announced on that lead's card
+        // only: the count the queued create raises, never the drop its discard explains.
+        const lead1Node = queryOne(`${statusOf("Lead 1")} > div`);
+        await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_log_call`).click();
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: new activity pending sync, 2 activities.");
+        const lead2Create = queued().find(
+            ({ value }) =>
+                value.model === "mail.activity" &&
+                value.method === "web_save" &&
+                value.args[1].res_id === 2
+        );
+        getService(OfflinePlugin).removeScheduledORM(lead2Create.key);
+        await animationFrame();
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: new activity no longer pending sync.");
+        await advanceTime(1000);
+
+        // A queued mark done of another lead's activity is announced on that lead's card only.
+        await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_activities`).click();
+        await markDone(qualifyId);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: completed activity pending sync.");
+        expect(queryOne(`${statusOf("Lead 1")} > div`)).toBe(lead1Node);
+        expect(queued()).toHaveLength(4);
+
+        // Reconnect: each replayed call is announced as no longer pending sync on its card,
+        // before the reconciliation reload. The replayed create announces no count: a call
+        // leaving the queue is no change the user made on the card, nor are the re-reads that
+        // follow it (test "after offline Log calls are replayed, …").
+        hold.promise = new Promise(() => {});
+        await setOffline(false);
+        // the first call replays at once, each next one a second later
+        await waitUntil(() => queued().length === 3);
+        await animationFrame();
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity no longer pending sync.");
+        await letQueueReplay(1);
+        expect(queued()).toHaveLength(2);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
+        await letQueueReplay(2);
+        expect(queued()).toHaveLength(0);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: completed activity no longer pending sync.");
+        expect(".o_crm_mobile_pending_badge").toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: card status region announces the activity count an online create and an online mark done change", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("mail.activity", "action_done", ({ args }) => {
+            MockServer.env["mail.activity"].action_feedback(args[0]);
+            return true;
+        });
+        watchRpcs(["mail.activity/web_save", "mail.activity/action_done"]);
+        await mountPipeline();
+        expect(queryOne(statusOf("Lead 2")).textContent).toBe("");
+
+        await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_log_call`).click();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/web_save"]);
+        expect(queued()).toHaveLength(0);
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_card_activities .badge`).toHaveText("1");
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: 1 activity.");
+        expect(queryOne(statusOf("Lead 1")).textContent).toBe("");
+
+        // The re-read after an online mark done changes the persisted rows: the count is
+        // announced.
+        await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_activities`).click();
+        await contains(
+            `${cardOf("Lead 2")} .o_crm_mobile_activity_row .o_crm_mobile_activity_done`
+        ).click();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/action_done"]);
+        expect(queued()).toHaveLength(0);
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_activity_row`).toHaveCount(0);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: no activities.");
+        expect(queryOne(statusOf("Lead 1")).textContent).toBe("");
+    });
+
+    /**
+     * Records, in order, the text of every message the card status regions render (each
+     * announcement is a new node), those of cards mounted later included, until the test ends.
+     *
+     * @returns {string[]}
+     */
+    function recordAnnouncements() {
+        const selector = ".o_crm_mobile_lead_card_status > div";
+        const messages = [];
+        const observer = new MutationObserver((mutations) => {
+            for (const { addedNodes } of mutations) {
+                for (const node of addedNodes) {
+                    if (node.nodeType !== Node.ELEMENT_NODE) {
+                        continue;
+                    }
+                    const added = node.matches(selector) ? [node] : node.querySelectorAll(selector);
+                    messages.push(...[...added].map((message) => message.textContent));
+                }
+            }
+        });
+        observer.observe(getFixture(), { childList: true, subtree: true });
+        after(() => observer.disconnect());
+        return messages;
+    }
+
+    /**
+     * Network latency the test releases (never a hold for the rest of it): while
+     * `latency.activities[<lead id>]` is set, the activity reads of that lead answer once it is
+     * resolved; while `latency.groups` is set, so do the lead group reads (the reconciliation
+     * reload). The answers are the server's at that time.
+     *
+     * @returns {{ activities: Object, groups: Object | null }} `Promise.withResolvers()` values
+     */
+    function delayReads() {
+        const latency = { activities: {}, groups: null };
+        onRpc("/web/dataset/call_kw/mail.activity/web_search_read", async (request) => {
+            const { params } = await request.clone().json();
+            const resId = params.kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            await latency.activities[resId]?.promise;
+        });
+        onRpc("crm.lead", "web_read_group", async () => {
+            await latency.groups?.promise;
+        });
+        return latency;
+    }
+
+    /**
+     * @param {string} name the lead name
+     * @returns {string} selector of the Activities count badge of the mobile card of that lead
+     */
+    function activityBadgeOf(name) {
+        return `${cardOf(name)} .o_crm_mobile_card_activities .badge`;
+    }
+
+    /**
+     * Resolves once the mobile card of a lead was mounted again (another element than `card`).
+     *
+     * @param {string} name the lead name
+     * @param {Element} card the card element mounted before
+     */
+    async function waitForRemountedCard(name, card) {
+        await waitUntil(() => {
+            const current = queryFirst(cardOf(name));
+            return Boolean(current) && current !== card;
+        });
+        await animationFrame();
+    }
+
+    test.tags("mobile");
+    test("mobile: after offline Log calls are replayed, the activity re-reads and the reconciliation reload announce no count", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Lead 1's activity read issued on reconnect answers after its create was replayed, the
+        // reconciliation reload lands after the replayed cards rendered their announcements, and
+        // Lead 2's activity read issued after that reload answers once its card was mounted again.
+        const latency = delayReads();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const announcements = recordAnnouncements();
+        for (const name of ["Lead 1", "Lead 2"]) {
+            expect(activityBadgeOf(name)).toHaveText("0");
+            expect(queryOne(statusOf(name)).textContent).toBe("");
+        }
+
+        // Offline Log call on both leads, which have no activity: each raises the count.
+        await setOffline(true);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).click();
+        await advanceTime(1000);
+        await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_log_call`).click();
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity pending sync, 1 activity.");
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: new activity pending sync, 1 activity.");
+        expect(queued()).toHaveLength(2);
+
+        // Reconnect: the activities are read again at once (Lead 2's answers before its create
+        // is replayed), and Lead 1's create is replayed at once.
+        latency.activities[1] = Promise.withResolvers();
+        latency.groups = Promise.withResolvers();
+        await setOffline(false);
+        await waitUntil(() => queued().length === 1);
+        await animationFrame();
+        const [lead1Activity] = MockServer.env["mail.activity"].search_read([["res_id", "=", 1]]);
+        expect(lead1Activity).not.toBe(undefined);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity no longer pending sync.");
+        expect(activityBadgeOf("Lead 1")).toHaveText("0");
+
+        // Lead 1's re-read brings the replayed server row to the same mounted card, whose
+        // displayed count rises: no count is announced.
+        const lead1Card = queryOne(cardOf("Lead 1"));
+        latency.activities[1].resolve();
+        await waitUntil(() => queryFirst(activityBadgeOf("Lead 1"))?.textContent === "1");
+        await animationFrame();
+        expect(queryOne(cardOf("Lead 1"))).toBe(lead1Card);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity no longer pending sync.");
+
+        // Lead 2's create is replayed a second later, which ends the sync window.
+        await letQueueReplay(1);
+        expect(queued()).toHaveLength(0);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: new activity no longer pending sync.");
+        expect(activityBadgeOf("Lead 2")).toHaveText("0");
+
+        // The reconciliation reload rebuilds the groups, so the cards are mounted again (silent,
+        // with the activities displayed so far), and their activities are read again: Lead 2's
+        // replayed server row reaches its new card, whose displayed count rises: no count is
+        // announced either.
+        const lead2Card = queryOne(cardOf("Lead 2"));
+        latency.activities[2] = Promise.withResolvers();
+        latency.groups.resolve();
+        await waitForRemountedCard("Lead 2", lead2Card);
+        expect(activityBadgeOf("Lead 2")).toHaveText("0");
+        latency.activities[2].resolve();
+        await waitUntil(() => queryFirst(activityBadgeOf("Lead 2"))?.textContent === "1");
+        await animationFrame();
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        const [lead2Activity] = MockServer.env["mail.activity"].search_read([["res_id", "=", 2]]);
+        for (const [name, activity] of [
+            ["Lead 1", lead1Activity],
+            ["Lead 2", lead2Activity],
+        ]) {
+            await contains(`${cardOf(name)} .o_crm_mobile_card_activities`).click();
+            expect(
+                `${cardOf(name)} .o_crm_mobile_activity_row[data-activity-id='${activity.id}']`
+            ).toHaveCount(1);
+            expect(`${cardOf(name)} .o_crm_mobile_activity_pending`).toHaveCount(0);
+            // a card mounted by the reload starts silent
+            expect(queryOne(statusOf(name)).textContent).toBe("");
+        }
+
+        // Each card's last announcement is its sync confirmation: no re-read announced a count.
+        expect(announcements).toEqual([
+            "Lead 1: new activity pending sync, 1 activity.",
+            "Lead 2: new activity pending sync, 1 activity.",
+            "Lead 1: new activity no longer pending sync.",
+            "Lead 2: new activity no longer pending sync.",
+        ]);
+    });
+
+    test.tags("mobile");
+    test("mobile: after offline mark dones are replayed, the activity re-reads and the reconciliation reload announce no count", async () => {
+        const [sendOfferId, qualifyId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+            { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Qualify" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Lead 1's activity read issued on reconnect answers after its mark done was replayed,
+        // the reconciliation reload lands after the replayed cards rendered their announcements,
+        // and Lead 2's activity reads answer once its card was mounted again by that reload.
+        const latency = delayReads();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const announcements = recordAnnouncements();
+
+        // Offline Mark done on both leads: each row stays, shown pending, and the count with it.
+        await setOffline(true);
+        for (const [name, activityId] of [
+            ["Lead 1", sendOfferId],
+            ["Lead 2", qualifyId],
+        ]) {
+            expect(activityBadgeOf(name)).toHaveText("1");
+            await contains(`${cardOf(name)} .o_crm_mobile_card_activities`).click();
+            // (activity ids are unique on the page: the row selector needs no card)
+            await contains(
+                `.o_crm_mobile_activity_row[data-activity-id='${activityId}'] .o_crm_mobile_activity_done`
+            ).click();
+            expect(statusOf(name)).toHaveText(`${name}: completed activity pending sync.`);
+            expect(activityBadgeOf(name)).toHaveText("1");
+            await advanceTime(1000);
+        }
+        expect(queued()).toHaveLength(2);
+
+        // Reconnect: Lead 1's mark done is replayed at once.
+        latency.activities[1] = Promise.withResolvers();
+        latency.activities[2] = Promise.withResolvers();
+        latency.groups = Promise.withResolvers();
+        await setOffline(false);
+        await waitUntil(() => queued().length === 1);
+        await animationFrame();
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+
+        // Lead 1's re-read drops the archived row from the same mounted card, whose displayed
+        // count falls: no count is announced.
+        const lead1Card = queryOne(cardOf("Lead 1"));
+        latency.activities[1].resolve();
+        await waitUntil(() => queryFirst(activityBadgeOf("Lead 1"))?.textContent === "0");
+        await animationFrame();
+        expect(queryOne(cardOf("Lead 1"))).toBe(lead1Card);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_row`).toHaveCount(0);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
+
+        // Lead 2's mark done is replayed a second later, which ends the sync window.
+        await letQueueReplay(1);
+        expect(queued()).toHaveLength(0);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: completed activity no longer pending sync.");
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
+
+        // The reconciliation reload mounts the cards again (silent, with the archived row still
+        // displayed), then Lead 2's re-read drops that row from its new card: no count either.
+        const lead2Card = queryOne(cardOf("Lead 2"));
+        latency.groups.resolve();
+        await waitForRemountedCard("Lead 2", lead2Card);
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
+        latency.activities[2].resolve();
+        await waitUntil(() => queryFirst(activityBadgeOf("Lead 2"))?.textContent === "0");
+        await animationFrame();
+        for (const name of ["Lead 1", "Lead 2"]) {
+            expect(activityBadgeOf(name)).toHaveText("0");
+            // a card mounted by the reload starts silent
+            expect(queryOne(statusOf(name)).textContent).toBe("");
+        }
+
+        // Each card's last announcement is its sync confirmation: no re-read announced a count.
+        expect(announcements).toEqual([
+            "Lead 1: completed activity pending sync.",
+            "Lead 2: completed activity pending sync.",
+            "Lead 1: completed activity no longer pending sync.",
+            "Lead 2: completed activity no longer pending sync.",
+        ]);
+    });
+
+    test.tags("mobile");
+    test("mobile: card status region announces the lead's own pending sync and its end, after a systray discard and after a replay", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const hold = holdGroupReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+
+        // An offline save of Lead 2 that keeps it in its stage queues its write.
+        await setOffline(true);
+        await recordOf(renderer, 2).update({ contact_name: "Monica Geller" });
+        await animationFrame();
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: changes pending sync.");
+        expect(queryOne(statusOf("Lead 1")).textContent).toBe("");
+
+        // The systray discard removes the entry: the lead is no longer pending sync.
+        const [entry] = queued();
+        getService(OfflinePlugin).removeScheduledORM(entry.key);
+        await animationFrame();
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: changes no longer pending sync.");
+
+        // Queued again, then replayed on reconnect.
+        await advanceTime(1000);
+        await recordOf(renderer, 2).update({ contact_name: "Phoebe Buffay" });
+        await animationFrame();
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: changes pending sync.");
+        hold.promise = new Promise(() => {});
+        await setOffline(false);
+        await letQueueReplay(1);
+        expect(queued()).toHaveLength(0);
+        expect(MockServer.env["crm.lead"].browse(2)[0].contact_name).toBe("Phoebe Buffay");
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: changes no longer pending sync.");
+        expect(queryOne(statusOf("Lead 1")).textContent).toBe("");
+    });
+
+    test.tags("mobile");
+    test("mobile: every pending-sync badge kind spaces its icon and label with Bootstrap gap-1", async () => {
+        const [activityId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const card = cardOf("Lead 1");
+        const activityRow = `${card} .o_crm_mobile_activity_row[data-activity-id='${activityId}']`;
+
+        // Offline: a lead write, an activity create and a mark done, one badge kind each.
+        await setOffline(true);
+        await recordOf(renderers[0], 1).update({ contact_name: "Monica Geller" });
+        await advanceTime(1000);
+        await contains(`${card} .o_crm_mobile_card_log_call`).click();
+        await advanceTime(1000);
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        await contains(`${activityRow} .o_crm_mobile_activity_done`).click();
+        expect(queued()).toHaveLength(3);
+
+        for (const badge of [
+            `${card} .o_crm_mobile_lead_card_body .o_crm_mobile_pending_badge`,
+            `${card} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`,
+            `${activityRow} .o_crm_mobile_pending_badge`,
+        ]) {
+            expect(badge).toHaveCount(1);
+            expect(badge).toHaveClass("gap-1");
+            expect(badge).toHaveText("Pending sync");
+            expect(`${badge} .oi[data-icon=cloud_upload]`).toHaveCount(1);
+            // $spacer (16px) * 0.25: the badge looks as it did with its former 0.25rem gap. Its
+            // inline-flex display computes to flex, as every item of a flex row (blockified).
+            const style = getComputedStyle(queryOne(badge));
+            expect(style.display).toBe("flex");
+            expect(style.alignItems).toBe("center");
+            expect(style.whiteSpace).toBe("nowrap");
+            expect(style.columnGap).toBe("4px");
+            expect(style.rowGap).toBe("4px");
+        }
+    });
 });
 
 // -----------------------------------------------------------------------------
@@ -6145,12 +8177,16 @@ function queueSnapshot() {
 function untouchedCardState() {
     return {
         stageListOpen: false,
+        // the stage list's roving tab stop, before any keyboard move
+        activeStageValue: null,
         followUpOpen: false,
         activitiesOpen: false,
         typeId: null,
         summary: "",
         date: serializeDate(today()),
         busy: false,
+        // the status region, which announced nothing
+        announcement: { message: "", sequence: 0 },
     };
 }
 
@@ -7035,5 +9071,347 @@ describe("Mobile lead card guards", () => {
         );
         expect(serverState.companies[0].currency_id).toBe(CURRENCY_ID);
         expect.verifyErrors(errors);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Mobile pipeline status region
+// -----------------------------------------------------------------------------
+
+describe("Mobile pipeline status region", () => {
+    /** The pipeline's status region: a direct child of the mobile root. */
+    const PIPELINE_STATUS = ".o_crm_mobile_pipeline > .o_crm_mobile_pipeline_status";
+
+    /** @returns {HTMLElement | null} the node of the pipeline's current announcement */
+    function announcementNode() {
+        return queryFirst(`${PIPELINE_STATUS} > div`);
+    }
+
+    /**
+     * @param {string} name the lead name
+     * @returns {string} selector of the status region of the mobile card showing that lead
+     */
+    function cardStatusOf(name) {
+        return `${cardOf(name)} .o_crm_mobile_lead_card_status`;
+    }
+
+    /**
+     * Queues a lead create through the open mobile quick create, offline.
+     *
+     * @param {string} name
+     * @param {string} [stageName] the stage chosen in the sheet (the displayed one by default)
+     * @returns {Promise<string | number>} the queue key of the create
+     */
+    async function queueQuickCreate(name, stageName) {
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({
+            name,
+            expected_revenue: "10",
+            ...(stageName ? { stage_id: stageName } : {}),
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        return queued().find(({ value }) => value.args[1].name === name).key;
+    }
+
+    test.tags("mobile");
+    test("mobile: pipeline status region is one stable polite region, silent at mount and after a remount with writes already queued", async () => {
+        const errors = cachedReadErrors([
+            // Lead 1's form offline, then the pipeline rebuilt from the cache with New's leads
+            // (both visited online) and the types
+            "crm.lead/web_read",
+            LEAD_GROUPS,
+            ACTIVITIES,
+            ACTIVITIES,
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        // Online: the pipeline and Lead 1's form are visited, hence available offline.
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_name`).click();
+        expect(".o_form_view").toHaveCount(1);
+        await contains(".o_back_button").click();
+
+        /** One polite, atomic, visually hidden region on the mobile root, outside every control. */
+        const expectSilentRegion = () => {
+            const regions = queryAll(".o_crm_mobile_pipeline_status");
+            expect(regions).toHaveLength(1);
+            const [region] = regions;
+            expect(region.parentElement).toHaveClass("o_crm_mobile_pipeline");
+            expect(region).toHaveAttribute("role", "status");
+            expect(region).toHaveAttribute("aria-live", "polite");
+            expect(region).toHaveAttribute("aria-atomic", "true");
+            expect(region).toHaveClass("visually-hidden");
+            expect(
+                region.closest(
+                    "button, .o_crm_mobile_pipeline_header, .o_kanban_group, .o_kanban_record"
+                )
+            ).toBe(null);
+            expect(region.textContent).toBe("");
+            // The pipeline itself and its stage body are no live regions.
+            const root = queryOne(".o_crm_mobile_pipeline");
+            expect(root).not.toHaveAttribute("aria-live");
+            expect(root).not.toHaveAttribute("role");
+            expect(".o_crm_mobile_pipeline_body[aria-live]").toHaveCount(0);
+        };
+        expectSilentRegion();
+
+        // Offline: a lead create and an in-place write of Lead 2 are queued. The create is
+        // announced by the pipeline; the write of a card that stays mounted by that card only.
+        await setOffline(true);
+        await visitedReady();
+        await queueQuickCreate("Queued lead");
+        expect(PIPELINE_STATUS).toHaveText("Queued lead: new lead pending sync.");
+        // The hidden message never matches the card selectors of the main flow.
+        expect(".o_kanban_group .o_kanban_record span:contains(Queued lead)").toHaveCount(1);
+        const createNode = announcementNode();
+        await advanceTime(1000);
+        await recordOf(renderers.at(-1), 2).update({ contact_name: "Monica Geller" });
+        await animationFrame();
+        expect(cardStatusOf("Lead 2")).toHaveText("Lead 2: changes pending sync.");
+        expect(announcementNode()).toBe(createNode);
+        expect(queued()).toHaveLength(2);
+
+        // Lead form, then back: a new pipeline mounts with both writes already queued, and
+        // announces neither; nor do its cards.
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_name`).click();
+        expect(".o_form_view").toHaveCount(1);
+        await contains(".o_back_button").click();
+        await animationFrame();
+        // three pipelines: the first visit, the online back, and this offline back
+        expect(renderers).toHaveLength(3);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(1);
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expectSilentRegion();
+        for (const region of queryAll(".o_crm_mobile_lead_card_status")) {
+            expect(region.textContent).toBe("");
+        }
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: pipeline status region announces a card stage move that leaves the lead pending sync, mark-won included; an online move or a move of a lead already pending announces nothing", async () => {
+        const errors = cachedReadErrors([
+            // mark-won of Lead 2: Proposition keeps Lead 4 (its activities, the types), then Won
+            // is displayed (Lead 2's activities, the types; Lead 5's were never read)
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+            // Lead 2 leaves Won (the types), then Qualified is displayed (Lead 2's activities,
+            // the types; Lead 3's were never read)
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+            // Lead 3 leaves Qualified (Lead 2's activities, the types), then Proposition is
+            // displayed (Lead 4's activities, the types)
+            ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(PIPELINE_STATUS).toHaveCount(1);
+        expect(queryOne(PIPELINE_STATUS).textContent).toBe("");
+
+        // Online: the move is saved at once, nothing is pending; the stage title tells the stage.
+        await chooseStage("Lead 2", 3);
+        expectHeader("Proposition", 2, 60);
+        expect(queued()).toHaveLength(0);
+        expect(queryOne(PIPELINE_STATUS).textContent).toBe("");
+
+        // Offline mark-won: the moved card is a new card in Won, showing its badge, whose own
+        // region stays silent; the pipeline announces the pending write.
+        await setOffline(true);
+        await chooseStage("Lead 2", 4);
+        expectHeader("Won", 2, 70);
+        expect(queuedCalls("crm.lead", "web_save").map(({ args }) => args)).toEqual([
+            [[2], { stage_id: 4 }],
+        ]);
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(queryOne(cardStatusOf("Lead 2")).textContent).toBe("");
+        expect(PIPELINE_STATUS).toHaveText("Lead 2: changes pending sync.");
+        const markWonNode = announcementNode();
+
+        // The same lead, already pending, moved again: nothing new to announce.
+        await chooseStage("Lead 2", 2);
+        expectHeader("Qualified", 2, 50);
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expect(announcementNode()).toBe(markWonNode);
+
+        // Another lead's offline move, from the keyboard (Stage, then the stage list's next
+        // enabled option, then Enter): announced in a new node.
+        const lead3Option = (stageId) =>
+            `${cardOf("Lead 3")} .o_crm_mobile_stage_option[data-stage-value='${stageId}']`;
+        queryOne(`${cardOf("Lead 3")} .o_crm_mobile_card_stage`).focus();
+        await press("Enter");
+        await animationFrame();
+        expect(lead3Option(1)).toBeFocused();
+        await press("ArrowDown");
+        expect(lead3Option(3)).toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        expectHeader("Proposition", 2, 70);
+        expect(`${cardOf("Lead 3")} .o_crm_mobile_card_stage`).toBeFocused();
+        expect(`${cardOf("Lead 3")} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expect(queryOne(cardStatusOf("Lead 3")).textContent).toBe("");
+        expect(PIPELINE_STATUS).toHaveText("Lead 3: changes pending sync.");
+        expect(announcementNode()).not.toBe(markWonNode);
+        expect(queued()).toHaveLength(2);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: pipeline status region announces a queued lead create, and its end after a systray discard and as its replay happens", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const replays = [];
+        onRpc("crm.lead", "web_save", async ({ args }) => {
+            expect.step(`replay ${args[1].name}`);
+            const deferred = Promise.withResolvers();
+            replays.push(deferred);
+            await deferred.promise;
+        });
+        watchRpcs([LEAD_GROUPS]);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps([LEAD_GROUPS]);
+        await setOffline(true);
+
+        // A create in another stage than the displayed one: no card shows it here, the pipeline
+        // announces it all the same.
+        await queueQuickCreate("Mobile lead", "Qualified");
+        expectHeader("New", 2, 120);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(PIPELINE_STATUS).toHaveText("Mobile lead: new lead pending sync.");
+        const firstNode = announcementNode();
+        await advanceTime(1000);
+
+        // A create in the displayed stage: its pending card appears, silent; the pipeline
+        // announces it in a new node.
+        const secondKey = await queueQuickCreate("Second lead");
+        expect(`.o_crm_mobile_lead_card[data-pending-key='${secondKey}']`).toHaveCount(1);
+        expect(
+            queryOne(
+                `.o_crm_mobile_lead_card[data-pending-key='${secondKey}'] .o_crm_mobile_lead_card_status`
+            ).textContent
+        ).toBe("");
+        expect(PIPELINE_STATUS).toHaveText("Second lead: new lead pending sync.");
+        expect(announcementNode()).not.toBe(firstNode);
+
+        // The systray's discard removes the entry: its card leaves, the pipeline tells it.
+        getService(OfflinePlugin).removeScheduledORM(secondKey);
+        await animationFrame();
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(PIPELINE_STATUS).toHaveText("Second lead: new lead no longer pending sync.");
+        const discardNode = announcementNode();
+        expect(queued()).toHaveLength(1);
+
+        // Reconnect: the sync re-reads the queue from its storage (new entries, same keys), which
+        // announces nothing while the replay is in flight.
+        await setOffline(false);
+        await expect.waitForSteps(["replay Mobile lead"]);
+        expect(getService(OfflinePlugin).syncingORM()).toBe(true);
+        expect(queued()).toHaveLength(1);
+        expect(announcementNode()).toBe(discardNode);
+        // The replay succeeds: the entry leaves the live queue and is announced at once.
+        replays.shift().resolve();
+        await waitUntil(() => queued().length === 0);
+        await animationFrame();
+        expect(PIPELINE_STATUS).toHaveText("Mobile lead: new lead no longer pending sync.");
+        const replayNode = announcementNode();
+        // The reconciliation reload lands; the server card replaces the pending one, with no
+        // other announcement.
+        await expect.waitForSteps([LEAD_GROUPS]);
+        await animationFrame();
+        expect(announcementNode()).toBe(replayNode);
+        await goToStage("Qualified");
+        expect(cardNames()).toEqual(["Lead 3", "Mobile lead"]);
+        expect(`${cardOf("Mobile lead")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(announcementNode()).toBe(replayNode);
+        const created = MockServer.env["crm.lead"].search_read([["name", "=", "Mobile lead"]]);
+        expect(created).toHaveLength(1);
+    });
+
+    test.tags("mobile");
+    test("mobile: a pending lead create in the displayed stage stays silent on its own card while the sync window keeps it after its replay; the pipeline alone tells it", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const replay = Promise.withResolvers();
+        onRpc("crm.lead", "web_save", async ({ args }) => {
+            expect.step(`replay ${args[1].name}`);
+            await replay.promise;
+        });
+        // Armed on reconnection: holds the reconciliation reload, so the sync window keeps the
+        // replayed create's pending card on screen until the test releases it.
+        let heldReload = null;
+        onRpc("crm.lead", "web_read_group", async () => {
+            if (heldReload) {
+                expect.step("reconciliation reload");
+                await heldReload.promise;
+            }
+        });
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+
+        // Offline, a create in the displayed stage: its pending card shows the badge, its own
+        // region stays silent, and the pipeline announces the create.
+        const key = await queueQuickCreate("Displayed lead");
+        const pendingCard = `.o_crm_mobile_lead_card_pending[data-pending-key='${key}']`;
+        const pendingStatus = `${pendingCard} .o_crm_mobile_lead_card_status`;
+        expectHeader("New", 3, 130);
+        expect(pendingCard).toHaveCount(1);
+        expect(`${pendingCard} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(queryOne(pendingStatus).textContent).toBe("");
+        expect(PIPELINE_STATUS).toHaveText("Displayed lead: new lead pending sync.");
+        const createNode = announcementNode();
+
+        // Reconnect: the replay is in flight, the card and both regions are unchanged.
+        heldReload = Promise.withResolvers();
+        await setOffline(false);
+        await expect.waitForSteps(["replay Displayed lead"]);
+        expect(getService(OfflinePlugin).syncingORM()).toBe(true);
+        expect(`${pendingCard} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expect(queryOne(pendingStatus).textContent).toBe("");
+        expect(announcementNode()).toBe(createNode);
+
+        // The replay succeeds: the entry leaves the live queue. The sync window keeps the pending
+        // card, without its badge; its own region stays silent and the pipeline tells the end.
+        replay.resolve();
+        await waitUntil(() => queued().length === 0);
+        await animationFrame();
+        expect(pendingCard).toHaveCount(1);
+        expect(`${pendingCard} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(queryOne(pendingStatus).textContent).toBe("");
+        expect(PIPELINE_STATUS).toHaveText("Displayed lead: new lead no longer pending sync.");
+        const replayNode = announcementNode();
+        await expect.waitForSteps(["reconciliation reload"]);
+        await animationFrame();
+        expect(pendingCard).toHaveCount(1);
+        expect(queryOne(pendingStatus).textContent).toBe("");
+        expect(announcementNode()).toBe(replayNode);
+
+        // The reconciliation reload lands: the server card replaces the pending one, its region
+        // silent, with no other announcement.
+        heldReload.resolve();
+        await animationFrame();
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2", "Displayed lead"]);
+        expect(`${cardOf("Displayed lead")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(queryOne(cardStatusOf("Displayed lead")).textContent).toBe("");
+        expect(announcementNode()).toBe(replayNode);
+        expect(PIPELINE_STATUS).toHaveText("Displayed lead: new lead no longer pending sync.");
+        const created = MockServer.env["crm.lead"].search_read([["name", "=", "Displayed lead"]]);
+        expect(created).toHaveLength(1);
     });
 });
