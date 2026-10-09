@@ -3,6 +3,8 @@
 import mimetypes
 from datetime import timedelta
 
+from lxml import etree
+
 from odoo import fields
 from odoo.service.model import call_kw
 from odoo.tests import HttpCase, tagged
@@ -532,6 +534,46 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             self.assertEqual(self.env['ir.attachment'].search_count(attachment_domain), attachment_count,
                              'No document is uploaded')
             self.assertEqual(self._count_lead_messages(lead), message_count, 'No feedback message')
+
+    # ------------------------------------------------------------
+    # K9 and DISABLE guards: offline wiring of the production views
+    # ------------------------------------------------------------
+
+    def test_offline_availability_view_wiring(self):
+        """ K9, DISABLE guards: the production views keep the offline wiring the lane-2 fixtures repeat. """
+        def own_arch(xmlid):
+            # the view's own arch, as its XML file defines it, without inheriting views
+            return etree.fromstring(self.env.ref(xmlid).arch)
+
+        # pipeline card menu: Edit and Delete stay usable offline, the offline plugin reads the
+        # attribute the card compiler copies onto the rendered anchors
+        [menu] = own_arch('crm.crm_case_kanban_view_leads').xpath("//templates/t[@t-name='menu']")
+        for anchor_type in ('open', 'delete'):
+            with self.subTest(anchor=anchor_type):
+                anchors = menu.xpath(f".//a[@type='{anchor_type}']")
+                self.assertEqual(len(anchors), 1)
+                self.assertEqual(anchors[0].get('data-available-offline'), '1')
+
+        # lead name: rendered by ``web.TextField``, whose <textarea> the CRM extension marks
+        [name_field] = own_arch('crm.crm_lead_view_form').xpath("//field[@name='name'][not(ancestor::field)]")
+        self.assertEqual(name_field.get('widget'), 'text')
+
+        # CRM settings: each DISABLE button is named as ``CRM_FOREIGN_DISABLED_BUTTONS`` lists it,
+        # the action buttons by xmlid (not by database id), and opens the same target online
+        settings = own_arch('crm.res_config_settings_view_form')
+        for name, button_type in (
+            ('crm.crm_recurring_plan_action', 'action'),
+            ('crm.crm_lead_pls_update_action', 'action'),
+            ('action_crm_assign_leads', 'object'),
+        ):
+            with self.subTest(button=name):
+                buttons = settings.xpath(f"//button[@name='{name}']")
+                self.assertEqual(len(buttons), 1)
+                self.assertEqual(buttons[0].get('type'), button_type)
+                if button_type == 'action':
+                    self.assertEqual(self.env.ref(name)._name, 'ir.actions.act_window')
+                else:
+                    self.assertTrue(callable(getattr(self.env['res.config.settings'], name, None)))
 
     # ------------------------------------------------------------
     # Lane 3: end-to-end offline session on the mobile pipeline

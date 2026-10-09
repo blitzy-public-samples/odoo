@@ -106,6 +106,7 @@ import { user } from "@web/core/user";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { Many2One } from "@web/views/fields/many2one/many2one";
 import { FormController } from "@web/views/form/form_controller";
+import { KanbanController } from "@web/views/kanban/kanban_controller";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { ListController } from "@web/views/list/list_controller";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
@@ -442,6 +443,11 @@ class UtmCampaign extends models.Model {
     };
 }
 
+/**
+ * CRM settings block (inventory B30 to B32). Its buttons are named as in the production settings
+ * view, the action buttons by xmlid, which the lane-1 `test_offline_availability_view_wiring`
+ * asserts against `crm.res_config_settings_view_form`.
+ */
 class ResConfigSettings extends models.Model {
     _name = "res.config.settings";
 
@@ -580,7 +586,11 @@ class MailFollowersEdit extends models.Model {
     };
 }
 
-/** Lead form mirroring `crm_lead_view_form` (header, smart buttons, PLS controls, fields). */
+/**
+ * Lead form mirroring `crm_lead_view_form` (header, smart buttons, PLS controls, fields). Its name
+ * is a `widget="text"` field as in production, so the `web.TextField` extension renders it; the
+ * production arch's widget is asserted by the lane-1 `test_offline_availability_view_wiring`.
+ */
 const LEAD_FORM_ARCH = /* xml */ `
     <form js_class="crm_form">
         <header>
@@ -604,7 +614,7 @@ const LEAD_FORM_ARCH = /* xml */ `
                 <button name="action_show_potential_duplicates" type="object"
                     class="oe_stat_button" icon="star" string="Similar Leads"/>
             </div>
-            <field name="name"/>
+            <field class="text-break" options="{'line_breaks': False}" widget="text" name="name"/>
             <field name="expected_revenue" widget="monetary"
                 options="{'currency_field': 'company_currency'}"/>
             <a class="btn btn-light o_crm_automated_probability_header"
@@ -636,7 +646,12 @@ const LEAD_CHATTER_FORM_ARCH = /* xml */ `
         <chatter reload_on_post="True"/>
     </form>`;
 
-/** Pipeline kanban mirroring `crm_case_kanban_view_leads` (card menu, color, priority). */
+/**
+ * Pipeline kanban mirroring `crm_case_kanban_view_leads` (card menu, color, priority). The card-menu
+ * Edit and Delete anchors repeat the production arch's offline attribute, so the tests prove only
+ * that the card compiler copies it onto the rendered anchors; the production arch's values are
+ * asserted by the lane-1 `test_offline_availability_view_wiring`.
+ */
 const LEAD_KANBAN_ARCH = /* xml */ `
     <kanban js_class="crm_kanban" highlight_color="color" default_group_by="stage_id"
         on_create="quick_create" archivable="false">
@@ -689,7 +704,10 @@ const OPPORTUNITY_LIST_ARCH = /* xml */ `
         <button name="crm.action_lead_mail_compose" type="action" icon="mail" string="Email"/>
     </list>`;
 
-/** Bound actions of `crm.lead` reached through the Actions menu (inventory D13 to D17). */
+/**
+ * Bound actions of `crm.lead` reached through the Actions menu (inventory D13 to D17), in
+ * inventory order, each bound to the view types the server binds it to.
+ */
 const BOUND_LEAD_ACTIONS = [
     {
         id: 101,
@@ -720,6 +738,17 @@ const BOUND_LEAD_ACTIONS = [
         target: "new",
         views: [[false, "form"]],
         binding_view_types: "form",
+    },
+    {
+        id: 105,
+        xml_id: "crm.action_lead_mass_mail",
+        name: "Send email",
+        res_model: "mail.compose.message",
+        type: "ir.actions.act_window",
+        target: "new",
+        views: [[false, "form"]],
+        context: { default_composition_mode: "mass_mail" },
+        binding_view_types: "list,kanban",
     },
     {
         id: 104,
@@ -874,6 +903,19 @@ class CrmLead extends models.Model {
     get_views() {
         const result = super.get_views(...arguments);
         result.models[this._name].has_activities = true;
+        // As on the server, a bound action is listed only in the views of its
+        // `binding_view_types`; the mock server lists every one in every view.
+        for (const [viewType, view] of Object.entries(result.views)) {
+            if (view.toolbar?.action) {
+                view.toolbar = {
+                    ...view.toolbar,
+                    action: view.toolbar.action.filter(
+                        ({ binding_view_types }) =>
+                            !binding_view_types || binding_view_types.split(",").includes(viewType)
+                    ),
+                };
+            }
+        }
         return result;
     }
 
@@ -1455,6 +1497,29 @@ const LEAD_HEADER_BUTTONS = [
     "action_show_potential_duplicates",
 ];
 
+/**
+ * Hotkeys (`alt+<key>`) of the lead form header buttons, as in the production arch: Won, Convert,
+ * Restore and Lost. The meeting and duplicates smart buttons, the blacklist buttons and the
+ * probability anchors have none.
+ */
+const LEAD_HEADER_HOTKEYS = {
+    w: "action_set_won_rainbowman",
+    v: "action_convert_to_opportunity",
+    x: "action_restore",
+    l: "crm.crm_lead_lost_action",
+};
+
+/**
+ * Presses Enter and Space on the element that has the keyboard focus, as a keyboard user
+ * activating a control would.
+ */
+async function pressEnterAndSpace() {
+    for (const key of ["Enter", " "]) {
+        await press(key);
+        await animationFrame();
+    }
+}
+
 /** Steps every view button the action service is asked to run, instead of running it. */
 function mockViewButtonActions() {
     mockService("action", {
@@ -1508,6 +1573,21 @@ describe("DISABLE controls and handler enforcement", () => {
         await getService("action").doAction(PIPELINE_ACTION_ID);
         expect.verifySteps(["has_group:sales_team.group_sale_manager"]);
         const switcher = findComponent(webClient, (component) => component instanceof TeamSwitcher);
+        // Keyboard selection in the open dropdown, as a keyboard user does it: the arrow keys move
+        // the focus to the team, and Enter selects it.
+        const selectTeamWithKeyboard = async (name) => {
+            const items = queryAll(".o_popover .o-dropdown-item");
+            for (let index = 0; index <= items.length; index++) {
+                if (queryFirst(".o_popover .o-dropdown-item.focus")?.textContent.includes(name)) {
+                    break;
+                }
+                await press("ArrowDown");
+                await animationFrame();
+            }
+            expect(".o_popover .o-dropdown-item.focus").toHaveText(name);
+            await press("Enter");
+            await animationFrame();
+        };
 
         // Online: a team is selected, and "Manage Teams" opens the team configuration.
         await contains(".o_cp_team_switcher").click();
@@ -1537,6 +1617,24 @@ describe("DISABLE controls and handler enforcement", () => {
         // The selected team facet (switcher label) is kept offline.
         expect(".o_cp_team_switcher").toHaveAttribute("data-tooltip", "Mushroom Kingdom");
 
+        // Keyboard selection in the dropdown left open changes nothing either: Enter on "Hyrule"
+        // only closes the dropdown, as any selection does.
+        await selectTeamWithKeyboard("Hyrule");
+        expect(".o_popover .dropdown-item").toHaveCount(0);
+        expect(switcher.selectedTeamId).toBe(1);
+        expect(".o_cp_team_switcher").toHaveText("Mushroom Kingdom");
+        // The disabled toggle cannot take the keyboard focus, so neither Enter, Space nor the
+        // arrow keys open the dropdown again. The toggle has no hotkey (no accesskey and no
+        // registered hotkey), so there is no hotkey route to exercise.
+        queryOne(".o_cp_team_switcher").focus();
+        expect(".o_cp_team_switcher").not.toBeFocused();
+        for (const key of ["Enter", " ", "ArrowDown"]) {
+            await press(key);
+            await animationFrame();
+        }
+        expect(".o_popover .dropdown-item").toHaveCount(0);
+        expect(switcher.selectedTeamId).toBe(1);
+
         // Back online: "Manage Teams" is offered again from the retained probe answer.
         await setOffline(false);
         expect(".o_cp_team_switcher").not.toHaveAttribute("disabled");
@@ -1545,6 +1643,10 @@ describe("DISABLE controls and handler enforcement", () => {
         }
         expect(".o_popover .dropdown-item:contains('Manage Teams')").toHaveCount(1);
         expect(switcher.isSaleManager).toBe(true);
+        // Online, the same keyboard selection switches the team.
+        await selectTeamWithKeyboard("Hyrule");
+        expect(switcher.selectedTeamId).toBe(2);
+        expect(".o_cp_team_switcher").toHaveText("Hyrule");
         // Exactly one probe in total, and nothing reached the network while offline.
         expect.verifySteps([]);
     });
@@ -1571,19 +1673,53 @@ describe("DISABLE controls and handler enforcement", () => {
                 return super.doAction(...arguments);
             },
         });
+        // "Generate" has the accesskey "c" (hotkey `alt+c`), which the New button of the
+        // pipeline also has: the hotkey runs the first of them in the DOM, New. The pipeline is
+        // shown without lead creation, so that `alt+c` is the hotkey of "Generate".
+        patchWithCleanup(KanbanController.prototype, {
+            get canCreate() {
+                return false;
+            },
+        });
         const webClient = await mountWithCleanup(WebClient);
         await getService("action").doAction(PIPELINE_ACTION_ID);
+        expect(".o-kanban-button-new").toHaveCount(0);
         const dropdown = findComponent(
             webClient,
             (component) => component instanceof LeadGenerationDropdown
         );
         const generateButton = "button.o-dropdown-caret:contains('Generate')";
         expect(generateButton).toBeEnabled();
+        // Keyboard selection of a choice in the open dropdown, as a keyboard user does it: the
+        // arrow keys move the focus to the choice, and Enter selects it.
+        const selectChoiceWithKeyboard = async (moduleXmlId) => {
+            const choice = `.o_lead_mining_element.focus[data-module-xml-id='${moduleXmlId}']`;
+            for (let index = 0; index <= queryAll(".o_lead_mining_element").length; index++) {
+                if (queryAll(choice).length) {
+                    break;
+                }
+                await press("ArrowDown");
+                await animationFrame();
+            }
+            expect(choice).toHaveCount(1);
+            await press("Enter");
+            await animationFrame();
+        };
 
         // Offline before the first opening: neither the module lookup nor the opening happens.
         await setOffline(true);
         expect(isDisabledOffline(generateButton)).toBe(true);
         await dropdown.toggleDropdown();
+        expect(".o_lead_mining_menu_choices").toHaveCount(0);
+        expect(dropdown.dropdownWasAlreadyOpened).toBe(undefined);
+        // Nor through the keyboard: its hotkey `alt+c` does nothing, and the disabled button
+        // cannot take the keyboard focus, so Enter does nothing either.
+        await press(["alt", "c"]);
+        await animationFrame();
+        queryOne(generateButton).focus();
+        expect(generateButton).not.toBeFocused();
+        await press("Enter");
+        await animationFrame();
         expect(".o_lead_mining_menu_choices").toHaveCount(0);
         expect(dropdown.dropdownWasAlreadyOpened).toBe(undefined);
         await setOffline(false);
@@ -1595,6 +1731,17 @@ describe("DISABLE controls and handler enforcement", () => {
         await contains(generateButton).click();
         expect.verifySteps(["ir.module.module/search_read"]);
         expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        // The hotkey is a real route to the same toggle: `alt+c` closes the dropdown and opens it
+        // again (the modules are known by now, so nothing is looked up again).
+        await press(["alt", "c"]);
+        await animationFrame();
+        expect(".o_lead_mining_menu_choices").toHaveCount(0);
+        await press(["alt", "c"]);
+        await animationFrame();
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        // Keyboard selection runs a choice: Enter on "Import leads from CSV" opens the import.
+        await selectChoiceWithKeyboard("base.module_crm");
+        expect.verifySteps(["doAction:import"]);
         await contains(
             ".o_lead_mining_element[data-module-xml-id='base.module_crm_iap_mine']"
         ).click();
@@ -1607,6 +1754,17 @@ describe("DISABLE controls and handler enforcement", () => {
         await contains(".modal .modal-footer .btn-primary").click();
         expect(".modal").toHaveCount(0);
         expect(".o_lead_mining_element .oi-spin").toHaveCount(0);
+
+        // The dropdown was left open behind the confirmation. Keyboard selection of its choices
+        // (the uninstalled module and the import) opens no confirmation and runs no action, and
+        // `alt+c` no longer toggles it.
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        await selectChoiceWithKeyboard("base.module_crm_iap_mine");
+        await selectChoiceWithKeyboard("base.module_crm");
+        await press(["alt", "c"]);
+        await animationFrame();
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        expect(".modal").toHaveCount(0);
 
         // Offline, "Generate" is disabled and every entry point is inert, without DOM event.
         expect(isDisabledOffline(generateButton)).toBe(true);
@@ -1631,6 +1789,11 @@ describe("DISABLE controls and handler enforcement", () => {
 
     test.tags("desktop");
     test("form header DISABLE buttons and probability anchors: disabled offline, re-enabled online, hotkeys and direct onClick() inert", async () => {
+        // The statusbar's "Move to next stage" command also has the hotkey `alt+x`, and hotkeys
+        // registered by components win over the DOM `data-hotkey` of Restore. In production,
+        // Restore is shown only on lost leads, whose statusbar is read-only, which makes that
+        // command unavailable; here the lead is in the last stage, which does the same.
+        CrmLead._records[0].stage_id = 3;
         const setOffline = mockOffline();
         keepPingsFailing();
         watchRpcs(["crm.lead/web_save"]);
@@ -1647,9 +1810,35 @@ describe("DISABLE controls and handler enforcement", () => {
             "doActionButton:action_set_won_rainbowman",
             "doActionButton:action_set_automated_probability",
         ]);
+        // The keyboard reaches the same handlers online: each header hotkey runs its button, and
+        // Enter on a focused button or probability anchor clicks it.
+        for (const key of Object.keys(LEAD_HEADER_HOTKEYS)) {
+            await press(["alt", key]);
+            await animationFrame();
+        }
+        expect.verifySteps(
+            Object.values(LEAD_HEADER_HOTKEYS).map((name) => `doActionButton:${name}`)
+        );
+        for (const name of LEAD_HEADER_BUTTONS) {
+            queryOne(`button[name='${name}']`).focus();
+            expect(`button[name='${name}']`).toBeFocused();
+            await press("Enter");
+            await animationFrame();
+        }
+        for (const anchor of queryAll("a[name='action_set_automated_probability']")) {
+            anchor.focus();
+            expect(anchor).toBeFocused();
+            await press("Enter");
+            await animationFrame();
+        }
+        expect.verifySteps([
+            ...LEAD_HEADER_BUTTONS.map((name) => `doActionButton:${name}`),
+            "doActionButton:action_set_automated_probability",
+            "doActionButton:action_set_automated_probability",
+        ]);
 
         // A pending edit: a button that got through would save it first.
-        await contains(".o_field_widget[name=name] input").edit("Lead 1 (unsaved)");
+        await contains(".o_field_widget[name=name] textarea").edit("Lead 1 (unsaved)");
         await setOffline(true);
         for (const name of LEAD_HEADER_BUTTONS) {
             expect(isDisabledOffline(`button[name='${name}']`)).toBe(true);
@@ -1666,6 +1855,21 @@ describe("DISABLE controls and handler enforcement", () => {
             await animationFrame();
         }
 
+        // Keyboard: the disabled buttons cannot take the keyboard focus, so neither Enter nor
+        // Space reaches them. The probability anchors are only dimmed: they still take the focus,
+        // and Enter (which clicks a link) and Space on them are inert. The anchors have no hotkey
+        // in the production arch, so there is no hotkey route to exercise for them.
+        for (const name of LEAD_HEADER_BUTTONS) {
+            queryOne(`button[name='${name}']`).focus();
+            expect(`button[name='${name}']`).not.toBeFocused();
+            await pressEnterAndSpace();
+        }
+        for (const anchor of anchors) {
+            anchor.focus();
+            expect(anchor).toBeFocused();
+            await pressEnterAndSpace();
+        }
+
         // Direct calls of every server button handler, without any DOM event.
         const serverButtons = buttons.filter(({ clickParams }) =>
             ["object", "action"].includes(clickParams.type)
@@ -1679,7 +1883,7 @@ describe("DISABLE controls and handler enforcement", () => {
         }
         await animationFrame();
         expect(".modal").toHaveCount(0);
-        expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 (unsaved)");
+        expect(".o_field_widget[name=name] textarea").toHaveValue("Lead 1 (unsaved)");
         expect(queuedEntries()).toHaveLength(0);
         expect.verifySteps([]);
 
@@ -1693,6 +1897,10 @@ describe("DISABLE controls and handler enforcement", () => {
             expect(anchor).not.toHaveAttribute("disabled");
             expect(anchor).not.toHaveClass("o_disabled_offline");
         }
+        // The hotkey runs Won again, after saving the edit kept through the disconnection.
+        await press(["alt", "w"]);
+        await animationFrame();
+        expect.verifySteps(["crm.lead/web_save", "doActionButton:action_set_won_rainbowman"]);
     });
 
     test.tags("desktop");
@@ -1729,12 +1937,30 @@ describe("DISABLE controls and handler enforcement", () => {
             // Online, a header button runs its action on the selected records.
             await contains(`button[name='${names[0]}']`).click();
             expect.verifySteps([`doActionButton:${names[0]}`]);
+            // So does Enter on each focused header button.
+            for (const name of names) {
+                queryOne(`button[name='${name}']`).focus();
+                expect(`button[name='${name}']`).toBeFocused({ message: `${rows}: ${name}` });
+                await press("Enter");
+                await animationFrame();
+            }
+            expect.verifySteps(names.map((name) => `doActionButton:${name}`));
 
             await setOffline(true);
             for (const name of names) {
                 expect(isDisabledOffline(`button[name='${name}']`)).toBe(true, {
                     message: `${rows}: ${name}`,
                 });
+            }
+            // Keyboard: Enter and Space where the focus was left online, then on each header
+            // button, which cannot take the keyboard focus while disabled. The header buttons have
+            // no hotkey in the production arch, so there is no hotkey route to exercise.
+            await pressEnterAndSpace();
+            document.activeElement.blur();
+            for (const name of names) {
+                queryOne(`button[name='${name}']`).focus();
+                expect(`button[name='${name}']`).not.toBeFocused({ message: `${rows}: ${name}` });
+                await pressEnterAndSpace();
             }
             const rendered = buttons.filter(({ clickParams }) => names.includes(clickParams.name));
             expect(new Set(rendered.map(({ clickParams }) => clickParams.name)).size).toBe(
@@ -1817,11 +2043,18 @@ describe("DISABLE controls and handler enforcement", () => {
         await contains(".o_select_domain").click();
         expect(currentMenu().props.isDomainSelected).toBe(true);
         expect(staticWrapper("duplicate")).not.toBe(undefined);
+        // Mark Lost, Merge, the mass mail "Send email" (105) and Add/Remove Followers.
+        expect(boundWrappers().map(({ action }) => action.id)).toEqual([101, 102, 105, 104]);
+        // Online, the mass mail picked with the keyboard runs on the searched domain.
+        await selectMenuItemWithKeyboard("u", "Send email");
+        await expect.waitForSteps(["crm.lead/search", "doAction:105"]);
         await setOffline(true);
         await callServerPathsDirectly();
         // The menu is opened through its hotkey and a bound wizard is picked with the keyboard.
         await selectMenuItemWithKeyboard("u", "Mark Lost");
         await selectMenuItemWithKeyboard("u", "Merge");
+        await selectMenuItemWithKeyboard("u", "Send email");
+        expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
         await setOffline(false);
 
@@ -1829,9 +2062,14 @@ describe("DISABLE controls and handler enforcement", () => {
         await getService("action").doAction(PIPELINE_ACTION_ID, { viewType: "kanban" });
         await contains(".o_kanban_record:first").click({ altKey: true });
         expect(".o_kanban_record.o_record_selected").toHaveCount(1);
+        expect(boundWrappers().map(({ action }) => action.id)).toEqual([101, 102, 105, 104]);
+        await selectMenuItemWithKeyboard("u", "Send email");
+        await expect.waitForSteps(["doAction:105"]);
         await setOffline(true);
         await callServerPathsDirectly();
         await selectMenuItemWithKeyboard("u", "Add/Remove Followers");
+        await selectMenuItemWithKeyboard("u", "Send email");
+        expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
         await setOffline(false);
 
@@ -1853,7 +2091,7 @@ describe("DISABLE controls and handler enforcement", () => {
         await toggleMenuItem("Send email");
         expect.verifySteps(["doAction:103"]);
         // A pending edit: a path that got through `shouldExecuteAction` would save it.
-        await contains(".o_field_widget[name=name] input").edit("Lead 1 (unsaved)");
+        await contains(".o_field_widget[name=name] textarea").edit("Lead 1 (unsaved)");
         // The menu is left open when the connection drops.
         await toggleActionMenu();
         await setOffline(true);
@@ -1864,7 +2102,7 @@ describe("DISABLE controls and handler enforcement", () => {
         await callServerPathsDirectly();
         await selectMenuItemWithKeyboard("u", "Send email");
         expect.verifySteps([]);
-        expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 (unsaved)");
+        expect(".o_field_widget[name=name] textarea").toHaveValue("Lead 1 (unsaved)");
         await contains(".o_form_button_cancel").click();
 
         await toggleActionMenu();
@@ -1949,6 +2187,20 @@ describe("DISABLE controls and handler enforcement", () => {
         await animationFrame();
         expect(crmEntry).toHaveCount(1); // the menu stays open: nothing was opened
         expect.verifySteps([]);
+        // Keyboard: the entry is not an item of the menu's keyboard navigation (no `o-navigable`
+        // class) and cannot take the keyboard focus, so the arrow keys and Enter in the open menu
+        // do not reach it. Neither the entry nor the systray toggle has a hotkey, so there is no
+        // hotkey route to exercise.
+        expect(`${crmEntry}.o-navigable, ${crmEntry} .o-navigable`).toHaveCount(0);
+        queryOne(crmEntry).focus();
+        expect(crmEntry).not.toBeFocused();
+        for (const key of ["ArrowDown", "Enter", "ArrowDown", "Enter"]) {
+            await press(key);
+            await animationFrame();
+        }
+        expect(crmEntry).toHaveCount(1);
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps([]);
 
         await setOffline(false);
         expect(crmEntry).not.toHaveAttribute("disabled");
@@ -1981,6 +2233,21 @@ describe("DISABLE controls and handler enforcement", () => {
             "doActionButton:action_primary_channel_button",
             "doActionButton:crm.crm_case_form_view_salesteams_lead",
         ]);
+        // The keyboard reaches the same handlers: Enter on a focused card opens it (the kanban
+        // renderer clicks the focused card), and Enter on a focused anchor clicks it.
+        queryOne(".o_crm_team_kanban .o_kanban_record:first").focus();
+        await press("Enter");
+        await animationFrame();
+        // Action buttons of cards are debounced (300 ms, leading call only): the window opened by
+        // the pointer click must pass, or the keyboard click would be dropped before the handler.
+        await advanceTime(300);
+        queryOne(`${anchorSelector}:contains('Leads'):first`).focus();
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps([
+            "doActionButton:action_primary_channel_button",
+            "doActionButton:crm.crm_case_form_view_salesteams_lead",
+        ]);
 
         await setOffline(true);
         for (const anchor of queryAll(anchorSelector)) {
@@ -1992,7 +2259,10 @@ describe("DISABLE controls and handler enforcement", () => {
         // DOM clicks reach the handlers of the dimmed card and anchors, which are inert.
         queryOne(".o_crm_team_kanban .o_kanban_record:first").click();
         queryOne(`${anchorSelector}:first`).click();
-        // Direct calls, with an event that is not a selection click and without any event.
+        // Direct calls, with an event that is not a selection click and without any event. The
+        // debounce windows of the anchors clicked above pass first, so that every call reaches the
+        // handler.
+        await advanceTime(300);
         const teamRecords = records.filter(({ props }) => props.record.resModel === "crm.team");
         expect(teamRecords.length).toBeGreaterThan(0);
         for (const record of teamRecords) {
@@ -2003,6 +2273,29 @@ describe("DISABLE controls and handler enforcement", () => {
             button.onClick();
         }
         await animationFrame();
+        expect.verifySteps([]);
+        // Keyboard: the dimmed cards and anchors still take the keyboard focus, and Enter on them
+        // is inert, on the focused card, on the next card reached with the arrow keys and on
+        // every anchor (once the debounce windows of the direct calls have passed). Neither the
+        // cards nor the anchors have a hotkey, so there is no hotkey route to exercise.
+        await advanceTime(300);
+        const cards = queryAll(".o_crm_team_kanban .o_kanban_record:not(.o_kanban_ghost)");
+        cards[0].focus();
+        expect(cards[0]).toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        await press("ArrowDown");
+        await animationFrame();
+        expect(cards[1]).toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        for (const anchor of queryAll(anchorSelector)) {
+            anchor.focus();
+            expect(anchor).toBeFocused();
+            await press("Enter");
+            await animationFrame();
+        }
+        expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
 
         await setOffline(false);
@@ -2021,6 +2314,9 @@ describe("DISABLE controls and handler enforcement", () => {
         ]);
         expect(CRM_OFFLINE_DISABLED_SELECTORS).toHaveLength(4);
 
+        // As in the form header test, the lead is in the last stage, so that `alt+x` is the
+        // hotkey of Restore and not the statusbar's "Move to next stage" command.
+        CrmLead._records[0].stage_id = 3;
         const setOffline = mockOffline();
         keepPingsFailing();
         watchOfflineRpcs();
@@ -2031,8 +2327,24 @@ describe("DISABLE controls and handler enforcement", () => {
 
         const partnerId = serverState.partnerId; // the current user's partner
         /**
+         * The hotkeys of a wizard confirm button: its `data-hotkey="q"` (`alt+q`), as in the
+         * production wizard arch, and the dialog's `control+Enter`, which clicks the first button
+         * of the dialog footer.
+         *
+         * @param {string} name
+         */
+        const wizardHotkeys = (name) => [
+            [["alt", "q"], name],
+            [["control", "Enter"], name],
+        ];
+        /**
          * Every DISABLE `<button>` row of the offline inventory, by the CRM view that renders it.
-         * `select` marks the lists whose header buttons need a selection.
+         * `select` marks the lists whose header buttons need a selection, and `hotkeys` lists the
+         * `[keys, button name]` hotkeys of the row. Only the lead form header buttons
+         * (`alt+w/v/x/l`) and the wizard confirm buttons have one in production; the other
+         * buttons (meeting, duplicates and blacklist buttons, list header and row buttons, lost
+         * reason, team, settings, partner and UTM campaign buttons) have none, so there is no
+         * hotkey route to exercise for them.
          */
         const views = [
             {
@@ -2040,6 +2352,10 @@ describe("DISABLE controls and handler enforcement", () => {
                 res_model: "crm.lead",
                 res_id: 1,
                 views: [[false, "form"]],
+                hotkeys: Object.entries(LEAD_HEADER_HOTKEYS).map(([key, name]) => [
+                    ["alt", key],
+                    name,
+                ]),
                 names: [
                     ...LEAD_HEADER_BUTTONS,
                     "mail_action_blacklist_remove",
@@ -2118,6 +2434,7 @@ describe("DISABLE controls and handler enforcement", () => {
                 res_model: "crm.lead.lost",
                 views: [[false, "form"]],
                 target: "new",
+                hotkeys: wizardHotkeys("action_lost_reason_apply"),
                 names: ["action_lost_reason_apply"],
             },
             {
@@ -2125,6 +2442,7 @@ describe("DISABLE controls and handler enforcement", () => {
                 res_model: "crm.lead.pls.update",
                 views: [[false, "form"]],
                 target: "new",
+                hotkeys: wizardHotkeys("action_update_crm_lead_probabilities"),
                 names: ["action_update_crm_lead_probabilities"],
             },
             {
@@ -2132,6 +2450,7 @@ describe("DISABLE controls and handler enforcement", () => {
                 res_model: "crm.lead2opportunity.partner.mass",
                 views: [[false, "form"]],
                 target: "new",
+                hotkeys: wizardHotkeys("action_apply"),
                 names: ["action_apply"],
             },
             {
@@ -2139,11 +2458,22 @@ describe("DISABLE controls and handler enforcement", () => {
                 res_model: "crm.merge.opportunity",
                 views: [[false, "form"]],
                 target: "new",
+                hotkeys: wizardHotkeys("action_merge"),
                 names: ["action_merge"],
             },
         ];
+        // `res.config.settings` is not a CRM model: its buttons are guarded only through
+        // `CRM_FOREIGN_DISABLED_BUTTONS`, which lists exactly the buttons the settings fixture
+        // renders, under the names of the production settings view (asserted by the lane-1
+        // `test_offline_availability_view_wiring`).
+        const settingsRow = views.find(({ res_model }) => res_model === "res.config.settings");
+        expect(CRM_OFFLINE_MODELS.includes(settingsRow.res_model)).toBe(false);
+        const guardedSettings = CRM_FOREIGN_DISABLED_BUTTONS.filter(
+            ([model]) => model === settingsRow.res_model
+        ).map(([, name]) => name);
+        expect(guardedSettings.sort()).toEqual([...settingsRow.names].sort());
 
-        for (const { rows, select, names, target, ...view } of views) {
+        for (const { rows, select, names, target, hotkeys = [], ...view } of views) {
             buttons.length = 0;
             if (target === "new") {
                 // Wizards are dialogs: their confirm buttons are in the dialog footer.
@@ -2161,10 +2491,47 @@ describe("DISABLE controls and handler enforcement", () => {
             for (const name of names) {
                 expect(`button[name='${name}']`).toBeEnabled({ message: `${rows}: ${name}` });
             }
+            // Online, each hotkey runs its button, and Enter on a focused button clicks it. Enter
+            // on a button of a list row opens the row's record instead (the list's keyboard
+            // navigation), so the row buttons are only checked offline, by the focus.
+            for (const [keys, name] of hotkeys) {
+                await press(keys);
+                await animationFrame();
+                expect.verifySteps([`doActionButton:${name}`]);
+            }
+            for (const name of names) {
+                const el = queryAll(`button[name='${name}']`).find(
+                    (button) => !button.closest(".o_data_row")
+                );
+                if (el) {
+                    el.focus();
+                    expect(el).toBeFocused({ message: `${rows}: ${name}` });
+                    await press("Enter");
+                    await animationFrame();
+                    expect.verifySteps([`doActionButton:${name}`]);
+                }
+            }
             await setOffline(true);
             for (const name of names) {
                 for (const el of queryAll(`button[name='${name}']`)) {
                     expect(isDisabledOffline(el)).toBe(true, { message: `${rows}: ${name}` });
+                }
+            }
+            // Keyboard: Enter and Space where the focus was left online, then the hotkeys, which
+            // only reach the disabled buttons through `click()`, a no-op on a disabled button.
+            // Last, every button: none can take the keyboard focus while disabled, so neither
+            // Enter nor Space reaches it.
+            await pressEnterAndSpace();
+            for (const [keys] of hotkeys) {
+                await press(keys);
+                await animationFrame();
+            }
+            document.activeElement.blur();
+            for (const name of names) {
+                for (const el of queryAll(`button[name='${name}']`)) {
+                    el.focus();
+                    expect(el).not.toBeFocused({ message: `${rows}: ${name}` });
+                    await pressEnterAndSpace();
                 }
             }
             const rendered = buttons.filter(({ clickParams }) => names.includes(clickParams.name));
@@ -2204,6 +2571,7 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(CRM_OFFLINE_MODELS.includes("res.partner")).toBe(false);
         const setOffline = mockOffline();
         keepPingsFailing();
+        watchOfflineRpcs();
         mockViewButtonActions();
         const buttons = captureInstances(ViewButton);
         await mountView({
@@ -2219,8 +2587,33 @@ describe("DISABLE controls and handler enforcement", () => {
                     <field name="name"/>
                 </form>`,
         });
+        const crmButton = "button[name='action_view_opportunity']";
+        const customButton = "button[name='action_partner_custom']";
+        // Online, Enter on the focused CRM button runs it.
+        queryOne(crmButton).focus();
+        expect(crmButton).toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps(["doActionButton:action_view_opportunity"]);
 
         await setOffline(true);
+        // The framework disables both buttons offline: neither carries the offline attribute.
+        expect(isDisabledOffline(crmButton)).toBe(true);
+        expect(isDisabledOffline(customButton)).toBe(true);
+        // Keyboard: Enter and Space where the focus was left online, then on the CRM button,
+        // which cannot take the keyboard focus while disabled. It has no hotkey in the production
+        // partner view, so there is no hotkey route to exercise.
+        await pressEnterAndSpace();
+        document.activeElement.blur();
+        queryOne(crmButton).focus();
+        expect(crmButton).not.toBeFocused();
+        await pressEnterAndSpace();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps([]);
+
+        // The foreign button is out of the keyboard's reach in the same way, because the
+        // framework disables it: what shows the scoping is a direct call, which still reaches
+        // `handleViewButton`.
         const button = (name) => buttons.find(({ clickParams }) => clickParams.name === name);
         // A button CRM does not list keeps its framework handling (the framework only dims it).
         await button("action_partner_custom").onClick();
@@ -2228,6 +2621,10 @@ describe("DISABLE controls and handler enforcement", () => {
         await button("action_view_opportunity").onClick();
         await animationFrame();
         expect.verifySteps(["doActionButton:action_partner_custom"]);
+
+        await setOffline(false);
+        expect(crmButton).toBeEnabled();
+        expect(customButton).toBeEnabled();
     });
 });
 
@@ -2332,11 +2729,28 @@ describe("SKIP and remaining DISABLE", () => {
         plsButton.popover.close();
         await animationFrame();
         expect(".o_crm_pls_tooltip").toHaveCount(0);
+        // So does Enter on the focused button.
+        queryOne(".o_crm_pls_tooltip_button").focus();
+        expect(".o_crm_pls_tooltip_button").toBeFocused();
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps(["crm.lead/prepare_pls_tooltip_data", "crm.lead/web_read"]);
+        expect(".o_crm_pls_tooltip").toHaveCount(1);
+        plsButton.popover.close();
+        await animationFrame();
+        expect(".o_crm_pls_tooltip").toHaveCount(0);
 
         // A pending edit: a click that got through would save it first.
         await contains(".o_field_widget[name=name] input").edit("Lead 1 (unsaved)");
         await setOffline(true);
         expect(isDisabledOffline(".o_crm_pls_tooltip_button")).toBe(true);
+        // Keyboard: the disabled button cannot take the keyboard focus, so neither Enter nor
+        // Space reaches it. The edited name gives the focus up first, so that the keys are not
+        // typed into it. The button has no hotkey, so there is no hotkey route to exercise.
+        queryOne(".o_field_widget[name=name] input").blur();
+        queryOne(".o_crm_pls_tooltip_button").focus();
+        expect(".o_crm_pls_tooltip_button").not.toBeFocused();
+        await pressEnterAndSpace();
         await plsButton.onClickPlsTooltipButton({
             currentTarget: queryOne(".o_crm_pls_tooltip_button"),
         });
@@ -3136,8 +3550,11 @@ describe("K9 attributes", () => {
         await mailContains(".o_field_widget[name=description] [contenteditable='true']");
         await setOffline(true);
         await visitedReady();
+        // The name is a `widget="text"` field: the `web.TextField` <textarea>, not a char <input>.
+        expect(".o_field_widget[name=name] textarea").toHaveCount(1);
+        expect(".o_field_widget[name=name] input").toHaveCount(0);
         const marked = [
-            ".o_field_widget[name=name] input",
+            ".o_field_widget[name=name] textarea",
             ".o_field_widget[name=email_from] input",
             ".o_field_widget[name=email_from] a[href^='mailto:']",
             ".o_field_widget[name=phone] input",
@@ -3186,7 +3603,7 @@ describe("K9 attributes", () => {
         expect(queryAllTexts(partnerSuggestions)).toEqual(["Deco Addict"]);
         await contains(`${partnerSuggestions}:contains('Deco Addict') > *`).click();
         expect(".o_field_widget[name=partner_id] input").toHaveValue("Deco Addict");
-        await contains(".o_field_widget[name=name] input").edit("Lead 1 (offline)");
+        await contains(".o_field_widget[name=name] textarea").edit("Lead 1 (offline)");
         await contains(".o_form_button_save").click();
         expect.verifySteps(["crm.lead/web_save"]);
         const [formSave] = queuedCalls("crm.lead", "web_save");
@@ -3212,7 +3629,9 @@ describe("K9 attributes", () => {
         expect(toggler).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
         expect(toggler).toBeEnabled();
         await contains(toggler).click();
-        // The card compiler turns `type` into a click handler: the anchors are found by label.
+        // The card compiler turns `type` into a click handler: the anchors are found by label. It
+        // copies the arch's offline attribute onto them; the production arch carries it, as the
+        // lane-1 `test_offline_availability_view_wiring` asserts.
         expect(".o-dropdown--menu a:contains('Edit')").toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
         expect(".o-dropdown--menu a:contains('Delete')").toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
         const colors = queryAll(".o-dropdown--menu .o_kanban_colorpicker button");
@@ -3793,7 +4212,7 @@ describe("Queue semantics", () => {
         await getService("action").doAction(LEAD_FORM_ACTION_ID);
 
         await setOffline(true);
-        await contains(".o_field_widget[name=name] input").edit("Lead 1 (offline)");
+        await contains(".o_field_widget[name=name] textarea").edit("Lead 1 (offline)");
         await contains(".o_form_button_save").click();
         expect(queuedEntries()).toHaveLength(1);
         // The stored call: the form record's context, the user context alone since the action
