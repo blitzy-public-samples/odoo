@@ -29,7 +29,7 @@
         announce, pending creates the pipeline's status region's (see _announceSyncChanges).
     -->
     <t t-name="crm.CrmMobileLeadCard">
-        <article class="o_kanban_record o_crm_mobile_lead_card card mb-2 p-2 w-100"
+        <article class="o_kanban_record o_crm_mobile_lead_card card border mb-2 p-2 w-100"
             data-available-offline="1"
             t-att-class="{ o_crm_mobile_lead_card_unavailable: this.props.unavailable, o_crm_mobile_lead_card_pending: this.isPending }"
             t-att-data-id="this.props.record?.id"
@@ -42,13 +42,13 @@
                     <button t-if="!this.isPending" type="button"
                         class="o_crm_mobile_lead_card_open d-flex align-items-center flex-grow-1 p-0 border-0 rounded bg-transparent text-reset text-start"
                         data-available-offline="1">
-                        <span class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-out="this.leadLabel"/>
+                        <span class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-att-title="this.leadLabel" t-out="this.leadLabel"/>
                         <span t-if="this.props.unavailable" class="visually-hidden"> (not available offline)</span>
                     </button>
-                    <span t-else="" class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-out="this.leadLabel"/>
+                    <span t-else="" class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-att-title="this.leadLabel" t-out="this.leadLabel"/>
                     <span t-if="this.isPendingSync" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                 </div>
-                <span t-if="this.partnerName" class="o_crm_mobile_lead_card_partner text-muted text-truncate" t-out="this.partnerName"/>
+                <span t-if="this.partnerName" class="o_crm_mobile_lead_card_partner text-700 text-truncate" t-att-title="this.partnerName" t-out="this.partnerName"/>
                 <span t-if="this.revenue" class="o_crm_mobile_lead_card_revenue" t-out="this.revenue"/>
             </div>
 
@@ -60,26 +60,26 @@
             <div t-if="!this.isPending" class="o_crm_mobile_lead_card_controls mt-2" t-on-click.stop="">
                 <div class="o_crm_mobile_lead_card_actions d-flex flex-wrap gap-1">
                     <button type="button"
-                        class="btn btn-secondary btn-sm o_crm_mobile_card_stage"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_stage"
                         data-available-offline="1"
                         title="Move to another stage"
                         aria-label="Stage"
                         t-att-aria-expanded="this.state.stageListOpen ? 'true' : 'false'"
                         t-ref="this.stageButtonRef"
                         t-on-click.stop="() => this.toggleStageList()">
-                        <i class="oi oi-fw" data-icon="swap_vert" aria-hidden="true"/> Stage
+                        <i class="oi oi-fw" data-icon="swap_vert" aria-hidden="true"/> <span>Stage</span>
                     </button>
                     <button type="button"
-                        class="btn btn-secondary btn-sm o_crm_mobile_card_log_call"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_log_call"
                         data-available-offline="1"
                         title="Log a call for today"
                         aria-label="Log call"
                         t-att-disabled="!this.canLogCall"
                         t-on-click.stop="() => this.onLogCall()">
-                        <i class="oi oi-fw" data-icon="phone" aria-hidden="true"/> Log call
+                        <i class="oi oi-fw" data-icon="phone" aria-hidden="true"/> <span>Log call</span>
                     </button>
                     <button type="button"
-                        class="btn btn-secondary btn-sm o_crm_mobile_card_follow_up"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_follow_up"
                         data-available-offline="1"
                         title="Schedule a follow-up activity"
                         aria-label="Follow-up"
@@ -87,16 +87,16 @@
                         t-att-aria-expanded="this.state.followUpOpen ? 'true' : 'false'"
                         t-ref="this.followUpButtonRef"
                         t-on-click.stop="() => this.toggleFollowUp()">
-                        <i class="oi oi-fw" data-icon="schedule" aria-hidden="true"/> Follow-up
+                        <i class="oi oi-fw" data-icon="schedule" aria-hidden="true"/> <span>Follow-up</span>
                     </button>
                     <button type="button"
-                        class="btn btn-secondary btn-sm o_crm_mobile_card_activities"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_activities"
                         data-available-offline="1"
                         title="Show the lead's activities"
-                        aria-label="Activities"
+                        t-att-aria-label="this.activitiesLabel"
                         t-att-aria-expanded="this.state.activitiesOpen ? 'true' : 'false'"
                         t-on-click.stop="() => this.toggleActivities()">
-                        <i class="oi oi-fw" data-icon="checklist" aria-hidden="true"/> Activities<span class="badge rounded-pill text-bg-light ms-1" t-out="this.activityCount"/>
+                        <i class="oi oi-fw" data-icon="checklist" aria-hidden="true"/> <span>Activities</span><span class="badge rounded-pill text-bg-light" t-out="this.activityCount"/>
                     </button>
                 </div>
 
@@ -138,7 +138,7 @@
                     </label>
                     <label class="form-label mb-0">Summary
                         <input type="text"
-                            class="form-control o_crm_mobile_follow_up_summary"
+                            class="form-control rounded o_crm_mobile_follow_up_summary"
                             placeholder="Summary"
                             data-available-offline="1"
                             t-att-value="this.state.summary"
@@ -169,9 +169,9 @@
                     <li t-foreach="this.pendingActivityCreates" t-as="entry" t-key="entry.key"
                         class="o_crm_mobile_activity_row o_crm_mobile_activity_pending d-flex align-items-center gap-2 py-1">
                         <div class="d-flex flex-column min-w-0">
-                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-out="this.pendingCreateTypeLabel(entry)"/>
-                            <span t-if="entry.value.args[1].summary" class="o_crm_mobile_activity_summary text-truncate" t-out="entry.value.args[1].summary"/>
-                            <span t-if="entry.value.args[1].date_deadline" class="o_crm_mobile_activity_deadline text-muted small" t-out="this.formatDeadline(entry.value.args[1].date_deadline)"/>
+                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-att-title="this.pendingCreateTypeLabel(entry)" t-out="this.pendingCreateTypeLabel(entry)"/>
+                            <span t-if="entry.value.args[1].summary" class="o_crm_mobile_activity_summary text-break" t-out="entry.value.args[1].summary"/>
+                            <span t-if="entry.value.args[1].date_deadline" class="o_crm_mobile_activity_deadline text-700 small" t-out="this.formatDeadline(entry.value.args[1].date_deadline)"/>
                         </div>
                         <span class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                     </li>
@@ -182,33 +182,33 @@
                         class="o_crm_mobile_activity_row d-flex align-items-center gap-2 py-1"
                         t-att-data-activity-id="activity.id">
                         <div class="d-flex flex-column min-w-0">
-                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-out="this.activityLabel(activity)"/>
-                            <span t-if="activity.summary" class="o_crm_mobile_activity_summary text-truncate" t-out="activity.summary"/>
-                            <span t-if="activity.date_deadline" class="o_crm_mobile_activity_deadline text-muted small" t-out="this.formatDeadline(activity.date_deadline)"/>
+                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-att-title="this.activityLabel(activity)" t-out="this.activityLabel(activity)"/>
+                            <span t-if="activity.summary" class="o_crm_mobile_activity_summary text-break" t-out="activity.summary"/>
+                            <span t-if="activity.date_deadline" class="o_crm_mobile_activity_deadline text-700 small" t-out="this.formatDeadline(activity.date_deadline)"/>
                         </div>
                         <span t-if="pendingArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                         <button t-else="" type="button"
-                            class="btn btn-sm btn-link o_crm_mobile_activity_done ms-auto flex-shrink-0"
+                            class="btn btn-link d-inline-flex align-items-center gap-1 o_crm_mobile_activity_done ms-auto flex-shrink-0"
                             data-available-offline="1"
-                            title="Mark done"
-                            aria-label="Mark done"
+                            t-att-title="this.markDoneLabel(activity)"
+                            t-att-aria-label="this.markDoneLabel(activity)"
                             t-att-disabled="this.state.busy"
                             t-on-click.stop="() => this.onMarkDone(activity)">
-                            <i class="oi oi-fw" data-icon="check" aria-hidden="true"/> Mark done
+                            <i class="oi oi-fw" data-icon="check" aria-hidden="true"/> <span>Mark done</span>
                         </button>
                     </li>
                     <!-- The page of activities is bounded: what it misses is said, never hidden. -->
                     <li t-if="this.hiddenActivityCount" class="o_crm_mobile_activities_more py-1">
                         <button t-if="!this.crmOffline.isOffline()" type="button"
-                            class="btn btn-sm btn-link o_crm_mobile_activities_show_all"
+                            class="btn btn-link o_crm_mobile_activities_show_all"
                             data-available-offline="1"
                             t-att-title="this.showAllActivitiesLabel"
                             t-att-aria-label="this.showAllActivitiesLabel"
                             t-on-click.stop="() => this.onShowAllActivities()"
                             t-out="this.showAllActivitiesLabel"/>
-                        <span t-else="" class="text-muted small" t-out="this.hiddenActivitiesLabel"/>
+                        <span t-else="" class="text-700 small" t-out="this.hiddenActivitiesLabel"/>
                     </li>
-                    <li t-if="!this.activityCount" class="text-muted small" t-out="this.noActivitiesLabel"/>
+                    <li t-if="!this.activityCount" class="text-700 small" t-out="this.noActivitiesLabel"/>
                 </ul>
             </div>
         </article>

@@ -26,9 +26,16 @@ $o-crm-mobile-touch: 44px;
     // Dimming of a lead that is not available offline. It mirrors the framework's offline dimming,
     // which cannot be used here: the framework strips its own class from elements tagged
     // `data-available-offline`, as this card is. The card stays tappable: the tap shows the
-    // offline action helper.
+    // offline action helper. Only the lead's details that cannot be opened offline are dimmed
+    // (name, partner, revenue). The open button itself is not, so its focus ring keeps full
+    // contrast, and neither are the pending-sync badge and the controls, which all work offline
+    // and must keep their enabled look.
     &.o_crm_mobile_lead_card_unavailable {
-        opacity: 0.5;
+        .o_crm_mobile_lead_card_name,
+        .o_crm_mobile_lead_card_partner,
+        .o_crm_mobile_lead_card_revenue {
+            opacity: 0.5;
+        }
     }
 
     // A queued lead create has no record to open and no control.
@@ -98,9 +105,19 @@ $o-crm-mobile-touch: 44px;
         }
     }
 
+    // Keyboard focus on a stage option shows the theme's focus ring, as on the open button, in
+    // place of the browser's default outline. The options are list-group items, which overlap:
+    // the focused one is raised above the selected one (z-index 2 in Bootstrap's list group) and
+    // above its other neighbours, so no adjacent option covers the ring.
     .o_crm_mobile_stage_option {
         display: flex;
         align-items: center;
+
+        &:focus-visible {
+            z-index: 3;
+            outline: none;
+            box-shadow: $focus-ring-box-shadow;
+        }
     }
 
     .o_crm_mobile_activity_row {

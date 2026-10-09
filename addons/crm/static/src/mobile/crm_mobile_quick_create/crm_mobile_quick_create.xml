@@ -24,7 +24,7 @@
                 <input id="o_crm_mobile_quick_create_name"
                     type="text"
                     name="name"
-                    class="form-control"
+                    class="form-control rounded"
                     required="1"
                     t-ref="this.nameRef"
                     t-model.proxy="this.state.name"
@@ -33,7 +33,7 @@
                     data-available-offline="1"/>
                 <div t-if="this.state.errors.name"
                     id="o_crm_mobile_quick_create_name_error"
-                    class="text-danger small"
+                    class="text-danger-emphasis small"
                     role="alert"
                     t-out="this.state.errors.name"/>
             </div>
@@ -43,7 +43,7 @@
                 <input id="o_crm_mobile_quick_create_contact_name"
                     type="text"
                     name="contact_name"
-                    class="form-control"
+                    class="form-control rounded"
                     t-model.proxy="this.state.contact_name"
                     data-available-offline="1"/>
             </div>
@@ -53,7 +53,7 @@
                 <input id="o_crm_mobile_quick_create_phone"
                     type="tel"
                     name="phone"
-                    class="form-control"
+                    class="form-control rounded"
                     t-model.proxy="this.state.phone"
                     data-available-offline="1"/>
             </div>
@@ -63,14 +63,14 @@
                 <input id="o_crm_mobile_quick_create_email_from"
                     type="email"
                     name="email_from"
-                    class="form-control"
+                    class="form-control rounded"
                     t-model.proxy="this.state.email_from"
                     t-att-aria-invalid="this.state.errors.email_from ? 'true' : false"
                     t-att-aria-describedby="this.state.errors.email_from ? 'o_crm_mobile_quick_create_email_from_error' : false"
                     data-available-offline="1"/>
                 <div t-if="this.state.errors.email_from"
                     id="o_crm_mobile_quick_create_email_from_error"
-                    class="text-danger small"
+                    class="text-danger-emphasis small"
                     role="alert"
                     t-out="this.state.errors.email_from"/>
             </div>
@@ -83,7 +83,7 @@
                     step="any"
                     min="0"
                     name="expected_revenue"
-                    class="form-control"
+                    class="form-control rounded"
                     t-on-input="(ev) => this.onRevenueInput(ev)"
                     t-ref="this.revenueRef"
                     t-att-aria-invalid="this.state.errors.expected_revenue ? 'true' : false"
@@ -91,7 +91,7 @@
                     data-available-offline="1"/>
                 <div t-if="this.state.errors.expected_revenue"
                     id="o_crm_mobile_quick_create_expected_revenue_error"
-                    class="text-danger small"
+                    class="text-danger-emphasis small"
                     role="alert"
                     t-out="this.state.errors.expected_revenue"/>
             </div>

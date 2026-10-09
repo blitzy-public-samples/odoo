@@ -1281,6 +1281,21 @@ describe("Mobile pipeline", () => {
         await goToStage("New");
         expect(`${cardOf("Lead 1")}`).not.toHaveClass("o_crm_mobile_lead_card_unavailable");
         expect(`${cardOf("Lead 2")}`).toHaveClass("o_crm_mobile_lead_card_unavailable");
+        // Only the lead's details are dimmed. The article, its open button, and its controls,
+        // which all work offline, keep their enabled look.
+        const dimmedParts = (name) =>
+            [queryOne(cardOf(name)), ...queryAll(`${cardOf(name)} *`)]
+                .map((el) => [
+                    [...el.classList].find((cls) => cls.startsWith("o_crm_mobile_")) ?? el.tagName,
+                    getComputedStyle(el).opacity,
+                ])
+                .filter(([, opacity]) => opacity !== "1");
+        expect(dimmedParts("Lead 1")).toEqual([]);
+        expect(dimmedParts("Lead 2")).toEqual([
+            ["o_crm_mobile_lead_card_name", "0.5"],
+            ["o_crm_mobile_lead_card_partner", "0.5"],
+            ["o_crm_mobile_lead_card_revenue", "0.5"],
+        ]);
         await contains(`${cardOf("Lead 2")} .o_crm_mobile_lead_card_name`).click();
         expect(".o_crm_mobile_pipeline_body .o_view_nocontent").toHaveCount(1);
         expect(".o_crm_mobile_pipeline_body .o_crm_mobile_lead_card").toHaveCount(0);
@@ -3241,6 +3256,14 @@ describe("Mobile pipeline", () => {
         expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_activities`).toHaveText(
             "No activities"
         );
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_activities li`).toHaveClass([
+            "text-700",
+            "small",
+        ]);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities (0)"
+        );
 
         // An online activity create reads the lead's activities again (no queue involved); the
         // activity list stays open and shows it.
@@ -4238,6 +4261,10 @@ describe("Mobile activity pages", () => {
         expect(showAll).toHaveAttribute("aria-label", "Show all (45)");
         expect(showAll).toHaveAttribute("title", "Show all (45)");
         expectTouchTarget(queryOne(showAll), "show all");
+        // The theme corner of every card button, not the small-button one.
+        expect(getComputedStyle(queryOne(showAll)).borderTopLeftRadius).toBe(
+            getComputedStyle(queryOne(`${card} .o_crm_mobile_card_activities`)).borderTopLeftRadius
+        );
 
         // Show all reads the whole list once, with the known total as its limit.
         await contains(showAll).click();
@@ -4302,6 +4329,7 @@ describe("Mobile activity pages", () => {
         expect(`${card} .o_crm_mobile_activities_more`).toHaveText(
             "5 more activities are not available offline"
         );
+        expect(`${card} .o_crm_mobile_activities_more span`).toHaveClass(["text-700", "small"]);
         expect(`${card} .o_crm_mobile_activities_show_all`).toHaveCount(0);
 
         // Direct calls read nothing offline: the expanded request was never cached.
@@ -5813,6 +5841,31 @@ function expectTouchTarget(el, label) {
 }
 
 /**
+ * Asserts a card button shows its icon, then its label, with a visible gap between them.
+ *
+ * @param {Element} button
+ * @param {string} label
+ * @returns {number} the gap, in CSS pixels, from the end of the icon to the start of the label
+ */
+function iconLabelGap(button, label) {
+    const icon = button.querySelector(":scope > .oi-fw");
+    const text = icon?.nextElementSibling;
+    expect(Boolean(icon && text)).toBe(true, { message: `${label} has an icon, then a label` });
+    const gap = text.getBoundingClientRect().left - icon.getBoundingClientRect().right;
+    expect(gap > 0).toBe(true, { message: `${label} has a ${gap}px icon-label gap` });
+    return gap;
+}
+
+/**
+ * @param {Element} el
+ * @returns {string} the computed top, right, bottom and left paddings of an element
+ */
+function boxPadding(el) {
+    const style = getComputedStyle(el);
+    return [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft].join(" ");
+}
+
+/**
  * @param {number} value
  * @returns {string} an amount as the card shows it (lead currency, whitespace-normalized)
  */
@@ -5954,6 +6007,7 @@ describe("Mobile lead card", () => {
     test("mobile: card shows name, partner, revenue; touch targets >= 44x44", async () => {
         await createActivities([
             { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+            { res_id: 2, activity_type_id: 2, activity_category: "phonecall" },
         ]);
         mockActivityTypes(ACTIVITY_TYPES);
         const cards = captureInstances(CrmMobileLeadCard);
@@ -5971,6 +6025,22 @@ describe("Mobile lead card", () => {
         expect(`${cardOf("Lead 2")} .o_crm_mobile_lead_card_revenue`).toHaveText(
             formatCardRevenue(20)
         );
+        // Secondary text uses the darker gray utility: text-muted falls below 4.5:1 on white.
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_partner`).toHaveClass("text-700");
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_partner`).not.toHaveClass("text-muted");
+        // The truncated name and partner keep their full text as a title.
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_name`).toHaveAttribute(
+            "title",
+            "Lead 1"
+        );
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_partner`).toHaveAttribute(
+            "title",
+            serverState.partnerName
+        );
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_lead_card_partner`).toHaveAttribute(
+            "title",
+            "Rachel Green"
+        );
         expect(`${cardOf("Lead 1")} .o_crm_mobile_pending_badge`).toHaveCount(0);
         // The upstream mobile main flow opens a lead through its name span.
         expect(".o_kanban_group .o_kanban_record span:contains(Lead 1)").toHaveCount(1);
@@ -5983,6 +6053,18 @@ describe("Mobile lead card", () => {
             expectTouchTarget(el, el.getAttribute("aria-label"));
         }
         expect(queryAll(`${card} .o_crm_mobile_lead_card_actions button`)).toHaveLength(4);
+        // Theme: the card border is the pipeline header's theme border, and every action shows
+        // its icon, then its label, with one gap and one padding (Mark done included, below).
+        expect(getComputedStyle(queryOne(card)).borderTopColor).toBe(
+            getComputedStyle(queryOne(".o_crm_mobile_pipeline_header")).borderBottomColor
+        );
+        const actions = queryAll(`${card} .o_crm_mobile_lead_card_actions button`);
+        const actionGap = iconLabelGap(actions[0], actions[0].className);
+        const actionPadding = boxPadding(actions[0]);
+        for (const el of actions) {
+            expect(iconLabelGap(el, el.className)).toBe(actionGap);
+            expect(boxPadding(el)).toBe(actionPadding, { message: `${el.className} padding` });
+        }
         await contains(`${card} .o_crm_mobile_card_stage`).click();
         expect(`${card} .o_crm_mobile_stage_option`).toHaveCount(4);
         expect(queryAllTexts(`${card} .o_crm_mobile_stage_option`)).toEqual([
@@ -6006,12 +6088,63 @@ describe("Mobile lead card", () => {
         for (const el of followUpControls) {
             expectTouchTarget(el, `follow-up ${el.className}`);
         }
+        // Theme corners: the summary input and every card button keep the select's corner, which
+        // the framework input reset would strip from the text input.
+        const themeRadius = getComputedStyle(
+            queryOne(`${card} .o_crm_mobile_follow_up_type`)
+        ).borderTopLeftRadius;
+        expect(themeRadius).not.toBe("0px");
+        for (const el of [...followUpControls, ...actions]) {
+            expect(getComputedStyle(el).borderTopLeftRadius).toBe(themeRadius, {
+                message: `${el.className} has the theme corner`,
+            });
+        }
         await contains(`${card} .o_crm_mobile_card_activities`).click();
         expect(`${card} .o_crm_mobile_lead_card_follow_up`).toHaveCount(0);
         expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(1);
+        expect(`${card} .o_crm_mobile_activity_deadline`).toHaveClass(["text-700", "small"]);
+        expect(`${card} .o_crm_mobile_activity_deadline`).not.toHaveClass("text-muted");
+        expect(`${card} .o_crm_mobile_activity_type`).toHaveAttribute("title", "Email");
+        expect(`${card} .o_crm_mobile_activity_summary`).toHaveText("Send offer");
+        expect(`${card} .o_crm_mobile_activity_summary`).toHaveClass("text-break");
+        expect(`${card} .o_crm_mobile_activity_summary`).not.toHaveClass("text-truncate");
         expectTouchTarget(queryOne(`${card} .o_crm_mobile_activity_done`), "mark done");
+        const markDone = queryOne(`${card} .o_crm_mobile_activity_done`);
+        expect(iconLabelGap(markDone, "mark done")).toBe(actionGap);
+        expect(boxPadding(markDone)).toBe(actionPadding, { message: "mark done padding" });
+        expect(getComputedStyle(markDone).borderTopLeftRadius).toBe(themeRadius);
+        // Accessible names start with the visible label and add what it shows or targets: the
+        // Activities count, the activity a Mark done completes (its summary when it has one).
+        expect(`${card} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities (1)"
+        );
+        expect(`${card} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "title",
+            "Show the lead's activities"
+        );
+        for (const attribute of ["aria-label", "title"]) {
+            expect(`${card} .o_crm_mobile_activity_done`).toHaveAttribute(
+                attribute,
+                "Mark done: Email – Send offer"
+            );
+        }
         await contains(`${card} .o_crm_mobile_card_activities`).click();
         expect(`${card} .o_crm_mobile_lead_card_activities`).toHaveCount(0);
+        const lead2Card = cardOf("Lead 2");
+        await contains(`${lead2Card} .o_crm_mobile_card_activities`).click();
+        expect(`${lead2Card} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities (1)"
+        );
+        expect(`${lead2Card} .o_crm_mobile_activity_summary`).toHaveCount(0);
+        for (const attribute of ["aria-label", "title"]) {
+            expect(`${lead2Card} .o_crm_mobile_activity_done`).toHaveAttribute(
+                attribute,
+                "Mark done: Call"
+            );
+        }
+        await contains(`${lead2Card} .o_crm_mobile_card_activities`).click();
         await goToStage("Qualified");
         for (const selector of [
             ".o_crm_mobile_pipeline_prev",
@@ -6023,6 +6156,73 @@ describe("Mobile lead card", () => {
             expect(el).toHaveAttribute("aria-label");
             expect(el).toHaveAttribute("title");
         }
+    });
+
+    test.tags("mobile");
+    test("mobile: a long lead name and partner keep their full text as a title; a long activity summary wraps beside Mark done", async () => {
+        const longName = `Lead 1 ${"with a name far too long for one line ".repeat(6)}`.trim();
+        const longPartner = `Contact ${"with a name far too long as well ".repeat(6)}`.trim();
+        // Words and an unbroken token (a reference number) wider than the screen.
+        const reference = `ref-${"0123456789".repeat(8)}`;
+        const words = "and the delivery dates ".repeat(8);
+        const longSummary = `Call back about the renewal terms ${reference} ${words}`.trim();
+        await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: longSummary },
+        ]);
+        MockServer.env["crm.lead"].write([1], {
+            name: longName,
+            partner_id: false,
+            contact_name: longPartner,
+        });
+        mockActivityTypes(ACTIVITY_TYPES);
+        await mountPipeline();
+        const card = cardOf(longName);
+
+        // The name and partner are truncated to one line each, their full text in a title.
+        const name = queryOne(`${card} .o_crm_mobile_lead_card_name`);
+        expect(name).toHaveAttribute("title", longName);
+        expect(name.scrollWidth > name.clientWidth).toBe(true, {
+            message: "the long name is truncated",
+        });
+        const partner = queryOne(`${card} .o_crm_mobile_lead_card_partner`);
+        expect(partner).toHaveText(longPartner);
+        expect(partner).toHaveAttribute("title", longPartner);
+        expect(partner.scrollWidth > partner.clientWidth).toBe(true, {
+            message: "the long partner is truncated",
+        });
+        // The upstream mobile main flow still finds the name as the card's first, leaf span.
+        expect(queryAll(`${card} span`)[0]).toBe(name);
+        expect(name.childElementCount).toBe(0);
+
+        // The summary wraps in the expanded list: shown in full on several lines, never wider
+        // than its column, with Mark done kept at the end of the row as a full touch target.
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        const row = queryOne(`${card} .o_crm_mobile_activity_row`);
+        const type = queryOne(`${card} .o_crm_mobile_activity_type`);
+        const summary = queryOne(`${card} .o_crm_mobile_activity_summary`);
+        const done = queryOne(`${card} .o_crm_mobile_activity_done`);
+        expect(summary).toHaveText(longSummary);
+        expect(summary.scrollWidth <= summary.clientWidth).toBe(true, {
+            message: `the summary (${summary.scrollWidth}px) fits its ${summary.clientWidth}px column`,
+        });
+        const summaryRect = summary.getBoundingClientRect();
+        expect(summaryRect.height > 2 * type.getBoundingClientRect().height).toBe(true, {
+            message: "the summary wraps over several lines",
+        });
+        const rowRect = row.getBoundingClientRect();
+        const doneRect = done.getBoundingClientRect();
+        expect(Math.abs(rowRect.right - doneRect.right) <= 1).toBe(true, {
+            message: "Mark done stays at the end of the row",
+        });
+        expect(summaryRect.right <= doneRect.left).toBe(true, {
+            message: "the summary never runs under Mark done",
+        });
+        expectTouchTarget(done, "mark done");
+        expect(rowRect.height >= 44).toBe(true, { message: "the row is a full touch target" });
+        expect(queryOne(card).scrollWidth <= queryOne(card).clientWidth).toBe(true, {
+            message: "the card never overflows the screen",
+        });
+        expect(done).toHaveAttribute("aria-label", `Mark done: Email – ${longSummary}`);
     });
 
     test.tags("mobile");
@@ -6748,6 +6948,17 @@ describe("Mobile quick create", () => {
                 message: `${el.getAttribute("name")} is at least 44px high`,
             });
         }
+        // Theme corners: every input keeps the stage select's corner, which the framework input
+        // reset would strip from the text, tel, email and number inputs.
+        const selectRadius = getComputedStyle(
+            queryOne(".o_crm_mobile_quick_create select[name=stage_id]")
+        ).borderTopLeftRadius;
+        expect(selectRadius).not.toBe("0px");
+        for (const el of controls) {
+            expect(getComputedStyle(el).borderTopLeftRadius).toBe(selectRadius, {
+                message: `${el.getAttribute("name")} has the theme corner`,
+            });
+        }
         expect(".o_crm_mobile_quick_create [name=phone]").toHaveAttribute("type", "tel");
         expect(".o_crm_mobile_quick_create [name=email_from]").toHaveAttribute("type", "email");
         expect(".o_crm_mobile_quick_create [name=expected_revenue]").toHaveAttribute(
@@ -6782,6 +6993,11 @@ describe("Mobile quick create", () => {
         // An empty name: an inline error, nothing queued.
         await contains(".o_crm_mobile_quick_create_save").click();
         expect(".o_crm_mobile_quick_create [role=alert]").toHaveText("The lead name is required.");
+        // The darker danger utility: text-danger falls below 4.5:1 on the sheet background.
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveClass([
+            "text-danger-emphasis",
+            "small",
+        ]);
         expect(".o_crm_mobile_quick_create [name=name]").toHaveAttribute("aria-invalid", "true");
         expect(queued()).toHaveLength(0);
 
@@ -6982,6 +7198,7 @@ describe("Mobile quick create", () => {
         const input = `.o_crm_mobile_quick_create [name=${name}]`;
         expect(`.o_crm_mobile_quick_create #${errorId}`).toHaveText(message);
         expect(`.o_crm_mobile_quick_create #${errorId}`).toHaveAttribute("role", "alert");
+        expect(`.o_crm_mobile_quick_create #${errorId}`).toHaveClass("text-danger-emphasis");
         expect(input).toHaveAttribute("aria-invalid", "true");
         expect(input).toHaveAttribute("aria-describedby", errorId);
     }
@@ -7754,6 +7971,15 @@ describe("Mobile quick create", () => {
         await animationFrame();
         expect(option(3)).toBeFocused();
         expect(tabIndexes()).toEqual(["-1", "-1", "0", "-1"]);
+        // The focused option shows the theme focus ring, not the browser's outline, raised above
+        // the selected option (z-index 2 in Bootstrap's list group). Stage shows the same ring
+        // once the focus is back on it (below).
+        expect(queryOne(option(3)).matches(":focus-visible")).toBe(true);
+        const optionStyle = getComputedStyle(queryOne(option(3)));
+        expect(optionStyle.outlineStyle).toBe("none");
+        expect(optionStyle.zIndex).toBe("3");
+        const optionRing = optionStyle.boxShadow;
+        expect(optionRing).not.toBe("none");
         await press("ArrowDown");
         expect(option(4)).toBeFocused();
         // No wrap at either end; ArrowUp from the first option does not focus the search.
@@ -7785,6 +8011,8 @@ describe("Mobile quick create", () => {
         expect(`${card} .o_crm_mobile_lead_card_stage_list`).toHaveCount(0);
         expect(stageButton).toBeFocused();
         expect(stageButton).toHaveAttribute("aria-expanded", "false");
+        expect(queryOne(stageButton).matches(":focus-visible")).toBe(true);
+        expect(getComputedStyle(queryOne(stageButton)).boxShadow).toBe(optionRing);
         // Outside the list, the card's other keys still reach the inherited kanban hotkeys.
         await press("ArrowDown");
         expect.verifySteps(["focusNextCard"]);
@@ -9420,6 +9648,18 @@ describe("Mobile activities", () => {
         expect(
             queryAllTexts(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_activity_type`)
         ).toEqual(["Call", "Email", "Email"]);
+        // A truncated type keeps its full text as a title; summaries wrap instead of truncating.
+        expect(
+            queryAll(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_activity_type`).map(
+                (el) => el.title
+            )
+        ).toEqual(["Call", "Email", "Email"]);
+        expect(
+            queryAllTexts(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_activity_summary`)
+        ).toEqual(["Call", "Send the proposal", "Check in"]);
+        expect(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_activity_summary`).toHaveClass(
+            "text-break"
+        );
         expect(
             queryAllTexts(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`)
         ).toEqual(["Pending sync", "Pending sync", "Pending sync"]);
@@ -9430,6 +9670,11 @@ describe("Mobile activities", () => {
         expect(
             `${card} .o_crm_mobile_activity_row:not(.o_crm_mobile_activity_pending) .o_crm_mobile_activity_type`
         ).toHaveText("Activity");
+        // An untyped activity's Mark done is named after the plain "Activity" label.
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveAttribute(
+            "aria-label",
+            "Mark done: Activity – Untyped"
+        );
         // The lead itself has no queued write: no lead badge.
         expect(`${card} .o_crm_mobile_lead_card_body .o_crm_mobile_pending_badge`).toHaveCount(0);
     });

@@ -37,6 +37,8 @@ import {
     beforeEach,
     describe,
     expect,
+    mockTouch,
+    mockUserAgent,
     queryAll,
     queryAllTexts,
     queryFirst,
@@ -44,7 +46,7 @@ import {
     runAllTimers,
     test,
 } from "@odoo/hoot";
-import { press } from "@odoo/hoot-dom";
+import { pointerDown, press, rightClick } from "@odoo/hoot-dom";
 import { defineCrmModels } from "@crm/../tests/crm_test_helpers";
 import {
     click as mailClick,
@@ -109,6 +111,7 @@ import { HtmlField } from "@html_editor/fields/html_field";
 import { ScheduledMessage } from "@mail/chatter/web/scheduled_message";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
+import { Message } from "@mail/core/common/message";
 import { MessageAction } from "@mail/core/common/message_actions";
 import { MessageDeleteDialog } from "@mail/core/common/message_delete_dialog";
 import { MessageReactionList } from "@mail/core/common/message_reaction_list";
@@ -122,6 +125,7 @@ import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import { RottingStatusBarDurationField } from "@mail/js/rotting_mixin/rotting_statusbar";
+import { LONG_PRESS_DELAY } from "@mail/utils/common/hooks";
 import { browser } from "@web/core/browser/browser";
 import { NonSecureContextError } from "@web/core/errors/non_secure_context_error";
 import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
@@ -4450,6 +4454,28 @@ describe("SKIP and remaining DISABLE", () => {
         );
     }
 
+    /**
+     * Asserts the presentation of the Send Now, Edit and Cancel controls of the one scheduled
+     * message shown: disabled (`disabled o_disabled_offline`, `aria-disabled="true"`), or
+     * rendered without any of these.
+     *
+     * @param {boolean} disabled
+     */
+    function expectScheduledMessageActionsDisabled(disabled) {
+        for (const label of ["Send Now", "Edit", "Cancel"]) {
+            const action = `.o-mail-Scheduled-Message-buttons > span.btn:contains('${label}')`;
+            expect(action).toHaveCount(1);
+            if (disabled) {
+                expect(action).toHaveClass(["disabled", "o_disabled_offline"]);
+                expect(action).toHaveAttribute("aria-disabled", "true");
+            } else {
+                expect(action).not.toHaveClass("disabled");
+                expect(action).not.toHaveClass("o_disabled_offline");
+                expect(action).not.toHaveAttribute("aria-disabled");
+            }
+        }
+    }
+
     /** Collects the instances of every patched mail component of the chatter. */
     function captureChatterComponents() {
         return {
@@ -4693,6 +4719,143 @@ describe("SKIP and remaining DISABLE", () => {
         await mailContains(".o-mail-Message:contains('Hello lead')");
     });
 
+    test("lead message offline: no context menu, long-press sheet or placeholder glyph; other threads keep them", async () => {
+        const { pyEnv } = await seedLeadThread();
+        const partnerId = pyEnv["res.partner"].create({ name: "Customer" });
+        pyEnv["mail.message"].create({
+            author_id: serverState.partnerId,
+            body: "Hello partner",
+            message_type: "comment",
+            model: "res.partner",
+            res_id: partnerId,
+        });
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        const messages = captureInstances(Message);
+        const messageActions = captureInstances(MessageAction);
+        await start();
+        const PARTNER_CHATTER_FORM_ARCH = /* xml */ `
+            <form>
+                <sheet><field name="name"/></sheet>
+                <chatter/>
+            </form>`;
+        const leadMessage = ".o-mail-Message:contains('Hello lead')";
+        const partnerMessage = ".o-mail-Message:contains('Hello partner')";
+        const selectedMessage = ".o-mail-Message.o-selected";
+        // The `mail.Message.emptyQuickAction` placeholder glyph.
+        const placeholder = "[data-icon='question_mark']";
+        // The message context menu and mobile actions sheet, as a popover or a bottom sheet. The
+        // discuss class sets them apart from the lead form's own menus, such as the many2one
+        // suggestions a small screen shows inline offline.
+        const actionsMenu = ".o-dropdown--menu.o-discuss-dropdownMenu";
+        /**
+         * @param {string} model
+         * @returns {Message} the mounted message component showing a message of `model`
+         */
+        const mountedMessage = (model) =>
+            messages.findLast(
+                (message) =>
+                    status(message) === "mounted" && message.props.message.thread?.model === model
+            );
+        /** Waits for the one actions menu, and asserts that it lists message actions. */
+        const expectActionsMenuListingActions = async () => {
+            await mailContains(actionsMenu);
+            expect(queryAll(`${actionsMenu} .o-dropdown-item`).length).toBeGreaterThan(0);
+        };
+
+        // Desktop OS, online: a right-click on a lead message opens its context menu, listing the
+        // message actions, and selects the message.
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(leadMessage);
+        const leadComponent = mountedMessage("crm.lead");
+        // The message reuses the offline hook result of the actions it owns.
+        const ownedActions = messageActions.filter(({ owner }) => owner === leadComponent);
+        expect(ownedActions.length).toBeGreaterThan(0);
+        for (const action of ownedActions) {
+            expect(action.crmOffline).toBe(leadComponent.crmOffline, { message: action.id });
+        }
+        await rightClick(leadMessage);
+        await expectActionsMenuListingActions();
+        expect(selectedMessage).toHaveCount(1);
+
+        // The connection drops: the context menu opened online closes and the selection clears.
+        await setOffline(true);
+        await animationFrame();
+        await mailContains(actionsMenu, { count: 0 });
+        expect(selectedMessage).toHaveCount(0);
+        await mailContains(".o-mail-Message[data-right-clicking]", { count: 0 });
+
+        // Offline, a right-click opens no menu and selects nothing: the browser's own menu shows.
+        const contextMenuEvent = (await rightClick(leadMessage)).get("contextmenu");
+        await animationFrame();
+        expect(contextMenuEvent.defaultPrevented).toBe(false);
+        expect(actionsMenu).toHaveCount(0);
+        expect(selectedMessage).toHaveCount(0);
+        expect(".o-mail-Message[data-right-clicking]").toHaveCount(0);
+        expect(mountedMessage("crm.lead").rightClickMenu.menuProps.dropdownState.isOpen).toBe(
+            false
+        );
+        // Offline, a hovered lead message renders no placeholder glyph next to its (no) actions.
+        await hover(leadMessage);
+        expect(`${leadMessage} .o-mail-Message-actions`).toHaveCount(1);
+        expect(`${leadMessage} ${placeholder}`).toHaveCount(0);
+
+        // A partner message offline still opens its context menu, listing its actions.
+        await setOffline(false);
+        await openFormView("res.partner", partnerId, { arch: PARTNER_CHATTER_FORM_ARCH });
+        await mailContains(partnerMessage);
+        await setOffline(true);
+        await animationFrame();
+        await rightClick(partnerMessage);
+        await expectActionsMenuListingActions();
+        expect(`${selectedMessage}:contains('Hello partner')`).toHaveCount(1);
+        mountedMessage("res.partner").rightClickMenu.menuProps.dropdownState.close();
+        await mailContains(actionsMenu, { count: 0 });
+
+        // Mobile OS, online: a long press on a lead message opens its actions sheet, and the
+        // message renders the upstream placeholder after its actions.
+        await setOffline(false);
+        mockUserAgent("android");
+        mockTouch(true);
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(leadMessage);
+        expect(`${leadMessage} ${placeholder}`).toHaveCount(1);
+        await pointerDown(leadMessage);
+        await advanceTime(LONG_PRESS_DELAY);
+        await expectActionsMenuListingActions();
+        expect(mountedMessage("crm.lead").optionsDropdown.isOpen).toBe(true);
+
+        // The connection drops: the sheet opened online closes.
+        await setOffline(true);
+        await animationFrame();
+        await mailContains(actionsMenu, { count: 0 });
+        expect(mountedMessage("crm.lead").optionsDropdown.isOpen).toBe(false);
+
+        // Offline, no placeholder glyph, and neither a long press nor a direct call opens a sheet.
+        expect(`${leadMessage} ${placeholder}`).toHaveCount(0);
+        await pointerDown(leadMessage);
+        await advanceTime(LONG_PRESS_DELAY);
+        mountedMessage("crm.lead").openMobileActions(NO_EVENT);
+        await animationFrame();
+        expect(actionsMenu).toHaveCount(0);
+        expect(mountedMessage("crm.lead").optionsDropdown.isOpen).toBe(false);
+
+        // A partner message offline on a mobile OS keeps its placeholder and its actions sheet.
+        await setOffline(false);
+        await openFormView("res.partner", partnerId, { arch: PARTNER_CHATTER_FORM_ARCH });
+        await mailContains(partnerMessage);
+        await setOffline(true);
+        await animationFrame();
+        expect(`${partnerMessage} ${placeholder}`).toHaveCount(1);
+        await pointerDown(partnerMessage);
+        await advanceTime(LONG_PRESS_DELAY);
+        await expectActionsMenuListingActions();
+        expect(mountedMessage("res.partner").optionsDropdown.isOpen).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
     test("chatter scheduled message on a lead: cancel, attachment removal, edit and send now inert offline", async () => {
         const pyEnv = await startServer();
         const { scheduledMessageId, attachmentId } = seedScheduledMessage(pyEnv, "crm.lead", 1);
@@ -4733,6 +4896,8 @@ describe("SKIP and remaining DISABLE", () => {
         expect(scheduledMessage.props.scheduledMessage.thread.id).toBe(1);
         const attachments = [...scheduledMessage.props.scheduledMessage.attachment_ids];
         expect(attachments.map(({ id }) => id)).toEqual([attachmentId]);
+        // Online, Send Now, Edit and Cancel render as upstream does.
+        expectScheduledMessageActionsDisabled(false);
 
         // Online, the cancellation asks for confirmation.
         await mailClick(".o-mail-Scheduled-Message-buttons .btn:contains('Cancel')");
@@ -4745,6 +4910,9 @@ describe("SKIP and remaining DISABLE", () => {
         await animationFrame();
         expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
+        // Offline, Send Now, Edit and Cancel are shown disabled, as the framework shows the
+        // buttons it disables.
+        expectScheduledMessageActionsDisabled(true);
 
         // Offline, every handler is inert, called directly or through its button.
         const offlineScheduledMessage = mountedScheduledMessage(scheduledMessages, "crm.lead");
@@ -4764,9 +4932,18 @@ describe("SKIP and remaining DISABLE", () => {
         expect(pyEnv["ir.attachment"].browse(attachmentId)).toHaveLength(1);
         expect(queuedEntries()).toHaveLength(0);
         expect.verifySteps([]);
+        // The clicks leave them disabled.
+        expectScheduledMessageActionsDisabled(true);
+
+        // Each reconnection removes the disabled state, and each disconnection restores it.
+        await setOffline(false);
+        expectScheduledMessageActionsDisabled(false);
+        await setOffline(true);
+        expectScheduledMessageActionsDisabled(true);
 
         // Back online, the same handlers reach the server again.
         await setOffline(false);
+        expectScheduledMessageActionsDisabled(false);
         await mailClick(".o-mail-Scheduled-Message-buttons .btn:contains('Send Now')");
         await expect.waitForSteps(["mail.scheduled.message/post_message"]);
         await mailClick(".o-mail-Scheduled-Message-buttons .btn:contains('Edit')");
@@ -5377,6 +5554,8 @@ describe("SKIP and remaining DISABLE", () => {
         const saves = queuedCalls("mail.activity", "web_save");
         expect(saves).toHaveLength(1);
         expect(saves[0].args[1]).toMatchObject({ summary: "Edited offline" });
+        // A partner scheduled message keeps its Send Now, Edit and Cancel as they are online.
+        expectScheduledMessageActionsDisabled(false);
         // A partner scheduled message still asks to confirm its cancellation.
         const partnerScheduledMessage = mountedScheduledMessage(scheduledMessages, "res.partner");
         expect(partnerScheduledMessage.props.scheduledMessage.thread.id).toBe(partnerId);

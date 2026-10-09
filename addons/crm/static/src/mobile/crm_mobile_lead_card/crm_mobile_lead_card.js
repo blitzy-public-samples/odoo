@@ -352,6 +352,14 @@ export class CrmMobileLeadCard extends Component {
         );
     }
 
+    /**
+     * Accessible name of the Activities button: its visible label, then the count its badge
+     * shows, so the name starts with what is seen and a screen reader hears the count too.
+     */
+    get activitiesLabel() {
+        return _t("Activities (%(count)s)", { count: this.activityCount });
+    }
+
     get showAllActivitiesLabel() {
         return _t("Show all (%(count)s)", { count: this.props.activityTotal });
     }
@@ -455,6 +463,21 @@ export class CrmMobileLeadCard extends Component {
      */
     activityLabel(activity) {
         return activity.activity_type_id?.display_name || _t("Activity");
+    }
+
+    /**
+     * Accessible name and tooltip of an activity's Mark done button: the visible label, then the
+     * activity it completes (type, and summary when it has one), so the rows' buttons are told
+     * apart.
+     *
+     * @param {Object} activity a cached `mail.activity` record
+     * @returns {string}
+     */
+    markDoneLabel(activity) {
+        const type = this.activityLabel(activity);
+        return activity.summary
+            ? _t("Mark done: %(type)s – %(summary)s", { type, summary: activity.summary })
+            : _t("Mark done: %(type)s", { type });
     }
 
     // -------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import "@mail/chatter/web/chatter_patch";
 import { ScheduledMessage } from "@mail/chatter/web/scheduled_message";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
+import { Message } from "@mail/core/common/message";
 import { MessageAction } from "@mail/core/common/message_actions";
 import { MessageDeleteDialog } from "@mail/core/common/message_delete_dialog";
 import { MessageReactionList } from "@mail/core/common/message_reaction_list";
@@ -718,6 +719,14 @@ patch(ScheduledMessage.prototype, {
         super.setup(...arguments);
         this.crmOffline = useCrmOffline();
     },
+    /**
+     * Whether the Send Now, Edit and Cancel controls are shown disabled: the scheduled message
+     * belongs to a lead and the client is offline. They are `<span>`s the framework never
+     * disables, so the template renders their disabled state from this getter.
+     */
+    get crmLeadOffline() {
+        return isCrmLeadOffline(this, this.props.scheduledMessage?.thread?.model);
+    },
     cancel() {
         if (isCrmLeadOffline(this, this.props.scheduledMessage?.thread?.model)) {
             return;
@@ -879,6 +888,75 @@ function messageActionModel(action, params) {
     const message = params ? params.message : action.messageFn?.();
     return thread?.model ?? message?.thread?.model;
 }
+
+/**
+ * The model a message component targets, by the rule of `messageActionModel`: the thread the
+ * message is viewed in, or else the message's own thread.
+ *
+ * @param {Message} component
+ * @returns {string | undefined}
+ */
+function messageComponentModel(component) {
+    return component.props.thread?.model ?? component.message?.thread?.model;
+}
+
+/**
+ * No message action is listed for an offline lead message (see the `MessageAction` patch below),
+ * so the message opens no action overlay: no context menu on right-click, which also leaves the
+ * message unselected and the browser's own menu shown, as for a message without actions, and no
+ * actions sheet on a mobile-OS long press. An overlay opened online closes when the connection
+ * drops, instead of staying open empty. Online, and for every other model, each patched method
+ * calls `super`.
+ */
+patch(Message.prototype, {
+    /**
+     * Reuses the CRM offline hook result the message's own actions were given while this setup
+     * ran (this message is their owner), or calls the hook when no action was set up.
+     */
+    setup() {
+        super.setup(...arguments);
+        this.crmOffline = crmOfflineByActionOwner.get(this) ?? useCrmOffline();
+        // Each overlay is closed only when open: closing the context menu also clears the
+        // message selection it made.
+        useCloseOnCrmOffline(
+            this,
+            () => messageComponentModel(this),
+            () => {
+                const contextMenuState = this.rightClickMenu.menuProps.dropdownState;
+                if (contextMenuState.isOpen) {
+                    contextMenuState.close();
+                }
+                if (this.optionsDropdown.isOpen) {
+                    this.optionsDropdown.close();
+                }
+            }
+        );
+    },
+    /**
+     * Whether the message targets a lead and the client is offline. Read by the empty quick
+     * action template, which then renders no placeholder: the framework's offline look of a
+     * disabled button would make that transparent placeholder visible.
+     *
+     * @returns {boolean}
+     */
+    get crmLeadOffline() {
+        return isCrmLeadOffline(this, messageComponentModel(this));
+    },
+    /** Returns before the context menu opens and the message is selected. */
+    onContextMenu() {
+        if (this.crmLeadOffline) {
+            return;
+        }
+        return super.onContextMenu(...arguments);
+    },
+    /** Reached by the mobile-OS long press: returns before the actions sheet opens. */
+    openMobileActions() {
+        if (this.crmLeadOffline) {
+            return;
+        }
+        return super.openMobileActions(...arguments);
+    },
+});
 
 patch(MessageAction.prototype, {
     /**
