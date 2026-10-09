@@ -1,0 +1,94 @@
+// Small-screen CRM pipeline (template `crm.CrmMobilePipeline`): one stage at a time.
+//
+// Layout only. Colors, borders and spacing come from the Bootstrap utility classes of the template
+// (`bg-view`, `border-bottom`, `px-2`, `gap-1`, `btn-*`, ...), so the pipeline follows the active
+// theme and this file holds no palette.
+//
+// The mobile root keeps `o_kanban_renderer o_renderer o_kanban_grouped`: the upstream mobile main
+// flow targets those classes and the base kanban controller saves and restores the scroll of
+// `.o_renderer` and of every unfolded `.o_kanban_group`. On small screens the web kanban styles
+// turn that root into a horizontal snap scroller of 90%-wide columns. Every rule below is nested
+// under the `.o_crm_mobile_pipeline` root, which only the small-screen stage-grouped branch
+// renders, and overrides those rules for this root alone: the desktop branch (`web.KanbanRenderer`)
+// and every other kanban view keep the web layout. The lead card and the quick create own their
+// stylesheets.
+//
+// Physical properties (`top`, `width`, `min-width`, ...) are used rather than logical ones: each
+// declaration either overrides a physical declaration of the web kanban layout or sets a touch
+// target measured as width x height, and the RTL bundle is flipped by the asset pipeline.
+
+// Minimum touch target, in CSS pixels, of every pipeline control. File-local on purpose: it is a
+// requirement of this component, not a theme value.
+$o-crm-mobile-touch: 44px;
+
+// Three classes: more specific than the web `.o_kanban_renderer.o_kanban_grouped` rules.
+.o_kanban_renderer.o_kanban_grouped.o_crm_mobile_pipeline {
+    // The displayed stage takes the full viewport width: no hint of the adjacent columns, which
+    // are not rendered (navigation is through the header buttons and the swipe).
+    --KanbanGroup-width: 100%;
+    --KanbanGroup-max-width: 100%;
+
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    height: 100%;
+    // The web small-screen layout sets `overflow: scroll hidden !important` to scroll the columns
+    // horizontally. An `!important` declaration can only be overridden by another one: here the
+    // root never scrolls, the stage body below is the scroll container.
+    overflow: hidden !important;
+    scroll-snap-type: none;
+
+    // Fixed header: previous stage, stage name with lead count and revenue sum, next stage, Add.
+    .o_crm_mobile_pipeline_header {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        flex: 0 0 auto;
+    }
+
+    .o_crm_mobile_pipeline_prev,
+    .o_crm_mobile_pipeline_next,
+    .o_crm_mobile_pipeline_add {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: center;
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+    }
+
+    // Stage body: the only `.o_kanban_group` in the DOM. It fills the width and the height left
+    // by the header, and it is the vertical scroll container whose `scrollTop` the base kanban
+    // controller saves and restores (lead opened, then back).
+    .o_kanban_group.o_crm_mobile_pipeline_body {
+        flex: 1 1 auto;
+        width: 100%;
+        min-width: 100%;
+        max-width: none;
+        min-height: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
+        scroll-snap-align: none;
+        // Vertical panning stays native; horizontal gestures are left to the swipe navigation.
+        touch-action: pan-y;
+        // Containing block of the offline action helper (`.o_view_nocontent`, absolutely
+        // positioned over its container): it covers the stage body, never the header.
+        position: relative;
+    }
+
+    // Back from the offline action helper. Stacked above the helper overlay, whatever its z-index,
+    // so it stays tappable; the stage body clips it, so it never covers the header.
+    .o_crm_mobile_pipeline_back {
+        position: relative;
+        z-index: calc(var(--o-view-nocontent-zindex, 1) + 1);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+    }
+
+    .o_crm_mobile_pipeline_load_more .btn {
+        min-height: $o-crm-mobile-touch;
+    }
+}
