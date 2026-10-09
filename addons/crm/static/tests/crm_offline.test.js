@@ -13,7 +13,11 @@
  *   replayed in timestamp order with last-write-wins and parked on rejection (PART 3, gate 8).
  *
  * Conventions:
- * - Every mock model is local to this file; no existing test helper is modified.
+ * - The mock models these tests add (the CRM models and the others their views need) are local
+ *   to this file. The shared fixture of `defineCrmModels()` (the shared mail mocks plus the CRM
+ *   helper's `crm.lead`, which the local lead model completes) is reused, and the shared
+ *   `MailActivity` mock only gets a local form view, set the way the mail tests configure it. No
+ *   existing test helper is modified.
  * - Offline state is driven only through the offline plugin (`mockOffline()` and
  *   `getService(OfflinePlugin)`).
  * - "Inert" always means: no RPC (stepped by a route watcher registered after `mockOffline()`, so
@@ -111,7 +115,7 @@ import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import { NonSecureContextError } from "@web/core/errors/non_secure_context_error";
-import { ConnectionLostError } from "@web/core/network/rpc";
+import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
@@ -5373,6 +5377,534 @@ describe("Queue semantics", () => {
         // The framework systray is the only error UI: no CRM notification, no dialog.
         expect(".o_notification").toHaveCount(0);
         expect(".modal").toHaveCount(0);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Remaining hook branches (both presets)
+// -----------------------------------------------------------------------------
+
+/**
+ * Mounts the pipeline kanban online and returns the hook API as a CRM component holds it: the one
+ * of a kanban column progress bar. It resolves once the mail store's start-up fetch has landed, so
+ * that a disconnection the test starts afterwards cannot make that fetch fail.
+ */
+async function mountHookApi() {
+    listenStoreFetch("init_messaging");
+    const progressBars = captureInstances(CrmColumnProgress);
+    await mountView({ type: "kanban", resModel: "crm.lead", arch: LEAD_KANBAN_ARCH });
+    await waitStoreFetch("init_messaging");
+    expect(progressBars.length).toBeGreaterThan(0);
+    return progressBars.at(-1).crmOffline;
+}
+
+describe("Remaining hook branches", () => {
+    test("latestStageWrite ignores a later queued write of the lead that carries no stage_id", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const crmOffline = await mountHookApi();
+
+        // Offline, Lead 1 is moved to Qualified, then another of its fields is saved from another
+        // record instance: two queue entries, the later one without `stage_id`, both shaped as
+        // the framework queues a record save.
+        await setOffline(true);
+        const offline = getService(OfflinePlugin);
+        const scheduleLeadSave = (values, changes, originalValues, timeStamp) =>
+            offline.scheduleORM(
+                "crm.lead",
+                "web_save",
+                [[1], values],
+                { context: {}, specification: {} },
+                {
+                    extras: {
+                        actionId: undefined,
+                        actionName: undefined,
+                        viewType: "kanban",
+                        timeStamp,
+                        displayName: "Lead 1",
+                        changes,
+                        originalValues,
+                    },
+                }
+            );
+        const stageKey = scheduleLeadSave(
+            { stage_id: 2 },
+            { stage_id: { id: 2, display_name: "Qualified" } },
+            { stage_id: { id: 1, display_name: "New" } },
+            1000
+        );
+        const priorityKey = scheduleLeadSave(
+            { priority: "3" },
+            { priority: "3" },
+            { priority: "0" },
+            2000
+        );
+        expect(
+            queuedEntries()
+                .map(({ key }) => key)
+                .sort()
+        ).toEqual([stageKey, priorityKey].sort());
+        const stageEntry = queuedEntries().find(({ key }) => key === stageKey);
+
+        // The later entry carries no stage: the stage write is still the latest one, from the live
+        // queue and from a copy of it in any order (the pipeline's sync-window entries).
+        expect(crmOffline.latestStageWrite(1)).toBe(stageEntry);
+        expect(crmOffline.latestStageWrite(1, [...queuedEntries()].reverse())).toBe(stageEntry);
+        expect(crmOffline.latestStageWrite(1).value.args).toEqual([[1], { stage_id: 2 }]);
+
+        // Once the move has left the queue (as a systray discard removes it), the lead has no
+        // queued stage write, although a write of the lead is still queued.
+        offline.removeScheduledORM(stageKey);
+        expect(queuedEntries().map(({ key }) => key)).toEqual([priorityKey]);
+        expect(crmOffline.latestStageWrite(1)).toBe(undefined);
+    });
+
+    test("loadActivityTypes and loadLeadActivities reject with a server error that is not a lost connection", async () => {
+        onRpc("mail.activity.type", "web_search_read", () => {
+            expect.step("mail.activity.type/web_search_read");
+            throw makeServerError({ message: "Activity types are not readable" });
+        });
+        onRpc("mail.activity", "web_search_read", () => {
+            expect.step("mail.activity/web_search_read");
+            throw makeServerError({ message: "Lead activities are not readable" });
+        });
+        const { orm } = await mountHookApi();
+        const updates = [];
+        const onUpdate = (result) => updates.push(result);
+
+        // Online, with nothing cached: the server's error reaches the caller as it is, where a lost
+        // connection resolves to `null`, and no update is delivered.
+        const typesError = await loadActivityTypes(orm, onUpdate).catch((error) => error);
+        expect(typesError).toBeInstanceOf(RPCError);
+        expect(typesError.message).toBe("Activity types are not readable");
+        const activitiesError = await loadLeadActivities(orm, 1, onUpdate).catch((error) => error);
+        expect(activitiesError).toBeInstanceOf(RPCError);
+        expect(activitiesError.message).toBe("Lead activities are not readable");
+        expect.verifySteps(["mail.activity.type/web_search_read", "mail.activity/web_search_read"]);
+        expect(updates).toEqual([]);
+    });
+
+    test("isRecordPendingSync is false without a record, and for a new record whose queue entry is gone", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const crmOffline = await mountHookApi();
+        expect(crmOffline.isRecordPendingSync(undefined)).toBe(false);
+        expect(crmOffline.isRecordPendingSync(null)).toBe(false);
+
+        // Offline, a lead is created: the framework queues a `web_save` without id and keeps the
+        // entry's key on the new record as its `offlineId`.
+        await setOffline(true);
+        const offline = getService(OfflinePlugin);
+        const createKey = offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Offline lead", stage_id: 1 }],
+            { context: {}, specification: {} },
+            {
+                extras: {
+                    actionId: undefined,
+                    actionName: undefined,
+                    viewType: "kanban",
+                    timeStamp: 1000,
+                    displayName: "Offline lead",
+                    changes: { name: "Offline lead" },
+                },
+            }
+        );
+        // New records as the predicate reads them: the framework's `resModel`, `resId` (false
+        // until the server created the record) and `offlineId`.
+        const createdOffline = { resModel: "crm.lead", resId: false, offlineId: createKey };
+        const otherNewLead = { resModel: "crm.lead", resId: false, offlineId: undefined };
+        expect(crmOffline.isRecordPendingSync(createdOffline)).toBe(true);
+        // The queued create, which has no id, is not attributed to another new lead.
+        expect(crmOffline.isRecordPendingSync(otherNewLead)).toBe(false);
+
+        // Once the entry has left the queue (replayed, or discarded from the systray), the record's
+        // `offlineId` outlives it and no longer counts: with no server id, nothing is pending.
+        offline.removeScheduledORM(createKey);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(crmOffline.isRecordPendingSync(createdOffline)).toBe(false);
+    });
+
+    test("runOrQueue rejects a call without a live function, or whose queued method the systray cannot render, before any live call or queue entry", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        const crmOffline = await mountHookApi();
+        const online = async () => {
+            expect.step("live call");
+            return true;
+        };
+        const markDone = { model: "mail.activity", method: "action_archive", args: [[1]] };
+        const onlineError = "runOrQueue: `online` must be a function performing the live call";
+        const methodError = (method) =>
+            `runOrQueue: only web_save and action_archive can be queued, got "${method}"`;
+        const rename = { model: "crm.lead", method: "write", args: [[1], { name: "Renamed" }] };
+        const invalidCalls = [
+            [{ queue: markDone }, onlineError],
+            [{ online: Promise.resolve(true), queue: markDone }, onlineError],
+            [{ online, queue: { ...markDone, method: "action_done" } }, methodError("action_done")],
+            [{ online, queue: rename }, methodError("write")],
+            [{ online, queue: { ...markDone, model: undefined } }, methodError("action_archive")],
+            [{ online }, methodError("undefined")],
+        ];
+        const expectEveryInvalidCallRejected = async () => {
+            for (const [params, message] of invalidCalls) {
+                const error = await crmOffline.runOrQueue(params).catch((error) => error);
+                expect(error).toBeInstanceOf(Error);
+                expect(error.message).toBe(message);
+            }
+            expect.verifySteps([]);
+            expect(queuedEntries()).toHaveLength(0);
+        };
+
+        // Online, no live call is made; offline, nothing is queued and nothing is requested.
+        await expectEveryInvalidCallRejected();
+        await setOffline(true);
+        await expectEveryInvalidCallRejected();
+
+        // The same API queues a valid call offline, the omitted kwargs and extras defaulted.
+        const result = await crmOffline.runOrQueue({ online, queue: markDone });
+        expect(result.queued).toBe(true);
+        expect(queuedEntries()).toHaveLength(1);
+        const [entry] = queuedEntries();
+        expect(entry.key).toBe(result.key);
+        expect(copyOrmCall(entry.value)).toEqual({ ...markDone, kwargs: {} });
+        expect(entry.value.extras.displayName).toBe("");
+        expect(entry.value.extras.changes).toEqual({});
+        expect.verifySteps([]);
+    });
+
+    test("offline, a direct call of a CRM wizard's special Cancel button still closes it, while its object button stays inert", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        const buttons = captureInstances(ViewButton);
+        listenStoreFetch("init_messaging");
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await waitStoreFetch("init_messaging");
+        // The lost wizard, opened online.
+        await getService("action").doAction({
+            type: "ir.actions.act_window",
+            res_model: "crm.lead.lost",
+            views: [[false, "form"]],
+            target: "new",
+        });
+        expect(".modal .o_form_view").toHaveCount(1);
+        const wizardButton = (matches) =>
+            buttons.find(
+                ({ props, clickParams }) =>
+                    props.record?.resModel === "crm.lead.lost" && matches(clickParams)
+            );
+        const markLost = wizardButton(({ name }) => name === "action_lost_reason_apply");
+        const cancel = wizardButton(({ special }) => special === "cancel");
+        expect(markLost.clickParams.type).toBe("object");
+        expect(cancel.clickParams.type).toBe(undefined);
+
+        await setOffline(true);
+        await markLost.onClick();
+        await animationFrame();
+        expect(".modal .o_form_view").toHaveCount(1);
+        // Cancel calls no server method: the CRM guard leaves it to the framework, which discards
+        // the new wizard record and closes the dialog without a request.
+        await cancel.onClick();
+        await animationFrame();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    test("pendingLeadCreates places a queued lead create without stage_id in the stage of its context default_stage_id", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const crmOffline = await mountHookApi();
+
+        await setOffline(true);
+        const offline = getService(OfflinePlugin);
+        const scheduleLeadSave = (ids, values, context, timeStamp) =>
+            offline.scheduleORM(
+                "crm.lead",
+                "web_save",
+                [ids, values],
+                { context, specification: {} },
+                {
+                    extras: {
+                        actionId: undefined,
+                        actionName: undefined,
+                        viewType: "kanban",
+                        timeStamp,
+                        displayName: values.name,
+                        changes: values,
+                    },
+                }
+            );
+        // A create whose values carry no stage: the server takes it from the context's
+        // `default_stage_id`, as for a lead created in a stage column.
+        const qualifiedColumn = { default_stage_id: 2 };
+        const contextKey = scheduleLeadSave([], { name: "Context lead" }, qualifiedColumn, 1);
+        // A create whose values name a stage: the values win over the context default.
+        const valuesKey = scheduleLeadSave(
+            [],
+            { name: "Values lead", stage_id: 1 },
+            qualifiedColumn,
+            2
+        );
+        // A write of an existing lead in the same context, and a create with no stage at all.
+        scheduleLeadSave([1], { name: "Lead 1 renamed" }, qualifiedColumn, 3);
+        scheduleLeadSave([], { name: "Stageless lead" }, {}, 4);
+        expect(queuedEntries()).toHaveLength(4);
+
+        const keysOf = (entries) => entries.map(({ key }) => key);
+        expect(keysOf(crmOffline.pendingLeadCreates(2))).toEqual([contextKey]);
+        expect(keysOf(crmOffline.pendingLeadCreates(1))).toEqual([valuesKey]);
+        expect(crmOffline.pendingLeadCreates(3)).toEqual([]);
+        // The entry as stored, from the live queue and from a copy of it (sync-window entries).
+        const [contextEntry] = crmOffline.pendingLeadCreates(2);
+        expect(contextEntry).toBe(queuedEntries().find(({ key }) => key === contextKey));
+        expect(crmOffline.pendingLeadCreates(2, [...queuedEntries()].reverse())).toEqual([
+            contextEntry,
+        ]);
+    });
+
+    test("targetsCrmLead falls back to the context's default_res_model, then default_model, when the mail form's own target field is empty", async () => {
+        // Records as the predicate reads them: `resModel`, `data` and `context`.
+        const mailForm = (resModel, data, context) => ({ resModel, data, context });
+        // The target field is empty or not loaded: the dialog's context names the lead.
+        const toLead = { default_res_model: "crm.lead" };
+        expect(targetsCrmLead(mailForm("mail.activity", { res_model: false }, toLead))).toBe(true);
+        expect(targetsCrmLead(mailForm("mail.activity.schedule", {}, toLead))).toBe(true);
+        const composerToLead = { default_model: "crm.lead" };
+        const emptyComposer = mailForm("mail.compose.message", { model: "" }, composerToLead);
+        expect(targetsCrmLead(emptyComposer)).toBe(true);
+        // The form's own target field comes first, then `default_res_model`, then `default_model`.
+        expect(
+            targetsCrmLead(mailForm("mail.followers.edit", { res_model: "res.partner" }, toLead))
+        ).toBe(false);
+        const partnerFirst = { default_res_model: "res.partner", default_model: "crm.lead" };
+        expect(targetsCrmLead(mailForm("mail.compose.message", {}, partnerFirst))).toBe(false);
+        // No target anywhere, another target, another model, no model or no record.
+        expect(targetsCrmLead(mailForm("mail.activity", { res_model: false }, {}))).toBe(false);
+        expect(
+            targetsCrmLead(mailForm("mail.compose.message", {}, { default_model: "res.partner" }))
+        ).toBe(false);
+        expect(targetsCrmLead(mailForm("res.partner", {}, toLead))).toBe(false);
+        expect(targetsCrmLead(mailForm(undefined, {}, toLead))).toBe(false);
+        expect(targetsCrmLead(undefined)).toBe(false);
+
+        // Framework records of the followers wizard and of the composer opened from a lead, whose
+        // forms leave the target field out: offline, their save is refused and nothing is queued.
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        const forms = captureInstances(FormController);
+        listenStoreFetch("init_messaging");
+        await mountView({
+            type: "form",
+            resModel: "mail.followers.edit",
+            arch: /* xml */ `<form><field name="res_ids"/></form>`,
+            context: toLead,
+        });
+        await mountView({
+            type: "form",
+            resModel: "mail.compose.message",
+            arch: /* xml */ `<form><field name="subject"/></form>`,
+            context: composerToLead,
+        });
+        await waitStoreFetch("init_messaging");
+        const [followers, composer] = forms.map(({ model }) => model.root);
+        expect([followers.resModel, composer.resModel]).toEqual([
+            "mail.followers.edit",
+            "mail.compose.message",
+        ]);
+        expect("res_model" in followers.data).toBe(false);
+        expect("model" in composer.data).toBe(false);
+        expect(targetsCrmLead(followers)).toBe(true);
+        expect(targetsCrmLead(composer)).toBe(true);
+
+        await setOffline(true);
+        expect(await followers.save()).toBe(false);
+        expect(await composer.save()).toBe(false);
+        expect.verifySteps([
+            "offline:mail.followers.edit/web_save",
+            "offline:mail.compose.message/web_save",
+        ]);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    /**
+     * Queues, as the framework queues a kanban record save, a move of Lead 1 (in New) to a stage,
+     * under the given queue key (the `id` option of `scheduleORM`) and timestamp.
+     *
+     * @param {string | number} key
+     * @param {number} stageId
+     * @param {string} stageName
+     * @param {number} timeStamp
+     * @returns {string | number} the queue key
+     */
+    function scheduleLead1StageWrite(key, stageId, stageName, timeStamp) {
+        return getService(OfflinePlugin).scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[1], { stage_id: stageId }],
+            { context: {}, specification: {} },
+            {
+                id: key,
+                extras: {
+                    actionId: undefined,
+                    actionName: undefined,
+                    viewType: "kanban",
+                    timeStamp,
+                    displayName: "Lead 1",
+                    changes: { stage_id: { id: stageId, display_name: stageName } },
+                    originalValues: { stage_id: { id: 1, display_name: "New" } },
+                },
+            }
+        );
+    }
+
+    /**
+     * Asserts that `latestStageWrite` returns the stored entry of `key`, a move of Lead 1 to
+     * `stageId`, whichever way it reads the queue: the live queue and a reversed copy of it, both
+     * scanned, and frozen copies in both orders, indexed. The answer depends on neither the array
+     * order nor the reader's path.
+     *
+     * @param {ReturnType<typeof useCrmOffline>} crmOffline
+     * @param {string | number} key
+     * @param {number} stageId
+     */
+    function expectLead1LatestStageWrite(crmOffline, key, stageId) {
+        const entries = queuedEntries();
+        const stored = entries.find((entry) => entry.key === key);
+        expect(stored.value.args).toEqual([[1], { stage_id: stageId }]);
+        const reversed = [...entries].reverse();
+        expect(crmOffline.latestStageWrite(1)).toBe(stored);
+        expect(crmOffline.latestStageWrite(1, reversed)).toBe(stored);
+        expect(crmOffline.latestStageWrite(1, Object.freeze([...entries]))).toBe(stored);
+        expect(crmOffline.latestStageWrite(1, Object.freeze([...reversed]))).toBe(stored);
+    }
+
+    test("latestStageWrite ranks tied stage writes under array-index keys in ascending numeric order, number and string keys alike", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const crmOffline = await mountHookApi();
+
+        // Offline, two moves of Lead 1 share their timestamp, under keys that are array indices:
+        // the string "10", queued first, then the number 9. The queue, like the one the replay
+        // rebuilds, enumerates such keys first, in ascending numeric order, so 9 replays before
+        // "10" and the server keeps Won: neither the later insertion (9) nor string order ("9"
+        // after "10") decides.
+        await setOffline(true);
+        const timeStamp = Date.now();
+        expect(scheduleLead1StageWrite("10", 3, "Won", timeStamp)).toBe("10");
+        expect(scheduleLead1StageWrite(9, 2, "Qualified", timeStamp)).toBe(9);
+        expect(queuedEntries().map(({ key }) => key)).toEqual([9, "10"]);
+        expectLead1LatestStageWrite(crmOffline, "10", 3);
+    });
+
+    test("latestStageWrite ranks a tied stage write under a number key that is not an array index before one under a string key", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const crmOffline = await mountHookApi();
+
+        // Offline, two moves of Lead 1 share their timestamp, under keys that are not array
+        // indices: a hash-shaped string, queued first, then the number 2 ** 32 - 1, one past the
+        // greatest array index. The queue enumerates them in insertion order, but the replay
+        // rebuilds it from IndexedDB, which returns number keys before string keys: the string
+        // replays last and the server keeps Won, although the number was queued later and its
+        // digits sort after the string.
+        await setOffline(true);
+        const timeStamp = Date.now();
+        const numberKey = 2 ** 32 - 1;
+        expect(scheduleLead1StageWrite("0abcdef0", 3, "Won", timeStamp)).toBe("0abcdef0");
+        expect(scheduleLead1StageWrite(numberKey, 2, "Qualified", timeStamp)).toBe(numberKey);
+        expect(queuedEntries().map(({ key }) => key)).toEqual(["0abcdef0", numberKey]);
+        expectLead1LatestStageWrite(crmOffline, "0abcdef0", 3);
+    });
+
+    test("latestStageWrite ranks tied stage writes under number keys that are not array indices in ascending numeric order", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const crmOffline = await mountHookApi();
+
+        // Offline, two moves of Lead 1 share their timestamp, under negative number keys, which
+        // are not array indices: -1, queued first, then -2. IndexedDB returns number keys in
+        // ascending order, so the replay applies -2 before -1 and the server keeps Won: neither
+        // the later insertion (-2) nor string order ("-2" after "-1") decides.
+        await setOffline(true);
+        const timeStamp = Date.now();
+        expect(scheduleLead1StageWrite(-1, 3, "Won", timeStamp)).toBe(-1);
+        expect(scheduleLead1StageWrite(-2, 2, "Qualified", timeStamp)).toBe(-2);
+        expect(queuedEntries().map(({ key }) => key)).toEqual([-1, -2]);
+        expectLead1LatestStageWrite(crmOffline, -1, 3);
+    });
+
+    test("the stage index of a frozen entries array skips a queued lead save without ids and still indexes the entries after it, as a scan does", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const crmOffline = await mountHookApi();
+
+        // Offline, the queue holds, in this order: a lead save stored without its arguments, the
+        // latest of all, which has no ids and so neither writes a lead nor creates one; a move of
+        // Lead 1 to Qualified; and a lead create in Qualified.
+        await setOffline(true);
+        const offline = getService(OfflinePlugin);
+        const timeStamp = Date.now();
+        const kanbanSaveExtras = (displayName, changes, at) => ({
+            actionId: undefined,
+            actionName: undefined,
+            viewType: "kanban",
+            timeStamp: at,
+            displayName,
+            changes,
+        });
+        const argumentlessKey = offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            undefined,
+            { context: {}, specification: {} },
+            {
+                id: "a0000001",
+                extras: kanbanSaveExtras(
+                    "Lead 1",
+                    { stage_id: { id: 3, display_name: "Won" } },
+                    timeStamp + 1
+                ),
+            }
+        );
+        const stageKey = scheduleLead1StageWrite("b0000002", 2, "Qualified", timeStamp);
+        const createKey = offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Offline lead", stage_id: 2 }],
+            { context: {}, specification: {} },
+            {
+                id: "c0000003",
+                extras: kanbanSaveExtras(
+                    "Offline lead",
+                    { name: "Offline lead", stage_id: { id: 2, display_name: "Qualified" } },
+                    timeStamp
+                ),
+            }
+        );
+        const entries = queuedEntries();
+        expect(entries.map(({ key }) => key)).toEqual([argumentlessKey, stageKey, createKey]);
+        const [argumentless, stageWrite, leadCreate] = entries;
+        expect(argumentless.value.args).toBe(undefined);
+
+        // The frozen array is indexed in one traversal that skips the save without ids and goes on
+        // with the entries after it. Every answer is the one a scan of the live queue gives: the
+        // move stays Lead 1's latest stage write, the create is the only one in Qualified, and the
+        // skipped save is placed nowhere, not even as a create without a stage.
+        const frozen = Object.freeze([...entries]);
+        for (const list of [frozen, queuedEntries()]) {
+            expect(crmOffline.latestStageWrite(1, list)).toBe(stageWrite);
+            const qualifiedCreates = crmOffline.pendingLeadCreates(2, list);
+            expect(qualifiedCreates).toHaveLength(1);
+            expect(qualifiedCreates[0]).toBe(leadCreate);
+            expect(crmOffline.pendingLeadCreates(3, list)).toEqual([]);
+            expect(crmOffline.pendingLeadCreates(undefined, list)).toEqual([]);
+        }
     });
 });
 

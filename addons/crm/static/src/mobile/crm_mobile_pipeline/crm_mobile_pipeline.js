@@ -48,10 +48,11 @@ import {
     signal,
     status,
     untrack,
-    useOnChange,
+    useEffect,
+    useListener,
 } from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
-import { ConnectionLostError } from "@web/core/network/rpc";
+import { ConnectionLostError, rpcBus } from "@web/core/network/rpc";
 import { usePopover } from "@web/core/popover/popover_hook";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
@@ -219,9 +220,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             /** Cached creatable activity types, `null` until read (or when not cached). */
             activityTypes: null,
             /**
-             * Queue entries as they were when the current sync window began, `null` outside a
-             * sync window. While set, a write replayed during the sync keeps its placement until
-             * the reconciliation reload that incorporates it has landed.
+             * Queue entries as they were when the current sync window began (or when the
+             * pipeline entered it), less those discarded from the systray since; `null` outside
+             * a sync window and outside the stage pipeline. While set, a write replayed during
+             * the sync keeps its placement until the reconciliation reload that incorporates it
+             * has landed.
              */
             syncEntries: null,
             /**
@@ -258,6 +261,25 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
          */
         this._pendingCreatesBaseline = null;
         /**
+         * Bumped by every sync window that may replay writes the loaded data do not include, so a
+         * reconciliation reload issued before that window never ends it (see `_reconcile`).
+         */
+        this.syncGeneration = 0;
+        /** The reconciliation reload in flight, `{ generation }`, `null` when none is. */
+        this.reconciliation = null;
+        /**
+         * The lead each replayed `crm.lead` create of the sync-window copy created, as the
+         * framework's replay answer gave it: queue key → lead id. Kept while the copy holds the
+         * entry and emptied with the copy (see `_setupSyncWindowDiscards`); read only by
+         * `_computeStageProjection`, for the pending creates of each stage. Not reactive and
+         * never persisted: it is written just before the entry leaves the queue, and every change
+         * that makes it matter (the entry leaving the queue, a load bringing the lead) is one the
+         * stage projection follows.
+         *
+         * @type {Map<string, number>}
+         */
+        this.replayedCreateIds = new Map();
+        /**
          * Placement of every loaded record and summary of every stage, derived in one pass (see
          * `_computeStageProjection`). Lazy: derived on the first read after a change of the
          * framework state it reads, then shared by every reader until the next change; never
@@ -290,7 +312,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this.helperFocus = null;
 
         this._setupActivityRevalidation();
+        this._setupActivityPruning();
         this._setupSyncReconciliation();
+        this._setupSyncWindowDiscards();
         this._setupHelperFocus();
         // After the helper focus: on a patch both handle, the helper's focus move comes first.
         this._setupNavFocus();
@@ -340,9 +364,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /**
      * Queue entries the placement and the totals are derived from: the live framework queue, plus,
      * during a sync window (and until its reconciliation reload has landed), the entries the window
-     * began with that have left the queue since (replayed writes the loaded data does not include
-     * yet). Entries are the framework's `{key, value}` objects, never copied into another shape and
-     * never mutated; a live entry wins over a snapshot entry of the same key.
+     * began with that have left the queue since by replay (replayed writes the loaded data does not
+     * include yet). An entry discarded from the systray leaves the copy as well (see
+     * `_setupSyncWindowDiscards`), so it stops placing its card at once. Entries are the
+     * framework's `{key, value}` objects, never copied into another shape and never mutated; a live
+     * entry wins over a snapshot entry of the same key.
      *
      * Union rather than replacement: an entry queued while the snapshot is held (the connection
      * dropped again during the sync, for instance) is placed at once as well.
@@ -410,8 +436,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     // reload rebuilds the groups and records from server or cache data that predate the queued
     // writes, so stored corrections would go stale, while derived ones survive a form → back, an
     // offline reload and a reconciliation that leaves a parked write. A parked entry
-    // (`extras.error`) stays in the queue and keeps its placement; a systray discard removes the
-    // entry and ends it.
+    // (`extras.error`) stays in the queue and keeps its placement. A systray discard removes the
+    // entry, which ends at once the placement the queue derives (a queued stage write, a pending
+    // create and their share of the totals), during a held sync window too. A move the framework
+    // already applied in memory on this record instance is placed by its framework group, not by
+    // the queue: it keeps its placement until the reload that runs on every reconnection.
 
     /**
      * The stage a loaded record is displayed in.
@@ -542,11 +571,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             }
         }
 
+        const isShownPending = this._pendingCreateFilter();
         /** @type {Map<string, StageSummary>} */
         const byGroupId = new Map();
         for (const group of groups) {
             const { own, placed, removed, adjustments } = tallies.get(group.id);
-            const pendingCreates = this.crmOffline.pendingLeadCreates(group.serverValue, entries);
+            let pendingCreates = this.crmOffline.pendingLeadCreates(group.serverValue, entries);
+            if (isShownPending) {
+                pendingCreates = pendingCreates.filter(isShownPending);
+            }
             if (sumFieldName !== null) {
                 for (const entry of pendingCreates) {
                     adjustments.push(Number(entry.value.args?.[1]?.[sumFieldName]) || 0);
@@ -563,6 +596,37 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             });
         }
         return { placement, groupsByValue, byGroupId };
+    }
+
+    /**
+     * Which queued creates the projection presents as pending cards.
+     *
+     * A create replayed during a sync window keeps its pending card from the window's copy until
+     * the reconciliation reload, unless a load already holds the lead it created: a load that
+     * lands inside the window (the fresh answer of a remounted pipeline's cache-first load, a
+     * filter change, a regroup back to stages, `list.load()`) reads data that include the lead,
+     * so its server card shows it and the loaded aggregates count it. Such a held entry is left
+     * out, and with it out of the count and the revenue, so the lead is presented once. Its id
+     * is the one the framework's own replay answer gave (`replayedCreateIds`, recorded by
+     * `_setupSyncWindowDiscards`). This is not id remapping: no queued call is rewritten and
+     * nothing is persisted; the answer only tells the window's copy that its create is now a
+     * loaded server record. An entry still in the live queue is always pending.
+     *
+     * @private
+     * @returns {((entry: QueueEntry) => boolean) | null} the filter, `null` when no created id is
+     *   recorded (as outside every sync window): every queued create is then pending
+     */
+    _pendingCreateFilter() {
+        if (!this.replayedCreateIds.size) {
+            return null;
+        }
+        const loadedIds = new Set(this.allLoadedRecords().map((record) => record.resId));
+        const liveKeys = new Set(this.crmOffline.queuedEntries().map((entry) => String(entry.key)));
+        return (entry) => {
+            const key = String(entry.key);
+            const createdId = this.replayedCreateIds.get(key);
+            return liveKeys.has(key) || createdId === undefined || !loadedIds.has(createdId);
+        };
     }
 
     /**
@@ -636,7 +700,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Queued `crm.lead` creates targeting a stage (rendered as pending cards, keyed by queue key).
-     * Read from the stage projection (shared array, must not be mutated).
+     * Read from the stage projection (shared array, must not be mutated). A replayed create a load
+     * already holds as a server record is not among them (see `_pendingCreateFilter`).
      *
      * @param {Group} group
      * @returns {QueueEntry[]}
@@ -822,19 +887,22 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /**
      * Activity and activity-type revalidation.
      *
-     * Dependencies: the gate; the displayed stage's list datapoint, a new object after every root
-     * load, model replacement, filter change or reconciliation reload; the ids of the persisted
-     * leads the displayed stage shows (stage navigation, Load more, queued moves); and the offline
-     * signal. On each change, while the gate holds, every displayed lead's activities and the
-     * activity types are read again through the framework disk cache: online that refreshes the
-     * cache, and a changed server answer is delivered through the cache callback; offline the
-     * cache answers. The per-lead request is the same on every trigger (the loader's bounded
-     * default, or the expansion an online "Show all" chose for that lead), so a lead's activities
-     * read online come back offline whichever stage, filter or page displayed it, and the types
-     * are read again on reconnect, so a cold offline cache miss clears without a manual reload.
-     * Each read carries the lead's total count, so a truncated page is shown as such. The
-     * connection dropping alone triggers no read (what is in memory is what the cache would
-     * answer).
+     * One effect with four dependencies, compared with those of its previous run: the gate; the
+     * displayed stage's list datapoint, a new object after every root load, model replacement,
+     * filter change or reconciliation reload; the ids of the persisted leads the displayed stage
+     * shows (stage navigation, Load more, queued moves); and the offline signal. On each change,
+     * while the gate holds, every displayed lead's activities and the activity types are read
+     * again through the framework disk cache: online that refreshes the cache, and a changed
+     * server answer is delivered through the cache callback; offline the cache answers. The
+     * per-lead request is the same on every trigger (the loader's bounded default, or the
+     * expansion an online "Show all" chose for that lead), so a lead's activities read online
+     * come back offline whichever stage, filter or page displayed it, and the types are read
+     * again on reconnect, so a cold offline cache miss clears without a manual reload. Each read
+     * carries the lead's total count, so a truncated page is shown as such. The connection
+     * dropping alone triggers no read (what is in memory is what the cache would answer), and
+     * sample records, whose ids are fake, are never read for.
+     *
+     * The activities kept in memory are limited to the loaded leads by `_setupActivityPruning`.
      *
      * Outside the gate the dependencies are constants (plus the offline signal) and nothing is
      * read, so desktop issues no extra RPC.
@@ -842,43 +910,39 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * @private
      */
     _setupActivityRevalidation() {
-        let previousDependencies = null;
-        useOnChange(
-            () => {
-                const gated = this.isMobilePipeline;
-                const group = gated ? this.currentGroup : null;
-                const usesSampleData = gated && Boolean(this.props.list.model.useSampleModel);
-                const leadIds =
-                    gated && !usesSampleData
-                        ? this.cardsFor(group)
-                              .filter((record) => record.resId)
-                              .map((record) => record.resId)
-                              .join(",")
-                        : "";
-                return [
-                    gated,
-                    usesSampleData,
-                    group?.list ?? null,
-                    leadIds,
-                    this.crmOffline.isOffline(),
-                ];
-            },
-            (...dependencies) => {
-                const [gated, usesSampleData, , leadIds, offline] = dependencies;
-                const previous = previousDependencies;
-                previousDependencies = dependencies;
+        let previous = null;
+        useEffect(() => {
+            const gated = this.isMobilePipeline;
+            const group = gated ? this.currentGroup : null;
+            const leadIds = gated
+                ? this.cardsFor(group)
+                      .filter((record) => record.resId)
+                      .map((record) => record.resId)
+                      .join(",")
+                : "";
+            const dependencies = [gated, group?.list ?? null, leadIds, this.crmOffline.isOffline()];
+            const last = previous;
+            if (last && dependencies.every((value, index) => Object.is(value, last[index]))) {
+                return;
+            }
+            previous = dependencies;
+            untrack(() => {
+                const offline = dependencies[3];
+                if (!gated) {
+                    return;
+                }
                 // Sample records carry fake ids: nothing is read for them.
-                if (!gated || usesSampleData) {
+                if (this.props.list.model.useSampleModel) {
                     return;
                 }
                 // The connection dropping, with nothing else changed, is not a revalidation
                 // trigger: the activities and types in memory are those the cache would answer,
                 // and the reads would only fail in the background.
                 const onlyWentOffline =
-                    previous &&
+                    last &&
                     offline &&
-                    !previous[4] &&
-                    previous.slice(0, 4).every((value, index) => value === dependencies[index]);
+                    !last[3] &&
+                    last.slice(0, 3).every((value, index) => value === dependencies[index]);
                 if (onlyWentOffline) {
                     return;
                 }
@@ -886,74 +950,327 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                     this._loadLeadActivities(resId);
                 }
                 this._loadActivityTypes();
+            });
+        });
+    }
+
+    /**
+     * Activities kept in memory follow the loaded leads.
+     *
+     * One effect, while the gate holds, follows the ids of every record a group of the pipeline
+     * holds (`allLoadedRecords`, folded groups included) and compares them with its previous run.
+     * When they change, the activities of the leads no group holds any more are forgotten
+     * (`_pruneActivities`). That covers a new list datapoint (root load, model replacement,
+     * filter change, reconciliation reload) and an in-place reload of a group's records (its
+     * list reloaded, Load more), which replaces the records but keeps the datapoint. A lead
+     * loaded again later gets its activities back from the disk cache, and a late answer for a
+     * lead no group holds is dropped (`_applyActivities`).
+     *
+     * Outside the gate it reads no record, so desktop does no work.
+     *
+     * @private
+     */
+    _setupActivityPruning() {
+        // ids of the loaded records at the previous run, `null` outside the gate
+        let previousIds = null;
+        useEffect(() => {
+            if (!this.isMobilePipeline) {
+                previousIds = null;
+                return;
             }
-        );
+            const ids = this.allLoadedRecords()
+                .map((record) => record.resId)
+                .join(",");
+            if (ids === previousIds) {
+                return;
+            }
+            previousIds = ids;
+            untrack(() => this._pruneActivities());
+        });
+    }
+
+    /**
+     * Forgets the activities, and their total counts, of the leads no group of the pipeline holds
+     * any more. The limit an online "Show all" chose for a lead (`activityLimitsByLead`) is kept,
+     * so a lead loaded again reissues the same expanded request, which the cache answers offline.
+     *
+     * @private
+     */
+    _pruneActivities() {
+        const loadedIds = new Set(this.allLoadedRecords().map((record) => record.resId));
+        const { activitiesByLead, activityTotalsByLead } = this.mobileState;
+        for (const byLead of [activitiesByLead, activityTotalsByLead]) {
+            for (const resId of Object.keys(byLead)) {
+                if (!loadedIds.has(Number(resId))) {
+                    delete byLead[resId];
+                }
+            }
+        }
     }
 
     /**
      * Post-sync reconciliation.
      *
      * Going online first clears the offline signal, then the framework replays the queue inside a
-     * sync window (`syncingORM`). When the window begins, the queue entries are copied
-     * (`syncEntries`), so a write replayed during the sync keeps its presentation. When the
-     * connection has returned and no sync is running, the pipeline reloads through the framework
-     * model, then drops the copy: created leads and activities appear as server records, and only
-     * the entries still in the queue (parked with `extras.error`) keep their pending presentation.
+     * sync window (`syncingORM`). One effect follows the gate, the offline signal and the sync
+     * signal, and compares them with its previous run. While the gate holds:
      *
-     * The reload runs immediately after reconnecting when nothing is queued, otherwise when the
-     * sync window ends; a window that replayed nothing (empty, or parked entries only) reloads only
-     * if the reconnection has not been reloaded for yet, so one reconnection reloads once. No id
-     * is remapped and nothing is persisted: the copy lives for one sync window, and the reload is
-     * the framework model's own.
+     * - When a window begins, or when the pipeline is mounted or enters the gate while one runs,
+     *   the queue entries are copied (`syncEntries`), so a write replayed during the sync keeps
+     *   its presentation. Entered inside a running window, the pipeline may have been loaded
+     *   before some of its writes were replayed, so it owes a reload even with nothing to copy.
+     * - When the connection has returned and no sync is running, the pipeline reloads through the
+     *   framework model, then drops the copy (`_reconcile`): created leads and activities appear
+     *   as server records, and only the entries still in the queue (parked with `extras.error`)
+     *   keep their pending presentation. The reload runs immediately after reconnecting when
+     *   nothing is queued, otherwise when the sync window ends; a window that replayed nothing
+     *   (empty, or parked entries only) reloads only if a reload is still owed, and a reload
+     *   already in flight that no later window outdates ends the window itself, so one
+     *   reconnection reloads once.
+     * - A window that ends because the connection dropped again keeps the copy, and the next
+     *   window starts from it.
+     *
+     * Outside the gate the queue is never read and no copy is taken; every window that begins
+     * there outdates the reloads in flight. Leaving the gate releases the copy; the reload owed
+     * then (a copy was held or a sync was running), after a reconnection or after a window that
+     * ends outside the gate, runs as soon as the gate holds again online with no sync running.
+     * Going offline drops an owed reload: the next reconnection owes its own.
+     *
+     * No id is remapped and nothing is persisted: the copy is an in-memory list of framework
+     * entries, and the reload is the framework model's own.
      *
      * @private
      */
     _setupSyncReconciliation() {
-        let wasOffline = this.crmOffline.isOffline();
-        let wasSyncing = this.crmOffline.syncingORM();
-        // whether the connection came back and the pipeline has not been reloaded since
+        let wasGated = false;
+        let wasOffline = untrack(() => this.crmOffline.isOffline());
+        let wasSyncing = false;
+        // whether the pipeline owes a reload: the connection came back, or its data may predate
+        // replayed writes, and it has not been reloaded since
         let reloadPending = false;
-        useOnChange(
-            () => [this.crmOffline.isOffline(), this.crmOffline.syncingORM()],
-            (offline, syncing) => {
-                const previousOffline = wasOffline;
-                const previousSyncing = wasSyncing;
-                wasOffline = offline;
-                wasSyncing = syncing;
-
+        useEffect(() => {
+            const gated = this.isMobilePipeline;
+            const offline = this.crmOffline.isOffline();
+            const syncing = this.crmOffline.syncingORM();
+            if (gated === wasGated && offline === wasOffline && syncing === wasSyncing) {
+                return;
+            }
+            const previousGated = wasGated;
+            const previousOffline = wasOffline;
+            const previousSyncing = wasSyncing;
+            wasGated = gated;
+            wasOffline = offline;
+            wasSyncing = syncing;
+            untrack(() => {
+                const reconnected = !offline && previousOffline;
+                // a window that ends while connected (a window the connection loss interrupts
+                // ends offline)
+                const windowEnded = !offline && !syncing && previousSyncing && !previousOffline;
                 if (offline && !previousOffline) {
                     reloadPending = false;
                 }
-                if (syncing && !previousSyncing) {
-                    this._takeSyncSnapshot();
+                if (!gated) {
+                    if (syncing && !previousSyncing) {
+                        // what the window replays is not known without reading the queue
+                        this.syncGeneration++;
+                    }
+                    if (previousGated) {
+                        if (this.mobileState.syncEntries || syncing) {
+                            reloadPending = true;
+                        }
+                        this.mobileState.syncEntries = null;
+                        this.mobileState.unavailableLeadId = null;
+                    }
+                    if (reconnected || windowEnded) {
+                        reloadPending = true;
+                    }
+                    return;
                 }
-                if (!offline && previousOffline) {
+                // ends the window, unless the reload in flight does: no window outdated it
+                const reconcile = () => {
+                    reloadPending = false;
+                    if (this.reconciliation?.generation !== this.syncGeneration) {
+                        this._reconcile();
+                    }
+                };
+                if (syncing && (!previousSyncing || !previousGated)) {
+                    this._takeSyncSnapshot();
+                    if (!previousGated) {
+                        reloadPending = true;
+                    }
+                }
+                if (reconnected) {
                     this.mobileState.unavailableLeadId = null;
                     reloadPending = true;
                     if (!syncing && this.crmOffline.queuedEntries().length === 0) {
+                        // the data shown offline may come from the disk cache: always reloaded
                         reloadPending = false;
                         this._reconcile();
                     }
-                }
-                if (!offline && !syncing && previousSyncing) {
+                } else if (windowEnded) {
                     const replayed = (this.mobileState.syncEntries ?? []).some(
                         (entry) => !entry.value?.extras?.error
                     );
                     if (replayed || reloadPending) {
-                        reloadPending = false;
-                        this._reconcile();
+                        reconcile();
                     } else {
                         this.mobileState.syncEntries = null;
                     }
+                } else if (!previousGated && !offline && !syncing && reloadPending) {
+                    reconcile();
                 }
-            }
-        );
+            });
+        });
     }
 
     /**
-     * Copies the queue entries a sync window begins with, united with the entries of an earlier
-     * window whose reconciliation did not land (the connection dropped again), deduplicated by
-     * key, the live entry winning. The entries themselves are the framework's, never mutated.
+     * Systray discards while a sync-window copy is held.
+     *
+     * The copy keeps placing an entry that has left the queue until the reconciliation reload:
+     * right for a replayed write, wrong for a discarded one, which stops placing its card and
+     * counting in the totals at once. They are told apart by the replay itself, not by timing.
+     * The framework replays an entry through a silent ORM call carrying the entry's model, method
+     * and very `args` object, and deletes the entry only once that call has succeeded; the
+     * network layer announces every answer on `rpcBus` (`RPC:RESPONSE`) before the caller
+     * resumes. So, while a copy is held and a sync runs, each successful silent call marks as
+     * replayed the entries, among the live entries last seen and the copy, of its model and
+     * method whose arguments are that same object (else, when none is, equal to it).
+     *
+     * An entry that leaves the queue stays in the copy only when it was marked replayed (the mark
+     * is then spent). Every other departure, a systray discard whenever it happens and whether or
+     * not the entry was parked (`extras.error`), is removed from the copy at once: a new list of
+     * the same framework entries, `null` once empty. Two consequences:
+     * - the framework still sends every call it listed when the window began, the call of an
+     *   entry discarded since included, so such a write can reach the server after its
+     *   presentation has ended: the reconciliation reload that ends the window then shows the
+     *   server state;
+     * - a window the pipeline enters mid-way holds only the entries still queued at entry (see
+     *   `_takeSyncSnapshot`); the reload it owes covers the writes replayed before.
+     *
+     * A replayed `crm.lead` create (`web_save` with no id) answers the records it created: the id
+     * of the first is recorded for the entry the answer marked (`replayedCreateIds`, by queue
+     * key). When entries of equal arguments match, the earliest by timestamp still without an id
+     * gets it, the order the framework replays them in. The id outlives the spent mark: it lasts
+     * while the copy holds the entry and is emptied with the copy. `_pendingCreateFilter` reads
+     * it, so a lead that a load already holds is presented once. This is not id remapping: no queued
+     * call is rewritten and nothing is persisted; the framework's own replay answer only tells the
+     * window's copy that its create is now a loaded server record.
+     *
+     * Without a copy, neither the listener nor the effect reads anything else, so desktop and
+     * every session outside a sync window do no work.
+     *
+     * @private
+     */
+    _setupSyncWindowDiscards() {
+        // live entries by key at the previous run, `null` while no copy is held
+        let seen = null;
+        // keys of the entries a successful replay call carried, not yet seen leaving the queue
+        const replayed = new Set();
+        // Registered during setup, not at mount: a pipeline set up inside a window misses no
+        // answer.
+        useListener(rpcBus, "RPC:RESPONSE", (ev) =>
+            untrack(() => {
+                const copy = this.mobileState.syncEntries;
+                if (!copy || !this.crmOffline.syncingORM()) {
+                    return;
+                }
+                const { data, settings, error, result } = ev.detail ?? {};
+                const params = data?.params;
+                if (
+                    error ||
+                    !settings?.silent ||
+                    !params?.model ||
+                    !params.method ||
+                    !Array.isArray(params.args)
+                ) {
+                    return;
+                }
+                const candidates = [...(seen?.values() ?? []), ...copy].filter(
+                    ({ value }) => value?.model === params.model && value.method === params.method
+                );
+                let matches = candidates.filter(({ value }) => value.args === params.args);
+                if (!matches.length && candidates.length) {
+                    const args = JSON.stringify(params.args);
+                    matches = candidates.filter(({ value }) => JSON.stringify(value.args) === args);
+                }
+                for (const entry of matches) {
+                    replayed.add(String(entry.key));
+                }
+                // a replayed lead create: the lead it created, for `pendingCreatesFor`
+                const createdId = Array.isArray(result) ? result[0]?.id : undefined;
+                if (
+                    !matches.length ||
+                    params.model !== "crm.lead" ||
+                    params.method !== "web_save" ||
+                    !Array.isArray(params.args[0]) ||
+                    params.args[0].length !== 0 ||
+                    !Number.isInteger(createdId)
+                ) {
+                    return;
+                }
+                const byKey = new Map(matches.map((entry) => [String(entry.key), entry]));
+                const [target] =
+                    byKey.size === 1
+                        ? byKey.values()
+                        : [...byKey.values()]
+                              .filter(({ key }) => !this.replayedCreateIds.has(String(key)))
+                              .sort(
+                                  (a, b) =>
+                                      (a.value.extras?.timeStamp ?? 0) -
+                                      (b.value.extras?.timeStamp ?? 0)
+                              );
+                if (target) {
+                    this.replayedCreateIds.set(String(target.key), createdId);
+                }
+            })
+        );
+        useEffect(() => {
+            const copy = this.mobileState.syncEntries;
+            if (!copy) {
+                seen = null;
+                replayed.clear();
+                this.replayedCreateIds.clear();
+                return;
+            }
+            const live = this.crmOffline.queuedEntries();
+            untrack(() => {
+                const previousSeen = seen;
+                seen = new Map(live.map((entry) => [String(entry.key), entry]));
+                if (!previousSeen) {
+                    return;
+                }
+                const discarded = new Set();
+                for (const key of previousSeen.keys()) {
+                    if (seen.has(key)) {
+                        continue;
+                    }
+                    if (replayed.has(key)) {
+                        replayed.delete(key);
+                    } else {
+                        discarded.add(key);
+                    }
+                }
+                if (!discarded.size) {
+                    return;
+                }
+                const remaining = copy.filter((entry) => !discarded.has(String(entry.key)));
+                if (remaining.length !== copy.length) {
+                    this.mobileState.syncEntries = remaining.length ? remaining : null;
+                }
+            });
+        });
+    }
+
+    /**
+     * Copies the queue entries a sync window begins with (or holds when the pipeline enters it),
+     * united with the entries of an earlier window whose reconciliation did not land (the
+     * connection dropped again), deduplicated by key, the live entry winning; `null` when that
+     * leaves nothing. The entries themselves are the framework's, never mutated.
+     *
+     * Every window takes the copy. Only a window with a write to replay (a live entry not parked)
+     * starts a new generation (`syncGeneration`): a reload issued before it no longer ends the
+     * window. A window with nothing to replay keeps the generation, so a reload already in flight
+     * still ends it, and one reconnection reloads once.
      *
      * @private
      */
@@ -961,32 +1278,73 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         const live = this.crmOffline.queuedEntries();
         const previous = this.mobileState.syncEntries ?? [];
         const liveKeys = new Set(live.map((entry) => String(entry.key)));
-        const snapshot = [...live, ...previous.filter((entry) => !liveKeys.has(String(entry.key)))];
-        this.mobileState.syncEntries = snapshot.length ? snapshot : null;
+        const entries = [...live, ...previous.filter((entry) => !liveKeys.has(String(entry.key)))];
+        this.mobileState.syncEntries = entries.length ? entries : null;
+        if (live.some((entry) => !entry.value?.extras?.error)) {
+            this.syncGeneration++;
+        }
     }
 
     /**
-     * Reloads the pipeline through the framework model after a sync, then ends the sync window.
-     * A reload that loses the connection keeps the copy, so the next window starts from it. Only
-     * in the stage pipeline: elsewhere nothing is reloaded and the copy is dropped.
+     * Reloads the pipeline through the framework model after a sync, then ends the sync window by
+     * dropping the copy. Only in the stage pipeline: outside it nothing is reloaded and the copy is
+     * left to the reconciliation effect, which owes the reload until the gate holds again. Sample
+     * data has nothing to reconcile.
+     *
+     * The copy is kept when the reload does not reconcile it:
+     * - the reload lost the connection, or the connection dropped while it ran (the disk cache may
+     *   then have answered it): the next window starts from the copy;
+     * - a window with a write to replay began while the reload ran (it started a new generation,
+     *   `syncGeneration`): the reload predates those writes, and that window's end reconciles it;
+     * - the gate no longer holds once the reload has landed.
+     * Every window takes the copy, but only a window with a write to replay starts a new
+     * generation: one running with the generation unchanged replays nothing the reload lacks, so
+     * it does not keep the copy.
+     *
+     * A root the view replaced while the reload ran (a new search, for instance) is reconciled in
+     * turn. Reloads never overlap: the framework model's mutex serializes list loads. While one is
+     * in flight, `reconciliation` holds its generation, so a window it still covers issues no
+     * second reload.
      *
      * @private
      * @returns {Promise<void>}
      */
     async _reconcile() {
-        if (!this.isMobilePipeline || this.props.list.model.useSampleModel) {
+        const list = this.props.list;
+        if (list.model.useSampleModel) {
             this.mobileState.syncEntries = null;
             return;
         }
+        if (!this.isMobilePipeline) {
+            return;
+        }
+        const generation = this.syncGeneration;
+        const reconciliation = { generation };
+        this.reconciliation = reconciliation;
         try {
-            await this.props.list.load();
-            if (status(this) !== "destroyed") {
-                this.mobileState.syncEntries = null;
-            }
+            await list.load();
         } catch (error) {
-            if (!(error instanceof ConnectionLostError)) {
-                throw error;
+            if (error instanceof ConnectionLostError) {
+                return;
             }
+            throw error;
+        } finally {
+            if (this.reconciliation === reconciliation) {
+                this.reconciliation = null;
+            }
+        }
+        if (
+            status(this) === "destroyed" ||
+            generation !== this.syncGeneration ||
+            this.crmOffline.isOffline()
+        ) {
+            return;
+        }
+        if (this.props.list !== list) {
+            return this._reconcile();
+        }
+        if (this.isMobilePipeline) {
+            this.mobileState.syncEntries = null;
         }
     }
 
@@ -1029,11 +1387,19 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * @private
      */
     _setupPendingCreateAnnouncements() {
-        // Serialized: the dependencies are compared shallowly, and equal snapshots must be equal.
-        useOnChange(
-            () => [JSON.stringify(this._readPendingLeadCreates())],
-            (snapshot) => this._announcePendingLeadCreates(JSON.parse(snapshot))
-        );
+        // the creates read at the previous run, serialized so that an unchanged queue compares
+        // equal; `null` before the first run, which never equals a snapshot, so the first run
+        // always reaches the comparison
+        let previousSnapshot = null;
+        useEffect(() => {
+            const snapshot = JSON.stringify(this._readPendingLeadCreates());
+            if (snapshot === previousSnapshot) {
+                return;
+            }
+            previousSnapshot = snapshot;
+            // the comparison writes the status region and reads its sequence: never tracked
+            untrack(() => this._announcePendingLeadCreates(JSON.parse(snapshot)));
+        });
     }
 
     /**
@@ -1171,7 +1537,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Stores a lead's activities and their total count. A result arriving after the gate turned
-     * false, or after the pipeline was destroyed, is dropped; `null` (connection lost, nothing
+     * false, after the pipeline was destroyed, or for a lead no group of the pipeline holds any
+     * more (another filter or a reload replaced it), is dropped; `null` (connection lost, nothing
      * cached) keeps what is displayed.
      *
      * @private
@@ -1180,6 +1547,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      */
     _applyActivities(resId, result) {
         if (status(this) === "destroyed" || !this.isMobilePipeline) {
+            return;
+        }
+        if (!this.allLoadedRecords().some((record) => record.resId === resId)) {
             return;
         }
         const records = this._normalizeRecords(result);
