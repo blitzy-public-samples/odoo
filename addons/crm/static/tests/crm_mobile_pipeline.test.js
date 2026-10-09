@@ -827,6 +827,63 @@ describe("Wiring", () => {
         expect(".o_kanban_renderer").toHaveCount(1);
         expect(".o_crm_mobile_pipeline").toHaveCount(isSmall() ? 1 : 0);
     });
+
+    test("controller root: the CRM kanban class replaces the js_class one in place and once; another view name keeps its classes", async () => {
+        registry.category("views").add("crm_mobile_pipeline_alias", {
+            ...registry.category("views").get("crm_mobile_pipeline"),
+        });
+        const controllers = captureInstances(CrmMobilePipelineController);
+        /**
+         * Mounts the pipeline arch with the given js_class and an arch class list that already
+         * holds the CRM kanban class, as a view of its own (the views are cached), and returns the
+         * classes of that mount's controller root.
+         *
+         * @param {string} jsClass
+         * @param {number} viewId
+         * @returns {Promise<string[]>}
+         */
+        const mountRootClasses = async (jsClass, viewId) => {
+            await mountPipeline({
+                arch: PIPELINE_ARCH.replace(
+                    'js_class="crm_mobile_pipeline"',
+                    `js_class="${jsClass}" class="o_kanban_small_column o_crm_kanban_view"`
+                ),
+                viewId,
+            });
+            return queryAll(".o_kanban_view").at(-1).className.split(" ");
+        };
+        // The base classes after the arch's, the same at both screen sizes but for the small-screen
+        // scroll delegation of a grouped kanban.
+        const baseClasses = [
+            "o_view_controller",
+            "o_action",
+            ...(isSmall() ? ["o_action_delegate_scroll"] : []),
+            "o_kanban_selection_available",
+        ];
+
+        const reference = await mountRootClasses("crm_kanban", 111);
+        expect(reference).toEqual([
+            "o_kanban_view",
+            "o_crm_kanban_view",
+            "o_kanban_small_column",
+            ...baseClasses,
+        ]);
+        expect(controllers).toHaveLength(0);
+        // The CRM kanban class takes the js_class position, and the arch's copy is not repeated.
+        expect(await mountRootClasses("crm_mobile_pipeline", 112)).toEqual(reference);
+        expect(controllers).toHaveLength(1);
+        // Another view name with this controller: nothing to replace, every class is kept.
+        expect(await mountRootClasses("crm_mobile_pipeline_alias", 113)).toEqual([
+            "o_kanban_view",
+            "o_crm_mobile_pipeline_alias_view",
+            "o_kanban_small_column",
+            "o_crm_kanban_view",
+            ...baseClasses,
+        ]);
+        expect(controllers).toHaveLength(2);
+        expect(".o_crm_mobile_pipeline_view").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline").toHaveCount(isSmall() ? 2 : 0);
+    });
 });
 
 // -----------------------------------------------------------------------------
@@ -856,6 +913,7 @@ describe("Desktop", () => {
         });
         const [referenceView] = queryAll(".o_action_manager");
         const referenceCalls = viewCalls();
+        const referenceRootClass = queryOne(".o_kanban_view", { root: referenceView }).className;
         const referenceHtml = normalize(queryOne(".o_kanban_renderer", { root: referenceView }));
         await contains(queryOne(".o-kanban-button-new", { root: referenceView })).click();
         await animationFrame();
@@ -878,8 +936,13 @@ describe("Desktop", () => {
         expect(renderers).toHaveLength(1);
         const pipelineCalls = viewCalls();
 
-        // Same DOM, same requests, and none for activities or activity types.
+        // Same DOM, same requests, and none for activities or activity types. The controller root
+        // keeps the CRM kanban classes, in the same order, not the one derived from the js_class.
         expect(".o_crm_mobile_pipeline").toHaveCount(0);
+        const pipelineRoot = queryOne(".o_kanban_view", { root: pipelineView });
+        expect(pipelineRoot.className).toBe(referenceRootClass);
+        expect(pipelineRoot).toHaveClass("o_crm_kanban_view");
+        expect(pipelineRoot).not.toHaveClass("o_crm_mobile_pipeline_view");
         expect(normalize(pipelineRenderer)).toBe(referenceHtml);
         expect(pipelineCalls).toEqual(referenceCalls);
         expect(pipelineCalls).toEqual(["crm.lead/read_progress_bar", "crm.lead/web_read_group"]);
@@ -923,6 +986,10 @@ describe("Mobile pipeline", () => {
         await mountPipeline();
 
         expect(".o_kanban_renderer.o_kanban_grouped.o_crm_mobile_pipeline").toHaveCount(1);
+        // The controller root keeps the CRM kanban class, not the one derived from the js_class,
+        // next to the base small-screen classes.
+        expect(".o_kanban_view").toHaveClass(["o_crm_kanban_view", "o_action_delegate_scroll"]);
+        expect(".o_kanban_view").not.toHaveClass("o_crm_mobile_pipeline_view");
         expect(".o_crm_mobile_pipeline_body").toHaveCount(1);
         expect(".o_kanban_group").toHaveCount(1);
         expect(getComputedStyle(queryOne(".o_crm_mobile_pipeline_header")).position).toBe("sticky");

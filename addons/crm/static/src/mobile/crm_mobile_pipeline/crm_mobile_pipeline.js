@@ -11,7 +11,8 @@
  *   the kanban DOM.
  * - `CrmMobilePipelineController`, the controller adapter, keeps the displayed stage across reloads
  *   and breadcrumbs, restores that stage's scroll and opens New's quick create in it. Outside the
- *   mobile pipeline every override calls `super`.
+ *   mobile pipeline every override calls `super`. At every screen size its root keeps the CRM
+ *   kanban root class (`o_crm_kanban_view`) in place of the one derived from this `js_class`.
  *
  * Offline rules:
  * - No offline machinery of its own: offline and small-screen state come from `useCrmOffline()`,
@@ -2211,6 +2212,31 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
     /** Whether the mobile pipeline is rendered (see `isCrmMobilePipeline`). */
     get isMobilePipeline() {
         return isCrmMobilePipeline(this.model.root, this.crmOffline.isSmall());
+    }
+
+    /**
+     * The root classes: the base ones, with the class the framework derives from this view's
+     * `js_class` (`o_crm_mobile_pipeline_view`) replaced in place by the one it derived from the
+     * CRM kanban's (`o_crm_kanban_view`), so the root keeps exactly the classes, in the same order,
+     * it had as a `crm_kanban` view. As the framework keeps one occurrence of each class, at the
+     * `js_class` position, a CRM kanban class the arch also carries is not repeated. Applies at
+     * every screen size, as the CRM kanban class did; every other class (the arch's, the action's,
+     * the base small-screen scroll delegation) is kept as it is, and a view registered under
+     * another name with this controller keeps its classes unchanged.
+     *
+     * @override
+     */
+    get className() {
+        const className = super.className || "";
+        const classList = className.split(" ");
+        const index = classList.indexOf("o_crm_mobile_pipeline_view");
+        if (index === -1) {
+            return className;
+        }
+        classList[index] = "o_crm_kanban_view";
+        return classList
+            .filter((cls, position) => cls !== "o_crm_kanban_view" || position === index)
+            .join(" ");
     }
 
     /**
