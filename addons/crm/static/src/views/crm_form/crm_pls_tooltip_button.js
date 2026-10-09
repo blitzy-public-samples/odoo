@@ -4,6 +4,7 @@ import { localization } from "@web/core/l10n/localization";
 import { registry } from '@web/core/registry';
 import { usePopover } from "@web/core/popover/popover_hook";
 import { useService } from "@web/core/utils/hooks";
+import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
 
 
 export class CrmPlsTooltip extends Component {
@@ -34,16 +35,41 @@ export class CrmPlsTooltipButton extends Component {
             position: "bottom-start",
             useBottomSheet: this.ui.isSmall
         });
+        // Offline state, read only through the shared CRM offline hooks.
+        this.crmOffline = useCrmOffline();
     }
 
+    /**
+     * Opens the predictive lead scoring tooltip: saves the record, asks the server for the tooltip
+     * data (which also recomputes the probability), reloads the record and shows the popover.
+     *
+     * Offline, this control is DISABLE: the save and the server lookup cannot be separated, and
+     * the lookup needs the server. The button itself is disabled by the framework's offline
+     * selector (it carries no `data-available-offline`); this handler is also inert offline, so a
+     * hotkey, a keyboard activation or a direct call neither saves, nor looks up, nor reloads.
+     * Closing an already open popover stays allowed. Online behaviour is unchanged.
+     *
+     * @param {MouseEvent} ev
+     */
     async onClickPlsTooltipButton(ev) {
-        const tooltipButtonEl = ev.currentTarget;
         if (this.popover.isOpen) {
             this.popover.close();
         } else {
+            if (this.crmOffline.isOffline()) {
+                return;
+            }
+            // Read after the offline guard, so an offline call without an event stays inert, and
+            // before the first await, while the event is still being dispatched.
+            const tooltipButtonEl = ev.currentTarget;
             // Apply pending changes. They may change probability
             await this.props.record.save();
-            if (status(this) === "destroyed" || !this.props.record.resId) {
+            // A save that lost the connection was queued and turned the client offline: the
+            // lookup would fail, so it is skipped along with the reload.
+            if (
+                status(this) === "destroyed" ||
+                !this.props.record.resId ||
+                this.crmOffline.isOffline()
+            ) {
                 return;
             }
 
