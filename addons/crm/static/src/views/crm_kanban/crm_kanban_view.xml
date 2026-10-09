@@ -12,7 +12,9 @@
         Offline availability of the existing controls rendered by CRM lead views.
 
         While offline, the offline plugin disables every <button> that lacks the
-        `data-available-offline` attribute and re-enables the elements that carry it; it never
+        `data-available-offline` attribute, and re-enables an element it disabled itself
+        (class `o_disabled_offline`) once that element carries the attribute; a control
+        disabled explicitly, without that class, stays disabled even when annotated. It never
         reads the attribute while online. The extensions below therefore mark, on the
         interactive element itself, every existing lead control that stays usable offline
         (edits queue a `web_save`, the card menu exposes the queued delete and color changes).
@@ -148,15 +150,14 @@
     </t>
 
     <!--
-        Small screens, offline, lead views: a many2one renders the autocomplete marked above
-        (normal dropdown mode, searched from the relational cache, no create) instead of the
-        read-only input that opens the search dialog. `crmOfflineAutocomplete` (patched in
-        `crm_offline_hooks.js`) is false online, on large screens, for every other model and for
-        many2many tags.
+        Small-screen read-only input of many2one and tag fields, which opens the search dialog.
+        Offline, in lead views, many2one fields switch to the autocomplete marked above through
+        the `Many2One` patch of `crm_offline_hooks.js` (`dropdown: false`), while many2many tags
+        keep this input: it carries the attribute itself. Absent for every other model.
     -->
     <t t-inherit="web.Many2XAutocomplete" t-inherit-mode="extension">
         <xpath expr="//input[@readonly]" position="attributes">
-            <attribute name="t-if">this.uiService.isSmall and this.props.dropdown and !this.crmOfflineAutocomplete</attribute>
+            <attribute name="t-att-data-available-offline">this.env.model?.root?.resModel === 'crm.lead' ? '1' : false</attribute>
         </xpath>
     </t>
 

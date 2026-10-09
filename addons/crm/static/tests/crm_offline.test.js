@@ -100,6 +100,7 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
+import { Many2One } from "@web/views/fields/many2one/many2one";
 import { FormController } from "@web/views/form/form_controller";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { ListController } from "@web/views/list/list_controller";
@@ -146,9 +147,13 @@ function watchRpcs(watched) {
 
 /**
  * Steps, as `"offline:<model>/<method>"` or `"offline:<path>"`, every request issued while the
- * offline plugin reports offline, except the plugin's own reconnection pings. Registered after
- * `mockOffline()`, it sees the requests the offline mock answers with a 502: a DISABLE guard that
- * lets anything reach the network is caught.
+ * offline plugin reports offline, except the plugin's own reconnection pings and the many2one
+ * autocomplete's `web_name_search`. Offline on small screens a lead many2one renders its
+ * autocomplete inline, which searches as soon as it is shown; the framework's
+ * `Many2XAutocomplete.search` answers that 502 from the relational-field cache. That read is the
+ * offline partner lookup, never a DISABLE path. Registered after `mockOffline()`, the watcher sees
+ * the requests the offline mock answers with a 502: a DISABLE guard that lets anything reach the
+ * network is caught.
  */
 function watchOfflineRpcs() {
     onRpc("/*", (request) => {
@@ -163,6 +168,9 @@ function watchOfflineRpcs() {
             return;
         }
         const match = path.match(R_CALL_KW);
+        if (match?.groups.method === "web_name_search") {
+            return;
+        }
         expect.step(`offline:${match ? `${match.groups.model}/${match.groups.method}` : path}`);
     });
 }
@@ -2824,16 +2832,14 @@ describe("K9 attributes", () => {
             ".o_field_widget[name=expected_revenue] input",
             ".o_field_widget[name=probability] input",
             ".o_field_widget[name=partner_id] input",
+            ".o_field_widget[name=tag_ids] input",
             ".o_field_widget[name=tag_ids] .o_delete",
             ".o_field_widget[name=description] [contenteditable='true']",
         ];
         if (isSmall()) {
             // Only many2one fields switch to the cached autocomplete on small screens offline: the
-            // tags field keeps the framework's search-dialog input, which carries no attribute.
+            // tags field keeps the framework's search-dialog input, which is marked as well.
             expect(".o_field_widget[name=tag_ids] input").toHaveAttribute("readonly");
-            expect(".o_field_widget[name=tag_ids] input").not.toHaveAttribute(OFFLINE_ATTRIBUTE);
-        } else {
-            marked.push(".o_field_widget[name=tag_ids] input");
         }
         for (const selector of marked) {
             expect(selector).toHaveAttribute(OFFLINE_ATTRIBUTE, "1", { message: selector });
@@ -2851,17 +2857,21 @@ describe("K9 attributes", () => {
         // On small screens too, the partner field is an editable autocomplete offline.
         expect(".o_field_widget[name=partner_id] input").not.toHaveAttribute("readonly");
 
-        // The cached customer is suggested; every suggestion entry is usable offline.
+        // The cached customer is suggested; every suggestion entry is usable offline. Suggestions
+        // are read within the partner field: offline on small screens every lead many2one shows
+        // its autocomplete list inline.
+        const partnerSuggestions =
+            ".o_field_widget[name=partner_id] .o-autocomplete--dropdown-item";
         await contains(".o_field_widget[name=partner_id] input").edit("Deco", { confirm: false });
         await runAllTimers();
-        const suggestions = queryAll(".o-autocomplete--dropdown-item");
+        const suggestions = queryAll(partnerSuggestions);
         expect(suggestions.length).toBeGreaterThan(0);
         for (const suggestion of suggestions) {
             expect(suggestion).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
             expect(suggestion.firstElementChild).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
         }
-        expect(queryAllTexts(".o-autocomplete--dropdown-item")).toEqual(["Deco Addict"]);
-        await contains(".o-autocomplete--dropdown-item:contains('Deco Addict') > *").click();
+        expect(queryAllTexts(partnerSuggestions)).toEqual(["Deco Addict"]);
+        await contains(`${partnerSuggestions}:contains('Deco Addict') > *`).click();
         expect(".o_field_widget[name=partner_id] input").toHaveValue("Deco Addict");
         await contains(".o_field_widget[name=name] input").edit("Lead 1 (offline)");
         await contains(".o_form_button_save").click();
@@ -3012,37 +3022,64 @@ describe("Partner lookup", () => {
         await seedLeadCustomer();
         const setOffline = mockOffline();
         keepPingsFailing();
+        const many2ones = captureInstances(Many2One);
         await mountWithCleanup(WebClient);
         await getService("action").doAction(LEAD_FORM_ACTION_ID);
+        // The lead form's only many2one on `res.partner` is its customer field.
+        const partnerField = () =>
+            many2ones.findLast(
+                (m2o) => m2o.props.relation === "res.partner" && status(m2o) === "mounted"
+            );
         const input = ".o_field_widget[name=partner_id] input";
+        const options = ".o_field_widget[name=partner_id] .o-autocomplete--dropdown-item";
+        // Online, the framework's autocomplete props are unchanged on every screen size.
+        expect("dropdown" in partnerField().many2XAutocompleteProps).toBe(false);
         if (isSmall()) {
             // Online, small screens use the read-only input that opens the search dialog.
             expect(input).toHaveAttribute("readonly");
         } else {
             // Online, the search reaches the server and offers to create.
             await contains(input).click();
-            expect(queryAllTexts(".o-autocomplete--dropdown-item")).toInclude("Search more...");
+            expect(queryAllTexts(options)).toInclude("Search more...");
             await contains(".o_form_renderer").click();
         }
 
         await setOffline(true);
+        // Offline, small screens render the autocomplete inline (`dropdown: false`); large screens
+        // keep the framework's props, whose autocomplete already searches the cache.
+        if (isSmall()) {
+            expect(partnerField().many2XAutocompleteProps.dropdown).toBe(false);
+        } else {
+            expect("dropdown" in partnerField().many2XAutocompleteProps).toBe(false);
+        }
         // Offline, on every screen size, the autocomplete searches the cached partners.
         expect(input).not.toHaveAttribute("readonly");
         await contains(input).edit("Azure", { confirm: false });
         await runAllTimers();
-        const options = queryAllTexts(".o-autocomplete--dropdown-item");
-        expect(options).toEqual(["Azure Interior"]);
+        const optionTexts = queryAllTexts(options);
+        expect(optionTexts).toEqual(["Azure Interior"]);
         for (const forbidden of ["Create", "Create and edit...", "Search more..."]) {
-            expect(options.some((option) => option.startsWith(forbidden))).toBe(false, {
+            expect(optionTexts.some((option) => option.startsWith(forbidden))).toBe(false, {
                 message: forbidden,
             });
         }
-        await contains(".o-autocomplete--dropdown-item:contains('Azure Interior') > *").click();
+        await contains(`${options}:contains('Azure Interior') > *`).click();
         expect(input).toHaveValue("Azure Interior");
+        if (isSmall()) {
+            // Text typed but not selected makes the field float, which hides its open-record
+            // button; switching back to the search-dialog input discards that text.
+            await contains(input).edit("Deco", { confirm: false });
+            await runAllTimers();
+            expect(partnerField().state.isFloating).toBe(true);
+        }
 
         await setOffline(false);
+        expect("dropdown" in partnerField().many2XAutocompleteProps).toBe(false);
         if (isSmall()) {
             expect(input).toHaveAttribute("readonly");
+            expect(input).toHaveValue("Azure Interior");
+            expect(partnerField().state.isFloating).toBe(false);
+            expect(".o_field_widget[name=partner_id] .o_external_button").toHaveCount(1);
         } else {
             expect(input).not.toHaveAttribute("readonly");
         }

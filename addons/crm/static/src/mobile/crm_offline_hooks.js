@@ -26,11 +26,11 @@
  *   a status for `web_save`, `unlink`/`web_unlink`, `action_archive` and `action_unarchive` only.
  * - Online behaviour never changes. Every patch calls `super` with the original arguments unless
  *   the client is offline and the target is a CRM model, a listed CRM button or a mail dialog form
- *   targeting a lead. The only widening patch (`Many2XAutocomplete`, with its template
- *   extension) applies offline, on small screens, in `crm.lead` views only.
+ *   targeting a lead. The only widening patch (`Many2One`, `dropdown: false` in its autocomplete
+ *   props) applies offline, on small screens, in `crm.lead` views only.
  */
 
-import { usePlugin } from "@odoo/owl";
+import { computed, untrack, useEffect, usePlugin } from "@odoo/owl";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { ORM } from "@web/core/orm_plugin";
@@ -40,7 +40,7 @@ import { Record as RelationalRecord } from "@web/model/relational_model/record";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
 import { useEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
-import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
+import { Many2One } from "@web/views/fields/many2one/many2one";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { ListController } from "@web/views/list/list_controller";
 import { MultiRecordViewButton } from "@web/views/view_button/multi_record_view_button";
@@ -717,29 +717,52 @@ patch(RelationalModel.prototype, {
 // Small-screen offline partner lookup
 // -----------------------------------------------------------------------------
 
-patch(Many2XAutocomplete.prototype, {
+patch(Many2One.prototype, {
     setup() {
         super.setup(...arguments);
         this.crmOffline = useCrmOffline();
+        /**
+         * Whether the field renders the autocomplete instead of the search-dialog input: offline,
+         * on a small screen, in a `crm.lead` view. Memoized, so its readers (the props getter and
+         * the effect below) only react when the answer changes.
+         */
+        this.crmOfflineLookup = computed(
+            () =>
+                this.crmOffline.isOffline() &&
+                this.crmOffline.isSmall() &&
+                this.env.model?.root?.resModel === "crm.lead"
+        );
+        // Switching between the search-dialog input and the autocomplete discards text typed but
+        // not selected. `state.isFloating` is set through `setInputFloats` by the autocomplete's
+        // input handler and is otherwise reset only by `update()`: without this reset, a
+        // reconnection while typing would leave the field floating and hide its open-record
+        // button. The effect runs once when created, which is not a switch; the reset runs
+        // untracked, so the effect depends on `crmOfflineLookup` alone.
+        let isInitialRun = true;
+        useEffect(() => {
+            this.crmOfflineLookup();
+            if (isInitialRun) {
+                isInitialRun = false;
+                return;
+            }
+            untrack(() => {
+                this.state.isFloating = false;
+            });
+        });
     },
     /**
      * On small screens a many2one renders a read-only input that opens a search dialog, which does
-     * not consult the framework's relational-field cache. Offline, in `crm.lead` views, this getter
-     * is true and the `web.Many2XAutocomplete` extension in `crm_kanban_view.xml` renders the
-     * autocomplete input instead, in its normal dropdown mode: it searches that cache and offers
-     * no create or search-more option while offline. Many2many tags (`isToMany`) are left alone.
+     * not consult the framework's relational-field cache. Offline, in `crm.lead` views,
+     * `dropdown: false` renders the autocomplete instead (its inline mode, as the framework's
+     * `KanbanMany2OneAssignPopover` does): it searches that cache, and the framework's `suggest()`
+     * offers no create or search-more option offline. Online, on large screens and for every other
+     * model the props are unchanged. The call is optional for subclasses whose `setup` skips this
+     * one.
      *
-     * The props are not changed: `dropdown: false` would also switch the autocomplete to its
-     * inline mode, a list that is always open and cannot be dismissed.
-     *
-     * @returns {boolean}
+     * @returns {Object}
      */
-    get crmOfflineAutocomplete() {
-        return Boolean(
-            this.crmOffline?.isOffline() &&
-                this.crmOffline.isSmall() &&
-                this.env.model?.root?.resModel === "crm.lead" &&
-                !this.props.isToMany
-        );
+    get many2XAutocompleteProps() {
+        const props = super.many2XAutocompleteProps;
+        return this.crmOfflineLookup?.() ? { ...props, dropdown: false } : props;
     },
 });
