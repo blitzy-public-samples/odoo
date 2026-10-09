@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Lead card of the small-screen CRM pipeline (CrmMobileLeadCard).
+
+        Offline rules carried by this markup:
+        - Every interactive element is tagged data-available-offline, so the framework offline UI
+          leaves it usable. Controls that must stay unusable (Log call or Follow-up without a cached
+          activity type, the stages the card cannot move to) render an explicit `disabled` that the
+          framework never removes, and their handlers re-check the same predicate.
+        - An unavailable card is dimmed with o_crm_mobile_lead_card_unavailable only: the framework
+          strips its own offline-disabled class from data-available-offline elements.
+        - The article has no tabindex, so the inherited kanban renderer hotkeys never act on it
+          (Space on a focused .o_kanban_record would toggle record selection). The card controls
+          stay keyboard-operable buttons; opening the lead is a tap on the card.
+        - The lead name is the first span of the article and a leaf: the upstream mobile main flow
+          opens the lead by clicking `.o_kanban_record span:contains(name)`, and the click bubbles
+          to onOpenCard. Clicks inside the controls never open the card.
+        - A pending lead create shows its queued values and the badge, with no control at all.
+    -->
+    <t t-name="crm.CrmMobileLeadCard">
+        <article class="o_kanban_record o_crm_mobile_lead_card card mb-2 p-2 w-100"
+            data-available-offline="1"
+            t-att-class="{ o_crm_mobile_lead_card_unavailable: this.props.unavailable, o_crm_mobile_lead_card_pending: this.isPending }"
+            t-att-data-id="this.props.record?.id"
+            t-att-data-pending-key="this.props.pendingCall?.key"
+            t-on-click="this.onOpenCard">
+            <div class="o_crm_mobile_lead_card_body d-flex flex-column gap-1">
+                <div class="d-flex align-items-start gap-2">
+                    <span class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-out="this.leadLabel"/>
+                    <span t-if="this.isPendingSync" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                </div>
+                <span t-if="this.partnerName" class="o_crm_mobile_lead_card_partner text-muted text-truncate" t-out="this.partnerName"/>
+                <span t-if="this.revenue" class="o_crm_mobile_lead_card_revenue" t-out="this.revenue"/>
+            </div>
+
+            <div t-if="!this.isPending" class="o_crm_mobile_lead_card_controls mt-2" t-on-click.stop="">
+                <div class="o_crm_mobile_lead_card_actions d-flex flex-wrap gap-1">
+                    <button type="button"
+                        class="btn btn-secondary btn-sm o_crm_mobile_card_stage"
+                        data-available-offline="1"
+                        title="Move to another stage"
+                        aria-label="Stage"
+                        t-att-aria-expanded="this.state.stageListOpen ? 'true' : 'false'"
+                        t-on-click.stop="() => this.toggleStageList()">
+                        <i class="oi oi-fw" data-icon="swap_vert" aria-hidden="true"/> Stage
+                    </button>
+                    <button type="button"
+                        class="btn btn-secondary btn-sm o_crm_mobile_card_log_call"
+                        data-available-offline="1"
+                        title="Log a call for today"
+                        aria-label="Log call"
+                        t-att-disabled="!this.canLogCall"
+                        t-on-click.stop="() => this.onLogCall()">
+                        <i class="oi oi-fw" data-icon="phone" aria-hidden="true"/> Log call
+                    </button>
+                    <button type="button"
+                        class="btn btn-secondary btn-sm o_crm_mobile_card_follow_up"
+                        data-available-offline="1"
+                        title="Schedule a follow-up activity"
+                        aria-label="Follow-up"
+                        t-att-disabled="!this.canFollowUp"
+                        t-att-aria-expanded="this.state.followUpOpen ? 'true' : 'false'"
+                        t-on-click.stop="() => this.toggleFollowUp()">
+                        <i class="oi oi-fw" data-icon="schedule" aria-hidden="true"/> Follow-up
+                    </button>
+                    <button type="button"
+                        class="btn btn-secondary btn-sm o_crm_mobile_card_activities"
+                        data-available-offline="1"
+                        title="Show the lead's activities"
+                        aria-label="Activities"
+                        t-att-aria-expanded="this.state.activitiesOpen ? 'true' : 'false'"
+                        t-on-click.stop="() => this.toggleActivities()">
+                        <i class="oi oi-fw" data-icon="checklist" aria-hidden="true"/> Activities<span class="badge rounded-pill text-bg-light ms-1" t-out="this.activityCount"/>
+                    </button>
+                </div>
+
+                <!-- Choosing the won stage is mark-won: the server turns that stage write into won. -->
+                <div t-if="this.state.stageListOpen" class="o_crm_mobile_lead_card_stage_list list-group mt-2" role="listbox" aria-label="Stages">
+                    <t t-foreach="this.stageOptions" t-as="option" t-key="option.key">
+                        <button type="button"
+                            role="option"
+                            class="list-group-item list-group-item-action o_crm_mobile_stage_option"
+                            t-att-class="{ active: option.selected }"
+                            t-att-aria-selected="option.selected ? 'true' : 'false'"
+                            t-att-disabled="option.disabled"
+                            t-att-data-stage-value="option.group.serverValue"
+                            data-available-offline="1"
+                            t-on-click.stop="() => this.onChooseStage(option.group)"
+                            t-out="option.label"/>
+                    </t>
+                </div>
+
+                <!-- No assignee picker (the owner is the session user), no upload, no meeting type. -->
+                <div t-if="this.state.followUpOpen" class="o_crm_mobile_lead_card_follow_up d-flex flex-column gap-2 mt-2">
+                    <label class="form-label mb-0">Activity type
+                        <select class="form-select o_crm_mobile_follow_up_type"
+                            data-available-offline="1"
+                            t-on-change="this.onFollowUpType">
+                            <option t-foreach="this.creatableTypes" t-as="type" t-key="type.id"
+                                t-att-value="type.id"
+                                t-att-selected="type.id === this.state.typeId"
+                                t-out="type.display_name"/>
+                        </select>
+                    </label>
+                    <label class="form-label mb-0">Summary
+                        <input type="text"
+                            class="form-control o_crm_mobile_follow_up_summary"
+                            placeholder="Summary"
+                            data-available-offline="1"
+                            t-att-value="this.state.summary"
+                            t-on-input="this.onFollowUpSummary"/>
+                    </label>
+                    <label class="form-label mb-0">Due date
+                        <input type="date"
+                            class="form-control o_crm_mobile_follow_up_date"
+                            data-available-offline="1"
+                            t-att-value="this.state.date"
+                            t-on-input="this.onFollowUpDate"/>
+                    </label>
+                    <div class="d-flex gap-2">
+                        <button type="button"
+                            class="btn btn-primary o_crm_mobile_follow_up_save"
+                            data-available-offline="1"
+                            t-att-disabled="!this.canFollowUp"
+                            t-on-click.stop="() => this.onSaveFollowUp()">Save</button>
+                        <button type="button"
+                            class="btn btn-secondary o_crm_mobile_follow_up_cancel"
+                            data-available-offline="1"
+                            t-on-click.stop="() => this.onCancelFollowUp()">Cancel</button>
+                    </div>
+                </div>
+
+                <ul t-if="this.state.activitiesOpen" class="o_crm_mobile_lead_card_activities list-unstyled mt-2 mb-0">
+                    <!-- Queued creates have no server id yet: no Mark done. -->
+                    <li t-foreach="this.pendingActivityCreates" t-as="entry" t-key="entry.key"
+                        class="o_crm_mobile_activity_row o_crm_mobile_activity_pending d-flex align-items-center gap-2 py-1">
+                        <div class="d-flex flex-column min-w-0">
+                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-out="this.pendingCreateTypeLabel(entry)"/>
+                            <span t-if="entry.value.args[1].summary" class="o_crm_mobile_activity_summary text-truncate" t-out="entry.value.args[1].summary"/>
+                            <span t-if="entry.value.args[1].date_deadline" class="o_crm_mobile_activity_deadline text-muted small" t-out="this.formatDeadline(entry.value.args[1].date_deadline)"/>
+                        </div>
+                        <span class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                    </li>
+                    <!-- Mark done is offered for every persisted activity, whatever its category. -->
+                    <li t-foreach="this.activityRows" t-as="activity" t-key="activity.id"
+                        class="o_crm_mobile_activity_row d-flex align-items-center gap-2 py-1"
+                        t-att-data-activity-id="activity.id">
+                        <div class="d-flex flex-column min-w-0">
+                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-out="this.activityLabel(activity)"/>
+                            <span t-if="activity.summary" class="o_crm_mobile_activity_summary text-truncate" t-out="activity.summary"/>
+                            <span t-if="activity.date_deadline" class="o_crm_mobile_activity_deadline text-muted small" t-out="this.formatDeadline(activity.date_deadline)"/>
+                        </div>
+                        <span t-if="this.pendingArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                        <button t-else="" type="button"
+                            class="btn btn-sm btn-link o_crm_mobile_activity_done ms-auto flex-shrink-0"
+                            data-available-offline="1"
+                            title="Mark done"
+                            aria-label="Mark done"
+                            t-att-disabled="this.state.busy"
+                            t-on-click.stop="() => this.onMarkDone(activity)">
+                            <i class="oi oi-fw" data-icon="check" aria-hidden="true"/> Mark done
+                        </button>
+                    </li>
+                    <li t-if="!this.activityCount" class="text-muted small" t-out="this.noActivitiesLabel"/>
+                </ul>
+            </div>
+        </article>
+    </t>
+
+</templates>
