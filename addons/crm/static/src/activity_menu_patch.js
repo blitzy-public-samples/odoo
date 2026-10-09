@@ -47,10 +47,13 @@ patch(ActivityMenu.prototype, {
             } else {
                 context["search_default_activities_upcoming_all"] = 1;
             }
-            // Necessary because activity_ids of mail.activity.mixin has auto_join
-            // So, duplicates are faking the count and "Load more" doesn't show up
+            // Force a search_count for activity-filtered results even when the current page is not full.
             context["force_search_count"] = 1;
             this.action.loadAction("crm.crm_lead_action_my_activities").then((action) => {
+                // The connection may have dropped while the action was loading: open nothing.
+                if (this.crmOffline.isOffline()) {
+                    return;
+                }
                 // to show lost leads in the activity
                 action.domain = Domain.and([
                     action.domain || [],

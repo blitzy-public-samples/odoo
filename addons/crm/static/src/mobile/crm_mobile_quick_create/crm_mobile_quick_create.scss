@@ -15,6 +15,7 @@ $o-crm-mobile-touch: 44px;
     input,
     select {
         min-height: $o-crm-mobile-touch;
+        min-width: $o-crm-mobile-touch;
     }
 
     .o_crm_mobile_quick_create_save,

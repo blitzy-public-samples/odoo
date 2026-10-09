@@ -16,13 +16,19 @@ export class CrmColumnProgress extends RottingColumnProgress {
          * displayed state from it and from the connectivity signal.
          */
         this.probedRecurringRevenue = signal(null);
-        /** Pending probe, shared by `onWillStart` and the reconnect effect (one probe per mount). */
+        /**
+         * Probe in flight, if any. At mount, `onWillStart` awaits the one the effect has just
+         * started; it is cleared once settled, so a later call starts a new attempt.
+         */
         this._recurringRevenueProbe = null;
 
-        // Probes while the answer is unknown and the client is online: at mount (the effect runs
-        // as soon as it is created), and when the connection returns after a cold offline mount or
-        // a probe that lost the connection. Only the two signals are tracked, so the effect re-runs
-        // on connectivity changes and on the probe's answer only; the probe itself runs untracked,
+        // Asks while the answer is unknown and the client is online: at mount (the effect runs as
+        // soon as it is created), then each time the client comes back online while the answer is
+        // still unknown, after a cold offline mount or a failed probe. An attempt is not always a
+        // request: `user.hasGroup` answers from the session's group cache, which also keeps a
+        // failed answer, so after a probe that lost the connection the aggregate stays hidden until
+        // the page is reloaded. Only the two signals are tracked, so the effect re-runs on
+        // connectivity changes and on the probe's answer only; the probe itself runs untracked,
         // and its promise is not returned, because an effect's return value is its cleanup.
         useEffect(() => {
             const isOffline = this.crmOffline.isOffline();
@@ -44,7 +50,8 @@ export class CrmColumnProgress extends RottingColumnProgress {
     /**
      * Whether the recurring-revenue aggregate (and its "MRR" label) is rendered: the user has the
      * recurring-revenue group and the client is online. Offline the aggregate is hidden rather
-     * than shown from values the offline client cannot refresh; it shows again on reconnect.
+     * than shown from values the offline client cannot refresh; it shows again on reconnect when
+     * the group answer is known to be positive.
      *
      * @returns {boolean}
      */
@@ -53,12 +60,17 @@ export class CrmColumnProgress extends RottingColumnProgress {
     }
 
     /**
-     * Asks once whether the user has the recurring-revenue group, when the progress bar declares
-     * a recurring revenue field. Never asks offline: `user.hasGroup` raises a
-     * `ConnectionLostError` there unless the answer is already cached. Concurrent callers share
-     * the pending probe. A probe that fails leaves the answer unknown (`null`), so the aggregate
-     * stays hidden and no error escapes the column; a probe that lost the connection runs again
-     * when the connection returns.
+     * Asks whether the user has the recurring-revenue group, when the progress bar declares a
+     * recurring revenue field and no answer is known yet. Never asks offline: `user.hasGroup`
+     * raises a `ConnectionLostError` there unless the answer is already cached. Callers share the
+     * probe in flight, so the effect and `onWillStart` of the initial mount wait on the same one;
+     * once it has settled, a later call (the effect, when the client is back online while the
+     * answer is still unknown) starts a new attempt. A probe that fails leaves the answer unknown
+     * (`null`), so the aggregate stays hidden and no error escapes the column. A new attempt does
+     * not always reach the server: `user.hasGroup` answers from the session's group cache, which
+     * keeps a failed answer too. After a probe that lost the connection, every later attempt
+     * therefore fails the same way without a request, and the aggregate stays hidden until the
+     * page is reloaded.
      *
      * @returns {Promise<void>}
      */
@@ -80,10 +92,11 @@ export class CrmColumnProgress extends RottingColumnProgress {
                     this.probedRecurringRevenue.set(Boolean(hasGroup));
                 } catch (error) {
                     // A lost connection has already flipped the client offline when the rejection
-                    // arrives (the offline plugin reacts to the failed RPC response first), and
-                    // the effect probes again on reconnect. Any other failure only hides the
-                    // aggregate instead of failing the whole kanban column; it is reported so
-                    // that it is not lost.
+                    // arrives (the offline plugin reacts to the failed RPC response first), so it
+                    // is not reported. Any other failure only hides the aggregate instead of
+                    // failing the whole kanban column; it is reported so that it is not lost. So
+                    // is the cached failure of a probe that lost the connection, which
+                    // `user.hasGroup` returns again to an attempt made once back online.
                     if (!this.crmOffline.isOffline()) {
                         console.warn("CRM: recurring revenue group probe failed", error);
                     }

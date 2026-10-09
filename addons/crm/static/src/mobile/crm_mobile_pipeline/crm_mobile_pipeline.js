@@ -32,13 +32,23 @@
  *   in the stage pipeline, so desktop RPC sequences are unchanged.
  */
 
-import { computed, proxy, status, useOnChange } from "@odoo/owl";
+import {
+    computed,
+    onPatched,
+    onWillPatch,
+    proxy,
+    signal,
+    status,
+    untrack,
+    useOnChange,
+} from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { usePopover } from "@web/core/popover/popover_hook";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
-import { useSubEnv } from "@web/owl2/utils";
+import { getTabableElements } from "@web/core/utils/ui";
+import { onWillRender, useSubEnv } from "@web/owl2/utils";
 import { useSetupAction } from "@web/search/action_hook";
 import { formatInteger, formatMonetary } from "@web/views/fields/formatters";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
@@ -181,6 +191,12 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
              */
             syncEntries: null,
         });
+        /**
+         * Ids of the stage groups whose Load more is in flight (`onLoadMoreClick`), each mapped to
+         * `true` until its load settles. Transient presentation state: the button is disabled and
+         * busy meanwhile (`isLoadingMore`).
+         */
+        this.loadingMoreGroups = proxy({});
         // Provided by `CrmMobilePipelineController`; a local state keeps the renderer usable on
         // its own (it then starts on the framework's default stage).
         this.stageState = this.env.crmMobileStage ?? proxy({ serverValue: null });
@@ -206,9 +222,23 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 previous.length === next.length &&
                 previous.every((group, index) => group === next[index]),
         });
+        /** Back button of the unavailable-lead helper. */
+        this.backRef = signal.ref();
+        /**
+         * Focus move pending for the unavailable-lead helper, consumed after a patch (see
+         * `_setupHelperFocus`): `resId` is the lead whose card was tapped, `focus` is `"back"`
+         * until the helper has focused Back, `"return"` once Back was chosen, `null` otherwise.
+         * Transient and never rendered: `null` while the helper is not displayed.
+         *
+         * @type {{ resId: number, focus: "back" | "return" | null } | null}
+         */
+        this.helperFocus = null;
 
         this._setupActivityRevalidation();
         this._setupSyncReconciliation();
+        this._setupHelperFocus();
+        // After the helper focus: on a patch both handle, the helper's focus move comes first.
+        this._setupNavFocus();
     }
 
     // -------------------------------------------------------------------------
@@ -985,6 +1015,134 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         }
     }
 
+    /**
+     * Focus of the unavailable-lead helper, which replaces the stage body's cards when a lead
+     * that is not available offline is tapped.
+     *
+     * - The patch that displays the helper focuses Back once. Back is described by the helper's
+     *   sentence, so a screen reader announces why the lead did not open; nothing in the stage
+     *   body is live-announced.
+     * - A reload keeps the stage body, which is keyed by stage, and Back in it, so Back keeps the
+     *   focus. A displayed stage that changes while the helper stays (stage navigation leaves the
+     *   helper first, but a reload whose groups no longer hold that stage does not) rebuilds the
+     *   stage body, Back included: the new Back takes the focus over when the old one held it. A
+     *   re-render never takes the focus back to Back from another control.
+     * - When the helper is left through Back, or while Back holds the focus (stage navigation,
+     *   reconnection), the focus moves, after the patch that removes the helper, to the tapped
+     *   card's first control, else a header control (see `_focusAfterHelper`), instead of
+     *   dropping to the document body. A later reload, such as the reconciliation reload after
+     *   reconnecting, re-creates the cards, whose keys carry the group datapoint id it renews,
+     *   and so drops that focus, as it does for any focused card control.
+     *
+     * Requests are one-shot and consumed after the patch that renders them, once the DOM exists.
+     *
+     * @private
+     */
+    _setupHelperFocus() {
+        let backHadFocus = false;
+        onWillPatch(() => {
+            const back = this.backRef();
+            backHadFocus = Boolean(back?.contains(document.activeElement));
+        });
+        onPatched(() => {
+            const request = this.helperFocus;
+            if (!request) {
+                return;
+            }
+            const back = this.backRef();
+            if (back) {
+                if (request.focus === "back" || (backHadFocus && document.activeElement !== back)) {
+                    request.focus = null;
+                    back.focus();
+                }
+                return;
+            }
+            if (this.mobileState.unavailableLeadId) {
+                // The helper is requested but not rendered yet (not the mobile pipeline, or a
+                // render that started earlier): the patch that renders it consumes the request.
+                return;
+            }
+            this.helperFocus = null;
+            if (request.focus === "return" || backHadFocus) {
+                this._focusAfterHelper(request.resId);
+            }
+        });
+    }
+
+    /**
+     * Focuses, once the unavailable-lead helper is left, the first control of the tapped lead's
+     * card when the displayed stage shows it (the card itself has no tabindex), else the first
+     * header control (previous, next, Add), else the first control of the pipeline. Nothing is
+     * focused outside the mobile pipeline.
+     *
+     * @private
+     * @param {number} resId the lead whose card opened the helper
+     */
+    _focusAfterHelper(resId) {
+        const root = this.rootRef();
+        if (!root || !this.isMobilePipeline) {
+            return;
+        }
+        const record = this.cardsFor(this.currentGroup).find((card) => card.resId === resId);
+        const cardEl =
+            record &&
+            [...root.querySelectorAll(".o_crm_mobile_pipeline_body .o_crm_mobile_lead_card")].find(
+                (el) => el.dataset.id === record.id
+            );
+        const headerEl = root.querySelector(".o_crm_mobile_pipeline_header");
+        const target =
+            (cardEl && getTabableElements(cardEl)[0]) ||
+            (headerEl && getTabableElements(headerEl)[0]) ||
+            getTabableElements(root)[0];
+        target?.focus();
+    }
+
+    /**
+     * Focus of the stage navigation. The previous button is not rendered on the first stage, nor
+     * the next button on the last one, so displaying that stage removes the button when it holds
+     * the focus (Next activated to reach the last stage, Previous to reach the first one). After
+     * the patch that removes it, the focus moves to the first header control, which is then the
+     * remaining navigation button, else Add, else the first control of the pipeline, instead of
+     * dropping to the document body.
+     *
+     * Only the removal of the focused navigation button moves the focus, whatever displayed the
+     * stage (a button, a key, a swipe or a reload), and only when no other control took the focus
+     * in that patch: the unavailable-lead helper's focus move (`_setupHelperFocus`, which runs
+     * first) wins, and a focus held anywhere else is never moved. Nothing is focused outside the
+     * mobile pipeline.
+     *
+     * @private
+     */
+    _setupNavFocus() {
+        /** @type {Element | null} the navigation button holding the focus before the patch */
+        let focusedNav = null;
+        onWillPatch(() => {
+            const active = document.activeElement;
+            focusedNav =
+                active?.matches(".o_crm_mobile_pipeline_prev, .o_crm_mobile_pipeline_next") &&
+                this.rootRef()?.contains(active)
+                    ? active
+                    : null;
+        });
+        onPatched(() => {
+            const removed = Boolean(focusedNav && !focusedNav.isConnected);
+            focusedNav = null;
+            const active = document.activeElement;
+            if (!removed || (active && active !== document.body)) {
+                // No focused navigation button was removed, or another control took the focus.
+                return;
+            }
+            const root = this.rootRef();
+            if (!root || !this.isMobilePipeline) {
+                return;
+            }
+            const headerEl = root.querySelector(".o_crm_mobile_pipeline_header");
+            const target =
+                (headerEl && getTabableElements(headerEl)[0]) || getTabableElements(root)[0];
+            target?.focus();
+        });
+    }
+
     // -------------------------------------------------------------------------
     // Handlers
     // -------------------------------------------------------------------------
@@ -1015,7 +1173,52 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         }
     }
 
-    /** Displays the previous stage; nothing on the first stage. */
+    /**
+     * Whether the Load more of a stage is in flight: its button is then disabled and busy.
+     *
+     * @param {Group} group
+     * @returns {boolean}
+     */
+    isLoadingMore(group) {
+        return Boolean(group && this.loadingMoreGroups[group.id]);
+    }
+
+    /**
+     * Load more, online only, as the template renders it: a folded stage is loaded and unfolded
+     * through the inherited `toggleGroup`, any other stage gets its next page through the inherited
+     * `loadMore`. The stage is marked as loading until the load settles, so its button shows a
+     * spinner, is busy and disabled meanwhile, and a second activation loads nothing. Offline
+     * nothing is loaded (a folded stage is never loaded offline). A lost connection leaves the
+     * stage as it was.
+     *
+     * @param {Group} group
+     * @returns {Promise<void>}
+     */
+    async onLoadMoreClick(group) {
+        if (!group || this.isLoadingMore(group) || this.crmOffline.isOffline()) {
+            return;
+        }
+        const groupId = group.id;
+        this.loadingMoreGroups[groupId] = true;
+        try {
+            if (group.isFolded) {
+                await this.toggleGroup(group);
+            } else {
+                await this.loadMore(group);
+            }
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
+            }
+        } finally {
+            delete this.loadingMoreGroups[groupId];
+        }
+    }
+
+    /**
+     * Displays the previous stage; nothing on the first stage. Reaching the first stage removes
+     * the previous button, whose focus then moves to the next one (see `_setupNavFocus`).
+     */
     onPrev() {
         const index = this.currentIndex;
         if (index > 0) {
@@ -1023,7 +1226,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         }
     }
 
-    /** Displays the next stage; nothing on the last stage. */
+    /**
+     * Displays the next stage; nothing on the last stage. Reaching the last stage removes the next
+     * button, whose focus then moves to the previous one (see `_setupNavFocus`).
+     */
     onNext() {
         const index = this.currentIndex;
         const groups = this.stageGroups;
@@ -1074,7 +1280,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Opens a lead: its form online, or offline when the form was visited online. Otherwise the
-     * stage body shows the offline action helper with a Back button.
+     * stage body shows the offline action helper with a Back button, which takes the focus.
      *
      * @param {RelationalRecord} record
      */
@@ -1087,11 +1293,17 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             this.mobileState.unavailableLeadId = null;
             return this.props.openRecord(record);
         }
+        this.helperFocus = { resId: record.resId, focus: "back" };
         this.mobileState.unavailableLeadId = record.resId;
     }
 
-    /** Leaves the offline helper of an unavailable lead. */
+    /**
+     * Leaves the offline helper of an unavailable lead. The focus then moves to the lead's card
+     * (or a header control), as Back disappears with the helper.
+     */
     onBackFromHelper() {
+        const resId = this.mobileState.unavailableLeadId;
+        this.helperFocus = resId ? { resId, focus: "return" } : null;
         this.mobileState.unavailableLeadId = null;
     }
 
@@ -1214,27 +1426,48 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
 export class CrmMobilePipelineController extends crmKanbanView.Controller {
     setup() {
-        // Before the base setup: its layout effect restores, at mount, the saved scroll of every
-        // saved stage column and dereferences each column's node without a null guard. The mobile
-        // pipeline renders the displayed stage only, which is the restored one, so only that
-        // stage's entry (`[serverValue, scrollTop]` pairs) is kept. A state without
-        // `crmMobileStage` was saved by the standard layout and restores into it: left untouched.
-        const state = this.props.state;
-        const hasMobileStage = Boolean(state && Object.hasOwn(state, "crmMobileStage"));
-        const columnScrollTops = state?.scrollPositions?.columnScrollTops;
-        if (hasMobileStage && Array.isArray(columnScrollTops)) {
-            state.scrollPositions.columnScrollTops = columnScrollTops.filter(
-                ([serverValue]) => serverValue === state.crmMobileStage
-            );
-        }
-
         super.setup();
         this.crmOffline = useCrmOffline();
-        /** The displayed stage (stage id), shared with the renderer through the env. */
+        /**
+         * The displayed stage (stage id), shared with the renderer through the env. Seeded from the
+         * restored state, where `false` is the group without stage; `null` when none was saved.
+         * Only read in the mobile pipeline.
+         */
         this.crmMobileStage = proxy({
-            serverValue: hasMobileStage ? state.crmMobileStage : null,
+            serverValue: this.props.state?.crmMobileStage ?? null,
         });
         useSubEnv({ crmMobileStage: this.crmMobileStage });
+
+        // Restored column scroll. The base layout effect restores, once the model is ready (at
+        // mount, or at the patch that follows a lazy first load), the saved scroll of every saved
+        // `[serverValue, scrollTop]` pair whose group exists, and dereferences that group's column
+        // node without a null guard. The mobile pipeline renders the displayed stage as its only
+        // column, so in the mobile pipeline the restored pairs are reduced to the displayed
+        // stage's, whichever layout saved them and whether or not a stage was saved. Anywhere else
+        // (desktop, another grouping, ungrouped, no group) the restored state is left exactly as
+        // received. The gate needs the loaded root and the current screen size, so this runs once,
+        // at the start of the first render with a ready model, which precedes that base effect.
+        let isRestoredScrollAdapted = false;
+        onWillRender(() => {
+            if (isRestoredScrollAdapted || !this.model.isReady()) {
+                return;
+            }
+            isRestoredScrollAdapted = true;
+            untrack(() => {
+                const scrollPositions = this.props.state?.scrollPositions;
+                if (!this.isMobilePipeline || !Array.isArray(scrollPositions?.columnScrollTops)) {
+                    return;
+                }
+                const displayed = resolveDisplayedGroup(
+                    this.model.root,
+                    this.crmMobileStage.serverValue
+                );
+                scrollPositions.columnScrollTops = scrollPositions.columnScrollTops.filter(
+                    ([serverValue]) => serverValue === displayed.serverValue
+                );
+            });
+        });
+
         // Merged by the action service with the base controller's local state.
         useSetupAction({
             getLocalState: () => {
@@ -1257,8 +1490,14 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
 
     /**
      * New: in the mobile pipeline, the framework quick create opens in the displayed stage instead
-     * of the first unfolded one (unfolded first when online), so it is visible. Everything else is
-     * the base behaviour.
+     * of the first unfolded one, so it is visible. Everything else is the base behaviour.
+     *
+     * Online, a folded displayed stage is loaded and unfolded first. The view may change while
+     * that load runs, so once it lands the quick create opens only if the controller is still
+     * alive, the mobile pipeline is still rendered and the displayed stage is still the one New
+     * was pressed on; otherwise nothing changes (the stage the user moved to stays displayed). It
+     * then opens in that stage's group of the current root, because a reload during the load
+     * rebuilds the groups with new datapoint ids.
      *
      * @override
      */
@@ -1267,9 +1506,17 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
         if (!this.isMobilePipeline || !(this.canQuickCreate && onCreate === "quick_create")) {
             return super.createRecord(...arguments);
         }
-        const group = resolveDisplayedGroup(this.model.root, this.crmMobileStage.serverValue);
+        let group = resolveDisplayedGroup(this.model.root, this.crmMobileStage.serverValue);
         if (group.isFolded && !this.crmOffline.isOffline()) {
+            const requestedStage = group.serverValue;
             await group.toggle();
+            if (status(this) === "destroyed" || !this.isMobilePipeline) {
+                return;
+            }
+            group = resolveDisplayedGroup(this.model.root, this.crmMobileStage.serverValue);
+            if (group.serverValue !== requestedStage) {
+                return;
+            }
         }
         this.crmMobileStage.serverValue = group.serverValue;
         await this.quickCreateState.openQuickCreate(group.id);

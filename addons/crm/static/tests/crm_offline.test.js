@@ -1566,6 +1566,57 @@ async function selectMenuItemWithKeyboard(hotkey, label) {
     await animationFrame();
 }
 
+/**
+ * Makes the visits of a test that happen before the returned function is called belong to an
+ * earlier session, as when the page is reloaded afterwards: `user.hasGroup(group)` answers them
+ * `true` itself, so neither the session's group cache nor the RPC cache holds an answer for
+ * `group` once the current session starts. Every call made while the client is offline is stepped
+ * as `"hasGroup while offline:<group>"`.
+ *
+ * @param {string} group
+ * @returns {() => void} starts the current session
+ */
+function visitInEarlierSession(group) {
+    let earlierSession = true;
+    patchWithCleanup(user, {
+        hasGroup(probedGroup) {
+            if (probedGroup === group) {
+                if (getService(OfflinePlugin).isOffline()) {
+                    expect.step(`hasGroup while offline:${group}`);
+                }
+                if (earlierSession) {
+                    return Promise.resolve(true);
+                }
+            }
+            return super.hasGroup(...arguments);
+        },
+    });
+    return () => {
+        earlierSession = false;
+    };
+}
+
+/**
+ * Holds the next group probe request for `group`, as a request still in flight, until the
+ * returned function answers it with the given response (a 502 is the connection lost during the
+ * call). Registered before `watchGroupProbes()`, so the watcher still steps the held request.
+ *
+ * @param {string} group
+ * @returns {(response: Response) => void}
+ */
+function holdGroupProbe(group) {
+    const held = Promise.withResolvers();
+    let holding = true;
+    onRpc("/web/dataset/call_kw/res.users/has_group", async (request) => {
+        const { params } = await request.clone().json();
+        if (holding && params.args[1] === group) {
+            holding = false;
+            return held.promise;
+        }
+    });
+    return held.resolve;
+}
+
 describe("DISABLE controls and handler enforcement", () => {
     test.tags("desktop");
     test("team switcher: online mount, disconnect, reconnect", async () => {
@@ -1664,16 +1715,212 @@ describe("DISABLE controls and handler enforcement", () => {
         expect.verifySteps([]);
     });
 
+    const SALE_MANAGER_GROUP = "sales_team.group_sale_manager";
+
     test.tags("desktop");
-    test("lead generation dropdown: disabled offline, no module lookup, access probe or install", async () => {
+    test("team switcher: cold offline mount without a known group answer probes once on reconnect", async () => {
+        // Offline, the kanban rendered again from its cache refreshes its groups in the
+        // background, which fails with a `ConnectionLostError`, as the framework does.
+        expect.errors(1);
         const setOffline = mockOffline();
         keepPingsFailing();
-        watchRpcs([
-            "ir.module.module/search_read",
-            "ir.module.module/button_immediate_install",
-            "has_access",
-            "check_access_rights",
+        watchGroupProbes([SALE_MANAGER_GROUP]);
+        const startSession = visitInEarlierSession(SALE_MANAGER_GROUP);
+        const switchers = captureInstances(TeamSwitcher);
+        await mountWithCleanup(WebClient);
+        // The pipeline and its list are cached by visits of an earlier session.
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        await getService("action").switchView("list");
+        expect.verifySteps([]);
+
+        // The session starts offline: the switcher mounted from the cache asks nothing.
+        startSession();
+        await setOffline(true);
+        await getService("action").switchView("kanban");
+        await animationFrame();
+        const switcher = switchers.at(-1);
+        expect(status(switcher)).toBe("mounted");
+        expect(".o_cp_team_switcher").toHaveCount(1);
+        expect(isDisabledOffline(".o_cp_team_switcher")).toBe(true);
+        expect(switcher.probedSaleManager()).toBe(null);
+        expect(switcher.isSaleManager).toBe(false);
+        await runAllTimers();
+        expect(switcher.probedSaleManager()).toBe(null);
+        expect.verifySteps([]);
+        expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
+        expect(queuedEntries()).toHaveLength(0);
+
+        // Back online: one probe reaches the server, and "Manage Teams" is offered.
+        await setOffline(false);
+        await expect.waitForSteps([`has_group:${SALE_MANAGER_GROUP}`]);
+        await animationFrame();
+        expect(switcher.probedSaleManager()).toBe(true);
+        expect(switcher.isSaleManager).toBe(true);
+        expect(".o_cp_team_switcher").not.toHaveAttribute("disabled");
+        await contains(".o_cp_team_switcher").click();
+        expect(".o_popover .dropdown-item:contains('Manage Teams')").toHaveCount(1);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test.tags("desktop");
+    test("team switcher: a mount probe that loses the connection mounts with Manage Teams hidden, also after reconnect", async () => {
+        const connection = mockConnectionDrop();
+        const answerProbe = holdGroupProbe(SALE_MANAGER_GROUP);
+        watchGroupProbes([SALE_MANAGER_GROUP]);
+        const switchers = captureInstances(TeamSwitcher);
+        await mountWithCleanup(WebClient);
+        const pipelineDisplayed = getService("action").doAction(PIPELINE_ACTION_ID);
+        await expect.waitForSteps([`has_group:${SALE_MANAGER_GROUP}`]);
+        await animationFrame();
+
+        // The connection drops while the mount probe is in flight (every request fails from now
+        // on, the reconnection pings included): the pipeline still mounts, with the answer
+        // unknown and "Manage Teams" hidden, and nothing is raised.
+        connection.offline = true;
+        answerProbe(new Response("", { status: 502 }));
+        await pipelineDisplayed;
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        const switcher = switchers.at(-1);
+        expect(status(switcher)).toBe("mounted");
+        expect(".o_kanban_view").toHaveCount(1);
+        expect(".o_cp_team_switcher").toHaveText("All Teams");
+        expect(isDisabledOffline(".o_cp_team_switcher")).toBe(true);
+        expect(switcher.probedSaleManager()).toBe(null);
+        expect(switcher.isSaleManager).toBe(false);
+        expect(queuedEntries()).toHaveLength(0);
+
+        // The connection returns and a reconnection ping succeeds. The switcher asks again, but
+        // the session's group cache keeps the failed answer: no request is sent, nothing is
+        // raised and "Manage Teams" stays hidden until the page is reloaded, the safe outcome.
+        connection.offline = false;
+        await runAllTimers();
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(switcher.probedSaleManager()).toBe(null);
+        expect(switcher.isSaleManager).toBe(false);
+        await contains(".o_cp_team_switcher").click();
+        expect(".o_popover .dropdown-item:contains('Hyrule')").toHaveCount(1);
+        expect(".o_popover .dropdown-item:contains('Manage Teams')").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Online, the user leaves the pipeline and comes back: each new switcher is answered that
+        // same failed answer by the session's group cache, without a request. The list and the
+        // pipeline still mount, with "Manage Teams" hidden, and nothing is raised.
+        await getService("action").switchView("list");
+        await getService("action").switchView("kanban");
+        await animationFrame();
+        const remounted = switchers.at(-1);
+        expect(remounted).not.toBe(switcher);
+        expect(status(remounted)).toBe("mounted");
+        expect(".o_kanban_view").toHaveCount(1);
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(remounted.probedSaleManager()).toBe(null);
+        expect(remounted.isSaleManager).toBe(false);
+        await contains(".o_cp_team_switcher").click();
+        expect(".o_popover .dropdown-item:contains('Hyrule')").toHaveCount(1);
+        expect(".o_popover .dropdown-item:contains('Manage Teams')").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test.tags("desktop");
+    test("team switcher: a mount probe that alone loses the connection while other requests succeed mounts with Manage Teams hidden", async () => {
+        const RECURRING_REVENUE_GROUP = "crm.group_use_recurring_revenues";
+        const answerProbe = holdGroupProbe(SALE_MANAGER_GROUP);
+        const answerColumnProbe = holdGroupProbe(RECURRING_REVENUE_GROUP);
+        watchGroupProbes([SALE_MANAGER_GROUP, RECURRING_REVENUE_GROUP]);
+        const switchers = captureInstances(TeamSwitcher);
+        await mountWithCleanup(WebClient);
+        const pipelineDisplayed = getService("action").doAction(PIPELINE_ACTION_ID);
+        // The switcher and the pipeline columns probe their groups at the same time.
+        await expect.waitForSteps([
+            `has_group:${SALE_MANAGER_GROUP}`,
+            `has_group:${RECURRING_REVENUE_GROUP}`,
         ]);
+        await animationFrame();
+
+        // Only the switcher's probe loses the connection. The columns' probe is answered right
+        // after it, which puts the client back online before that failure reaches the switcher:
+        // the pipeline still mounts, with the answer unknown and "Manage Teams" hidden, and
+        // nothing is raised.
+        answerProbe(new Response("", { status: 502 }));
+        answerColumnProbe(true); // the server's answer, sent back as the JSON-RPC result
+        await pipelineDisplayed;
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        const switcher = switchers.at(-1);
+        expect(status(switcher)).toBe("mounted");
+        expect(".o_kanban_view").toHaveCount(1);
+        expect(switcher.probedSaleManager()).toBe(null);
+        expect(switcher.isSaleManager).toBe(false);
+        expect(".o_cp_team_switcher").not.toHaveAttribute("disabled");
+        await contains(".o_cp_team_switcher").click();
+        expect(".o_popover .dropdown-item:contains('Hyrule')").toHaveCount(1);
+        expect(".o_popover .dropdown-item:contains('Manage Teams')").toHaveCount(0);
+        // Nothing asks again later: the group cache keeps the failed answer until reload.
+        await runAllTimers();
+        expect(switcher.isSaleManager).toBe(false);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test.tags("desktop");
+    test("team switcher: a mount probe the server rejects still fails the mount", async () => {
+        // The server error reaches the framework unchanged: the switcher does not swallow it.
+        expect.errors(1);
+        onRpc("/web/dataset/call_kw/res.users/has_group", async (request) => {
+            const { params } = await request.clone().json();
+            if (params.args[1] === SALE_MANAGER_GROUP) {
+                throw makeServerError({ message: "Group probe refused" });
+            }
+        });
+        watchGroupProbes([SALE_MANAGER_GROUP]);
+        await mountWithCleanup(WebClient);
+        // Not awaited: the pipeline never finishes mounting.
+        getService("action").doAction(PIPELINE_ACTION_ID);
+        await expect.waitForSteps([`has_group:${SALE_MANAGER_GROUP}`]);
+        await expect.waitForErrors(["Group probe refused"]);
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(".o_cp_team_switcher").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    const LEAD_GEN_BUTTON = "button.o-dropdown-caret:contains('Generate')";
+    const LEAD_GEN_SURVEY_ITEM = ".o_lead_mining_element[data-module-xml-id='base.module_survey']";
+    const LEAD_GEN_RPCS = [
+        "ir.module.module/search_read",
+        "ir.module.module/button_immediate_install",
+        "has_access",
+        "check_access_rights",
+    ];
+
+    /**
+     * Makes the Survey entry of the lead generation dropdown access-gated, as an installed
+     * lead-generation addon does: it gets a model, so the first opening probes `crm.lead` creation
+     * access, and its own action steps `"onClick:survey"` instead of running. The probe is
+     * answered `false`, the opposite of the entry's default for admin.
+     */
+    function mockAccessGatedLeadGenEntry() {
+        patchWithCleanup(LeadGenerationDropdown.prototype, {
+            setup() {
+                super.setup(...arguments);
+                const survey = this.state.dropdownContentElements.find(
+                    (element) => element.moduleXmlId === "base.module_survey"
+                );
+                Object.assign(survey, {
+                    model: "crm.lead",
+                    onClick: () => expect.step("onClick:survey"),
+                    status: "INSTALLED",
+                });
+            },
+        });
+        onRpc("crm.lead", "has_access", () => false);
+    }
+
+    /** Steps the import and access-request actions of the dropdown instead of running them. */
+    function mockLeadGenActions() {
         mockService("action", {
             doAction(action) {
                 if (
@@ -1686,6 +1933,51 @@ describe("DISABLE controls and handler enforcement", () => {
                 return super.doAction(...arguments);
             },
         });
+    }
+
+    /**
+     * Holds the next request to `route`, then answers it with a 502 when the returned function is
+     * called, as a connection that drops during the call. Registered before `watchRpcs()`, so the
+     * watcher still steps the request.
+     *
+     * @param {string} route
+     * @returns {() => Promise<void>} drops the held request
+     */
+    function dropNextRequest(route) {
+        const held = Promise.withResolvers();
+        let holding = true;
+        onRpc(route, async () => {
+            if (holding) {
+                holding = false;
+                await held.promise;
+                return new Response("", { status: 502 });
+            }
+        });
+        return async () => {
+            held.resolve();
+            await animationFrame();
+        };
+    }
+
+    /** @returns {LeadGenerationDropdown} the dropdown of the current pipeline */
+    function findLeadGenDropdown(webClient) {
+        return findComponent(webClient, (component) => component instanceof LeadGenerationDropdown);
+    }
+
+    /** @returns {Object} the access-gated Survey entry of `dropdown` */
+    function surveyEntry(dropdown) {
+        return dropdown.state.dropdownContentElements.find(
+            (element) => element.moduleXmlId === "base.module_survey"
+        );
+    }
+
+    test.tags("desktop");
+    test("lead generation dropdown: disabled offline, no module lookup, access probe or install", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        mockAccessGatedLeadGenEntry();
+        watchRpcs(LEAD_GEN_RPCS);
+        mockLeadGenActions();
         // "Generate" has the accesskey "c" (hotkey `alt+c`), which the New button of the
         // pipeline also has: the hotkey runs the first of them in the DOM, New. The pipeline is
         // shown without lead creation, so that `alt+c` is the hotkey of "Generate".
@@ -1697,12 +1989,12 @@ describe("DISABLE controls and handler enforcement", () => {
         const webClient = await mountWithCleanup(WebClient);
         await getService("action").doAction(PIPELINE_ACTION_ID);
         expect(".o-kanban-button-new").toHaveCount(0);
-        const dropdown = findComponent(
-            webClient,
-            (component) => component instanceof LeadGenerationDropdown
-        );
-        const generateButton = "button.o-dropdown-caret:contains('Generate')";
+        const dropdown = findLeadGenDropdown(webClient);
+        const survey = surveyEntry(dropdown);
+        const surveyItem = LEAD_GEN_SURVEY_ITEM;
+        const generateButton = LEAD_GEN_BUTTON;
         expect(generateButton).toBeEnabled();
+        expect(survey.hasAccess).toBe(true);
         // Keyboard selection of a choice in the open dropdown, as a keyboard user does it: the
         // arrow keys move the focus to the choice, and Enter selects it.
         const selectChoiceWithKeyboard = async (moduleXmlId) => {
@@ -1739,11 +2031,15 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(generateButton).toBeEnabled();
         expect.verifySteps([]);
 
-        // Online: the first opening looks the modules up, and an uninstalled choice asks to
-        // install it.
+        // Online: the first opening looks the modules up and probes the access of the gated
+        // entry, whose answer replaces its default: selecting it asks for access instead of
+        // running its action. An uninstalled choice asks to install it.
         await contains(generateButton).click();
-        expect.verifySteps(["ir.module.module/search_read"]);
+        expect.verifySteps(["ir.module.module/search_read", "crm.lead/has_access"]);
         expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        expect(survey.hasAccess).toBe(false);
+        await contains(surveyItem).click();
+        expect.verifySteps(["doAction:base.module.install.request"]);
         // The hotkey is a real route to the same toggle: `alt+c` closes the dropdown and opens it
         // again (the modules are known by now, so nothing is looked up again).
         await press(["alt", "c"]);
@@ -1761,7 +2057,9 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(".modal").toHaveCount(1);
         expect(".modal .modal-footer .btn-primary").toHaveText("Install");
 
-        // The connection drops while the confirmation is open: confirming installs nothing.
+        // The connection drops while the confirmation and the menu are open: confirming
+        // installs nothing.
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
         await setOffline(true);
         expect(".modal .modal-footer .btn-primary").toBeEnabled();
         await contains(".modal .modal-footer .btn-primary").click();
@@ -1779,13 +2077,29 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(".o_lead_mining_menu_choices").toHaveCount(1);
         expect(".modal").toHaveCount(0);
 
-        // Offline, "Generate" is disabled and every entry point is inert, without DOM event.
+        // Offline, "Generate" and the entries of the menu left open are disabled, and neither
+        // the keyboard nor a click reaches an entry.
         expect(isDisabledOffline(generateButton)).toBe(true);
+        expect(isDisabledOffline(surveyItem)).toBe(true);
+        await press(["alt", "c"]);
+        await animationFrame();
+        await press("ArrowDown");
+        await press("Enter");
+        await animationFrame();
+        await contains(surveyItem).click();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps([]);
+
+        // Every entry point is inert without DOM event too: toggling neither closes the menu
+        // nor probes, and the gated entry neither runs its action nor asks for access.
         const [leadSourcing] = dropdown.state.dropdownContentElements;
         const leadImport = dropdown.state.dropdownContentElements.find(
             (element) => element.moduleName === "Lead Import"
         );
         await dropdown.toggleDropdown();
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        await dropdown.onClickAction(survey);
+        await dropdown.onClickAction({ ...survey, hasAccess: true });
         await dropdown.onClickAction(leadSourcing);
         await dropdown.onClickAction(leadImport);
         await dropdown.onClickAction({ ...leadSourcing, hasAccess: false });
@@ -1794,10 +2108,140 @@ describe("DISABLE controls and handler enforcement", () => {
         await animationFrame();
         expect(".modal").toHaveCount(0);
         expect(leadSourcing.status).toBe("NOT_INSTALLED");
+        expect(survey.hasAccess).toBe(false);
 
         await setOffline(false);
         expect(generateButton).toBeEnabled();
         expect.verifySteps([]);
+    });
+
+    test.tags("desktop");
+    test("lead generation dropdown: an opening whose module lookup loses the connection initializes again once online", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        mockAccessGatedLeadGenEntry();
+        const dropLookup = dropNextRequest("/web/dataset/call_kw/ir.module.module/search_read");
+        watchRpcs(LEAD_GEN_RPCS);
+        mockLeadGenActions();
+        const webClient = await mountWithCleanup(WebClient);
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        const dropdown = findLeadGenDropdown(webClient);
+
+        // The first opening starts both lookups. A click while they are pending toggles the
+        // menu open without looking anything up again, as before.
+        await contains(LEAD_GEN_BUTTON).click();
+        expect.verifySteps(["ir.module.module/search_read", "crm.lead/has_access"]);
+        await contains(LEAD_GEN_BUTTON).click();
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        expect.verifySteps([]);
+
+        // The module lookup loses the connection: the client goes offline, no error escapes
+        // (Hoot fails on any undeclared error), the menu is closed and the dropdown is no longer
+        // initialized.
+        await dropLookup();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(".o_lead_mining_menu_choices").toHaveCount(0);
+        expect(dropdown.dropdownWasAlreadyOpened).toBe(false);
+
+        // Back online, in the same dropdown: the next opening looks the modules up again (the
+        // access answer is reused), opens the menu, and an uninstalled choice asks to install
+        // it with its module name.
+        await setOffline(false);
+        expect(LEAD_GEN_BUTTON).toBeEnabled();
+        await contains(LEAD_GEN_BUTTON).click();
+        expect.verifySteps(["ir.module.module/search_read"]);
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        expect(dropdown.dropdownWasAlreadyOpened).toBe(true);
+        expect(surveyEntry(dropdown).hasAccess).toBe(false);
+        await contains(
+            ".o_lead_mining_element[data-module-xml-id='base.module_crm_iap_mine']"
+        ).click();
+        expect(".modal").toHaveCount(1);
+        expect(".modal .modal-body").toHaveText(
+            'Do you want to install the "Lead Generation" App?'
+        );
+        expect(".modal .modal-footer .btn-primary").toHaveText("Install");
+        expect.verifySteps([]);
+    });
+
+    test.tags("desktop");
+    test("lead generation dropdown: an access probe lost to a dropped connection keeps the default access", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        mockAccessGatedLeadGenEntry();
+        const dropProbe = dropNextRequest("/web/dataset/call_kw/crm.lead/has_access");
+        watchRpcs(LEAD_GEN_RPCS);
+        mockLeadGenActions();
+        const webClient = await mountWithCleanup(WebClient);
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        const dropdown = findLeadGenDropdown(webClient);
+
+        // The module lookup succeeds, then the access probe loses the connection: the
+        // initialization completes with the entry's default access, but the menu does not open
+        // offline and no error escapes.
+        await contains(LEAD_GEN_BUTTON).click();
+        expect.verifySteps(["ir.module.module/search_read", "crm.lead/has_access"]);
+        await dropProbe();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(".o_lead_mining_menu_choices").toHaveCount(0);
+        expect(dropdown.dropdownWasAlreadyOpened).toBe(true);
+        expect(surveyEntry(dropdown).hasAccess).toBe(true);
+
+        // Back online: the menu opens without any lookup, and the gated entry runs its action.
+        await setOffline(false);
+        await contains(LEAD_GEN_BUTTON).click();
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        await contains(LEAD_GEN_SURVEY_ITEM).click();
+        expect.verifySteps(["onClick:survey"]);
+
+        // A new pipeline initializes a new dropdown. The user access cache still holds the lost
+        // answer and the module lookup is cached, so nothing reaches the network, yet the menu
+        // opens with the default access.
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        const newDropdown = findLeadGenDropdown(webClient);
+        expect(newDropdown).not.toBe(dropdown);
+        expect(newDropdown.dropdownWasAlreadyOpened).toBe(undefined);
+        await contains(LEAD_GEN_BUTTON).click();
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        expect(newDropdown.dropdownWasAlreadyOpened).toBe(true);
+        expect(surveyEntry(newDropdown).hasAccess).toBe(true);
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect.verifySteps([]);
+    });
+
+    test.tags("desktop");
+    test("lead generation dropdown: a module lookup server error propagates and the next opening initializes again", async () => {
+        expect.errors(1);
+        mockAccessGatedLeadGenEntry();
+        let refuseLookup = true;
+        onRpc("ir.module.module", "search_read", () => {
+            if (refuseLookup) {
+                refuseLookup = false;
+                throw makeServerError({ message: "Module lookup refused" });
+            }
+        });
+        watchRpcs(LEAD_GEN_RPCS);
+        mockLeadGenActions();
+        const webClient = await mountWithCleanup(WebClient);
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        const dropdown = findLeadGenDropdown(webClient);
+
+        // The server refuses the module lookup: its error reaches the framework unchanged, the
+        // client stays online, the menu stays closed and the dropdown is no longer initialized.
+        await contains(LEAD_GEN_BUTTON).click();
+        await animationFrame();
+        expect.verifySteps(["ir.module.module/search_read", "crm.lead/has_access"]);
+        expect.verifyErrors(["Module lookup refused"]);
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(".o_lead_mining_menu_choices").toHaveCount(0);
+        expect(dropdown.dropdownWasAlreadyOpened).toBe(false);
+
+        // The next opening looks the modules up again and opens the menu.
+        await contains(".o_error_dialog .modal-footer .btn-primary").click();
+        await contains(LEAD_GEN_BUTTON).click();
+        expect.verifySteps(["ir.module.module/search_read"]);
+        expect(".o_lead_mining_menu_choices").toHaveCount(1);
+        expect(dropdown.dropdownWasAlreadyOpened).toBe(true);
     });
 
     test.tags("desktop");
@@ -2142,15 +2586,20 @@ describe("DISABLE controls and handler enforcement", () => {
         keepPingsFailing();
         watchOfflineRpcs();
         listenStoreFetch("systray_get_activities");
+        const myActivitiesAction = () => ({
+            type: "ir.actions.act_window",
+            res_model: "crm.lead",
+            views: [[false, "list"]],
+            domain: [],
+        });
+        // When set, the next loadAction answers only once the test resolves this deferred.
+        let deferredLoadAction = null;
         mockService("action", {
             async loadAction(action) {
                 expect.step(`loadAction:${action}`);
-                return {
-                    type: "ir.actions.act_window",
-                    res_model: "crm.lead",
-                    views: [[false, "list"]],
-                    domain: [],
-                };
+                const deferred = deferredLoadAction;
+                deferredLoadAction = null;
+                return deferred ? deferred.promise : myActivitiesAction();
             },
             async doAction(action, options) {
                 if (action?.res_model === "crm.lead" && options?.clearBreadcrumbs) {
@@ -2218,6 +2667,18 @@ describe("DISABLE controls and handler enforcement", () => {
         await setOffline(false);
         expect(crmEntry).not.toHaveAttribute("disabled");
         expect(crmEntry).not.toHaveClass("o_disabled_offline");
+
+        // Clicked online, but the connection drops while the action is loading: once the action
+        // arrives, nothing is opened.
+        deferredLoadAction = Promise.withResolvers();
+        const pendingLoadAction = deferredLoadAction;
+        await mailClick(crmEntry);
+        await setOffline(true);
+        pendingLoadAction.resolve(myActivitiesAction());
+        await animationFrame();
+        expect.verifySteps(["loadAction:crm.crm_lead_action_my_activities"]);
+
+        await setOffline(false);
     });
 
     test.tags("desktop");
@@ -2724,6 +3185,141 @@ describe("SKIP and remaining DISABLE", () => {
         expect(offlineBar.showRecurringRevenue).toBe(true);
         // The answer of the first probe is reused: still a single probe in total.
         expect.verifySteps([]);
+    });
+
+    const RECURRING_REVENUE_GROUP = "crm.group_use_recurring_revenues";
+    const MRR_AGGREGATE = ".o_kanban_counter .o_animated_number[data-tooltip='Expected MRR']";
+
+    test("recurring revenue aggregate: cold offline mount without a known group answer probes once on reconnect", async () => {
+        // Offline, the kanban rendered again from its cache refreshes its groups in the
+        // background, which fails with a `ConnectionLostError`, as the framework does.
+        expect.errors(1);
+        // A single pipeline column.
+        for (const record of CrmLead._records) {
+            record.stage_id = 1;
+        }
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchGroupProbes([RECURRING_REVENUE_GROUP]);
+        const startSession = visitInEarlierSession(RECURRING_REVENUE_GROUP);
+        const progressBars = captureInstances(CrmColumnProgress);
+        await mountWithCleanup(WebClient);
+        // The pipeline and its list are cached by visits of an earlier session.
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        await getService("action").switchView("list");
+        expect.verifySteps([]);
+
+        // The session starts offline: the progress bar mounted from the cache asks nothing and
+        // hides the aggregate (not shown as 0, no "MRR" label).
+        startSession();
+        await setOffline(true);
+        await getService("action").switchView("kanban");
+        await animationFrame();
+        expect(".o_kanban_group").toHaveCount(1);
+        const bar = progressBars.at(-1);
+        expect(status(bar)).toBe("mounted");
+        expect(bar.probedRecurringRevenue()).toBe(null);
+        expect(bar.showRecurringRevenue).toBe(false);
+        expect(MRR_AGGREGATE).toHaveCount(0);
+        expect(".o_kanban_counter").not.toHaveText(/\+|MRR/);
+        await runAllTimers();
+        expect(bar.probedRecurringRevenue()).toBe(null);
+        expect.verifySteps([]);
+        expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
+        expect(queuedEntries()).toHaveLength(0);
+
+        // Back online: one probe reaches the server, and the bar renders the aggregate the
+        // progress bar computes. Its counter waits for the progress bar counts, which the
+        // framework could not read offline (`read_progress_bar` is not cached): the next load of
+        // the pipeline shows the value, answered from the probe, without asking again.
+        await setOffline(false);
+        await expect.waitForSteps([`has_group:${RECURRING_REVENUE_GROUP}`]);
+        await animationFrame();
+        expect(bar.probedRecurringRevenue()).toBe(true);
+        expect(bar.showRecurringRevenue).toBe(true);
+        const { group, progressBarState } = bar.props;
+        const rrField = progressBarState.progressAttributes.recurring_revenue_sum_field;
+        expect(bar.getRecurringRevenueGroupAggregate(group)).toEqual(
+            progressBarState.getAggregateValue(group, rrField)
+        );
+        expect(bar.getRecurringRevenueGroupAggregate(group).title).toBe("Expected MRR");
+        await getService("action").switchView("list");
+        await getService("action").switchView("kanban");
+        expect(MRR_AGGREGATE).toHaveText("+15");
+        expect(progressBars.at(-1).probedRecurringRevenue()).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test("recurring revenue aggregate: a mount probe that loses the connection hides the aggregate, also after reconnect", async () => {
+        // A single pipeline column.
+        for (const record of CrmLead._records) {
+            record.stage_id = 1;
+        }
+        const connection = mockConnectionDrop();
+        const answerProbe = holdGroupProbe(RECURRING_REVENUE_GROUP);
+        watchGroupProbes([RECURRING_REVENUE_GROUP]);
+        // Once the column is mounted, each group question is stepped, whether or not it reaches
+        // the network. Each failure the progress bar reports is stepped too.
+        let stepGroupQuestions = false;
+        patchWithCleanup(user, {
+            hasGroup(group) {
+                if (stepGroupQuestions && group === RECURRING_REVENUE_GROUP) {
+                    expect.step(`hasGroup:${group}`);
+                }
+                return super.hasGroup(...arguments);
+            },
+        });
+        patchWithCleanup(console, {
+            warn(message, error) {
+                if (String(message).startsWith("CRM:")) {
+                    expect.step(`warn:${message}: ${error?.message}`);
+                    return;
+                }
+                return super.warn(...arguments);
+            },
+        });
+        const progressBars = captureInstances(CrmColumnProgress);
+        await mountWithCleanup(WebClient);
+        const pipelineDisplayed = getService("action").doAction(PIPELINE_ACTION_ID);
+        await expect.waitForSteps([`has_group:${RECURRING_REVENUE_GROUP}`]);
+        await animationFrame();
+
+        // The connection drops while the mount probe is in flight (every request fails from now
+        // on, the reconnection pings included): the column still mounts, the aggregate is hidden
+        // (not shown as 0, no "MRR" label), and nothing is raised or reported.
+        connection.offline = true;
+        answerProbe(new Response("", { status: 502 }));
+        await pipelineDisplayed;
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(".o_kanban_group").toHaveCount(1);
+        const bar = progressBars.at(-1);
+        expect(status(bar)).toBe("mounted");
+        expect(bar.probedRecurringRevenue()).toBe(null);
+        expect(bar.showRecurringRevenue).toBe(false);
+        expect(MRR_AGGREGATE).toHaveCount(0);
+        expect(".o_kanban_counter").not.toHaveText(/\+|MRR/);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // The connection returns and a reconnection ping succeeds. The progress bar asks again,
+        // but the session's group cache returns the failed answer without a request: the
+        // aggregate stays hidden until the page is reloaded. Received online, that replayed
+        // failure is reported as a warning only.
+        stepGroupQuestions = true;
+        connection.offline = false;
+        await runAllTimers();
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect.verifySteps([
+            `hasGroup:${RECURRING_REVENUE_GROUP}`,
+            `warn:CRM: recurring revenue group probe failed: Connection to "/web/dataset/call_kw/res.users/has_group" couldn't be established or was interrupted`,
+        ]);
+        expect(bar.probedRecurringRevenue()).toBe(null);
+        expect(bar.showRecurringRevenue).toBe(false);
+        expect(MRR_AGGREGATE).toHaveCount(0);
+        expect(".o_kanban_counter").not.toHaveText(/\+|MRR/);
+        expect(queuedEntries()).toHaveLength(0);
     });
 
     test("pls tooltip button: disabled offline, no lookup", async () => {
@@ -3558,6 +4154,98 @@ describe("SKIP and remaining DISABLE", () => {
         await mailContains(".modal-footer button:contains('Cancel Message')");
     });
 
+    test("chatter load that loses the connection: a lead chatter keeps what it shows; other errors and other threads still raise", async () => {
+        const { pyEnv } = await seedLeadThread();
+        const partnerId = pyEnv["res.partner"].create({ name: "Customer" });
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        // Once the lead load loses the connection, every request fails. Registered before the
+        // held-load handler below, which runs first and so still answers the request it holds.
+        const connection = mockConnectionDrop();
+        // The loads under test request what the chatter reloads after followers were added.
+        const requestList = ["followers", "suggestedRecipients"];
+        // Their thread data request is stepped as `"thread data:<model>"` and held in flight,
+        // then answered as the test decides.
+        let heldLoad = null;
+        onRpc("/mail/store", async (request) => {
+            const { params } = await request.clone().json();
+            const threadRequest = params.fetch_params.find(
+                (fetchParam) =>
+                    Array.isArray(fetchParam) &&
+                    fetchParam[0] === "mail.thread" &&
+                    JSON.stringify(fetchParam[1].request_list) === JSON.stringify(requestList)
+            );
+            if (heldLoad && threadRequest) {
+                expect.step(`thread data:${threadRequest[1].thread_model}`);
+                const answer = heldLoad.promise;
+                heldLoad = null;
+                return answer;
+            }
+        });
+        const holdNextLoad = () => (heldLoad = Promise.withResolvers());
+        // Every chatter write is stepped: there is none.
+        watchRpcs(MAIL_WRITES);
+        const chatters = captureInstances(Chatter);
+        await start();
+
+        // Another model: a lost connection during its chatter load is not swallowed by CRM.
+        await openFormView("res.partner", partnerId, {
+            arch: /* xml */ `
+                <form>
+                    <sheet><field name="name"/></sheet>
+                    <chatter/>
+                </form>`,
+        });
+        await mailContains(".o-mail-Chatter");
+        const partnerChatter = chatters.find(
+            (c) => c.threadModel() === "res.partner" && status(c) === "mounted"
+        );
+        let held = holdNextLoad();
+        const partnerLoad = partnerChatter.load(partnerChatter.state.thread, requestList);
+        await expect.waitForSteps(["thread data:res.partner"]);
+        held.resolve(new Response("", { status: 502 }));
+        await expect(partnerLoad).rejects.toThrow(/Connection to "\/mail\/store"/);
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        await setOffline(false);
+
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message:contains('Hello lead')");
+        await mailContains(".o-mail-Activity");
+        await mailContains(".o-mail-Followers-counter:text('2')");
+        const chatter = chatters.find(
+            (c) => c.threadModel() === "crm.lead" && status(c) === "mounted"
+        );
+        const thread = chatter.state.thread;
+
+        // A lead chatter load the server rejects for another reason still raises.
+        held = holdNextLoad();
+        const refusedLoad = chatter.load(thread, requestList);
+        await expect.waitForSteps(["thread data:crm.lead"]);
+        held.reject(makeServerError({ message: "Thread data refused" }));
+        await expect(refusedLoad).rejects.toThrow(/Thread data refused/);
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+
+        // A lead chatter load whose request loses the connection: no error, the chatter keeps
+        // what it shows, nothing is written or queued. The connection stays down for the rest of
+        // the test, so every request the now offline form issues fails too: on small screens the
+        // lead's partner field switches to its inline autocomplete, which searches at once and
+        // falls back to the relational-field cache.
+        held = holdNextLoad();
+        const lostLoad = chatter.load(thread, requestList);
+        await expect.waitForSteps(["thread data:crm.lead"]);
+        connection.offline = true;
+        held.resolve(new Response("", { status: 502 }));
+        await expect(lostLoad).resolves.toBe(undefined);
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(".o-mail-Message:contains('Hello lead')").toHaveCount(1);
+        expect(".o-mail-Activity").toHaveCount(1);
+        expect(".o-mail-Followers-counter").toHaveText("2");
+        expect(".modal").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
     test("message delete confirmation opened online closes on disconnect and removes nothing", async () => {
         await seedLeadThread();
         const setOffline = mockOffline();
@@ -3795,6 +4483,70 @@ describe("SKIP and remaining DISABLE", () => {
         expect.verifySteps(["crm.team/web_search_read"]);
         expect(offlineItem.state.teams.map(({ id }) => id)).toEqual([1, 2]);
         expect(offlineItem.state.selected_team.id).toBe(1);
+    });
+
+    test("share target item: a team read that loses the connection keeps the teams; other errors still raise", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        // A team read can be held in flight, then answered as the test decides.
+        let heldRead = null;
+        onRpc("/web/dataset/call_kw/crm.team/web_search_read", () => {
+            if (heldRead) {
+                const answer = heldRead.promise;
+                heldRead = null;
+                return answer;
+            }
+        });
+        const holdNextRead = () => (heldRead = Promise.withResolvers());
+        watchRpcs(["crm.team/web_search_read"]);
+        const pngFile = new File([new Uint8Array(1)], "text.png", { type: "image/png" });
+        const items = captureInstances(CrmShareTargetItem);
+        patchWithCleanup(shareTargetService, {
+            _getShareTargetFiles: async () => [pngFile],
+        });
+        const webClient = await mountWithCleanup(WebClient);
+        await animationFrame();
+        expect(".o_dialog").toHaveCount(1);
+        const dialog = findComponent(
+            webClient,
+            (component) => typeof component?.onSelectedApp === "function"
+        );
+        if (!dialog.isSelectedShareTarget("Lead")) {
+            dialog.onSelectedApp("Lead");
+        }
+        await animationFrame();
+        expect(".o_dialog button.active").toHaveText("Lead");
+        // Online, the item reads the sales teams of the company, and the user picks the second.
+        expect.verifySteps(["crm.team/web_search_read"]);
+        const item = items.at(-1);
+        expect(status(item)).toBe("mounted");
+        expect(item.state.teams.map(({ id }) => id)).toEqual([1, 2]);
+        item.state.selected_team = item.state.teams[1];
+
+        // A read whose request loses the connection: it resolves without an error, and the
+        // teams and the selected team keep their values.
+        let held = holdNextRead();
+        const lostRead = item.updateTeams();
+        await expect.waitForSteps(["crm.team/web_search_read"]);
+        held.resolve(new Response("", { status: 502 }));
+        await expect(lostRead).resolves.toBe(undefined);
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(item.state.teams.map(({ id }) => id)).toEqual([1, 2]);
+        expect(item.state.selected_team.id).toBe(2);
+        expect(".o_dialog button.active").toHaveText("Lead");
+        expect(queuedEntries()).toHaveLength(0);
+
+        // Back online, a read the server rejects for another reason still raises.
+        await setOffline(false);
+        held = holdNextRead();
+        const refusedRead = item.updateTeams();
+        await expect.waitForSteps(["crm.team/web_search_read"]);
+        held.reject(makeServerError({ message: "Team read refused" }));
+        await expect(refusedRead).rejects.toThrow(/Team read refused/);
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(item.state.selected_team.id).toBe(2);
+        expect(queuedEntries()).toHaveLength(0);
     });
 });
 

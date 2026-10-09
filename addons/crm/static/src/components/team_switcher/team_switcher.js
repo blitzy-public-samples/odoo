@@ -2,6 +2,7 @@ import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
 import { Dropdown } from "@web/core/dropdown/dropdown";
 import { DropdownItem } from "@web/core/dropdown/dropdown_item";
 import { _t } from "@web/core/l10n/translation";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { user } from "@web/core/user";
 import { useService } from "@web/core/utils/hooks";
 
@@ -32,12 +33,13 @@ export class TeamSwitcher extends Component {
             try {
                 await this._probeSaleManager();
             } catch (error) {
-                // The connection dropped while the probe was in flight: the offline plugin is
-                // already offline when the RPC rejects, so the mount goes on with the item hidden
-                // instead of failing. The answer stays unknown (the user group cache may keep
-                // that failed answer, which keeps the item hidden: the safe outcome). Any other
-                // error propagates as it always did.
-                if (!this.crmOffline.isOffline()) {
+                // A probe that lost the connection, whether it just happened (the client may
+                // already be back online by now) or is the failed answer the user group cache
+                // keeps and replays to every later mount, leaves the answer unknown: the mount
+                // goes on with "Manage Teams" hidden instead of failing, the safe outcome until
+                // the page is reloaded. Any other error received online propagates, as it always
+                // did.
+                if (!(error instanceof ConnectionLostError) && !this.crmOffline.isOffline()) {
                     throw error;
                 }
             }
@@ -55,7 +57,7 @@ export class TeamSwitcher extends Component {
             }
             untrack(() => this._probeSaleManager()).catch(() => {
                 // A failed reconnect probe leaves the answer unknown, so "Manage Teams" stays
-                // hidden; an online mount reports the same failure through `onWillStart`.
+                // hidden; an online mount handles the same failure in `onWillStart`.
             });
         });
     }

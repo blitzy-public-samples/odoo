@@ -6,6 +6,7 @@ import { useService } from "@web/core/utils/hooks";
 import { useHotkey } from "@web/core/hotkeys/hotkey_hook";
 import { sprintf } from "@web/core/utils/strings";
 import { _t } from "@web/core/l10n/translation";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { user } from "@web/core/user";
 import { ConfirmationDialog } from "@web/core/confirmation_dialog/confirmation_dialog";
 import { ErrorDialog } from "@web/core/errors/error_dialogs";
@@ -170,10 +171,19 @@ export class LeadGenerationDropdown extends Component {
                     return;
                 }
                 const accesses = await Promise.all(
-                    modelsToCheck.map(async (model) => [
-                        model,
-                        await user.checkAccessRight(model, "create"),
-                    ])
+                    modelsToCheck.map(async (model) => {
+                        try {
+                            return [model, await user.checkAccessRight(model, "create")];
+                        } catch (error) {
+                            // An answer lost to a dropped connection keeps the entry's default
+                            // access until the page is reloaded: the user access cache keeps the
+                            // failed answer, so asking again would only fail again.
+                            if (error instanceof ConnectionLostError) {
+                                return [model, elementsToUpdate[model].hasAccess];
+                            }
+                            throw error;
+                        }
+                    })
                 );
                 for (const [model, access] of accesses) {
                     elementsToUpdate[model].hasAccess = access;
@@ -181,7 +191,23 @@ export class LeadGenerationDropdown extends Component {
             })()
         );
 
-        await Promise.all(proms);
+        try {
+            await Promise.all(proms);
+        } catch (error) {
+            // A failed lookup leaves `modulesInfo` incomplete: the next opening initializes
+            // again, and a menu a toggle opened meanwhile is closed. A lost connection is
+            // already reported by the offline state; any other error propagates.
+            this.dropdownWasAlreadyOpened = false;
+            this.dropdown.close();
+            if (error instanceof ConnectionLostError) {
+                return;
+            }
+            throw error;
+        }
+        // The connection may have dropped during the lookups: do not open offline.
+        if (this.crmOffline.isOffline()) {
+            return;
+        }
         this.dropdown.open();
     }
 

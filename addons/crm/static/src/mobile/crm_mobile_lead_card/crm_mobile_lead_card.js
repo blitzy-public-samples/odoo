@@ -229,7 +229,8 @@ export class CrmMobileLeadCard extends Component {
     }
 
     /**
-     * Queued activity calls of the lead, as stored by the framework (never copied or mutated).
+     * Queued activity calls of the lead, as stored by the framework (never copied or mutated), in
+     * replay order: the order they were made in, so the pending rows list them in that order.
      * Memoized: the queue is scanned once per queue change, whatever the number of readers.
      *
      * @returns {QueueEntry[]}
@@ -242,7 +243,7 @@ export class CrmMobileLeadCard extends Component {
         this.isPersisted ? this.crmOffline.pendingActivityCalls(this.props.record.resId) : []
     );
 
-    /** @returns {QueueEntry[]} the queued activity creates of the lead (memoized) */
+    /** @returns {QueueEntry[]} the lead's queued activity creates, in replay order (memoized) */
     get pendingActivityCreates() {
         return this._pendingActivityCreates();
     }

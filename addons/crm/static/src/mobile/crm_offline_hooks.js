@@ -417,7 +417,7 @@ function compareReplayOrder(entryA, entryB) {
  *   leadCreates: Map<number | false | undefined, QueueEntry[]> }} StageIndex what the stage
  *   readers look up in an array of queue entries: by lead id, the queued `stage_id` write of the
  *   lead that comes last in replay order; by stage id, the queued `crm.lead` creates targeting the
- *   stage, in array order. It holds the entries themselves.
+ *   stage, in replay order. It holds the entries themselves.
  */
 
 /**
@@ -441,7 +441,8 @@ const stageIndexes = new WeakMap();
 function buildStageIndex(entries) {
     /** @type {Map<number, { key: string | number, value: QueuedCall, entry: QueueEntry }>} */
     const latest = new Map();
-    const leadCreates = new Map();
+    /** By stage id, the creates targeting it, each held as `{ key, value, entry }` like above. */
+    const creates = new Map();
     for (const entry of entries) {
         const { key, value } = entry;
         if (value?.model !== "crm.lead" || value.method !== "web_save") {
@@ -456,11 +457,13 @@ function buildStageIndex(entries) {
             if (Number.isNaN(stageId)) {
                 continue;
             }
-            const creates = leadCreates.get(stageId);
-            if (creates) {
-                creates.push(entry);
+            // Sorted on the value read above, so the traversal reads it once per entry.
+            const create = { key, value, entry };
+            const stageCreates = creates.get(stageId);
+            if (stageCreates) {
+                stageCreates.push(create);
             } else {
-                leadCreates.set(stageId, [entry]);
+                creates.set(stageId, [create]);
             }
         } else if (vals && Object.hasOwn(vals, "stage_id")) {
             // Ranked on the value read above, so the traversal reads it once per entry.
@@ -476,6 +479,14 @@ function buildStageIndex(entries) {
     const latestStageWrites = new Map();
     for (const [resId, { entry }] of latest) {
         latestStageWrites.set(resId, entry);
+    }
+    const leadCreates = new Map();
+    for (const [stageId, stageCreates] of creates) {
+        stageCreates.sort(compareReplayOrder);
+        leadCreates.set(
+            stageId,
+            stageCreates.map(({ entry }) => entry)
+        );
     }
     return { latestStageWrites, leadCreates };
 }
@@ -571,7 +582,9 @@ export function useCrmOffline() {
      * @param {number | false} stageValue the stage id (a group's `serverValue`)
      * @param {QueueEntry[]} [entries] defaults to the live queue; a frozen array is indexed once
      *   (see `frozenStageIndex`)
-     * @returns {QueueEntry[]} a new array on every call, in the order of `entries`
+     * @returns {QueueEntry[]} a new array on every call, in replay order (see
+     *   `compareReplayOrder`): the order the leads were created in, whatever the order of `entries`
+     *   and the enumeration order of their queue keys
      */
     function pendingLeadCreates(stageValue, entries = queuedEntries()) {
         const index = frozenStageIndex(entries);
@@ -579,17 +592,19 @@ export function useCrmOffline() {
             // A new array, so that no caller can change the index.
             return [...(index.leadCreates.get(stageValue) ?? [])];
         }
-        return entries.filter(({ value }) => {
-            if (value?.model !== "crm.lead" || value.method !== "web_save") {
-                return false;
-            }
-            const [ids, vals] = value.args ?? [];
-            if (!Array.isArray(ids) || ids.length !== 0) {
-                return false;
-            }
-            const stageId = vals?.stage_id ?? value.kwargs?.context?.default_stage_id;
-            return stageId === stageValue;
-        });
+        return entries
+            .filter(({ value }) => {
+                if (value?.model !== "crm.lead" || value.method !== "web_save") {
+                    return false;
+                }
+                const [ids, vals] = value.args ?? [];
+                if (!Array.isArray(ids) || ids.length !== 0) {
+                    return false;
+                }
+                const stageId = vals?.stage_id ?? value.kwargs?.context?.default_stage_id;
+                return stageId === stageValue;
+            })
+            .sort(compareReplayOrder);
     }
 
     /**
@@ -597,23 +612,27 @@ export function useCrmOffline() {
      * `mail.activity` archive (mark done), which callers match to an activity by `args[0][0]`.
      *
      * @param {number} resId the lead id
-     * @returns {QueueEntry[]}
+     * @returns {QueueEntry[]} a new array, in replay order (see `compareReplayOrder`): the order
+     *   the calls were made in, which is the order the framework replays them in, whatever the
+     *   enumeration order of their queue keys
      */
     function pendingActivityCalls(resId) {
-        return queuedEntries().filter(({ value }) => {
-            if (value?.model !== "mail.activity") {
-                return false;
-            }
-            if (value.method === "action_archive") {
-                return true;
-            }
-            const vals = value.args?.[1];
-            return (
-                value.method === "web_save" &&
-                vals?.res_model === "crm.lead" &&
-                vals.res_id === resId
-            );
-        });
+        return queuedEntries()
+            .filter(({ value }) => {
+                if (value?.model !== "mail.activity") {
+                    return false;
+                }
+                if (value.method === "action_archive") {
+                    return true;
+                }
+                const vals = value.args?.[1];
+                return (
+                    value.method === "web_save" &&
+                    vals?.res_model === "crm.lead" &&
+                    vals.res_id === resId
+                );
+            })
+            .sort(compareReplayOrder);
     }
 
     /**

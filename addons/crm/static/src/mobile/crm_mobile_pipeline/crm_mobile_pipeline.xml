@@ -18,9 +18,13 @@
           when New opened it in this stage, and the cards (`.o_kanban_record`, name in a span).
         - Placement and totals come from the renderer's derived getters (pending-aware), never from
           state stored by the template.
+        - Previous is not rendered on the first stage, nor Next on the last one. When the one that
+          disappears held the focus, the renderer moves the focus to the first header control
+          (the remaining navigation button, else Add), never to the document body.
 
         Offline: every button here carries `data-available-offline`, so the framework offline UI
-        leaves navigation, Add, Back and Load more usable; the attribute is inert online.
+        leaves navigation (prev/next), Add and Back usable. Load more is rendered online only, so
+        offline no uncached read is attempted. The attribute is inert online.
     -->
     <t t-name="crm.CrmMobilePipeline">
         <t t-if="this.isMobilePipeline">
@@ -72,23 +76,37 @@
                     role="region"
                     t-att-aria-label="group.displayName"
                     t-att-data-id="group.id"
-                    t-key="group.id"
+                    t-key="'stage_' + group.serverValue"
                     t-on-touchstart="(ev) => this.onTouchStart(ev)"
                     t-on-touchmove="(ev) => this.onTouchMove(ev)"
                     t-on-touchend="(ev) => this.onTouchEnd(ev)">
-                    <!-- A lead whose form is not available offline was tapped. -->
+                    <!--
+                        A lead whose form is not available offline was tapped. Back takes the focus
+                        and is described by the helper's sentence, so the reason is announced with
+                        it. The description is a hidden copy of that sentence: the helper markup
+                        also holds an icon whose ligature text and a Reset Filters button would be
+                        read into it. A reload keeps this stage body (keyed by stage), Back and the
+                        helper, so the focus stays where it was. The helper carries the body's key
+                        because component keys are scoped to this template, not to the body's
+                        t-key: when the body is rebuilt for another stage while the helper shows,
+                        a keyless helper would be handed from the old body to the new one, which
+                        Owl cannot mount.
+                    -->
                     <t t-if="this.mobileState.unavailableLeadId">
-                        <OfflineActionHelper/>
                         <div class="d-flex justify-content-center py-2">
                             <button type="button"
                                 class="btn btn-secondary o_crm_mobile_pipeline_back"
                                 data-available-offline="1"
                                 aria-label="Back"
                                 title="Back"
+                                aria-describedby="o_crm_mobile_pipeline_unavailable_help"
+                                t-ref="this.backRef"
                                 t-on-click="() => this.onBackFromHelper()">
                                 <i class="oi me-1" data-icon="arrow_back" aria-hidden="true"/> Back
                             </button>
+                            <span id="o_crm_mobile_pipeline_unavailable_help" hidden="">There is no data to display offline for the given filters</span>
                         </div>
+                        <OfflineActionHelper t-key="'stage_' + group.serverValue"/>
                     </t>
                     <t t-else="">
                         <!-- Framework quick create (New), props as in web.KanbanRenderer. -->
@@ -136,8 +154,13 @@
                                 onActivitiesChanged="(resId) => this.onActivitiesChanged(resId)"
                             />
                         </t>
-                        <!-- Offline, the stage holds leads none of which was loaded online. -->
-                        <OfflineActionHelper t-if="this.isStageDataMissing(group)"/>
+                        <!--
+                            Offline, the stage holds leads none of which was loaded online. Keyed
+                            like the stage body, for the reason given for the unavailable-lead
+                            helper: moving between two such stages rebuilds the body with this
+                            helper in both, while a reload keeps the body and the helper.
+                        -->
+                        <OfflineActionHelper t-if="this.isStageDataMissing(group)" t-key="'stage_' + group.serverValue"/>
                         <t t-set="unavailableCount" t-value="this.unavailableMoreCount(group)"/>
                         <div t-if="unavailableCount > 0"
                             class="o_crm_mobile_pipeline_unavailable_more text-muted small text-center py-2"
@@ -146,14 +169,19 @@
                         <t t-if="!this.crmOffline.isOffline()">
                             <t t-set="unloadedCount" t-value="this.getGroupUnloadedCount(group)"/>
                             <div t-if="unloadedCount > 0" class="o_kanban_load_more o_crm_mobile_pipeline_load_more" t-key="unloadedCount">
+                                <!-- Busy and disabled while its load is in flight. -->
                                 <button t-if="group.isFolded" type="button"
                                     class="btn btn-outline-primary w-100 mt-3"
                                     data-available-offline="1"
-                                    t-on-click="() => this.toggleGroup(group)">Load more... (<t t-out="unloadedCount"/> remaining)</button>
+                                    t-att-disabled="this.isLoadingMore(group)"
+                                    t-att-aria-busy="this.isLoadingMore(group) ? 'true' : 'false'"
+                                    t-on-click="() => this.onLoadMoreClick(group)"><i t-if="this.isLoadingMore(group)" class="oi oi-spin me-1" data-icon="autorenew" aria-hidden="true"/>Load more... (<t t-out="unloadedCount"/> remaining)</button>
                                 <button t-else="" type="button"
                                     class="btn btn-outline-primary w-100 mt-3"
                                     data-available-offline="1"
-                                    t-on-click="() => this.loadMore(group)">Load more... (<t t-out="unloadedCount"/> remaining)</button>
+                                    t-att-disabled="this.isLoadingMore(group)"
+                                    t-att-aria-busy="this.isLoadingMore(group) ? 'true' : 'false'"
+                                    t-on-click="() => this.onLoadMoreClick(group)"><i t-if="this.isLoadingMore(group)" class="oi oi-spin me-1" data-icon="autorenew" aria-hidden="true"/>Load more... (<t t-out="unloadedCount"/> remaining)</button>
                             </div>
                         </t>
                     </t>

@@ -89,6 +89,7 @@ $o-crm-mobile-touch: 44px;
     }
 
     .o_crm_mobile_pipeline_load_more .btn {
+        min-width: $o-crm-mobile-touch;
         min-height: $o-crm-mobile-touch;
     }
 }
