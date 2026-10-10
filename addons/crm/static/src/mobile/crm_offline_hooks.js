@@ -268,7 +268,14 @@ export async function loadActivityTypes(orm, onUpdate) {
  * stable key.
  *
  * Resolution and refresh behave as in `loadActivityTypes`: `onUpdate` receives the same shape as
- * the promise.
+ * the promise, only when the server answer differs from the cached value.
+ *
+ * `onSettled`, when given, tells that the server answered: it receives the server's answer, in
+ * the shape `onUpdate` receives (the same value, when `onUpdate` is called first), every time the
+ * server answers the read, whether or not the answer differs from the cached value, and also when
+ * nothing was cached (then before the caller receives that answer from the promise). A call the
+ * cache joined to an identical read already in flight settles with that read's answer. It is
+ * never called when the read fails: a lost connection, or a server error.
  *
  * @param {ORM} orm the ORM of the calling component (`useCrmOffline().orm`)
  * @param {number} resId the lead id
@@ -276,15 +283,17 @@ export async function loadActivityTypes(orm, onUpdate) {
  * @param {Object} [options]
  * @param {number} [options.limit=40] the number of activities to read, a positive integer; any
  *   other value throws before a request is issued
- * @param {boolean} [options.withLength=false] whether the promise and `onUpdate` receive
- *   `{records, length}` (`length` being the server's total count of the lead's activities)
- *   rather than the records alone
+ * @param {boolean} [options.withLength=false] whether the promise, `onUpdate` and `onSettled`
+ *   receive `{records, length}` (`length` being the server's total count of the lead's
+ *   activities) rather than the records alone
+ * @param {(activities: Object[] | { records: Object[], length: number }) => void}
+ *   [options.onSettled] called with every server answer to the read (see above)
  * @returns {Promise<Object[] | { records: Object[], length: number } | null>} the `mail.activity`
  *   records (or `{records, length}` with `withLength`), or `null` when the connection is lost and
  *   nothing is cached
  */
 export async function loadLeadActivities(orm, resId, onUpdate, options = {}) {
-    const { limit = LEAD_ACTIVITIES_LIMIT, withLength = false } = options ?? {};
+    const { limit = LEAD_ACTIVITIES_LIMIT, withLength = false, onSettled } = options ?? {};
     if (!Number.isInteger(limit) || limit <= 0) {
         throw new Error("loadLeadActivities: `limit` must be a positive integer");
     }
@@ -306,10 +315,13 @@ export async function loadLeadActivities(orm, resId, onUpdate, options = {}) {
             .cache({
                 type: "disk",
                 update: "always",
+                // called with every server answer, never when the read fails
                 callback: (freshResult, hasChanged) => {
+                    const value = toValue(freshResult);
                     if (hasChanged) {
-                        onUpdate?.(toValue(freshResult));
+                        onUpdate?.(value);
                     }
+                    onSettled?.(value);
                 },
             })
             .webSearchRead(
@@ -361,7 +373,7 @@ export async function loadLeadActivities(orm, resId, onUpdate, options = {}) {
  * @property {(record: RelationalRecord | undefined | null) => boolean} isRecordPendingSync
  * @property {(stageValue: number | false, entries?: QueueEntry[]) =>
  *   QueueEntry[]} pendingLeadCreates
- * @property {(resId: number) => QueueEntry[]} pendingActivityCalls
+ * @property {(resId: number, entries?: QueueEntry[]) => QueueEntry[]} pendingActivityCalls
  * @property {(resId: number, entries?: QueueEntry[]) => QueueEntry | undefined} latestStageWrite
  * @property {(params: { online: () => Promise<any>, queue: Object }) =>
  *   Promise<{ queued: true, key: string | number } | { queued: false, result: any }>} runOrQueue
@@ -532,22 +544,97 @@ function frozenStageIndex(entries) {
 }
 
 /**
+ * @typedef {{ creates: Map<number, { key: string | number, value: QueuedCall,
+ *   entry: QueueEntry }[]>, archives: { key: string | number, value: QueuedCall,
+ *   entry: QueueEntry }[], byLead: Map<number, QueueEntry[]> }} ActivityIndex what
+ *   `pendingActivityCalls` looks up in an array of queue entries: by lead id, the queued
+ *   `mail.activity` creates targeting the lead; every queued `mail.activity` archive; and, filled on
+ *   the first lookup of each lead, its answer in replay order. Each call is held with the `key` and
+ *   `value` read once from its entry, so ranking reads no entry again.
+ */
+
+/**
+ * The activity index of every frozen entries array `pendingActivityCalls` was given, held weakly:
+ * it lives as long as its array.
+ *
+ * @type {WeakMap<readonly QueueEntry[], ActivityIndex>}
+ */
+const activityIndexes = new WeakMap();
+
+/**
+ * Indexes an array of queue entries for `pendingActivityCalls` in one traversal that reads each
+ * entry's `value` once. The index answers exactly as the direct scan does: the same entries, in
+ * the same replay rank. A lead id that is `NaN` is not indexed, because it equals no lead id.
+ *
+ * @param {readonly QueueEntry[]} entries
+ * @returns {ActivityIndex}
+ */
+function buildActivityIndex(entries) {
+    const creates = new Map();
+    const archives = [];
+    for (const entry of entries) {
+        const { key, value } = entry;
+        if (value?.model !== "mail.activity") {
+            continue;
+        }
+        if (value.method === "action_archive") {
+            archives.push({ key, value, entry });
+            continue;
+        }
+        const vals = value.args?.[1];
+        if (value.method !== "web_save" || vals?.res_model !== "crm.lead") {
+            continue;
+        }
+        if (Number.isNaN(vals.res_id)) {
+            continue;
+        }
+        const leadCreates = creates.get(vals.res_id);
+        if (leadCreates) {
+            leadCreates.push({ key, value, entry });
+        } else {
+            creates.set(vals.res_id, [{ key, value, entry }]);
+        }
+    }
+    return { creates, archives, byLead: new Map() };
+}
+
+/**
+ * The activity index of a frozen entries array, built on its first use and reused for every later
+ * `pendingActivityCalls` call on the same array, as `frozenStageIndex` does for the stage readers.
+ *
+ * @param {readonly QueueEntry[]} entries
+ * @returns {ActivityIndex | null} `null` unless `entries` is a frozen array
+ */
+function frozenActivityIndex(entries) {
+    if (!Array.isArray(entries) || !Object.isFrozen(entries)) {
+        return null;
+    }
+    let index = activityIndexes.get(entries);
+    if (!index) {
+        index = buildActivityIndex(entries);
+        activityIndexes.set(entries, index);
+    }
+    return index;
+}
+
+/**
  * Component hook giving CRM code its offline state. Call it from a component `setup` (or from a
  * patched `setup`, or while a component's setup runs), like any hook.
  *
- * A read of the live queue (`queuedEntries`, `isRecordPendingSync`, `pendingActivityCalls`, and the
- * stage readers without an `entries` argument) reads the `_ormToSync` signal, so a component that
- * makes one while rendering re-renders whenever the queue changes: a call is scheduled, replayed
- * or discarded from the systray. Given an explicit `entries` array, the stage readers
- * (`pendingLeadCreates`, `latestStageWrite`) read only that array, and a frozen one may be
- * answered from its index without reading any entry, so the caller owns that array's reactivity
- * and lifetime. Readers return the framework's `{key, value}` entries as stored, never a copy and
- * never mutated, so each result carries its queue key (for `t-key`) next to its value.
+ * A read of the live queue (`queuedEntries`, `isRecordPendingSync`, and the readers that take an
+ * `entries` argument, `pendingLeadCreates`, `pendingActivityCalls` and `latestStageWrite`, when
+ * called without it) reads the `_ormToSync` signal, so a component that makes one while
+ * rendering re-renders whenever the queue changes: a call is scheduled, replayed or discarded
+ * from the systray. Given an explicit `entries` array, those readers read only that array (and
+ * may answer a frozen one from its index without reading any entry), so the caller owns that
+ * array's reactivity and lifetime. Readers return the framework's `{key, value}` entries as
+ * stored, never a copy and never mutated, so each result carries its queue key (for `t-key`) next
+ * to its value.
  *
- * The stage readers index a frozen `entries` array in one traversal on its first use and answer
- * every later call on that array from the index, so a caller looking up many leads and stages in
- * one frozen array reads each entry once. Any other array, the live queue included, is scanned on
- * each call.
+ * The stage readers and `pendingActivityCalls` index a frozen `entries` array in one traversal on
+ * its first use and answer every later call on that array from the index, so callers looking up
+ * many leads and stages in one frozen array read each entry once. Any other array, the live queue
+ * included, is scanned on each call.
  *
  * @example
  * setup() {
@@ -637,12 +724,28 @@ export function useCrmOffline() {
      * `mail.activity` archive (mark done), which callers match to an activity by `args[0][0]`.
      *
      * @param {number} resId the lead id
+     * @param {QueueEntry[]} [entries] defaults to the live queue; the mobile pipeline gives its
+     *   cards the live queue united with its sync-window copy, so a replayed call keeps its row
+     *   until the reload that incorporates it; a frozen array is indexed once (see
+     *   `frozenActivityIndex`), so every card of the pipeline reads each entry once in all
      * @returns {QueueEntry[]} a new array, parked entries included, in replay rank (see
      *   `compareReplayOrder`): by `extras.timeStamp`, ties by the enumeration order of their queue
      *   keys rather than the order of the calls
      */
-    function pendingActivityCalls(resId) {
-        return queuedEntries()
+    function pendingActivityCalls(resId, entries = queuedEntries()) {
+        const index = frozenActivityIndex(entries);
+        if (index) {
+            let calls = index.byLead.get(resId);
+            if (!calls) {
+                calls = [...(index.creates.get(resId) ?? []), ...index.archives]
+                    .sort(compareReplayOrder)
+                    .map(({ entry }) => entry);
+                index.byLead.set(resId, calls);
+            }
+            // A new array, so that no caller can change the index.
+            return [...calls];
+        }
+        return entries
             .filter(({ value }) => {
                 if (value?.model !== "mail.activity") {
                     return false;

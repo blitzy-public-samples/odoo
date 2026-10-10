@@ -2481,8 +2481,9 @@ describe("Mobile pipeline", () => {
         expect(`${cardOf("Offline lead")} .o_crm_mobile_pending_badge`).toHaveCount(0);
         expect(cardOf("Offline lead")).toHaveAttribute("data-id");
         expectHeader("New", 3, 170);
-        // The logged call is a server activity of Lead 1, offered for Mark done.
-        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
+        // The reload kept the cards: both activity lists opened offline are still open. The
+        // logged call is a server activity of Lead 1, offered for Mark done.
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_activities`).toHaveCount(1);
         expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_pending`).toHaveCount(0);
         expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_row`).toHaveCount(1);
         expect(
@@ -2492,7 +2493,7 @@ describe("Mobile pipeline", () => {
         // The parked archive is still shown pending.
         expect(queued()).toHaveLength(1);
         expect(queued()[0].value.extras.error).toMatch(/This activity is locked/);
-        await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_activities`).click();
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_lead_card_activities`).toHaveCount(1);
         expect(
             `${cardOf(
                 "Lead 2"
@@ -2834,8 +2835,16 @@ describe("Mobile pipeline", () => {
         const loadedLeads = renderer.allLoadedRecords().length;
         expect(loadedLeads).toBe(5);
         // Plus the pipeline status region's own pass over the live queue: each entry once, and
-        // the name of each of the 2 queued creates.
-        const onePass = { passes: 1 + 1, visits: entryCount + 3 + 2 + (entryCount + 2) };
+        // the name of each of the 2 queued creates. Plus the cards' activity rows: the 2 cards
+        // New displays take the same frozen array, whose activity index reads each entry once for
+        // both, and each card reads the one call it matches, the queued mark done, 3 times (for
+        // its pending creates and its queued mark-done ids).
+        const displayedCards = cardNames().length;
+        expect(displayedCards).toBe(2);
+        const onePass = {
+            passes: 1 + 1,
+            visits: entryCount + 3 + 2 + (entryCount + 2) + entryCount + displayedCards * 3,
+        };
         expect({ passes, visits }).toEqual(onePass);
         expect(visits).toBeLessThan(loadedLeads * entryCount);
 
@@ -7345,14 +7354,16 @@ describe("Mobile lead card", () => {
         expect(`${card} .o_crm_mobile_activity_done`).toHaveCount(3);
         expect(`${card} .o_crm_mobile_pending_badge`).toHaveCount(0);
 
-        // From now on, every read of the shared activity queue reader by Lead 1's card is a step.
+        // From now on, every read of the shared activity queue reader by Lead 1's card is a step
+        // (the reader gets the entries the pipeline gives the card).
         const lead1Card = cards.find(
             (instance) => instance.props.record?.resId === 1 && instance.__owl__.status === 1
         );
         patchWithCleanup(lead1Card.crmOffline, {
-            pendingActivityCalls(resId) {
+            pendingActivityCalls(resId, entries) {
                 expect.step(`pendingActivityCalls ${resId}`);
-                return super.pendingActivityCalls(resId);
+                expect(entries).toBe(lead1Card.props.queueEntries);
+                return super.pendingActivityCalls(...arguments);
             },
         });
 
@@ -12012,7 +12023,7 @@ describe("Mobile activities", () => {
     });
 
     test.tags("mobile");
-    test("mobile: an online follow-up completing after a reload re-keyed its card refreshes the lead still displayed and closes nothing on the old card", async () => {
+    test("mobile: an online follow-up completing after a reload keeps its card, which closes its form and refreshes the lead", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         const save = Promise.withResolvers();
         onRpc("mail.activity", "web_save", async () => {
@@ -12026,11 +12037,9 @@ describe("Mobile activities", () => {
         expect.verifySteps(["activities:1", "activities:2"]);
         const [renderer] = renderers;
         const card = cardOf("Lead 1");
-        const mountedLead1Card = () =>
-            cards.find(
-                (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
-            );
-        const oldCard = mountedLead1Card();
+        const lead1Card = mountedCardOf(cards, 1);
+        const loadedRecord = lead1Card.props.record;
+        const cardEl = queryOne(card);
 
         await contains(`${card} .o_crm_mobile_card_follow_up`).click();
         await contains(`${card} .o_crm_mobile_follow_up_summary`).edit("Send the proposal", {
@@ -12038,24 +12047,30 @@ describe("Mobile activities", () => {
         });
         await contains(`${card} .o_crm_mobile_follow_up_save`).click();
         await expect.waitForSteps(["mail.activity/web_save"]);
-        // A reload rebuilds the groups and records with new ids: the lead stays displayed in a
-        // new card, whose activities are read before the write has landed.
+        // A reload rebuilds the groups and records with new ids, before the write has landed. The
+        // card is keyed by stage and lead, so it is kept and given the new record: its form, the
+        // text typed and the call in flight stay, and the lead's activities are read again.
         await renderer.props.list.load();
         await animationFrame();
         expect.verifySteps(["activities:1", "activities:2"]);
-        expect(status(oldCard)).toBe("destroyed");
-        const newCard = mountedLead1Card();
-        expect(newCard).not.toBe(oldCard);
+        expect(mountedCardOf(cards, 1)).toBe(lead1Card);
+        expect(queryOne(card)).toBe(cardEl);
+        expect(lead1Card.props.record).not.toBe(loadedRecord);
+        expect(lead1Card.props.record).toBe(recordOf(renderer, 1));
+        expect(lead1Card.state.followUpOpen).toBe(true);
+        expect(lead1Card.state.summary).toBe("Send the proposal");
+        expect(lead1Card.state.busy).toBe(true);
+        expect(`${card} .o_crm_mobile_follow_up_summary`).toHaveValue("Send the proposal");
 
         save.resolve();
         await animationFrame();
-        // The completion refreshes the lead the new card shows ...
+        // The completion refreshes the lead and closes the form of the same card, now free.
         expect.verifySteps(["activities:1"]);
-        // ... and writes nothing on the destroyed card: its form is left as it was.
-        expect(oldCard.state.followUpOpen).toBe(true);
-        expect(oldCard.state.summary).toBe("Send the proposal");
-        expect(oldCard.state.busy).toBe(true);
-        expect(newCard.state.busy).toBe(false);
+        expect(status(lead1Card)).toBe("mounted");
+        expect(lead1Card.state.followUpOpen).toBe(false);
+        expect(lead1Card.state.summary).toBe("");
+        expect(lead1Card.state.busy).toBe(false);
+        expect(`${card} .o_crm_mobile_lead_card_follow_up`).toHaveCount(0);
         await contains(`${card} .o_crm_mobile_card_activities`).click();
         expect(`${card} .o_crm_mobile_activity_summary`).toHaveText("Send the proposal");
     });
@@ -12129,21 +12144,6 @@ describe("Mobile activities", () => {
         return `${cardOf(name)} .o_crm_mobile_lead_card_status`;
     }
 
-    /**
-     * Holds every `crm.lead` `web_read_group` while `hold.promise` is set: the reconciliation
-     * reload that follows a replay rebuilds the groups, and so remounts the cards. Holding it keeps
-     * the cards the replay updated mounted while they are asserted.
-     *
-     * @returns {{ promise: Promise<void> | null }}
-     */
-    function holdGroupReads() {
-        const hold = { promise: null };
-        onRpc("crm.lead", "web_read_group", async () => {
-            await hold.promise;
-        });
-        return hold;
-    }
-
     test.tags("mobile");
     test("mobile: card status region announces queued activity creates and mark done, their sync and count changes, never the mount state", async () => {
         const [sendOfferId, callBackId, qualifyId] = await createActivities([
@@ -12153,7 +12153,7 @@ describe("Mobile activities", () => {
         ]);
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
-        const hold = holdGroupReads();
+        const renderers = captureInstances(CrmMobilePipeline);
         await mountPipeline();
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
 
@@ -12224,11 +12224,13 @@ describe("Mobile activities", () => {
         expect(queryOne(`${statusOf("Lead 1")} > div`)).toBe(lead1Node);
         expect(queued()).toHaveLength(4);
 
-        // Reconnect: each replayed call is announced as no longer pending sync on its card,
-        // before the reconciliation reload. The replayed create announces no count: a call
-        // leaving the queue is no change the user made on the card, nor are the re-reads that
-        // follow it (test "after offline Log calls are replayed, …").
-        hold.promise = new Promise(() => {});
+        // Reconnect: each replayed call is announced as no longer pending sync on its card, as it
+        // is replayed. The replayed create announces no count: a call leaving the queue is no
+        // change the user made on the card, nor are the re-reads that follow it (test "after
+        // offline Log calls are replayed, …"). The reconciliation reload that ends the sync keeps
+        // the cards, so their last announcements stay in their regions.
+        const lead1Region = queryOne(statusOf("Lead 1"));
+        const lead2Region = queryOne(statusOf("Lead 2"));
         await setOffline(false);
         // the first call replays at once, each next one a second later
         await waitUntil(() => queued().length === 3);
@@ -12239,8 +12241,13 @@ describe("Mobile activities", () => {
         expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
         await letQueueReplay(2);
         expect(queued()).toHaveLength(0);
+        // the copy is dropped once the reconciliation reload has landed
+        await waitUntil(() => renderers.at(-1).mobileState.syncEntries === null);
+        await animationFrame();
         expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
         expect(statusOf("Lead 2")).toHaveText("Lead 2: completed activity no longer pending sync.");
+        expect(queryOne(statusOf("Lead 1"))).toBe(lead1Region);
+        expect(queryOne(statusOf("Lead 2"))).toBe(lead2Region);
         expect(".o_crm_mobile_pending_badge").toHaveCount(0);
     });
 
@@ -12331,30 +12338,19 @@ describe("Mobile activities", () => {
         return `${cardOf(name)} .o_crm_mobile_card_activities .badge`;
     }
 
-    /**
-     * Resolves once the mobile card of a lead was mounted again (another element than `card`).
-     *
-     * @param {string} name the lead name
-     * @param {Element} card the card element mounted before
-     */
-    async function waitForRemountedCard(name, card) {
-        await waitUntil(() => {
-            const current = queryFirst(cardOf(name));
-            return Boolean(current) && current !== card;
-        });
-        await animationFrame();
-    }
-
     test.tags("mobile");
     test("mobile: after offline Log calls are replayed, the activity re-reads and the reconciliation reload announce no count", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
-        // Lead 1's activity read issued on reconnect answers after its create was replayed, the
-        // reconciliation reload lands after the replayed cards rendered their announcements, and
-        // Lead 2's activity read issued after that reload answers once its card was mounted again.
+        // Lead 1's activity reads, issued on reconnect and after its replay, answer once its create
+        // was replayed; the reconciliation reload lands after the replayed cards rendered their
+        // announcements; Lead 2's re-read, issued after its replay, answers once that reload has
+        // landed.
         const latency = delayReads();
+        const renderers = captureInstances(CrmMobilePipeline);
         await mountPipeline();
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
         const announcements = recordAnnouncements();
         for (const name of ["Lead 1", "Lead 2"]) {
             expect(activityBadgeOf(name)).toHaveText("0");
@@ -12369,9 +12365,12 @@ describe("Mobile activities", () => {
         expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity pending sync, 1 activity.");
         expect(statusOf("Lead 2")).toHaveText("Lead 2: new activity pending sync, 1 activity.");
         expect(queued()).toHaveLength(2);
+        const lead1Card = queryOne(cardOf("Lead 1"));
+        const lead2Card = queryOne(cardOf("Lead 2"));
 
         // Reconnect: the activities are read again at once (Lead 2's answers before its create
-        // is replayed), and Lead 1's create is replayed at once.
+        // is replayed), and Lead 1's create is replayed at once. The sync window keeps its row,
+        // so the count stays.
         latency.activities[1] = Promise.withResolvers();
         latency.groups = Promise.withResolvers();
         await setOffline(false);
@@ -12380,48 +12379,58 @@ describe("Mobile activities", () => {
         const [lead1Activity] = MockServer.env["mail.activity"].search_read([["res_id", "=", 1]]);
         expect(lead1Activity).not.toBe(undefined);
         expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity no longer pending sync.");
-        expect(activityBadgeOf("Lead 1")).toHaveText("0");
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
 
-        // Lead 1's re-read brings the replayed server row to the same mounted card, whose
-        // displayed count rises: no count is announced.
-        const lead1Card = queryOne(cardOf("Lead 1"));
+        // Lead 1's re-reads bring the replayed server row to the same mounted card, in place of
+        // its replayed row: the count stays, and no count is announced.
         latency.activities[1].resolve();
-        await waitUntil(() => queryFirst(activityBadgeOf("Lead 1"))?.textContent === "1");
+        await waitUntil(() =>
+            renderer.mobileState.activitiesByLead[1]?.some(({ id }) => id === lead1Activity.id)
+        );
         await animationFrame();
         expect(queryOne(cardOf("Lead 1"))).toBe(lead1Card);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
         expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity no longer pending sync.");
 
-        // Lead 2's create is replayed a second later, which ends the sync window.
+        // Lead 2's create is replayed a second later, which ends the sync window: its row stays
+        // too, until its re-read answers.
+        latency.activities[2] = Promise.withResolvers();
         await letQueueReplay(1);
         expect(queued()).toHaveLength(0);
         expect(statusOf("Lead 2")).toHaveText("Lead 2: new activity no longer pending sync.");
-        expect(activityBadgeOf("Lead 2")).toHaveText("0");
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
 
-        // The reconciliation reload rebuilds the groups, so the cards are mounted again (silent,
-        // with the activities displayed so far), and their activities are read again: Lead 2's
-        // replayed server row reaches its new card, whose displayed count rises: no count is
-        // announced either.
-        const lead2Card = queryOne(cardOf("Lead 2"));
-        latency.activities[2] = Promise.withResolvers();
+        // The reconciliation reload lands: the records are new, the cards are kept, with their
+        // counts. The window goes on until Lead 2's activities show its replayed create.
+        const lead2Record = recordOf(renderer, 2);
         latency.groups.resolve();
-        await waitForRemountedCard("Lead 2", lead2Card);
-        expect(activityBadgeOf("Lead 2")).toHaveText("0");
-        latency.activities[2].resolve();
-        await waitUntil(() => queryFirst(activityBadgeOf("Lead 2"))?.textContent === "1");
+        await waitUntil(() => recordOf(renderer, 2) !== lead2Record);
         await animationFrame();
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(queryOne(cardOf("Lead 1"))).toBe(lead1Card);
+        expect(queryOne(cardOf("Lead 2"))).toBe(lead2Card);
         expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
+
+        // Lead 2's re-read brings its server row in place of its replayed row, which ends the
+        // window: no count is announced either.
+        latency.activities[2].resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
         const [lead2Activity] = MockServer.env["mail.activity"].search_read([["res_id", "=", 2]]);
-        for (const [name, activity] of [
-            ["Lead 1", lead1Activity],
-            ["Lead 2", lead2Activity],
+        for (const [name, activity, card] of [
+            ["Lead 1", lead1Activity, lead1Card],
+            ["Lead 2", lead2Activity, lead2Card],
         ]) {
+            expect(queryOne(cardOf(name))).toBe(card);
+            expect(activityBadgeOf(name)).toHaveText("1");
             await contains(`${cardOf(name)} .o_crm_mobile_card_activities`).click();
             expect(
                 `${cardOf(name)} .o_crm_mobile_activity_row[data-activity-id='${activity.id}']`
             ).toHaveCount(1);
             expect(`${cardOf(name)} .o_crm_mobile_activity_pending`).toHaveCount(0);
-            // a card mounted by the reload starts silent
-            expect(queryOne(statusOf(name)).textContent).toBe("");
+            // the kept card keeps its last announcement
+            expect(statusOf(name)).toHaveText(`${name}: new activity no longer pending sync.`);
         }
 
         // Each card's last announcement is its sync confirmation: no re-read announced a count.
@@ -12441,12 +12450,14 @@ describe("Mobile activities", () => {
         ]);
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
-        // Lead 1's activity read issued on reconnect answers after its mark done was replayed,
-        // the reconciliation reload lands after the replayed cards rendered their announcements,
-        // and Lead 2's activity reads answer once its card was mounted again by that reload.
+        // Lead 1's activity reads, issued on reconnect and after its replay, answer once its mark
+        // done was replayed; the reconciliation reload lands after the replayed cards rendered
+        // their announcements; Lead 2's activity reads answer once that reload has landed.
         const latency = delayReads();
+        const renderers = captureInstances(CrmMobilePipeline);
         await mountPipeline();
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
         const announcements = recordAnnouncements();
 
         // Offline Mark done on both leads: each row stays, shown pending, and the count with it.
@@ -12466,8 +12477,24 @@ describe("Mobile activities", () => {
             await advanceTime(1000);
         }
         expect(queued()).toHaveLength(2);
+        const lead1Card = queryOne(cardOf("Lead 1"));
+        const lead2Card = queryOne(cardOf("Lead 2"));
 
-        // Reconnect: Lead 1's mark done is replayed at once.
+        /**
+         * @param {number} activityId
+         * @param {boolean} queuedDone whether its mark done is still in the queue
+         */
+        function expectArchivedRow(activityId, queuedDone) {
+            const row = `.o_crm_mobile_activity_row[data-activity-id='${activityId}']`;
+            expect(row).toHaveCount(1);
+            expect(`${row} .o_crm_mobile_pending_badge`).toHaveCount(queuedDone ? 1 : 0);
+            expect(`${row} .o_crm_mobile_activity_done`).toHaveCount(0);
+        }
+        expectArchivedRow(sendOfferId, true);
+        expectArchivedRow(qualifyId, true);
+
+        // Reconnect: Lead 1's mark done is replayed at once. The sync window keeps its row,
+        // without badge and without Mark done, and the count with it.
         latency.activities[1] = Promise.withResolvers();
         latency.activities[2] = Promise.withResolvers();
         latency.groups = Promise.withResolvers();
@@ -12476,10 +12503,11 @@ describe("Mobile activities", () => {
         await animationFrame();
         expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
         expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        expectArchivedRow(sendOfferId, false);
+        expectArchivedRow(qualifyId, true);
 
-        // Lead 1's re-read drops the archived row from the same mounted card, whose displayed
+        // Lead 1's re-reads drop the archived row from the same mounted card, whose displayed
         // count falls: no count is announced.
-        const lead1Card = queryOne(cardOf("Lead 1"));
         latency.activities[1].resolve();
         await waitUntil(() => queryFirst(activityBadgeOf("Lead 1"))?.textContent === "0");
         await animationFrame();
@@ -12487,25 +12515,42 @@ describe("Mobile activities", () => {
         expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_row`).toHaveCount(0);
         expect(statusOf("Lead 1")).toHaveText("Lead 1: completed activity no longer pending sync.");
 
-        // Lead 2's mark done is replayed a second later, which ends the sync window.
+        // Lead 2's mark done is replayed a second later, which ends the sync window: its row
+        // stays, without badge and without Mark done.
         await letQueueReplay(1);
         expect(queued()).toHaveLength(0);
         expect(statusOf("Lead 2")).toHaveText("Lead 2: completed activity no longer pending sync.");
         expect(activityBadgeOf("Lead 2")).toHaveText("1");
+        expectArchivedRow(qualifyId, false);
 
-        // The reconciliation reload mounts the cards again (silent, with the archived row still
-        // displayed), then Lead 2's re-read drops that row from its new card: no count either.
-        const lead2Card = queryOne(cardOf("Lead 2"));
+        // The reconciliation reload lands: the records are new, the cards are kept, open, with
+        // the archived row still displayed. The window goes on until Lead 2's activities no
+        // longer hold it.
+        const lead2Record = recordOf(renderer, 2);
         latency.groups.resolve();
-        await waitForRemountedCard("Lead 2", lead2Card);
-        expect(activityBadgeOf("Lead 2")).toHaveText("1");
-        latency.activities[2].resolve();
-        await waitUntil(() => queryFirst(activityBadgeOf("Lead 2"))?.textContent === "0");
+        await waitUntil(() => recordOf(renderer, 2) !== lead2Record);
         await animationFrame();
-        for (const name of ["Lead 1", "Lead 2"]) {
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(queryOne(cardOf("Lead 1"))).toBe(lead1Card);
+        expect(queryOne(cardOf("Lead 2"))).toBe(lead2Card);
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
+        expectArchivedRow(qualifyId, false);
+
+        // Lead 2's re-read drops that row, which ends the window: no count either.
+        latency.activities[2].resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        for (const [name, card] of [
+            ["Lead 1", lead1Card],
+            ["Lead 2", lead2Card],
+        ]) {
+            expect(queryOne(cardOf(name))).toBe(card);
             expect(activityBadgeOf(name)).toHaveText("0");
-            // a card mounted by the reload starts silent
-            expect(queryOne(statusOf(name)).textContent).toBe("");
+            expect(`${cardOf(name)} .o_crm_mobile_activity_row`).toHaveCount(0);
+            // the kept card keeps its last announcement
+            expect(statusOf(name)).toHaveText(
+                `${name}: completed activity no longer pending sync.`
+            );
         }
 
         // Each card's last announcement is its sync confirmation: no re-read announced a count.
@@ -12521,7 +12566,6 @@ describe("Mobile activities", () => {
     test("mobile: card status region announces the lead's own pending sync and its end, after a systray discard and after a replay", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
-        const hold = holdGroupReads();
         const renderers = captureInstances(CrmMobilePipeline);
         await mountPipeline();
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
@@ -12546,14 +12590,1110 @@ describe("Mobile activities", () => {
         await recordOf(renderer, 2).update({ contact_name: "Phoebe Buffay" });
         await animationFrame();
         expect(statusOf("Lead 2")).toHaveText("Lead 2: changes pending sync.");
-        hold.promise = new Promise(() => {});
+        // The replay is announced as it happens, and the reconciliation reload that ends the sync
+        // keeps the card, its region and that announcement.
+        const lead2Message = queryOne(`${statusOf("Lead 2")} > div`);
         await setOffline(false);
         await letQueueReplay(1);
         expect(queued()).toHaveLength(0);
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
         expect(MockServer.env["crm.lead"].browse(2)[0].contact_name).toBe("Phoebe Buffay");
+        expect(recordOf(renderer, 2).data.contact_name).toBe("Phoebe Buffay");
         expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(0);
         expect(statusOf("Lead 2")).toHaveText("Lead 2: changes no longer pending sync.");
+        expect(queryOne(`${statusOf("Lead 2")} > div`)).not.toBe(lead2Message);
+        expect(queryOne(`${statusOf("Lead 2")} > div`).isConnected).toBe(true);
         expect(queryOne(statusOf("Lead 1")).textContent).toBe("");
+    });
+
+    test.tags("mobile");
+    test("mobile: the reconciliation reload keeps every card, with its follow-up draft, its focus, its expanded activities and its open stage list", async () => {
+        await createActivities([
+            { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Qualify" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+        const lead2 = cardOf("Lead 2");
+        const summary = `${lead1} .o_crm_mobile_follow_up_summary`;
+        const kept = [
+            [1, mountedCardOf(cards, 1), queryOne(lead1), lead1],
+            [2, mountedCardOf(cards, 2), queryOne(lead2), lead2],
+        ];
+
+        /** Asserts that each card is the one mounted first, given the record of the last load. */
+        function expectKeptCards() {
+            for (const [resId, card, element, selector] of kept) {
+                expect(mountedCardOf(cards, resId)).toBe(card);
+                expect(queryOne(selector)).toBe(element);
+                expect(card.props.record).toBe(recordOf(renderer, resId));
+            }
+        }
+
+        // Offline, with nothing queued: a follow-up summary is being typed on Lead 1, whose input
+        // has the focus, and Lead 2's activities are expanded.
+        await setOffline(true);
+        await contains(`${lead2} .o_crm_mobile_card_activities`).click();
+        await contains(`${lead1} .o_crm_mobile_card_follow_up`).click();
+        await contains(summary).edit("Call back on Monday", { confirm: false });
+        const summaryInput = queryOne(summary);
+        expect(summary).toBeFocused();
+        expect(queued()).toHaveLength(0);
+
+        // Reconnect: with nothing to replay, the pipeline reloads at once. The records are new;
+        // the cards, the draft, the focus and the expanded list stay.
+        let loaded = recordOf(renderer, 1);
+        await setOffline(false);
+        await waitUntil(() => recordOf(renderer, 1) !== loaded);
+        await animationFrame();
+        expectKeptCards();
+        expect(queryOne(summary)).toBe(summaryInput);
+        expect(summary).toHaveValue("Call back on Monday");
+        expect(summary).toBeFocused();
+        expect(kept[0][1].state.summary).toBe("Call back on Monday");
+        expect(`${lead2} .o_crm_mobile_lead_card_activities`).toHaveCount(1);
+        expect(`${lead2} .o_crm_mobile_activity_row`).toHaveCount(1);
+
+        // Offline again: a write of Lead 2 is queued, then its stage list is opened, which
+        // focuses its active option. Lead 1's draft stays open.
+        await setOffline(true);
+        await recordOf(renderer, 2).update({ contact_name: "Monica Geller" });
+        await animationFrame();
+        expect(queued()).toHaveLength(1);
+        await contains(`${lead2} .o_crm_mobile_card_stage`).click();
+        const activeOption = `${lead2} .o_crm_mobile_stage_option[tabindex='0']`;
+        expect(activeOption).toBeFocused();
+        const optionButton = queryOne(activeOption);
+
+        // Reconnect: the write is replayed, and the reconciliation reload that ends the sync keeps
+        // the cards, the draft, the open stage list and its focused option.
+        loaded = recordOf(renderer, 2);
+        await setOffline(false);
+        await letQueueReplay(1);
+        expect(queued()).toHaveLength(0);
+        await waitUntil(
+            () => recordOf(renderer, 2) !== loaded && renderer.mobileState.syncEntries === null
+        );
+        await animationFrame();
+        expect(MockServer.env["crm.lead"].browse(2)[0].contact_name).toBe("Monica Geller");
+        expectKeptCards();
+        expect(`${lead2} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: changes no longer pending sync.");
+        expect(`${lead2} .o_crm_mobile_lead_card_stage_list`).toHaveCount(1);
+        expect(queryOne(activeOption)).toBe(optionButton);
+        expect(activeOption).toBeFocused();
+        expect(queryOne(summary)).toBe(summaryInput);
+        expect(summary).toHaveValue("Call back on Monday");
+
+        // The draft kept is the one saved, online.
+        await contains(`${lead1} .o_crm_mobile_follow_up_save`).click();
+        await waitUntil(() => !queryFirst(`${lead1} .o_crm_mobile_lead_card_follow_up`));
+        expect(queued()).toHaveLength(0);
+        expect(
+            MockServer.env["mail.activity"]
+                .search_read([["res_id", "=", 1]])
+                .map((activity) => activity.summary)
+        ).toEqual(["Call back on Monday"]);
+    });
+
+    test.tags("mobile");
+    test("mobile: during the sync window a replayed follow-up keeps its row and the count until its server row replaces it in one render, and a replayed or parked mark done never offers Mark done", async () => {
+        const [qualifyId, demoId] = await createActivities([
+            { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Qualify" },
+            { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Demo" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        onRpc("mail.activity", "action_archive", ({ args }) => {
+            if (args[0][0] === demoId) {
+                throw makeServerError({ message: "This activity is locked" });
+            }
+        });
+        // The activity reads of both leads, those the replays ask for included, answer when the
+        // test releases them.
+        const latency = delayReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+        const lead2 = cardOf("Lead 2");
+        const row = (activityId) => `.o_crm_mobile_activity_row[data-activity-id='${activityId}']`;
+
+        // Offline: a follow-up is saved on Lead 1, then both activities of Lead 2 are marked done;
+        // both activity lists are open.
+        await setOffline(true);
+        await contains(`${lead1} .o_crm_mobile_card_follow_up`).click();
+        await contains(`${lead1} .o_crm_mobile_follow_up_summary`).edit("Send the proposal", {
+            confirm: false,
+        });
+        await contains(`${lead1} .o_crm_mobile_follow_up_save`).click();
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        await advanceTime(1000);
+        await contains(`${lead2} .o_crm_mobile_card_activities`).click();
+        for (const activityId of [qualifyId, demoId]) {
+            await contains(`${row(activityId)} .o_crm_mobile_activity_done`).click();
+            await advanceTime(1000);
+        }
+        expect(queued()).toHaveLength(3);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        expect(`${lead1} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`).toHaveCount(
+            1
+        );
+        expect(activityBadgeOf("Lead 2")).toHaveText("2");
+        expect(`${lead2} .o_crm_mobile_activity_row .o_crm_mobile_pending_badge`).toHaveCount(2);
+        expect(`${lead2} .o_crm_mobile_activity_done`).toHaveCount(0);
+
+        // What every render shows from now on.
+        const renders = [];
+        const observer = new MutationObserver(() =>
+            renders.push({
+                lead1Count: queryFirst(activityBadgeOf("Lead 1"))?.textContent,
+                lead1Rows: queryAll(`${lead1} .o_crm_mobile_activity_row`).length,
+                lead2Count: queryFirst(activityBadgeOf("Lead 2"))?.textContent,
+                markDones: queryAll(`${lead2} .o_crm_mobile_activity_done`).length,
+                demoRows: queryAll(row(demoId)).length,
+            })
+        );
+        observer.observe(getFixture(), {
+            attributes: true,
+            characterData: true,
+            childList: true,
+            subtree: true,
+        });
+        after(() => observer.disconnect());
+
+        // Reconnect: Lead 1's follow-up is replayed at once. Its row stays, without badge, and
+        // the count with it.
+        latency.activities[1] = Promise.withResolvers();
+        latency.activities[2] = Promise.withResolvers();
+        await setOffline(false);
+        await waitUntil(() => queued().length === 2);
+        await animationFrame();
+        const [created] = MockServer.env["mail.activity"].search_read([["res_id", "=", 1]]);
+        expect(created.summary).toBe("Send the proposal");
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity no longer pending sync.");
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(1);
+        expect(`${lead1} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`).toHaveCount(
+            0
+        );
+        expect(`${lead1} .o_crm_mobile_activity_pending .o_crm_mobile_activity_summary`).toHaveText(
+            "Send the proposal"
+        );
+
+        // Lead 1's re-reads answer: its server row, offered for Mark done, replaces it.
+        latency.activities[1].resolve();
+        await waitUntil(() => queryAll(row(created.id)).length === 1);
+        await animationFrame();
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(0);
+        expect(`${row(created.id)} .o_crm_mobile_activity_done`).toHaveCount(1);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+
+        // Lead 2's first mark done is replayed: its row stays, with neither badge nor Mark done.
+        await letQueueReplay(1);
+        expect(queued()).toHaveLength(1);
+        expect(statusOf("Lead 2")).toHaveText("Lead 2: completed activity no longer pending sync.");
+        expect(activityBadgeOf("Lead 2")).toHaveText("2");
+        expect(row(qualifyId)).toHaveCount(1);
+        expect(`${row(qualifyId)} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(`${row(qualifyId)} .o_crm_mobile_activity_done`).toHaveCount(0);
+        expect(`${row(demoId)} .o_crm_mobile_pending_badge`).toHaveCount(1);
+
+        // The second is rejected and parked, which ends the sync: the reconciliation reload lands
+        // and waits for Lead 2's activities to show the replayed mark done.
+        const lead2Record = recordOf(renderer, 2);
+        await letQueueReplay(1);
+        await waitUntil(() => recordOf(renderer, 2) !== lead2Record);
+        await animationFrame();
+        expect(queued()).toHaveLength(1);
+        expect(queued()[0].value.extras.error).toMatch(/This activity is locked/);
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(activityBadgeOf("Lead 2")).toHaveText("2");
+        expect(`${row(qualifyId)} .o_crm_mobile_activity_done`).toHaveCount(0);
+        expect(`${row(demoId)} .o_crm_mobile_pending_badge`).toHaveCount(1);
+
+        // Lead 2's re-reads drop the replayed row, which ends the window; the parked mark done
+        // stays pending.
+        latency.activities[2].resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        observer.disconnect();
+        expect(row(qualifyId)).toHaveCount(0);
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
+        expect(`${row(demoId)} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expect(`${row(demoId)} .o_crm_mobile_activity_done`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(1);
+        expect(row(created.id)).toHaveCount(1);
+
+        // No render showed Lead 1 without its row or with two, nor dipped a count, and none
+        // offered Mark done on Lead 2: its count fell once, when its replayed row left.
+        const changes = (values) =>
+            values.filter((value, index) => index === 0 || value !== values[index - 1]);
+        expect(renders.length).toBeGreaterThan(0);
+        expect(changes(renders.map((render) => render.lead1Count))).toEqual(["1"]);
+        expect(changes(renders.map((render) => render.lead1Rows))).toEqual([1]);
+        expect(changes(renders.map((render) => render.lead2Count))).toEqual(["2", "1"]);
+        expect(changes(renders.map((render) => render.markDones))).toEqual([0]);
+        expect(changes(renders.map((render) => render.demoRows))).toEqual([1]);
+    });
+
+    /**
+     * Asserts that the sync window is over: no copy, no reconciliation reload in flight or
+     * waiting, and nothing kept for the replayed activity calls.
+     *
+     * @param {CrmMobilePipeline} renderer
+     */
+    function expectWindowEnded(renderer) {
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(renderer.reconciliation).toBe(null);
+        expect(renderer._activityRowWaiters).toEqual([]);
+        expect(renderer.replayedActivityCalls.size).toBe(0);
+        expect(renderer._settledActivityReads.size).toBe(0);
+        expect(renderer._activityAnswerNumbers.size).toBe(0);
+        expect(renderer.mobileState.activityAnswersByLead).toEqual({});
+    }
+
+    test.tags("mobile");
+    test("mobile: a replayed Log call whose activity the server deletes before the lead's re-read answers ends the sync window at the read after the reconciliation reload, with no ghost row and the server's count", async () => {
+        const [qualifyId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Qualify" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Lead 1's activity reads issued after its call is replayed answer when the test
+        // releases them.
+        const latency = delayReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+        const row = (activityId) =>
+            `${lead1} .o_crm_mobile_activity_row[data-activity-id='${activityId}']`;
+
+        // Offline: a write of Lead 2, then a Log call on Lead 1, whose activities are expanded.
+        await setOffline(true);
+        await recordOf(renderer, 2).update({ contact_name: "Monica Geller" });
+        await advanceTime(1000);
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        await contains(`${lead1} .o_crm_mobile_card_log_call`).click();
+        expect(queued()).toHaveLength(2);
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+        expect(`${lead1} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`).toHaveCount(
+            1
+        );
+
+        // Reconnect: the write of Lead 2 is replayed at once, and the activities are read again.
+        await setOffline(false);
+        await waitUntil(() => queued().length === 1);
+        await animationFrame();
+
+        // The Log call is replayed a second later, which ends the sync window, and the
+        // reconciliation reload lands. Lead 1's re-read has not answered: the window goes on, and
+        // the replayed row stays, without badge, with the count.
+        latency.activities[1] = Promise.withResolvers();
+        const loaded = recordOf(renderer, 1);
+        await letQueueReplay(1);
+        await waitUntil(() => recordOf(renderer, 1) !== loaded);
+        await animationFrame();
+        expect(queued()).toHaveLength(0);
+        const [created] = MockServer.env["mail.activity"].search_read([
+            ["res_id", "=", 1],
+            ["id", "!=", qualifyId],
+        ]);
+        expect(created.summary).toBe("Call");
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(renderer._activityRowWaiters).toHaveLength(1);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(1);
+        expect(`${lead1} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`).toHaveCount(
+            0
+        );
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+
+        // The server deletes that activity before Lead 1's reads answer, so no read will ever show
+        // it. The read issued after the reconciliation reload answers: the window ends, the
+        // replayed row leaves with the copy, and the count is the server's.
+        MockServer.env["mail.activity"].unlink([created.id]);
+        latency.activities[1].resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        expectWindowEnded(renderer);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(0);
+        expect(row(created.id)).toHaveCount(0);
+        expect(row(qualifyId)).toHaveCount(1);
+        expect(`${row(qualifyId)} .o_crm_mobile_activity_done`).toHaveCount(1);
+        const serverActivities = MockServer.env["mail.activity"].search_read([
+            ["res_model", "=", "crm.lead"],
+            ["res_id", "=", 1],
+        ]);
+        expect(serverActivities.map(({ id }) => id)).toEqual([qualifyId]);
+        expect(activityBadgeOf("Lead 1")).toHaveText(String(serverActivities.length));
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(serverActivities.length);
+        expect(".o_crm_mobile_pending_badge").toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: a replayed mark done whose activity the server reactivates before the lead's re-read answers ends the sync window at the read after the reconciliation reload, offering Mark done on the server's row", async () => {
+        const [qualifyId] = await createActivities([
+            { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Qualify" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Lead 2's activity reads issued after its call is replayed answer when the test
+        // releases them.
+        const latency = delayReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead2 = cardOf("Lead 2");
+        const row = `${lead2} .o_crm_mobile_activity_row[data-activity-id='${qualifyId}']`;
+
+        // Offline: a write of Lead 1, then Lead 2's activity is marked done.
+        await setOffline(true);
+        await recordOf(renderer, 1).update({ contact_name: "Monica Geller" });
+        await advanceTime(1000);
+        await contains(`${lead2} .o_crm_mobile_card_activities`).click();
+        await contains(`${row} .o_crm_mobile_activity_done`).click();
+        expect(queued()).toHaveLength(2);
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
+        expect(`${row} .o_crm_mobile_pending_badge`).toHaveCount(1);
+        expect(`${row} .o_crm_mobile_activity_done`).toHaveCount(0);
+
+        // Reconnect: the write of Lead 1 is replayed at once, and the activities are read again.
+        await setOffline(false);
+        await waitUntil(() => queued().length === 1);
+        await animationFrame();
+
+        // The mark done is replayed a second later, which ends the sync window, and the
+        // reconciliation reload lands. Lead 2's re-read has not answered: the window goes on, and
+        // the archived row stays, with neither badge nor Mark done.
+        latency.activities[2] = Promise.withResolvers();
+        const loaded = recordOf(renderer, 2);
+        await letQueueReplay(1);
+        await waitUntil(() => recordOf(renderer, 2) !== loaded);
+        await animationFrame();
+        expect(queued()).toHaveLength(0);
+        expect(
+            MockServer.env["mail.activity"].search_read([
+                ["id", "=", qualifyId],
+                ["active", "=", false],
+            ])
+        ).toHaveLength(1);
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(renderer._activityRowWaiters).toHaveLength(1);
+        expect(row).toHaveCount(1);
+        expect(`${row} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(`${row} .o_crm_mobile_activity_done`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 2")).toHaveText("1");
+
+        // The server reactivates the activity before Lead 2's reads answer, so no read will ever
+        // drop it. The read issued after the reconciliation reload answers: the window ends, and
+        // the row is the server's, offering Mark done again; the count is the server's.
+        MockServer.env["mail.activity"].write([qualifyId], { active: true });
+        latency.activities[2].resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        expectWindowEnded(renderer);
+        expect(row).toHaveCount(1);
+        expect(`${row} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(`${row} .o_crm_mobile_activity_done`).toHaveCount(1);
+        const serverActivities = MockServer.env["mail.activity"].search_read([
+            ["res_model", "=", "crm.lead"],
+            ["res_id", "=", 2],
+        ]);
+        expect(serverActivities.map(({ id }) => id)).toEqual([qualifyId]);
+        expect(activityBadgeOf("Lead 2")).toHaveText(String(serverActivities.length));
+        expect(`${lead2} .o_crm_mobile_activity_row`).toHaveCount(serverActivities.length);
+        expect(".o_crm_mobile_pending_badge").toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: an answer from before the replay to a lead read the reconciliation reload's reads joined does not end the sync window: the lead is read again, and its server row replaces the replayed row in one render", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // While `held[<lead id>]` is set, the next activity read of that lead is answered with
+        // the server data of the moment it arrives, but only once released.
+        const held = {};
+        const requests = { 1: 0 };
+        onRpc("mail.activity", "web_search_read", async ({ kwargs, parent }) => {
+            const resId = kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            requests[resId] = (requests[resId] ?? 0) + 1;
+            const hold = held[resId];
+            if (hold) {
+                held[resId] = null;
+                const result = await parent();
+                await hold.promise;
+                return result;
+            }
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+
+        // Offline: a write of Lead 2, then a Log call on Lead 1, whose activities are expanded.
+        await setOffline(true);
+        await recordOf(renderer, 2).update({ contact_name: "Monica Geller" });
+        await advanceTime(1000);
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        await contains(`${lead1} .o_crm_mobile_card_log_call`).click();
+        expect(queued()).toHaveLength(2);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+
+        // Reconnect: Lead 1's activities are read at once, and that read is answered with the
+        // data of that moment, before its Log call is replayed, but late. The write of Lead 2 is
+        // replayed at once.
+        held[1] = Promise.withResolvers();
+        const release = held[1];
+        await setOffline(false);
+        await waitUntil(() => queued().length === 1);
+        await animationFrame();
+        expect(held[1]).toBe(null);
+        const sentBeforeReplay = requests[1];
+
+        // The Log call is replayed a second later, which ends the sync window, and the
+        // reconciliation reload lands. Every read of Lead 1 since (after the replay, after the
+        // reload) joins the read still in flight: no other request is sent, and the window goes
+        // on with the replayed row.
+        const loaded = recordOf(renderer, 1);
+        await letQueueReplay(1);
+        await waitUntil(() => recordOf(renderer, 1) !== loaded);
+        await animationFrame();
+        expect(queued()).toHaveLength(0);
+        const [created] = MockServer.env["mail.activity"].search_read([["res_id", "=", 1]]);
+        expect(created.summary).toBe("Call");
+        expect(requests[1]).toBe(sentBeforeReplay);
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(renderer._activityRowWaiters).toHaveLength(1);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(1);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+
+        // What every render shows from now on.
+        const renders = [];
+        const observer = new MutationObserver(() =>
+            renders.push({
+                count: queryFirst(activityBadgeOf("Lead 1"))?.textContent,
+                rows: queryAll(`${lead1} .o_crm_mobile_activity_row`).length,
+            })
+        );
+        observer.observe(getFixture(), {
+            attributes: true,
+            characterData: true,
+            childList: true,
+            subtree: true,
+        });
+        after(() => observer.disconnect());
+
+        // The late answer, without the replayed activity, does not end the window: Lead 1 is read
+        // again, once, and that answer's server row ends it.
+        release.resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        observer.disconnect();
+        expect(requests[1]).toBe(sentBeforeReplay + 1);
+        expectWindowEnded(renderer);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(0);
+        expect(
+            `${lead1} .o_crm_mobile_activity_row[data-activity-id='${created.id}'] .o_crm_mobile_activity_done`
+        ).toHaveCount(1);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+
+        // No render showed Lead 1 without its row or with two, nor changed its count.
+        const changes = (values) =>
+            values.filter((value, index) => index === 0 || value !== values[index - 1]);
+        expect(renders.length).toBeGreaterThan(0);
+        expect(changes(renders.map((render) => render.count))).toEqual(["1"]);
+        expect(changes(renders.map((render) => render.rows))).toEqual([1]);
+    });
+
+    test.tags("mobile");
+    test("mobile: lead reads the server rejects never hold the sync window: a rejected read sent before the reconciliation reload has the lead read again, and a rejected read sent after it ends the window", async () => {
+        // The background refreshes of Lead 1's cached activities the server rejects.
+        const errors = [/Activities are locked/, /Activities are locked/];
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // While `held[<lead id>]` is set, the next activity read of that lead waits for its
+        // release; while `rejected[<lead id>]` is positive, the activity reads of that lead are
+        // rejected.
+        const held = {};
+        const rejected = {};
+        const requests = { 1: 0 };
+        onRpc("mail.activity", "web_search_read", async ({ kwargs }) => {
+            const resId = kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            requests[resId] = (requests[resId] ?? 0) + 1;
+            const hold = held[resId];
+            if (hold) {
+                held[resId] = null;
+                await hold.promise;
+            }
+            if (rejected[resId] > 0) {
+                rejected[resId]--;
+                throw makeServerError({ message: "Activities are locked" });
+            }
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+
+        // Offline: a write of Lead 2, then a Log call on Lead 1, whose activities are expanded.
+        await setOffline(true);
+        await recordOf(renderer, 2).update({ contact_name: "Monica Geller" });
+        await advanceTime(1000);
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        await contains(`${lead1} .o_crm_mobile_card_log_call`).click();
+        expect(queued()).toHaveLength(2);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+
+        // Reconnect: Lead 1's activities are read at once, and that read waits. The write of
+        // Lead 2 is replayed at once, the Log call a second later, which ends the sync window,
+        // and the reconciliation reload lands; every read of Lead 1 since joined the one waiting.
+        held[1] = Promise.withResolvers();
+        const release = held[1];
+        await setOffline(false);
+        await waitUntil(() => queued().length === 1);
+        await animationFrame();
+        const sentBeforeReplay = requests[1];
+        const loaded = recordOf(renderer, 1);
+        await letQueueReplay(1);
+        await waitUntil(() => recordOf(renderer, 1) !== loaded);
+        await animationFrame();
+        expect(queued()).toHaveLength(0);
+        expect(requests[1]).toBe(sentBeforeReplay);
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(renderer._activityRowWaiters).toHaveLength(1);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(1);
+
+        // The server rejects that read, sent before the reload: Lead 1 is read again, and the
+        // server rejects that read too, sent after the reload began. The window ends: the
+        // replayed row leaves with the copy, and the card keeps the activities it had read.
+        rejected[1] = 2;
+        release.resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        expect(requests[1]).toBe(sentBeforeReplay + 1);
+        expect(rejected[1]).toBe(0);
+        expectWindowEnded(renderer);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("0");
+        expect(".o_crm_mobile_pending_badge").toHaveCount(0);
+        expect.verifyErrors(errors);
+    });
+
+    /**
+     * Records what every render shows from now on: one `snapshot()` per batch of DOM mutations of
+     * the fixture, until `stop()` or the end of the test.
+     *
+     * @template T
+     * @param {() => T} snapshot
+     * @returns {{ renders: T[], stop: () => void }}
+     */
+    function recordRenders(snapshot) {
+        const renders = [];
+        const observer = new MutationObserver(() => renders.push(snapshot()));
+        observer.observe(getFixture(), {
+            attributes: true,
+            characterData: true,
+            childList: true,
+            subtree: true,
+        });
+        after(() => observer.disconnect());
+        return { renders, stop: () => observer.disconnect() };
+    }
+
+    /**
+     * @template T
+     * @param {T[]} values
+     * @returns {T[]} the values, each run of equal consecutive values reduced to one
+     */
+    function distinctRuns(values) {
+        return values.filter((value, index) => index === 0 || value !== values[index - 1]);
+    }
+
+    /**
+     * Holds the network for two follow-ups replayed on Lead 1: the first replayed activity create
+     * waits for `firstReplay`; while `hold.partial` is set, Lead 1's activity read whose answer
+     * (the server data when it arrives) counts `partialLength` activities waits for
+     * `partialRead`, and `hold.partialStarted` tells it arrived; while `hold.groupsHeld` is set,
+     * the lead group reads (the reconciliation reload) wait for `groups`.
+     *
+     * @param {number} partialLength
+     * @returns {Object} the holds and their flags
+     */
+    function holdOverlappingReplays(partialLength) {
+        const hold = {
+            firstReplay: Promise.withResolvers(),
+            partialRead: Promise.withResolvers(),
+            groups: Promise.withResolvers(),
+            partial: false,
+            partialStarted: false,
+            groupsHeld: false,
+        };
+        let blockFirst = true;
+        onRpc("mail.activity", "web_save", async () => {
+            if (blockFirst) {
+                blockFirst = false;
+                await hold.firstReplay.promise;
+            }
+        });
+        onRpc("mail.activity", "web_search_read", async ({ kwargs, parent }) => {
+            const resId = kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            if (!hold.partial || resId !== 1) {
+                return;
+            }
+            const result = await parent();
+            if (result.length === partialLength) {
+                hold.partialStarted = true;
+                await hold.partialRead.promise;
+            }
+            return result;
+        });
+        onRpc("crm.lead", "web_read_group", async () => {
+            if (hold.groupsHeld) {
+                await hold.groups.promise;
+            }
+        });
+        return hold;
+    }
+
+    /**
+     * Saves follow-ups on a lead's card, one second apart, then expands its activities.
+     *
+     * @param {string} lead the card selector of the lead
+     * @param {Array<{ summary: string, date?: string }>} followUps
+     */
+    async function saveFollowUps(lead, followUps) {
+        for (const { summary, date } of followUps) {
+            await contains(`${lead} .o_crm_mobile_card_follow_up`).click();
+            await contains(`${lead} .o_crm_mobile_follow_up_summary`).edit(summary, {
+                confirm: false,
+            });
+            if (date) {
+                await setDateInput(`${lead} .o_crm_mobile_follow_up_date`, date);
+            }
+            await contains(`${lead} .o_crm_mobile_follow_up_save`).click();
+            await advanceTime(1000);
+        }
+        await contains(`${lead} .o_crm_mobile_card_activities`).click();
+    }
+
+    /**
+     * Reconnects and replays the two follow-ups of `holdOverlappingReplays`: the first one, whose
+     * re-read is answered with that moment's data but held; then the second one, whose re-read
+     * joins the held one, which ends the sync window; the reconciliation reload is held.
+     *
+     * @param {Function} setOffline
+     * @param {ReturnType<typeof holdOverlappingReplays>} hold
+     */
+    async function replayOverlappingFollowUps(setOffline, hold) {
+        await setOffline(false);
+        await animationFrame();
+        hold.partial = true;
+        hold.groupsHeld = true;
+        hold.firstReplay.resolve();
+        await waitUntil(() => queued().length === 1 && hold.partialStarted);
+        await letQueueReplay(1);
+        await waitUntil(() => queued().length === 0);
+    }
+
+    test.tags("mobile");
+    test("mobile: two follow-ups replayed on one lead are each kept until an answer accounts for it: an answer to a read sent between their replays, showing the first only, keeps the second's row and the count", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const hold = holdOverlappingReplays(1);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead = cardOf("Lead 1");
+        const summaries = () => queryAllTexts(`${lead} .o_crm_mobile_activity_summary`);
+        const serverRow = (id) => `${lead} .o_crm_mobile_activity_row[data-activity-id='${id}']`;
+
+        // Offline: two follow-ups on Lead 1, which has no activity.
+        await setOffline(true);
+        await saveFollowUps(lead, [{ summary: "First FU" }, { summary: "Second FU" }]);
+        expect(queued()).toHaveLength(2);
+        expect(summaries()).toEqual(["First FU", "Second FU"]);
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+        const { renders, stop } = recordRenders(() => ({
+            count: queryFirst(activityBadgeOf("Lead 1"))?.textContent,
+            summaries: summaries(),
+        }));
+
+        // Reconnect: the first follow-up is replayed, and the read it asks for is answered with
+        // the server data of that moment (the first activity only), but late. The second one is
+        // replayed meanwhile, its read joins that one, the sync window ends, and the
+        // reconciliation reload waits. Both rows stay, without badge, and the count with them.
+        await replayOverlappingFollowUps(setOffline, hold);
+        const [first, second] = [...renderer.replayedActivityCalls.values()];
+        expect(second.replaySeq).toBeGreaterThan(first.replaySeq);
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+        expect(`${lead} .o_crm_mobile_activity_pending`).toHaveCount(2);
+        expect(`${lead} .o_crm_mobile_pending_badge`).toHaveCount(0);
+
+        // The late answer was sent after the first replay and before the second: it accounts for
+        // the first create, whose server row replaces its row, but not for the second, whose row
+        // stays. The count stays 2.
+        hold.partial = false;
+        hold.partialRead.resolve();
+        await waitUntil(() => renderer.mobileState.activityTotalsByLead[1] === 1);
+        await animationFrame();
+        const serverIds = Object.fromEntries(
+            MockServer.env["mail.activity"]
+                .search_read([["res_id", "=", 1]])
+                .map(({ id, summary }) => [summary, id])
+        );
+        expect(first.activityId).toBe(serverIds["First FU"]);
+        expect(second.activityId).toBe(serverIds["Second FU"]);
+        const answer = renderer.mobileState.activityAnswersByLead[1];
+        expect(answer).toBeGreaterThan(first.replaySeq);
+        expect(answer).toBeLessThan(second.replaySeq + 1);
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+        expect(summaries()).toEqual(["Second FU", "First FU"]);
+        expect(`${lead} .o_crm_mobile_activity_pending .o_crm_mobile_activity_summary`).toHaveText(
+            "Second FU"
+        );
+        expect(`${serverRow(serverIds["First FU"])} .o_crm_mobile_activity_done`).toHaveCount(1);
+
+        // The reconciliation reload lands and waits for the second create: the read issued after
+        // it answers with both server rows, which end the window.
+        hold.groupsHeld = false;
+        hold.groups.resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        stop();
+        expectWindowEnded(renderer);
+        expect(`${lead} .o_crm_mobile_activity_pending`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+        expect(summaries()).toEqual(["First FU", "Second FU"]);
+        for (const id of Object.values(serverIds)) {
+            expect(`${serverRow(id)} .o_crm_mobile_activity_done`).toHaveCount(1);
+        }
+
+        // At every render: the count 2, and both follow-ups, each shown once.
+        expect(renders.length).toBeGreaterThan(0);
+        expect(distinctRuns(renders.map((render) => render.count))).toEqual(["2"]);
+        for (const render of renders) {
+            expect([...render.summaries].sort()).toEqual(["First FU", "Second FU"]);
+        }
+    });
+
+    test.tags("mobile");
+    test("mobile: follow-ups replayed beyond a lead's bounded page each leave the card at the answer to a read sent after their own replay, the count being the server's total at every render", async () => {
+        // 45 activities due on 2030-01-10: the page holds the first 40.
+        await createLeadActivities(1, 45);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const hold = holdOverlappingReplays(46);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead = cardOf("Lead 1");
+        const pendingRows = `${lead} .o_crm_mobile_activity_pending`;
+        const serverRows = `${lead} .o_crm_mobile_activity_row:not(.o_crm_mobile_activity_pending)`;
+
+        // Offline: two follow-ups due after every other activity, hence beyond the page.
+        await setOffline(true);
+        await saveFollowUps(lead, [
+            { summary: "First FU", date: "2031-06-30" },
+            { summary: "Second FU", date: "2031-07-31" },
+        ]);
+        expect(queued()).toHaveLength(2);
+        expect(activityBadgeOf("Lead 1")).toHaveText("47");
+        expect(pendingRows).toHaveCount(2);
+        expect(serverRows).toHaveCount(40);
+        const { renders, stop } = recordRenders(() => ({
+            count: queryFirst(activityBadgeOf("Lead 1"))?.textContent,
+            pending: queryAll(pendingRows).length,
+            server: queryAll(serverRows).length,
+        }));
+
+        // Reconnect: as the first follow-up is replayed, the read it asks for is answered with the
+        // data of that moment (46 activities, the page unchanged) but late; the second one is
+        // replayed meanwhile, its read joining that one, and the reconciliation reload waits.
+        await replayOverlappingFollowUps(setOffline, hold);
+        expect(activityBadgeOf("Lead 1")).toHaveText("47");
+        expect(pendingRows).toHaveCount(2);
+        expect(`${lead} .o_crm_mobile_pending_badge`).toHaveCount(0);
+
+        // That answer accounts for the first create only, which its total counts: the first row
+        // leaves, the second stays, and the count is that total plus the second create.
+        hold.partial = false;
+        hold.partialRead.resolve();
+        await waitUntil(() => renderer.mobileState.activityTotalsByLead[1] === 46);
+        await animationFrame();
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(activityBadgeOf("Lead 1")).toHaveText("47");
+        expect(pendingRows).toHaveCount(1);
+        expect(`${pendingRows} .o_crm_mobile_activity_summary`).toHaveText("Second FU");
+        expect(serverRows).toHaveCount(40);
+        expect(`${lead} .o_crm_mobile_activities_show_all`).toHaveText("Show all (46)");
+
+        // The reconciliation reload lands and waits for the second create: the read issued after
+        // it counts both, which ends the window. The count is the server's.
+        hold.groupsHeld = false;
+        hold.groups.resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        stop();
+        expectWindowEnded(renderer);
+        const serverCount = MockServer.env["mail.activity"].search_count([
+            ["res_model", "=", "crm.lead"],
+            ["res_id", "=", 1],
+        ]);
+        expect(serverCount).toBe(47);
+        expect(activityBadgeOf("Lead 1")).toHaveText(String(serverCount));
+        expect(pendingRows).toHaveCount(0);
+        expect(serverRows).toHaveCount(40);
+        expect(`${lead} .o_crm_mobile_activities_show_all`).toHaveText("Show all (47)");
+
+        // At every render the count was the server's total of that moment plus the creates it did
+        // not count yet: never a dip, never a create counted twice.
+        expect(renders.length).toBeGreaterThan(0);
+        expect(distinctRuns(renders.map((render) => render.count))).toEqual(["47"]);
+        expect(distinctRuns(renders.map((render) => render.server))).toEqual([40]);
+        expect(distinctRuns(renders.map((render) => render.pending))).toEqual([2, 1, 0]);
+    });
+
+    test.tags("mobile");
+    test("mobile: an answer to a read sent after a replayed Log call that equals the cached activities still ends the replayed row, before the reconciliation reload lands, when the server no longer has the activity", async () => {
+        const [qualifyId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Qualify" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Once the Log call is replayed, the next read of Lead 1's activities finds its activity
+        // deleted by the server, and answers that (the cached rows, unchanged) once released;
+        // while `groupsHeld` is set, the reconciliation reload waits for `groups`.
+        let armed = false;
+        let rereadStarted = false;
+        const reread = Promise.withResolvers();
+        const groups = Promise.withResolvers();
+        let groupsHeld = false;
+        onRpc("mail.activity", "web_save", async ({ parent }) => {
+            const result = await parent();
+            armed = true;
+            return result;
+        });
+        onRpc("mail.activity", "web_search_read", async ({ kwargs, parent }) => {
+            const resId = kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            if (!armed || resId !== 1) {
+                return;
+            }
+            armed = false;
+            const created = MockServer.env["mail.activity"].search([
+                ["res_id", "=", 1],
+                ["id", "!=", qualifyId],
+            ]);
+            MockServer.env["mail.activity"].unlink(created);
+            rereadStarted = true;
+            const result = await parent();
+            await reread.promise;
+            return result;
+        });
+        onRpc("crm.lead", "web_read_group", async () => {
+            if (groupsHeld) {
+                await groups.promise;
+            }
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+        const pendingRows = `${lead1} .o_crm_mobile_activity_pending`;
+        const qualifyRow = `${lead1} .o_crm_mobile_activity_row[data-activity-id='${qualifyId}']`;
+
+        // Offline: a write of Lead 2, then a Log call on Lead 1, whose activities are expanded.
+        await setOffline(true);
+        await recordOf(renderer, 2).update({ contact_name: "Monica Geller" });
+        await advanceTime(1000);
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        await contains(`${lead1} .o_crm_mobile_card_log_call`).click();
+        expect(queued()).toHaveLength(2);
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+
+        // Reconnect: the write of Lead 2 is replayed at once, and the activities are read again.
+        await setOffline(false);
+        await waitUntil(() => queued().length === 1);
+        await animationFrame();
+        groupsHeld = true;
+        const { renders, stop } = recordRenders(() => ({
+            count: queryFirst(activityBadgeOf("Lead 1"))?.textContent,
+            pending: queryAll(pendingRows).length,
+            rows: queryAll(`${lead1} .o_crm_mobile_activity_row`).length,
+        }));
+
+        // The Log call is replayed a second later, which ends the sync window; the read it asks
+        // for waits, and so does the reconciliation reload. The replayed row stays.
+        await letQueueReplay(1);
+        await waitUntil(() => rereadStarted && queued().length === 0);
+        await animationFrame();
+        const [call] = [...renderer.replayedActivityCalls.values()];
+        expect(call.method).toBe("web_save");
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(pendingRows).toHaveCount(1);
+        expect(`${pendingRows} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+        const cachedRows = renderer.mobileState.activitiesByLead[1];
+
+        // That read answers the cached rows unchanged, so nothing is applied; sent after the
+        // replay, its answer still accounts for the create: the replayed row leaves, and the
+        // count is the server's, while the reload still waits.
+        reread.resolve();
+        await waitUntil(
+            () => (renderer.mobileState.activityAnswersByLead[1] ?? 0) > call.replaySeq
+        );
+        await animationFrame();
+        expect(renderer.mobileState.activitiesByLead[1]).toBe(cachedRows);
+        expect(renderer.mobileState.syncEntries).not.toBe(null);
+        expect(pendingRows).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        expect(`${qualifyRow} .o_crm_mobile_activity_done`).toHaveCount(1);
+
+        // The reconciliation reload lands: nothing is waited for any more, and the window ends.
+        groupsHeld = false;
+        groups.resolve();
+        await waitUntil(() => renderer.mobileState.syncEntries === null);
+        await animationFrame();
+        stop();
+        expectWindowEnded(renderer);
+        expect(pendingRows).toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(1);
+        expect(`${qualifyRow} .o_crm_mobile_activity_done`).toHaveCount(1);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+
+        // The replayed row and its count left together, in one render, and never came back.
+        expect(renders.length).toBeGreaterThan(0);
+        expect(distinctRuns(renders.map((render) => render.count))).toEqual(["2", "1"]);
+        expect(distinctRuns(renders.map((render) => render.pending))).toEqual([1, 0]);
+        for (const render of renders) {
+            expect(render.count).toBe(String(render.rows));
+        }
+    });
+
+    test.tags("mobile");
+    test("mobile: a card's sync confirmation stays connected through the reconciliation reload, with its expanded activities, its focus and its count", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // The reconciliation reload lands once the test releases it.
+        const latency = delayReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+        const toggle = `${lead1} .o_crm_mobile_card_activities`;
+
+        // Offline Log call on Lead 1, whose activities are expanded and whose Activities toggle
+        // has the focus.
+        await setOffline(true);
+        await contains(toggle).click();
+        await contains(`${lead1} .o_crm_mobile_card_log_call`).click();
+        queryOne(toggle).focus();
+        expect(toggle).toBeFocused();
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        const region = queryOne(statusOf("Lead 1"));
+
+        // Reconnect: the call is replayed and confirmed while the reconciliation reload runs.
+        latency.groups = Promise.withResolvers();
+        await setOffline(false);
+        await letQueueReplay(1);
+        expect(queued()).toHaveLength(0);
+        expect(statusOf("Lead 1")).toHaveText("Lead 1: new activity no longer pending sync.");
+        const confirmation = queryOne(`${statusOf("Lead 1")} > div`);
+        const removed = [];
+        const observer = new MutationObserver((mutations) => {
+            for (const { removedNodes } of mutations) {
+                removed.push(...removedNodes);
+            }
+        });
+        observer.observe(region, { childList: true, subtree: true });
+        after(() => observer.disconnect());
+
+        // The reload lands: the region and its confirmation stay in the document, never removed,
+        // and so do the focus, the expanded list and the count.
+        const loaded = recordOf(renderer, 1);
+        latency.groups.resolve();
+        await waitUntil(
+            () => recordOf(renderer, 1) !== loaded && renderer.mobileState.syncEntries === null
+        );
+        await animationFrame();
+        expect(queryOne(statusOf("Lead 1"))).toBe(region);
+        expect(queryOne(`${statusOf("Lead 1")} > div`)).toBe(confirmation);
+        expect(confirmation.isConnected).toBe(true);
+        expect(removed).toEqual([]);
+        expect(toggle).toBeFocused();
+        expect(`${lead1} .o_crm_mobile_lead_card_activities`).toHaveCount(1);
+        expect(activityBadgeOf("Lead 1")).toHaveText("1");
+        const [activity] = MockServer.env["mail.activity"].search_read([["res_id", "=", 1]]);
+        expect(
+            `${lead1} .o_crm_mobile_activity_row[data-activity-id='${activity.id}']`
+        ).toHaveCount(1);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: a card move re-keys the lead's card into the target stage, where the moved card keeps reacting, and a reload keeps it", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        const lead1 = cardOf("Lead 1");
+        const firstCard = mountedCardOf(cards, 1);
+        expect(firstCard.props.displayedStageValue).toBe(1);
+
+        // Lead 1 moves to Qualified, which the pipeline then displays: its card of New is
+        // destroyed, and the lead gets a new card in that stage (the key carries the stage).
+        await chooseStage("Lead 1", 2);
+        expect(".o_crm_mobile_pipeline_header .o_crm_mobile_pipeline_stage_name").toHaveText(
+            "Qualified"
+        );
+        expect(status(firstCard)).toBe("destroyed");
+        const movedCard = mountedCardOf(cards, 1);
+        expect(movedCard).not.toBe(undefined);
+        expect(movedCard).not.toBe(firstCard);
+        expect(movedCard.props.displayedStageValue).toBe(2);
+        expect(movedCard.props.record).toBe(recordOf(renderer, 1));
+        expect(lead1).toHaveCount(1);
+
+        // The moved card reacts to its own state and props: its activities expand, and a call
+        // logged online is read back into its count and its list.
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        expect(`${lead1} .o_crm_mobile_lead_card_activities`).toHaveCount(1);
+        expect(activityBadgeOf("Lead 1")).toHaveText("0");
+        await contains(`${lead1} .o_crm_mobile_card_log_call`).click();
+        await waitUntil(() => queryFirst(activityBadgeOf("Lead 1"))?.textContent === "1");
+        await animationFrame();
+        expect(`${lead1} .o_crm_mobile_activity_row .o_crm_mobile_activity_type`).toHaveText(
+            "Call"
+        );
+
+        // A reload keeps the moved card, with its expanded list.
+        const movedElement = queryOne(lead1);
+        await renderer.props.list.load();
+        await animationFrame();
+        expect(mountedCardOf(cards, 1)).toBe(movedCard);
+        expect(queryOne(lead1)).toBe(movedElement);
+        expect(movedCard.props.record).toBe(recordOf(renderer, 1));
+        expect(`${lead1} .o_crm_mobile_lead_card_activities`).toHaveCount(1);
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(1);
     });
 
     test.tags("mobile");

@@ -4,9 +4,13 @@
  * `crm.lead` framework `record` or a queued lead create (`pendingCall`).
  *
  * - All offline state is read through `useCrmOffline()`: no dirty flag, nothing persisted. Pending
- *   badges and rows are derived from the live framework queue (memoized), so they clear on replay
- *   or a systray discard. A pending lead create stays on screen while the pipeline holds it, but
- *   its badge follows the live queue.
+ *   badges are derived from the live framework queue (memoized), so they clear on replay or a
+ *   systray discard. Queued activity rows are derived from the entries the pipeline gives
+ *   (`queueEntries`, the live queue by default): during a sync window, a replayed activity
+ *   create keeps its row (without badge) and a replayed mark done keeps its row without Mark
+ *   done, until their server rows or the reconciliation reload replace them, so neither the rows
+ *   nor the Activities count flicker. A pending lead create stays on screen while the pipeline
+ *   holds it, but its badge follows the live queue.
  * - Through `runOrQueue` it queues only `mail.activity` `web_save` and `mail.activity`
  *   `action_archive`, the two families the shared offline systray renders.
  * - Activities need server ids: a pending lead create offers no action, a pending activity create
@@ -23,12 +27,16 @@
  *   opens (stage list, follow-up form, activity list) is scrolled into view, only as far as
  *   needed, by the patch that renders it; closing a panel scrolls nothing (see
  *   `revealPanelOnPatch`).
+ * - The pipeline keys a record card by stage and lead, values a reload keeps: a reload (the
+ *   reconciliation after a sync included) only gives the card its new `record` and `group`, so
+ *   its open panel, follow-up draft, focus and status region stay. Stage navigation, a move, a
+ *   regroup or a load that no longer shows the lead in the stage destroy the card or re-key it.
  * - A call ending after the card was destroyed writes no card state; a successful online activity
  *   write is still handed to the pipeline, which shows it at once on the lead's cards and
  *   re-reads the lead (only if alive, and showing the lead for the read).
  * - Status region (polite, atomic `role="status"`, empty at mount): it announces queue changes
  *   while the card stays mounted, and the Activities count only after the user's own activity
- *   call (see `_announceSyncChanges`). Card creation, remount and destruction, and pending lead
+ *   call (see `_announceSyncChanges`). Card creation, re-keying and destruction, and pending lead
  *   creates, are the pipeline's status region's to announce.
  */
 
@@ -135,6 +143,14 @@ export class CrmMobileLeadCard extends Component {
         onShowAllActivities: t.function().optional(),
         /** Cached creatable activity types `{id, display_name, category}`. */
         activityTypes: t.or([t.array(), t.literal(null)]).optional(null),
+        /**
+         * Queue entries `{key, value}` the queued activity rows are derived from; the live queue
+         * when absent. The pipeline gives the live queue united, during a sync window, with the
+         * entries the window began with (see `CrmMobilePipeline.cardQueueEntries`), so a replayed
+         * call keeps its row until its server row or the reconciliation reload replaces it. The
+         * "Pending sync" badges always read the live queue.
+         */
+        queueEntries: t.array().optional(),
         /** Whether the lead's form is unavailable offline (the card is dimmed). */
         unavailable: t.boolean().optional(false),
         /** `serverValue` (stage id) of the displayed stage. */
@@ -349,9 +365,13 @@ export class CrmMobileLeadCard extends Component {
     }
 
     /**
-     * Queued activity calls of the lead, as stored by the framework (never copied or mutated), in
-     * replay order: the order they were made in, so the pending rows list them in that order.
-     * Memoized: the queue is scanned once per queue change, whatever the number of readers.
+     * Activity calls of the lead the card presents as pending, read from `queueEntries` (the live
+     * queue by default), as stored by the framework (never copied or mutated), in replay order:
+     * the order they were made in, so the pending rows list them in that order. During a sync
+     * window they include the calls replayed since it began, whose rows stay until their server
+     * rows or the reconciliation reload replace them (`queuedActivityKeys` tells the ones still
+     * queued). Memoized: the entries are scanned once per change of them, whatever the number of
+     * readers.
      *
      * @returns {QueueEntry[]}
      */
@@ -360,10 +380,44 @@ export class CrmMobileLeadCard extends Component {
     }
 
     _pendingActivityEntries = computed(() =>
-        this.isPersisted ? this.crmOffline.pendingActivityCalls(this.props.record.resId) : []
+        this.isPersisted
+            ? this.crmOffline.pendingActivityCalls(this.props.record.resId, this.props.queueEntries)
+            : []
     );
 
-    /** @returns {QueueEntry[]} the lead's queued activity creates, in replay order (memoized) */
+    /**
+     * Queue keys of the lead's activity calls (`pendingActivityEntries`) that are still in the
+     * live queue: their rows show "Pending sync", which clears as each call is replayed or
+     * discarded. Memoized like the other queue projections.
+     *
+     * @returns {Set<string>}
+     */
+    get queuedActivityKeys() {
+        return this._queuedActivityKeys();
+    }
+
+    _queuedActivityKeys = computed(() => {
+        const keys = this.pendingActivityEntries.map((entry) => String(entry.key));
+        if (!keys.length || !this.props.queueEntries) {
+            // no call, or every call was read from the live queue
+            return new Set(keys);
+        }
+        const queued = new Set(this.crmOffline.queuedEntries().map((entry) => String(entry.key)));
+        return new Set(keys.filter((key) => queued.has(key)));
+    });
+
+    /**
+     * @param {QueueEntry} entry one of `pendingActivityEntries`
+     * @returns {boolean} whether the call is still in the live queue (its row shows "Pending sync")
+     */
+    isActivityCallQueued(entry) {
+        return this.queuedActivityKeys.has(String(entry.key));
+    }
+
+    /**
+     * @returns {QueueEntry[]} the lead's activity creates, queued or replayed during the sync
+     *   window, in replay order (memoized)
+     */
     get pendingActivityCreates() {
         return this._pendingActivityCreates();
     }
@@ -372,7 +426,10 @@ export class CrmMobileLeadCard extends Component {
         this.pendingActivityEntries.filter((entry) => entry.value.method === "web_save")
     );
 
-    /** @returns {Set<number>} ids of the activities whose mark-done is queued (memoized) */
+    /**
+     * @returns {Set<number>} ids of the activities whose mark-done is queued or, during a sync
+     *   window, was replayed: they offer no Mark done (memoized)
+     */
     get pendingArchivedIds() {
         return this._pendingArchivedIds();
     }
@@ -382,6 +439,27 @@ export class CrmMobileLeadCard extends Component {
             new Set(
                 this.pendingActivityEntries
                     .filter((entry) => entry.value.method === "action_archive")
+                    .map((entry) => entry.value.args?.[0]?.[0])
+            )
+    );
+
+    /**
+     * @returns {Set<number>} ids of the activities whose mark-done is in the live queue: they show
+     *   "Pending sync" (memoized)
+     */
+    get queuedArchivedIds() {
+        return this._queuedArchivedIds();
+    }
+
+    _queuedArchivedIds = computed(
+        () =>
+            new Set(
+                this.pendingActivityEntries
+                    .filter(
+                        (entry) =>
+                            entry.value.method === "action_archive" &&
+                            this.isActivityCallQueued(entry)
+                    )
                     .map((entry) => entry.value.args?.[0]?.[0])
             )
     );
@@ -396,7 +474,10 @@ export class CrmMobileLeadCard extends Component {
         return typeof total === "number" ? Math.max(0, total - this.activityRows.length) : 0;
     }
 
-    /** Every activity of the lead: its server total (or loaded rows) plus its queued creates. */
+    /**
+     * Every activity of the lead: its server total (or loaded rows) plus its pending creates
+     * (queued, or replayed during the sync window and not among the rows yet).
+     */
     get activityCount() {
         return (
             Math.max(this.props.activityTotal ?? 0, this.activityRows.length) +
@@ -448,15 +529,29 @@ export class CrmMobileLeadCard extends Component {
         return values;
     }
 
+    /**
+     * The options of the stage list, one per group of the pipeline. Each is keyed by its stage
+     * (`serverValue`), which a reload keeps, never by the group datapoint id, which a reload
+     * renews: the reconciliation reload after a sync leaves an open list with its option buttons,
+     * and the focus on them. A stage the server answers in several groups gets one key per
+     * occurrence, so keys stay unique.
+     */
     get stageOptions() {
         const disabledValues = this.disabledStageValues;
-        return this.props.stages.map((group) => ({
-            group,
-            key: group.id,
-            label: group.displayName,
-            selected: group.serverValue === this.props.displayedStageValue,
-            disabled: this.state.busy || disabledValues.includes(group.serverValue),
-        }));
+        const occurrences = new Map();
+        return this.props.stages.map((group) => {
+            const occurrence = occurrences.get(group.serverValue) ?? 0;
+            occurrences.set(group.serverValue, occurrence + 1);
+            return {
+                group,
+                key: occurrence
+                    ? `stage_${group.serverValue}_${occurrence}`
+                    : `stage_${group.serverValue}`,
+                label: group.displayName,
+                selected: group.serverValue === this.props.displayedStageValue,
+                disabled: this.state.busy || disabledValues.includes(group.serverValue),
+            };
+        });
     }
 
     /**
@@ -654,7 +749,9 @@ export class CrmMobileLeadCard extends Component {
         try {
             await this.props.onMove?.(this.props.record, group);
         } finally {
-            // A move re-keys or removes the card: a destroyed card gets no state write.
+            // A move the framework made displays the target stage, where the lead gets a new card
+            // (its key carries the stage), and destroys this one: a destroyed card gets no state
+            // write.
             if (status(this) !== "destroyed") {
                 this.state.busy = false;
             }
@@ -717,10 +814,11 @@ export class CrmMobileLeadCard extends Component {
                 this._expectActivityChange = true;
                 // `web_save` answers `[{ id }]` with the empty specification.
                 const id = res.result?.[0]?.id;
-                // Requested even when this card was destroyed meanwhile: a reload re-keys the card
-                // of a lead that stays displayed, and its new card would keep the activities read
-                // before this write. The pipeline shows the write at once and re-reads only while
-                // alive and displaying the lead, so no read starts for a lead nobody shows.
+                // Requested even when this card was destroyed meanwhile: a move or stage
+                // navigation can bring the lead back in a new card, which would keep the
+                // activities read before this write. The pipeline shows the write at once and
+                // re-reads only while alive and displaying the lead, so no read starts for a lead
+                // nobody shows.
                 if (id) {
                     // the activity created, in the shape the pipeline reads, from the values sent
                     this.props.onActivitiesChanged?.(record.resId, {
@@ -823,7 +921,8 @@ export class CrmMobileLeadCard extends Component {
     /**
      * Marks a persisted activity done: `action_done` online; offline (or when the connection
      * drops), a queued `action_archive`, a state change only, with no feedback message, no
-     * calendar event and no upload, whatever the activity's category.
+     * calendar event and no upload, whatever the activity's category. An activity whose mark done
+     * is queued, or was replayed during the sync window, is not marked again.
      *
      * @param {Object} activity a cached `mail.activity` record
      */
@@ -989,24 +1088,30 @@ export class CrmMobileLeadCard extends Component {
 
     /**
      * What the status region describes, read from the getters the template renders, as plain
-     * values: queue entries are identified by their key, never copied.
+     * values: queue entries are identified by their key, never copied. The pending-sync parts
+     * follow the badges, hence the live queue: a call the sync window keeps on screen after its
+     * replay is announced as no longer pending sync at its replay, and the count follows the
+     * displayed rows, which that call keeps until its server row replaces it.
      *
      * @private
      * @returns {{ pendingSync: boolean, createKeys: string[], activityIds: number[],
      *   total: number | null, doneIds: number[], count: number, activitiesKnown: boolean }} the
      *   lead badge (always false on a pending lead create, whose badge the card never announces),
-     *   the keys of the pending create rows, the ids of the lead's persisted (cached)
-     *   activity rows, the server's total of them (the rows are a bounded page), the ids of those
-     *   whose mark done is queued (other leads' queued archives left out), the Activities count,
-     *   and whether the lead's activities are loaded
+     *   the keys of the pending create rows still in the live queue, the ids of the lead's
+     *   persisted (cached) activity rows, the server's total of them (the rows are a bounded
+     *   page), the ids of those whose mark done is in the live queue (other leads' queued
+     *   archives left out), the displayed Activities count, and whether the lead's activities
+     *   are loaded
      */
     _readSyncSnapshot() {
-        const archivedIds = this.pendingArchivedIds;
+        const archivedIds = this.queuedArchivedIds;
         const activityIds = this.activityRows.map((activity) => activity.id);
         return {
             // A pending create's badge is the pipeline's to announce (see `_announceSyncChanges`).
             pendingSync: !this.isPending && this.isPendingSync,
-            createKeys: this.pendingActivityCreates.map((entry) => String(entry.key)),
+            createKeys: this.pendingActivityCreates
+                .filter((entry) => this.isActivityCallQueued(entry))
+                .map((entry) => String(entry.key)),
             activityIds,
             total: this.props.activityTotal,
             doneIds: activityIds.filter((id) => archivedIds.has(id)),
@@ -1036,11 +1141,11 @@ export class CrmMobileLeadCard extends Component {
      *   reflects the same write announces nothing more.
      * No other count change is announced. A create or mark done leaving the queue (replay or
      * discard) is told by "no longer pending sync" alone, and a background re-read (activity
-     * revalidation, the reconciliation reload after a sync, on this card or on one remounted by
-     * that reload) is no change the user made, so its count never replaces the sync confirmation
-     * in the atomic region. A newly queued activity call also ends a pending expectation: the
-     * connection dropped before that re-read could land, and the rows that change next are the
-     * reconnection's.
+     * revalidation, the re-read a replayed activity call asks for, the one after the
+     * reconciliation reload, which keeps this card mounted) is no change the user made, so its
+     * count never replaces the sync confirmation in the atomic region. A newly queued activity
+     * call also ends a pending expectation: the connection dropped before that re-read could
+     * land, and the rows that change next are the reconnection's.
      *
      * @private
      * @param {ReturnType<CrmMobileLeadCard["_readSyncSnapshot"]>} snapshot

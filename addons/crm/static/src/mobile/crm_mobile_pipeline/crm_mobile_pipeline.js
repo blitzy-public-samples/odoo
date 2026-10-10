@@ -41,7 +41,7 @@ import {
     useListener,
 } from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
-import { ConnectionLostError, rpcBus } from "@web/core/network/rpc";
+import { ConnectionLostError, RPCError, rpcBus } from "@web/core/network/rpc";
 import { usePopover } from "@web/core/popover/popover_hook";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
@@ -200,6 +200,25 @@ function leadName(name) {
 }
 
 /**
+ * The entry of the sync-window copy that a successful replay answer belongs to, among the entries
+ * its call matched: the only one, else the earliest by timestamp that has no recorded id yet, the
+ * order the framework replays entries of equal arguments in.
+ *
+ * @param {QueueEntry[]} matches the entries the replayed call matched
+ * @param {Map<string, number>} recordedIds the ids already recorded, by queue key
+ * @returns {QueueEntry | undefined}
+ */
+function replayedEntryOf(matches, recordedIds) {
+    const byKey = new Map(matches.map((entry) => [String(entry.key), entry]));
+    if (byKey.size === 1) {
+        return byKey.values().next().value;
+    }
+    return [...byKey.values()]
+        .filter(({ key }) => !recordedIds.has(String(key)))
+        .sort((a, b) => (a.value.extras?.timeStamp ?? 0) - (b.value.extras?.timeStamp ?? 0))[0];
+}
+
+/**
  * The order of `loadLeadActivities` (`date_deadline ASC, id ASC`, an activity without deadline
  * last, as the database sorts null values in ascending order), so the rows the server sent keep
  * their place among those a confirmed write adds, and a bounded read tells which activities its
@@ -266,6 +285,16 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
              */
             activityTotalsByLead: {},
             /**
+             * While a sync-window copy is held, the number of the activity request
+             * (`_activityReadSequence`) whose server answer each lead's loaded activities and
+             * total are: lead id → request number, `0` for a cached value of unknown age. Written
+             * with the rows it describes (or by the answer that confirms them unchanged), in the
+             * same turn, so a card drops a replayed create's row in the render that shows that
+             * answer (see `_isActivityReplayReflected`). A rejected request writes nothing: its
+             * answer brings no rows. Pruned with the rows and emptied with the copy.
+             */
+            activityAnswersByLead: {},
+            /**
              * Activity limit by lead id, set only by an explicit online "Show all": every later
              * revalidation of that lead reissues the same expanded request (answered by the cache
              * offline). A lead without an entry is read with the loader's default request.
@@ -290,8 +319,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
              * Queue entries as they were when the current sync window began (or when the
              * pipeline entered it), less those discarded from the systray since; `null` outside
              * a sync window and outside the stage pipeline. While set, a write replayed during
-             * the sync keeps its placement until the reconciliation reload that incorporates it
-             * has landed.
+             * the sync keeps its placement, and a replayed activity call its row on the card
+             * (see `cardQueueEntries`), until the reconciliation reload that incorporates it has
+             * landed.
              */
             syncEntries: null,
             /**
@@ -364,6 +394,89 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
          * @type {Map<string, number>}
          */
         this.replayedCreateIds = new Map();
+        /**
+         * The `mail.activity` calls of the sync-window copy replayed on a lead, as the framework's
+         * replay answer told them (see `_onActivityCallReplayed`): queue key → `{ resId, method,
+         * activityId, replaySeq }`, the lead, the method, the activity created (`web_save`, when
+         * the answer gave its id) or marked done (`action_archive`), and the number of the last
+         * activity request sent when the replay answered (`_activityReadSequence`): a request
+         * numbered above it was sent after the replay committed. Emptied with the copy, like
+         * `replayedCreateIds`; read by `_computeCardQueueEntries` and `_awaitsActivityRows` (see
+         * `_isActivityReplayReflected`). Not reactive and never persisted, for the same reasons.
+         *
+         * @type {Map<string, { resId: number, method: string, activityId: number | undefined,
+         *   replaySeq: number }>}
+         */
+        this.replayedActivityCalls = new Map();
+        /**
+         * Number of the last activity request an activity read sent (`_loadLeadActivities`): a
+         * read that sends its own request takes the next one, so a request numbered above the
+         * value taken at some moment was sent after it (see `_reconcile`). Not reactive.
+         */
+        this._activityReadSequence = 0;
+        /**
+         * The number of the last request sent for each activity request of a lead (lead id and
+         * limit, see `_loadLeadActivities`): a read the cache joins to the identical request in
+         * flight is answered by that request, and takes its number. Not reactive and never
+         * persisted.
+         *
+         * @type {Map<string, number>}
+         */
+        this._activityRequestNumbers = new Map();
+        /**
+         * Leads whose activities a waiting reconciliation reload has read again in the next task
+         * (see `_onActivityReadSettled`), each until that read goes. Not reactive.
+         *
+         * @type {Set<number>}
+         */
+        this._scheduledActivityReads = new Set();
+        /**
+         * While a sync-window copy is held, the highest number of the requests for each lead's
+         * activities (`_activityReadSequence`) that the server answered, the answer changed or
+         * not: lead id → request number. It bounds the wait of a reconciliation reload (see
+         * `_awaitsActivityRows`). Emptied with the copy, like `replayedActivityCalls`; not
+         * reactive and never persisted.
+         *
+         * @type {Map<number, number>}
+         */
+        this._settledActivityReads = new Map();
+        /**
+         * While a sync-window copy is held, the number of the last request for each activity
+         * request of a lead (lead id and limit) that the server answered with rows: the framework
+         * cache answers the next read of that request with those rows first, so they keep that
+         * number (`activityAnswersByLead`). Emptied with the copy; not reactive and never
+         * persisted.
+         *
+         * @type {Map<string, number>}
+         */
+        this._activityAnswerNumbers = new Map();
+        /**
+         * The reconciliation reloads waiting for the server rows of replayed activity calls (see
+         * `_reconcile`): for each, the number of the last activity request sent before its reload
+         * began (`since`) and its resolver, called once no displayed lead waits for it any more
+         * under that bound (`_releaseActivityRowWaiters`), or when the copy is dropped.
+         *
+         * @type {Array<{ since: number, resolve: () => void }>}
+         */
+        this._activityRowWaiters = [];
+        /**
+         * Queue entries placement, totals and cards are derived from (see `stageEntries`): one
+         * frozen array until the queue or the sync-window copy changes. Never read outside the
+         * mobile pipeline.
+         *
+         * @type {() => readonly QueueEntry[]}
+         */
+        this._stageEntries = computed(() => this._computeStageEntries());
+        /**
+         * Queue entries the record cards derive their queued activity rows from (see
+         * `_computeCardQueueEntries`): one frozen array until the queue, the sync-window copy or,
+         * once an activity create was replayed, its lead's loaded activities or the answer they
+         * come from (`activityAnswersByLead`) change, so a card derives its rows again only then.
+         * Never read outside the mobile pipeline.
+         *
+         * @type {() => readonly QueueEntry[]}
+         */
+        this._cardQueueEntries = computed(() => this._computeCardQueueEntries());
         /**
          * Placement of every loaded record and summary of every stage, derived in one pass (see
          * `_computeStageProjection`). Lazy: derived on the first read after a change of the
@@ -478,10 +591,24 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * Union rather than replacement: an entry queued while the snapshot is held (the connection
      * dropped again during the sync, for instance) is placed at once as well.
      *
+     * Memoized (`_stageEntries`): one array per change of the queue or of the copy, shared by the
+     * stage projection and the cards (`cardQueueEntries`), so the live queue is read once per
+     * change and the hook readers index that one array once.
+     *
      * @returns {readonly QueueEntry[]} a frozen array, so the hook readers index it once (only the
      *   array is frozen, never the entries)
      */
     get stageEntries() {
+        return this._stageEntries();
+    }
+
+    /**
+     * See `stageEntries`.
+     *
+     * @private
+     * @returns {readonly QueueEntry[]}
+     */
+    _computeStageEntries() {
         const live = this.crmOffline.queuedEntries();
         const snapshot = this.mobileState.syncEntries;
         if (!snapshot?.length) {
@@ -492,6 +619,156 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             ...live,
             ...snapshot.filter((entry) => !liveKeys.has(String(entry.key))),
         ]);
+    }
+
+    /**
+     * Queue entries the record cards derive their queued activity rows from (prop
+     * `queueEntries`): `stageEntries`, so that during a sync window a replayed activity create
+     * keeps its row and the Activities count, and a replayed mark done keeps its row without Mark
+     * done, until the reconciliation reload has landed (see `_reconcile`); less each replayed
+     * create the lead's loaded activities already account for (see `_isActivityReplayReflected`):
+     * they show its server row, or are a server answer to a request sent after its replay, so the
+     * card follows the server in the render that shows them. The cards' "Pending sync" badges
+     * read the live queue, so they clear as each call replays.
+     *
+     * @returns {readonly QueueEntry[]} a frozen array, the same until the queue, the sync-window
+     *   copy or, once an activity create was replayed, its lead's loaded activities or the answer
+     *   they come from change (shared, must not be mutated)
+     */
+    get cardQueueEntries() {
+        return this._cardQueueEntries();
+    }
+
+    /**
+     * See `cardQueueEntries`. Each replayed create is judged on its own, by what its replay
+     * answer told (`replayedActivityCalls`, see `_isActivityReplayReflected`): no queued call is
+     * rewritten and nothing is persisted. The judgement reads the reactive state it depends on
+     * (the lead's rows and `activityAnswersByLead`), so a server answer that changes nothing in
+     * the rows still recomputes the entries.
+     *
+     * @private
+     * @returns {readonly QueueEntry[]}
+     */
+    _computeCardQueueEntries() {
+        const entries = this.stageEntries;
+        if (!this.replayedActivityCalls.size) {
+            return entries;
+        }
+        const kept = entries.filter((entry) => {
+            const call = this.replayedActivityCalls.get(String(entry.key));
+            return !call || call.method !== "web_save" || !this._isActivityReplayReflected(call);
+        });
+        return kept.length === entries.length ? entries : Object.freeze(kept);
+    }
+
+    /**
+     * Whether the loaded activities of a lead already account for a replayed activity call (see
+     * `replayedActivityCalls`):
+     * - a mark done, once its activity is no longer among the lead's rows;
+     * - a create, once the activity it created is among them, or once the rows and total loaded
+     *   are the server's answer to an activity request numbered above the create's `replaySeq`
+     *   (`activityAnswersByLead`). Such a request was sent after the replay committed, so its
+     *   answer is the server's state with the create: the activity is among the rows, or beyond
+     *   the bounded page and counted by the total, or no longer on the server. The card then
+     *   follows the server. An answer to a request sent earlier proves nothing about this
+     *   create, whatever it shows of the lead's other activities or total: two creates replayed
+     *   on one lead are each judged by their own activity and request number.
+     *
+     * Reads only reactive state, so the cards follow every answer applied (see
+     * `_computeCardQueueEntries`).
+     *
+     * @private
+     * @param {{ resId: number, method: string, activityId: number | undefined,
+     *   replaySeq: number }} call
+     * @returns {boolean}
+     */
+    _isActivityReplayReflected({ resId, method, activityId, replaySeq }) {
+        const rows = this.mobileState.activitiesByLead[resId];
+        const loaded = Array.isArray(rows);
+        const holdsActivity = loaded && rows.some((activity) => activity.id === activityId);
+        if (method !== "web_save") {
+            return !holdsActivity;
+        }
+        return (
+            holdsActivity ||
+            (loaded && (this.mobileState.activityAnswersByLead[resId] ?? 0) > replaySeq)
+        );
+    }
+
+    /**
+     * Whether a reconciliation reload that began after activity request `since` (see
+     * `_reconcile`) still waits for the server rows of a replayed activity call: a call replayed
+     * on a lead the displayed stage shows, whose activities are loaded, that those activities do
+     * not account for yet (see `_isActivityReplayReflected`), and for whose lead the server has
+     * not yet answered a request numbered above `since` (`_settledActivityReads`). Its server
+     * rows are still to come, from the re-read its replay asked for or the revalidation that
+     * follows the reload.
+     *
+     * The bound: a request numbered above `since` was sent after the reload began, hence after
+     * every replay of the window (each call's `replaySeq` is at most `since`). The revalidation
+     * that follows the reload reads each displayed lead; a read the cache joins to an identical
+     * request still in flight takes that request's number, and when an answer to a request sent
+     * before the reload began leaves the lead waited for, the lead is read again
+     * (`_onActivityReadSettled`). A create stops being waited for at the first answer with rows
+     * to a request sent after its replay, which then accounts for it. A mark done is waited for
+     * until its activity leaves the rows, or until the server has answered a request sent after
+     * the reload began: the server may have unarchived that activity. The server rejecting a
+     * request sent after the reload began ends the wait of either as well, though that answer
+     * brings no rows. The call is then waited for no more, and the copy the reload drops takes
+     * its row away. Leads no card shows are never waited for.
+     *
+     * @private
+     * @param {number} since the number of the last activity request sent before the reload
+     *   began (`_activityReadSequence`)
+     * @param {number} [resId] only the calls replayed on this lead, when given
+     * @returns {boolean}
+     */
+    _awaitsActivityRows(since, resId) {
+        if (!this.replayedActivityCalls.size || !this.isMobilePipeline) {
+            return false;
+        }
+        const shown = new Set(this.cardsFor(this.currentGroup).map((record) => record.resId));
+        const { activitiesByLead } = this.mobileState;
+        for (const call of this.replayedActivityCalls.values()) {
+            if (
+                (resId === undefined || call.resId === resId) &&
+                shown.has(call.resId) &&
+                Array.isArray(activitiesByLead[call.resId]) &&
+                (this._settledActivityReads.get(call.resId) ?? 0) <= since &&
+                !this._isActivityReplayReflected(call)
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Resumes each reconciliation reload waiting for the server rows of replayed activity calls
+     * (see `_reconcile`) once no displayed lead waits for them any more under its own bound (see
+     * `_awaitsActivityRows`), or every one at once with `force` (the copy was dropped). A reload
+     * still waiting keeps its place.
+     *
+     * @private
+     * @param {boolean} [force]
+     */
+    _releaseActivityRowWaiters(force = false) {
+        if (!this._activityRowWaiters.length) {
+            return;
+        }
+        const released = [];
+        const waiting = [];
+        for (const waiter of this._activityRowWaiters) {
+            if (!force && this._awaitsActivityRows(waiter.since)) {
+                waiting.push(waiter);
+            } else {
+                released.push(waiter);
+            }
+        }
+        this._activityRowWaiters = waiting;
+        for (const { resolve } of released) {
+            resolve();
+        }
     }
 
     get hasRevenue() {
@@ -1284,23 +1561,35 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Forgets the activities, their total counts and their confirmed writes not read yet, of the
-     * leads no group of the pipeline holds any more. The limit an online "Show all" chose for a
-     * lead (`activityLimitsByLead`) is kept, so a lead loaded again reissues the same expanded
-     * request, which the cache answers offline.
+     * Forgets the activities, their total counts, the answers they came from and their confirmed
+     * writes not read yet, of the leads no group of the pipeline holds any more. The limit an
+     * online "Show all" chose for a lead (`activityLimitsByLead`) is kept, so a lead loaded again
+     * reissues the same expanded request, which the cache answers offline.
      *
      * @private
      */
     _pruneActivities() {
         const loadedIds = new Set(this.allLoadedRecords().map((record) => record.resId));
-        const { activitiesByLead, activityTotalsByLead, activityWritesByLead } = this.mobileState;
-        for (const byLead of [activitiesByLead, activityTotalsByLead, activityWritesByLead]) {
+        const {
+            activitiesByLead,
+            activityTotalsByLead,
+            activityAnswersByLead,
+            activityWritesByLead,
+        } = this.mobileState;
+        for (const byLead of [
+            activitiesByLead,
+            activityTotalsByLead,
+            activityAnswersByLead,
+            activityWritesByLead,
+        ]) {
             for (const resId of Object.keys(byLead)) {
                 if (!loadedIds.has(Number(resId))) {
                     delete byLead[resId];
                 }
             }
         }
+        // a lead no longer loaded waits for no activity rows
+        this._releaseActivityRowWaiters();
     }
 
     /**
@@ -1451,6 +1740,14 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * queued call is rewritten and nothing is persisted; the framework's own replay answer only
      * tells the window's copy that its create is now a loaded server record.
      *
+     * A replayed `mail.activity` call of a lead goes to `_onActivityCallReplayed`, which records
+     * it the same way (`replayedActivityCalls`, emptied with the copy too, as are the answered
+     * activity reads that bound a reconciliation reload's wait, `_settledActivityReads`, and the
+     * answers the loaded activities come from, `_activityAnswerNumbers` and
+     * `activityAnswersByLead`; dropping the copy also resumes a reconciliation reload waiting for
+     * its rows) and has the lead's activities read again, so the card's server rows replace the
+     * replayed call's rows inside the window.
+     *
      * Without a copy, neither the listener nor the effect reads anything else, so desktop and
      * every session outside a sync window do no work.
      *
@@ -1491,10 +1788,16 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 for (const entry of matches) {
                     replayed.add(String(entry.key));
                 }
+                if (!matches.length) {
+                    return;
+                }
+                if (params.model === "mail.activity") {
+                    this._onActivityCallReplayed(params, result, matches);
+                    return;
+                }
                 // a replayed lead create: the lead it created, for `pendingCreatesFor`
                 const createdId = Array.isArray(result) ? result[0]?.id : undefined;
                 if (
-                    !matches.length ||
                     params.model !== "crm.lead" ||
                     params.method !== "web_save" ||
                     !Array.isArray(params.args[0]) ||
@@ -1503,17 +1806,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 ) {
                     return;
                 }
-                const byKey = new Map(matches.map((entry) => [String(entry.key), entry]));
-                const [target] =
-                    byKey.size === 1
-                        ? byKey.values()
-                        : [...byKey.values()]
-                              .filter(({ key }) => !this.replayedCreateIds.has(String(key)))
-                              .sort(
-                                  (a, b) =>
-                                      (a.value.extras?.timeStamp ?? 0) -
-                                      (b.value.extras?.timeStamp ?? 0)
-                              );
+                const target = replayedEntryOf(matches, this.replayedCreateIds);
                 if (target) {
                     this.replayedCreateIds.set(String(target.key), createdId);
                 }
@@ -1525,6 +1818,14 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 seen = null;
                 replayed.clear();
                 this.replayedCreateIds.clear();
+                this.replayedActivityCalls.clear();
+                this._settledActivityReads.clear();
+                this._activityAnswerNumbers.clear();
+                untrack(() => {
+                    this.mobileState.activityAnswersByLead = {};
+                });
+                // nothing is held any more: a reconciliation reload waiting for rows goes on
+                this._releaseActivityRowWaiters(true);
                 return;
             }
             const live = this.crmOffline.queuedEntries();
@@ -1554,6 +1855,71 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 }
             });
         });
+    }
+
+    /**
+     * A `mail.activity` call of the sync window was replayed successfully (see
+     * `_setupSyncWindowDiscards`, which matched it to `matches`), and its entry is about to leave
+     * the queue while the copy keeps its row on the card (see `cardQueueEntries`).
+     *
+     * - The call is recorded for its entry (`replayedActivityCalls`, the entry chosen as for
+     *   `replayedCreateIds`): its lead, the activity its answer created (an activity create on a
+     *   lead: `web_save` without id, `res_model` `crm.lead`) or the activity it marked done
+     *   (`action_archive`), and `replaySeq`, the number of the last activity request sent so far
+     *   (`_activityReadSequence`), taken before the re-read below is sent: every request numbered
+     *   above it is sent after this replay committed. The cards drop the pending row of a create
+     *   once the lead's loaded activities account for it, and the reconciliation reload ends the
+     *   window only once the displayed leads' activities account for every recorded call (see
+     *   `_isActivityReplayReflected`), or the server answered a read of their lead issued after
+     *   the reload began (see `_awaitsActivityRows`).
+     * - The lead's activities are read again, as after an online activity write
+     *   (`onActivitiesChanged`, which reads only a lead the displayed stage shows): when that read
+     *   sends its own request, its answer accounts for the call, and the server rows replace the
+     *   replayed call's rows in one render, inside the window; the cache-first read after the
+     *   reconciliation reload answers with them. A read the cache joins to a request sent before
+     *   (numbered at most `replaySeq`) does not account for it.
+     *
+     * The lead of a mark done is the one whose loaded activities hold the activity. A call whose
+     * lead is unknown (a mark done no loaded lead holds, another model's activity) changes
+     * nothing.
+     *
+     * @private
+     * @param {{ method: string, args: any[] }} params the replayed call
+     * @param {any} result its answer (`web_save`: the records it created)
+     * @param {QueueEntry[]} matches the entries the call matched (at least one)
+     */
+    _onActivityCallReplayed({ method, args }, result, matches) {
+        const [ids, vals] = args;
+        if (!Array.isArray(ids)) {
+            return;
+        }
+        let resId;
+        let activityId;
+        if (method === "web_save" && ids.length === 0 && vals?.res_model === "crm.lead") {
+            resId = vals.res_id;
+            const createdId = Array.isArray(result) ? result[0]?.id : undefined;
+            activityId = Number.isInteger(createdId) ? createdId : undefined;
+        } else if (method === "action_archive") {
+            activityId = ids[0];
+            const lead = Object.entries(this.mobileState.activitiesByLead).find(([, rows]) =>
+                rows?.some((activity) => activity.id === activityId)
+            );
+            resId = lead ? Number(lead[0]) : undefined;
+        }
+        if (!Number.isInteger(resId)) {
+            return;
+        }
+        const target = replayedEntryOf(matches, this.replayedActivityCalls);
+        if (target) {
+            this.replayedActivityCalls.set(String(target.key), {
+                resId,
+                method,
+                activityId,
+                // taken before the re-read below takes the next number
+                replaySeq: this._activityReadSequence,
+            });
+        }
+        this.onActivitiesChanged(resId);
     }
 
     /**
@@ -1599,6 +1965,22 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * generation: one running with the generation unchanged replays nothing the reload lacks, so
      * it does not keep the copy.
      *
+     * Activities are not part of the reload: they come from the re-read each replayed activity
+     * call asked for and from the revalidation that follows the reload. While the loaded
+     * activities of a displayed lead do not account for an activity call replayed during the
+     * window yet (`_awaitsActivityRows`), the reload is not over: the copy keeps the call's row (a
+     * create without badge, a mark done without Mark done) until they do, so the row neither
+     * vanishes nor offers Mark done again in between. The wait is bounded: the number of the last
+     * activity request sent before the reload begins is taken first, and a call stops being
+     * waited for once its lead's activities account for it (for a create, the first answer with
+     * rows to a request sent after its replay does) or once the server has answered a request
+     * for that lead numbered above that first number, which the revalidation after the reload
+     * sends, or the read that follows an answer to an earlier request (see
+     * `_awaitsActivityRows`). The server may never show the call (its activity deleted or
+     * unarchived meanwhile, or beyond a bounded page): the card then shows the lead as the
+     * server has it. The applied activities and the answered reads resume the reload
+     * (`_releaseActivityRowWaiters`), and so does the copy being dropped.
+     *
      * A root the view replaced while the reload ran (a new search, for instance) is reconciled in
      * turn. Reloads never overlap: the framework model's mutex serializes list loads. While one is
      * in flight, `reconciliation` holds its generation, so a window it still covers issues no
@@ -1615,8 +1997,17 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         const generation = this.syncGeneration;
         const reconciliation = { generation };
         this.reconciliation = reconciliation;
+        // every activity request numbered above this one is sent after the reload began
+        const since = this._activityReadSequence;
         try {
             await list.load();
+            // The reload carries no activity: the copy also keeps the rows of the activity calls
+            // replayed during the window until the displayed leads' activities show them, or
+            // until the server has answered a request for their leads sent since the reload
+            // began.
+            if (this._awaitsActivityRows(since)) {
+                await new Promise((resolve) => this._activityRowWaiters.push({ since, resolve }));
+            }
         } catch (error) {
             if (error instanceof ConnectionLostError) {
                 return;
@@ -1790,6 +2181,27 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * limit is no longer the lead's (a bounded read still in flight when "Show all" expanded it)
      * is dropped, so it never replaces the expanded page.
      *
+     * Each read is numbered by the request that answers it (`_activityReadSequence`): a read
+     * that sends its own request takes the next number, and a read the cache joins to the
+     * identical request in flight takes that request's (`_activityRequestNumbers`), so the
+     * number tells when the answer's request was sent. The framework network layer announces a
+     * request on `rpcBus` (`RPC:REQUEST`) while the loader is called, before the loader returns,
+     * which tells the two apart. While a sync-window copy is held, every server answer to a read
+     * of the lead's current request, changed or not, records its number for the lead
+     * (`_settledActivityReads`) and for the request (`_activityAnswerNumbers`), numbers the rows
+     * shown (`activityAnswersByLead`: a changed answer's rows as they are applied, an unchanged
+     * answer's as they are), and is handled by `_onActivityReadSettled`, all in the turn the
+     * answer's rows are applied. An answer that comes before the promise delivers its value
+     * (nothing was cached) is recorded and handled once that value is applied, so the rows it
+     * brings are shown before the reload drops the copy, and a card never drops a replayed
+     * create's row before the rows that account for it are shown. A cached value the promise
+     * delivers first is numbered by the last answer to the request (`0` when none came during
+     * the window), whose rows the framework cache holds. A request the server rejects answers no
+     * read, the cache tells none of them, and the rows stay as they are: the server's error is
+     * its answer to that request, recorded for the lead and handled the same way
+     * (`_watchActivityRequestError`), so a reload never waits for a request that will not
+     * answer; it numbers no rows.
+     *
      * @private
      * @param {number} resId
      * @returns {Promise<{ records: Object[], length: number } | null>} the value read, `null` when
@@ -1797,19 +2209,171 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      */
     async _loadLeadActivities(resId) {
         const limit = this.mobileState.activityLimitsByLead[resId];
-        const apply = (result) => {
+        const requestKey = `${resId}:${limit ?? ""}`;
+        // the number of the request that answers this read, set once the loader is called
+        let read = 0;
+        // whether the promise's value was applied, and whether the server answered before
+        let delivered = false;
+        let answeredEarly = false;
+        /**
+         * @param {{ records: Object[], length: number } | null} result
+         * @param {number} answer the number of the server answer `result` is, `0` if unknown
+         */
+        const apply = (result, answer) => {
             if (this.mobileState.activityLimitsByLead[resId] === limit) {
-                this._applyActivities(resId, result);
+                this._applyActivities(resId, result, answer);
             }
         };
-        const activities = await loadLeadActivities(
-            this.crmOffline.orm,
-            resId,
-            apply,
-            limit ? { withLength: true, limit } : { withLength: true }
-        );
-        apply(activities);
+        // Records the server's answer to request `read` (its rows are applied, or unchanged) and
+        // handles it, while a copy is held and the request is still the lead's.
+        const record = () => {
+            if (
+                !this.mobileState.syncEntries ||
+                this.mobileState.activityLimitsByLead[resId] !== limit
+            ) {
+                return;
+            }
+            if ((this._settledActivityReads.get(resId) ?? 0) < read) {
+                this._settledActivityReads.set(resId, read);
+            }
+            if ((this._activityAnswerNumbers.get(requestKey) ?? 0) < read) {
+                this._activityAnswerNumbers.set(requestKey, read);
+            }
+            // An unchanged answer applies nothing: the rows shown are its own, so they take its
+            // number in this same turn, as a changed answer's rows did (`apply` just before).
+            const { activitiesByLead, activityAnswersByLead } = this.mobileState;
+            if (
+                Array.isArray(activitiesByLead[resId]) &&
+                (activityAnswersByLead[resId] ?? 0) < read
+            ) {
+                activityAnswersByLead[resId] = read;
+            }
+            this._onActivityReadSettled(resId, read, requestKey);
+        };
+        const settle = () => {
+            if (delivered) {
+                record();
+            } else {
+                // nothing was cached: the promise delivers this answer next, and the answer is
+                // recorded with the rows it brings, never before them
+                answeredEarly = true;
+            }
+        };
+        // a changed answer: the server's rows of request `read`, applied before `settle` runs
+        const onUpdate = (fresh) => apply(fresh, read);
+        // the request the loader sent, `null` when the cache joined the read to one in flight
+        let sent = null;
+        const onRequest = ({ detail }) => {
+            const params = detail?.data?.params;
+            if (params?.model === "mail.activity" && params.method === "web_search_read") {
+                sent = detail.data;
+            }
+        };
+        rpcBus.addEventListener("RPC:REQUEST", onRequest);
+        let loading;
+        try {
+            loading = loadLeadActivities(this.crmOffline.orm, resId, onUpdate, {
+                withLength: true,
+                onSettled: settle,
+                ...(limit ? { limit } : {}),
+            });
+        } finally {
+            rpcBus.removeEventListener("RPC:REQUEST", onRequest);
+        }
+        if (sent) {
+            read = ++this._activityReadSequence;
+            this._activityRequestNumbers.set(requestKey, read);
+            this._watchActivityRequestError(sent, resId, read, requestKey, limit);
+        } else {
+            read = this._activityRequestNumbers.get(requestKey) ?? 0;
+        }
+        const activities = await loading;
+        delivered = true;
+        if (answeredEarly) {
+            // the server's answer itself, recorded in the turn its rows are applied
+            apply(activities, read);
+            record();
+        } else {
+            // the cached value, which the framework cache keeps from the last answer to this
+            // request: the rows of that answer, numbered when it came during the window
+            apply(activities, this._activityAnswerNumbers.get(requestKey) ?? 0);
+        }
         return activities;
+    }
+
+    /**
+     * Follows the answer to an activity request a read sent (see `_loadLeadActivities`): when
+     * the server rejects it while a sync-window copy is held and the request is still the
+     * lead's, the error is recorded as that request's answer (`_settledActivityReads`) and
+     * handled by `_onActivityReadSettled`. A lost or aborted connection is no answer: it records
+     * nothing, and the next connection reads again. The listener leaves with the request's
+     * answer, which the framework network layer announces once for every request.
+     *
+     * @private
+     * @param {Object} request the request's data, as `rpcBus` announced it
+     * @param {number} resId
+     * @param {number} read the request's number
+     * @param {string} requestKey the lead's request (lead id and limit)
+     * @param {number | undefined} limit the lead's limit when the request was sent
+     */
+    _watchActivityRequestError(request, resId, read, requestKey, limit) {
+        const onResponse = ({ detail }) => {
+            if (detail?.data !== request) {
+                return;
+            }
+            rpcBus.removeEventListener("RPC:RESPONSE", onResponse);
+            if (
+                !(detail.error instanceof RPCError) ||
+                status(this) === "destroyed" ||
+                !this.mobileState.syncEntries ||
+                this.mobileState.activityLimitsByLead[resId] !== limit
+            ) {
+                return;
+            }
+            if ((this._settledActivityReads.get(resId) ?? 0) < read) {
+                this._settledActivityReads.set(resId, read);
+            }
+            this._onActivityReadSettled(resId, read, requestKey);
+        };
+        rpcBus.addEventListener("RPC:RESPONSE", onResponse);
+    }
+
+    /**
+     * The server answered a request for a lead's activities, numbered `read` (see
+     * `_loadLeadActivities`), while a sync-window copy is held: resumes the reconciliation
+     * reloads it no longer keeps waiting (`_releaseActivityRowWaiters`). A reload still waiting
+     * for the lead whose bound this answer's request predates (sent before that reload began, it
+     * may predate the replays) gets the lead read again, once, unless a request sent since that
+     * reload began is in flight. The read goes in the next task, once the cache has let go of the
+     * answered request, so it sends a request of its own, whose answer ends that wait (see
+     * `_awaitsActivityRows`); the answers to the reads joined to that request schedule no other
+     * (`_scheduledActivityReads`), and a read no longer needed by then is not sent.
+     *
+     * @private
+     * @param {number} resId
+     * @param {number} read the number of the request that answered
+     * @param {string} requestKey the lead's request (lead id and limit)
+     */
+    _onActivityReadSettled(resId, read, requestKey) {
+        this._releaseActivityRowWaiters();
+        // whether a reload still waits for the lead with no request sent since it began
+        const readAgain = () => {
+            const lastSent = this._activityRequestNumbers.get(requestKey) ?? 0;
+            return this._activityRowWaiters.some(
+                ({ since }) =>
+                    read <= since && lastSent <= since && this._awaitsActivityRows(since, resId)
+            );
+        };
+        if (this._scheduledActivityReads.has(resId) || !readAgain()) {
+            return;
+        }
+        this._scheduledActivityReads.add(resId);
+        setTimeout(() => {
+            this._scheduledActivityReads.delete(resId);
+            if (readAgain()) {
+                this.onActivitiesChanged(resId);
+            }
+        });
     }
 
     /**
@@ -1852,17 +2416,21 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Stores a lead's activities and their total count. A result arriving after the gate turned
-     * false, after the pipeline was destroyed, or for a lead no group of the pipeline holds any
-     * more (another filter or a reload replaced it), is dropped; `null` (connection lost, nothing
-     * cached) keeps what is displayed. The confirmed writes the result reflects are forgotten
-     * (`_forgetReadActivityWrites`).
+     * Stores a lead's activities and their total count, and resumes a reconciliation reload that
+     * waited for them (see `_reconcile`). A result arriving after the gate turned false, after the
+     * pipeline was destroyed, or for a lead no group of the pipeline holds any more (another
+     * filter or a reload replaced it), is dropped; `null` (connection lost, nothing cached) keeps
+     * what is displayed. The confirmed writes the result reflects are forgotten
+     * (`_forgetReadActivityWrites`). While a sync-window copy is held, the number of the server
+     * answer the result is goes with it, in the same turn (`activityAnswersByLead`).
      *
      * @private
      * @param {number} resId
      * @param {Object[] | { records: Object[], length: number } | null} result
+     * @param {number} [answer=0] the number of the activity request whose server answer
+     *   `result` is, `0` when unknown (a value cached before the sync window)
      */
-    _applyActivities(resId, result) {
+    _applyActivities(resId, result, answer = 0) {
         if (status(this) === "destroyed" || !this.isMobilePipeline) {
             return;
         }
@@ -1875,6 +2443,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             this._forgetReadActivityWrites(resId, records, total);
             this.mobileState.activitiesByLead[resId] = records;
             this.mobileState.activityTotalsByLead[resId] = total;
+            if (this.mobileState.syncEntries) {
+                this.mobileState.activityAnswersByLead[resId] = answer;
+            }
+            this._releaseActivityRowWaiters();
         }
     }
 
@@ -2104,8 +2676,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *   reconnection), the focus moves, after the patch that removes the helper, to the tapped
      *   card's open control, else a header control (see `_focusAfterHelper`), instead of
      *   dropping to the document body. A later reload, such as the reconciliation reload after
-     *   reconnecting, re-creates the cards, whose keys carry the group datapoint id it renews,
-     *   and so drops that focus, as it does for any focused card control.
+     *   reconnecting, keeps that card (its key is made of the stage and lead ids, which a reload
+     *   keeps), so the focus stays on it, as on any focused card control.
      *
      * Requests are one-shot and consumed after the patch that renders them, once the DOM exists.
      *
@@ -2620,8 +3192,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Called by a card after an online activity create or mark-done, while this pipeline is
-     * alive and shows the stage pipeline:
+     * Called by a card after an online activity create or mark-done, for a replayed one by the
+     * sync window (see `_onActivityCallReplayed`), and for a lead a reconciliation reload still
+     * waits for after an answer older than that reload (see `_onActivityReadSettled`), while this
+     * pipeline is alive and shows the stage pipeline:
      * - the write the server confirmed, when the card gives it, is shown at once on every card
      *   of a lead a group holds (`_recordActivityWrite`), until a read reflects it, so a re-read
      *   that loses the connection, or that the cache answers with the rows from before it, never
@@ -2629,8 +3203,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * - the lead's activities are read again, with its current request (bounded, or expanded by
      *   "Show all"), only when the displayed stage shows the lead (the same placement the
      *   activity revalidation reads for).
-     * A card can call it after it was destroyed (stage navigation, a filter, a move or a reload
-     * re-keyed or removed it): a lead no longer displayed is not read now, and is read again
+     * A card can call it after it was destroyed (stage navigation, a move, a regroup or a load
+     * that no longer shows the lead re-keyed or removed it; a reload that still shows the lead in
+     * the stage keeps the card): a lead no longer displayed is not read now, and is read again
      * when a stage displays it.
      *
      * @param {number} resId

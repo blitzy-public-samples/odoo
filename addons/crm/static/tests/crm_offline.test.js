@@ -9224,6 +9224,144 @@ describe("Shared hooks contract", () => {
         ]);
     });
 
+    test("loadLeadActivities: onSettled receives every server answer, changed or not, joined calls included, never a failed read", async () => {
+        let total = 2;
+        let failure = null;
+        // while set, the server answers once it is resolved
+        let latency = null;
+        /** @param {number} count @returns {Object[]} the first `count` activities of the lead */
+        const activities = (count) =>
+            Array.from({ length: count }, (_, index) => ({
+                id: index + 1,
+                summary: `Activity ${index + 1}`,
+            }));
+        onRpc("mail.activity", "web_search_read", async ({ kwargs }) => {
+            expect.step(`activities read: limit ${kwargs.limit}`);
+            await latency?.promise;
+            if (failure) {
+                throw failure;
+            }
+            return { length: total, records: activities(Math.min(total, kwargs.limit)) };
+        });
+        // Registered after the server answer: while offline, its 502 comes first.
+        const setOffline = mockOffline();
+        const { orm } = await mountHooksHarness();
+        /**
+         * @param {string} label
+         * @returns {(value: Object[] | { records: Object[], length: number }) => void}
+         */
+        const stepper = (label) => (value) =>
+            expect.step(
+                Array.isArray(value)
+                    ? `${label} ${value.length} records`
+                    : `${label} ${value.records.length} records of ${value.length}`
+            );
+        const onUpdate = stepper("onUpdate");
+        const onSettled = stepper("onSettled");
+
+        // Cold and offline: the lost connection resolves null, and nothing settles.
+        await setOffline(true);
+        await expect(loadLeadActivities(orm, 7, onUpdate, { onSettled })).resolves.toBe(null);
+        await animationFrame();
+        expect.verifySteps([]);
+        await setOffline(false);
+
+        // Any other server error, nothing cached: rethrown, and nothing settles.
+        failure = makeServerError({ message: "Activities are locked" });
+        await expect(loadLeadActivities(orm, 7, onUpdate, { onSettled })).rejects.toThrow(
+            /Activities are locked/
+        );
+        await animationFrame();
+        expect.verifySteps(["activities read: limit 40"]);
+        failure = null;
+
+        // The first read, nothing cached: no onUpdate, but the answer settles, before the
+        // promise delivers it.
+        let delivered = false;
+        const first = await loadLeadActivities(orm, 7, onUpdate, {
+            onSettled: (value) =>
+                expect.step(`onSettled ${value.length} records, delivered ${delivered}`),
+        });
+        delivered = true;
+        expect(first).toEqual(activities(2));
+        expect.verifySteps(["activities read: limit 40", "onSettled 2 records, delivered false"]);
+
+        // The same answer: the cached records first; the refresh changes nothing, so no onUpdate,
+        // but it settles.
+        await expect(loadLeadActivities(orm, 7, onUpdate, { onSettled })).resolves.toEqual(
+            activities(2)
+        );
+        await expect.waitForSteps(["activities read: limit 40", "onSettled 2 records"]);
+
+        // A changed answer: onUpdate, then onSettled, with the same value.
+        total = 3;
+        const received = [];
+        await expect(
+            loadLeadActivities(
+                orm,
+                7,
+                (value) => {
+                    received.push(value);
+                    onUpdate(value);
+                },
+                {
+                    onSettled: (value) => {
+                        received.push(value);
+                        onSettled(value);
+                    },
+                }
+            )
+        ).resolves.toEqual(activities(2));
+        await expect.waitForSteps([
+            "activities read: limit 40",
+            "onUpdate 3 records",
+            "onSettled 3 records",
+        ]);
+        expect(received).toHaveLength(2);
+        expect(received[1]).toBe(received[0]);
+
+        // With `withLength`, onSettled receives what onUpdate does: the records and the total.
+        total = 45;
+        await expect(
+            loadLeadActivities(orm, 7, onUpdate, { withLength: true, onSettled })
+        ).resolves.toEqual({ records: activities(3), length: 3 });
+        await expect.waitForSteps([
+            "activities read: limit 40",
+            "onUpdate 40 records of 45",
+            "onSettled 40 records of 45",
+        ]);
+
+        // An identical call while the read is in flight joins it: no second request, the cached
+        // value for both, and both settle with the one answer.
+        latency = Promise.withResolvers();
+        const inFlight = loadLeadActivities(orm, 7, onUpdate, { withLength: true, onSettled });
+        const joined = loadLeadActivities(orm, 7, onUpdate, {
+            withLength: true,
+            onSettled: stepper("joined onSettled"),
+        });
+        const cached = { records: activities(40), length: 45 };
+        await expect(inFlight).resolves.toEqual(cached);
+        await expect(joined).resolves.toEqual(cached);
+        await expect.waitForSteps(["activities read: limit 40"]);
+        latency.resolve();
+        await expect.waitForSteps([
+            "onSettled 40 records of 45",
+            "joined onSettled 40 records of 45",
+        ]);
+        latency = null;
+
+        // A lost connection with a cached value: the cached value, and nothing settles. The
+        // framework cache's background refresh rejects with the lost connection, unawaited.
+        expect.errors(1);
+        await setOffline(true);
+        await expect(
+            loadLeadActivities(orm, 7, onUpdate, { withLength: true, onSettled })
+        ).resolves.toEqual(cached);
+        await animationFrame();
+        expect.verifySteps([]);
+        expect.verifyErrors([`Connection to "/web/dataset/call_kw/mail.activity/web_search_read"`]);
+    });
+
     test("isRecordPendingSync: a live offlineId, or a queued pending-method call on the record's model and id", async () => {
         const setOffline = mockOffline();
         const crmOffline = await mountHooksHarness();

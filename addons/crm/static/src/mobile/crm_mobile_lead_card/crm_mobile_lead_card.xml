@@ -169,7 +169,11 @@
 
                 <ul t-if="this.state.activitiesOpen" class="o_crm_mobile_lead_card_activities list-unstyled mt-2 mb-0"
                     t-ref="this.activitiesListRef">
-                    <!-- Queued creates have no server id yet: no Mark done. -->
+                    <!--
+                        Pending creates have no server id yet: no Mark done. "Pending sync" while
+                        the create is in the live queue; one replayed during the sync window keeps
+                        its row, without badge, until its server row replaces it.
+                    -->
                     <li t-foreach="this.pendingActivityCreates" t-as="entry" t-key="entry.key"
                         class="o_crm_mobile_activity_row o_crm_mobile_activity_pending d-flex align-items-center gap-2 py-1">
                         <div class="d-flex flex-column min-w-0">
@@ -177,10 +181,16 @@
                             <span t-if="entry.value.args[1].summary" class="o_crm_mobile_activity_summary text-break" t-out="entry.value.args[1].summary"/>
                             <span t-if="entry.value.args[1].date_deadline" class="o_crm_mobile_activity_deadline text-700 small" t-out="this.formatDeadline(entry.value.args[1].date_deadline)"/>
                         </div>
-                        <span class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                        <span t-if="this.isActivityCallQueued(entry)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
                     </li>
-                    <!-- The queued mark-done ids, read once for the whole list rather than per row. -->
+                    <!--
+                        The mark-done ids, read once for the whole list rather than per row: those
+                        in the live queue show "Pending sync"; those the sync window keeps after
+                        their replay show neither the badge nor Mark done, until the re-read or the
+                        reconciliation reload removes their row.
+                    -->
                     <t t-set="pendingArchivedIds" t-value="this.pendingArchivedIds"/>
+                    <t t-set="queuedArchivedIds" t-value="this.queuedArchivedIds"/>
                     <!-- Mark done is offered for every persisted activity, whatever its category. -->
                     <li t-foreach="this.activityRows" t-as="activity" t-key="activity.id"
                         class="o_crm_mobile_activity_row d-flex align-items-center gap-2 py-1"
@@ -190,8 +200,8 @@
                             <span t-if="activity.summary" class="o_crm_mobile_activity_summary text-break" t-out="activity.summary"/>
                             <span t-if="activity.date_deadline" class="o_crm_mobile_activity_deadline text-700 small" t-out="this.formatDeadline(activity.date_deadline)"/>
                         </div>
-                        <span t-if="pendingArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
-                        <button t-else="" type="button"
+                        <span t-if="queuedArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                        <button t-elif="!pendingArchivedIds.has(activity.id)" type="button"
                             class="btn btn-link d-inline-flex align-items-center gap-1 o_crm_mobile_activity_done ms-auto flex-shrink-0"
                             data-available-offline="1"
                             t-att-title="this.markDoneLabel(activity)"
