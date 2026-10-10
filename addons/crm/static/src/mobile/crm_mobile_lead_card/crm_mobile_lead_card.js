@@ -19,9 +19,13 @@
  *   `toggleFollowUp`, `onSaveFollowUp`, `onMarkDone`, `toggleActivities`) re-check their
  *   predicate, so a direct call is inert while it fails. The follow-up input handlers only copy
  *   their event's value; `onCancelFollowUp` resets and closes the form, and gives the focus back
- *   to Follow-up unless it was moved out of the form (see `_focusAfterFollowUp`).
+ *   to Follow-up unless it was moved out of the form (see `_focusAfterFollowUp`). A panel a toggle
+ *   opens (stage list, follow-up form, activity list) is scrolled into view, only as far as
+ *   needed, by the patch that renders it; closing a panel scrolls nothing (see
+ *   `revealPanelOnPatch`).
  * - A call ending after the card was destroyed writes no card state; a successful online activity
- *   write still asks the pipeline to re-read (it reads only if alive and showing the lead).
+ *   write is still handed to the pipeline, which shows it at once on the lead's cards and
+ *   re-reads the lead (only if alive, and showing the lead for the read).
  * - Status region (polite, atomic `role="status"`, empty at mount): it announces queue changes
  *   while the card stays mounted, and the Activities count only after the user's own activity
  *   call (see `_announceSyncChanges`). Card creation, remount and destruction, and pending lead
@@ -46,6 +50,8 @@ import { formatMonetary } from "@web/views/fields/formatters";
 import { user } from "@web/core/user";
 import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
 
+const { DateTime } = luxon;
+
 /**
  * Activity categories never offered for creation: a meeting needs a calendar round-trip and an
  * upload a file transfer, neither of which can be queued.
@@ -55,6 +61,28 @@ const NON_CREATABLE_CATEGORIES = ["meeting", "upload_file"];
 /** Keyword arguments of every `mail.activity` `web_save` the card issues or queues. */
 function activityCreateKwargs() {
     return { context: {}, specification: {} };
+}
+
+/**
+ * The session user's today: the start of the current day in the user's time zone, so that
+ * `serializeDate(userToday())` is "today" serialized as the user's calendar day. The follow-up
+ * form defaults its date to it, and saves it when the date was cleared or is not a valid date,
+ * because the server judges a `date_deadline` against the day in the activity owner's time zone
+ * (the session user here) when it tells due today from overdue. `today()` is the day in the
+ * browser's zone, which is the previous (or the next) day whenever the two zones are on different
+ * dates; Log call keeps that day by specification (see `onLogCall`). Without a user time zone, or
+ * with one luxon does not know, this is exactly `today()`.
+ *
+ * @returns {DateTime}
+ */
+function userToday() {
+    if (user.tz) {
+        const now = DateTime.now().setZone(user.tz);
+        if (now.isValid) {
+            return now.startOf("day");
+        }
+    }
+    return today();
 }
 
 /**
@@ -117,7 +145,11 @@ export class CrmMobileLeadCard extends Component {
         onOpen: t.function().optional(),
         /** `async (record, targetGroup) => …`: the pipeline moves the card. */
         onMove: t.function().optional(),
-        /** `(resId) => …`: called after an online activity create or mark-done succeeded. */
+        /**
+         * `(resId, write) => …`: called after an online activity create or mark-done succeeded;
+         * `write` is `{ created }` (the activity created, when the server gave its id) or
+         * `{ doneId }`.
+         */
         onActivitiesChanged: t.function().optional(),
     });
 
@@ -129,6 +161,8 @@ export class CrmMobileLeadCard extends Component {
     followUpButtonRef = signal.ref();
     /** The follow-up form, while it is open. */
     followUpFormRef = signal.ref();
+    /** The activity list, while it is open. */
+    activitiesListRef = signal.ref();
 
     setup() {
         this.crmOffline = useCrmOffline();
@@ -139,7 +173,24 @@ export class CrmMobileLeadCard extends Component {
          * follow-up form while it held the focus (see `onCancelFollowUp`).
          */
         this.focusFollowUpOnPatch = false;
+        /**
+         * Ref of the panel a toggle has just opened (the stage list, the follow-up form or the
+         * activity list), which the patch that renders it scrolls into view; `null` once that is
+         * done, and when the panel closes before it is rendered.
+         *
+         * @type {Function | null}
+         */
+        this.revealPanelOnPatch = null;
         onPatched(() => {
+            // Only on the patch that renders the panel: a render started earlier may patch first.
+            const panel = this.revealPanelOnPatch?.();
+            if (panel) {
+                this.revealPanelOnPatch = null;
+                // `nearest` scrolls only as far as the whole panel needs (not at all when it is in
+                // view). Done before the stage list focuses its active option: that option is then
+                // in view, so its focus scrolls nothing away again.
+                panel.scrollIntoView({ block: "nearest" });
+            }
             if (this.focusStageListOnPatch) {
                 this.focusStageListOnPatch = false;
                 this._focusActiveStageOption();
@@ -158,7 +209,7 @@ export class CrmMobileLeadCard extends Component {
             activitiesOpen: false,
             typeId: null,
             summary: "",
-            date: serializeDate(today()),
+            date: serializeDate(userToday()),
             // blocks double submission while a call (or a move) is in flight
             busy: false,
             // last message of the status region; a new `sequence` renders it in a new node, so a
@@ -173,9 +224,10 @@ export class CrmMobileLeadCard extends Component {
          */
         this._syncBaseline = null;
         /**
-         * Whether an online activity create or mark done of this card succeeded and the re-read
-         * it asked for has not changed the persisted rows yet: the next change of those rows is
-         * the user's own, and its Activities count is announced (see `_announceSyncChanges`).
+         * Whether an online activity create or mark done of this card succeeded and the persisted
+         * rows have not changed since: the next change of those rows (the pipeline showing the
+         * confirmed write, or the re-read it asked for) is the user's own, and its Activities
+         * count is announced (see `_announceSyncChanges`).
          * A plain in-memory field, never persisted and never rendered.
          *
          * @type {boolean}
@@ -520,8 +572,10 @@ export class CrmMobileLeadCard extends Component {
         const open = !this.state.stageListOpen;
         this._closePanels();
         this.state.stageListOpen = open;
-        // Once rendered, an opened list takes the focus on its active option.
+        // Once rendered, an opened list is scrolled into view and takes the focus on its active
+        // option.
         this.focusStageListOnPatch = open;
+        this.revealPanelOnPatch = open ? this.stageListRef : null;
     }
 
     /**
@@ -546,6 +600,7 @@ export class CrmMobileLeadCard extends Component {
         ev.stopPropagation();
         if (ev.key === "Escape") {
             this.state.stageListOpen = false;
+            this._cancelPanelReveal(this.stageListRef);
             this.stageButtonRef()?.focus();
             return;
         }
@@ -594,6 +649,7 @@ export class CrmMobileLeadCard extends Component {
             return;
         }
         this.state.stageListOpen = false;
+        this._cancelPanelReveal(this.stageListRef);
         this.state.busy = true;
         try {
             await this.props.onMove?.(this.props.record, group);
@@ -659,11 +715,27 @@ export class CrmMobileLeadCard extends Component {
             });
             if (!res.queued) {
                 this._expectActivityChange = true;
+                // `web_save` answers `[{ id }]` with the empty specification.
+                const id = res.result?.[0]?.id;
                 // Requested even when this card was destroyed meanwhile: a reload re-keys the card
                 // of a lead that stays displayed, and its new card would keep the activities read
-                // before this write. The pipeline drops the request when it was destroyed itself
-                // or no longer displays the lead, so no read starts for a lead nobody shows.
-                this.props.onActivitiesChanged?.(record.resId);
+                // before this write. The pipeline shows the write at once and re-reads only while
+                // alive and displaying the lead, so no read starts for a lead nobody shows.
+                if (id) {
+                    // the activity created, in the shape the pipeline reads, from the values sent
+                    this.props.onActivitiesChanged?.(record.resId, {
+                        created: {
+                            id,
+                            activity_type_id: { id: type.id, display_name: type.display_name },
+                            activity_category: type.category ?? false,
+                            summary,
+                            date_deadline: dateDeadline,
+                            user_id: { id: user.userId, display_name: user.name },
+                        },
+                    });
+                } else {
+                    this.props.onActivitiesChanged?.(record.resId);
+                }
             }
             return res;
         } finally {
@@ -678,6 +750,8 @@ export class CrmMobileLeadCard extends Component {
             return;
         }
         const type = this.phonecallType;
+        // A logged call is due on `today()`, the browser's day, by specification; only the
+        // follow-up date defaults to the session user's day (`userToday()`).
         return this._createActivity(type, type.display_name, serializeDate(today()));
     }
 
@@ -693,7 +767,9 @@ export class CrmMobileLeadCard extends Component {
                 this.state.typeId = types[0].id;
             }
             this.state.summary = "";
-            this.state.date = serializeDate(today());
+            this.state.date = serializeDate(userToday());
+            // Once rendered, the opened form is scrolled into view; it takes no focus.
+            this.revealPanelOnPatch = this.followUpFormRef;
         }
         this.state.followUpOpen = open;
     }
@@ -724,8 +800,9 @@ export class CrmMobileLeadCard extends Component {
         // Read before the patch that removes the form and, with it, the focus it holds.
         this.focusFollowUpOnPatch = this._followUpFormHasFocus();
         this.state.followUpOpen = false;
+        this._cancelPanelReveal(this.followUpFormRef);
         this.state.summary = "";
-        this.state.date = serializeDate(today());
+        this.state.date = serializeDate(userToday());
     }
 
     /** @param {Event} ev change of the activity type `<select>` */
@@ -780,7 +857,7 @@ export class CrmMobileLeadCard extends Component {
             if (!res.queued) {
                 this._expectActivityChange = true;
                 // Requested even when this card was destroyed meanwhile, as in `_createActivity`.
-                this.props.onActivitiesChanged?.(resId);
+                this.props.onActivitiesChanged?.(resId, { doneId: activity.id });
             }
         } finally {
             if (status(this) !== "destroyed") {
@@ -797,6 +874,8 @@ export class CrmMobileLeadCard extends Component {
         const open = !this.state.activitiesOpen;
         this._closePanels();
         this.state.activitiesOpen = open;
+        // Once rendered, the opened list is scrolled into view; it takes no focus.
+        this.revealPanelOnPatch = open ? this.activitiesListRef : null;
     }
 
     /**
@@ -822,9 +901,25 @@ export class CrmMobileLeadCard extends Component {
     _closePanels() {
         // A panel toggled since the follow-up form closed keeps the focus where the user put it.
         this.focusFollowUpOnPatch = false;
+        // A panel closed before it was rendered is never scrolled to.
+        this.revealPanelOnPatch = null;
         this.state.stageListOpen = false;
         this.state.followUpOpen = false;
         this.state.activitiesOpen = false;
+    }
+
+    /**
+     * Drops the pending scroll into view of a panel that closes (see `revealPanelOnPatch`), so a
+     * panel closed before the patch that would render it is never scrolled to. The pending scroll
+     * of another panel, opened since, is kept.
+     *
+     * @private
+     * @param {Function} panelRef the ref of the closing panel
+     */
+    _cancelPanelReveal(panelRef) {
+        if (this.revealPanelOnPatch === panelRef) {
+            this.revealPanelOnPatch = null;
+        }
     }
 
     /**
@@ -889,7 +984,7 @@ export class CrmMobileLeadCard extends Component {
         if (value && deserializeDate(value).isValid) {
             return value;
         }
-        return serializeDate(today());
+        return serializeDate(userToday());
     }
 
     /**
@@ -934,9 +1029,11 @@ export class CrmMobileLeadCard extends Component {
      *
      * The Activities count is announced only for a change the user made on this card:
      * - together with an activity create it queued, which raises the visible count at once;
-     * - at the first change of the persisted rows (or of their server total) after one of its
-     *   online creates or mark dones succeeded (`_expectActivityChange`): the re-read that call
-     *   asked for. The expectation ends with that change.
+     * - at the first change of the persisted rows (or of their total) after one of its online
+     *   creates or mark dones succeeded (`_expectActivityChange`): the pipeline shows the write
+     *   the server confirmed at once, and otherwise (no created id given) the re-read that call
+     *   asked for brings it. The expectation ends with that change, so the re-read that then
+     *   reflects the same write announces nothing more.
      * No other count change is announced. A create or mark done leaving the queue (replay or
      * discard) is told by "no longer pending sync" alone, and a background re-read (activity
      * revalidation, the reconciliation reload after a sync, on this card or on one remounted by

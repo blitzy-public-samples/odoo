@@ -2,7 +2,9 @@
  * Lead quick create of the small-screen CRM pipeline, shown in a bottom sheet. It creates a
  * `crm.lead` through `runOrQueue` from the shared CRM offline hooks: online, the pipeline adds the
  * created lead to its stage (`onCreated`); offline, or when the connection drops during the call,
- * the `web_save` is queued and the pipeline renders the pending card from the queue.
+ * the `web_save` is queued and the pipeline renders the pending card from the queue. A lead the
+ * server created but the pipeline could not show because the connection was lost afterwards is
+ * announced by a notification: it was saved, and shows once the connection is back.
  *
  * - Only `crm.lead` `web_save` is queued, a family the shared offline systray renders.
  * - `partner_id` is never sent: the contact is `contact_name` (char), so no contact is created
@@ -13,6 +15,9 @@
  *   stage the lead goes to becomes the pipeline's displayed stage (`env.crmMobileStage`).
  * - The sheet focuses its lead name input as it opens; the pipeline moves the focus back to its
  *   Add button as the sheet closes (`onClose`).
+ * - The sheet is modal: while it is open, its content is the UI active element, so Tab and
+ *   Shift+Tab cycle through its controls and the pipeline's hotkeys stay inactive behind it, and
+ *   both the content and the hosting sheet are named after the "New Lead" title.
  *
  * @example
  * this.quickCreatePopover = usePopover(CrmMobileQuickCreate, {
@@ -27,16 +32,34 @@
  *     list: this.props.list,
  *     group: this.currentGroup,
  *     // adds the lead with `validateQuickCreate(resId, "close", group)`, or reloads the list when
- *     // `group` is undefined (its stage is gone); nothing when the lead is already loaded
+ *     // `group` is undefined (its stage is gone); nothing when the lead is already loaded; rejects
+ *     // with a `ConnectionLostError` when the connection is lost before the lead is shown
  *     onCreated: (resId, group) => this.onQuickCreated(resId, group),
  * });
  */
 
-import { Component, proxy, signal, status, t, untrack, useEffect, useProps } from "@odoo/owl";
+import {
+    Component,
+    onMounted,
+    proxy,
+    signal,
+    status,
+    t,
+    untrack,
+    useEffect,
+    usePlugin,
+    useProps,
+} from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
+import { ConnectionLostError } from "@web/core/network/rpc";
+import { NotificationPlugin } from "@web/core/notifications/notification_plugin";
+import { useActiveElement } from "@web/core/ui/ui_plugin";
 import { useAutofocus } from "@web/core/utils/hooks";
 import { isEmail } from "@web/core/utils/strings";
 import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
+
+/** Id of the sheet's "New Lead" title, which names the sheet and its content. */
+const TITLE_ID = "o_crm_mobile_quick_create_title";
 
 /**
  * View type recorded with a queued create. The offline systray opens only `form` entries, so a
@@ -131,6 +154,8 @@ export class CrmMobileQuickCreate extends Component {
          * `(resId, group) => Promise`: adds a lead created online to its stage. `group` is the
          * live group of the stage written, resolved once the call has returned, or `undefined`
          * when that stage is no longer listed. Called even if the sheet was dismissed meanwhile.
+         * Rejects with a `ConnectionLostError` when the connection was lost before the lead
+         * could be shown: the sheet then tells the user the lead was saved.
          */
         onCreated: t.function(),
     });
@@ -144,12 +169,22 @@ export class CrmMobileQuickCreate extends Component {
     /** The email input, focused when a save fails on it. */
     emailRef = signal.ref();
 
+    /** The sheet content: the UI active element while the sheet is open. */
+    rootRef = signal.ref();
+
     setup() {
         // The sheet is modal: as it opens, the focus moves from the pipeline's Add button to the
         // first field, once, so later renders leave the user's focus alone. `mobile` focuses it
         // on touch screens too, where the sheet is shown.
         useAutofocus({ ref: this.nameRef, mobile: true });
+        // The content becomes the UI active element while it is mounted: Tab from Discard wraps
+        // to the lead name and Shift+Tab from the lead name to Discard, and only the hotkeys
+        // registered while it is active answer (the sheet's Escape among them), not those of the
+        // pipeline behind it. The pipeline's `onClose` still decides where the focus goes next.
+        useActiveElement(this.rootRef);
+        onMounted(() => this.nameHostingSheet());
         this.crmOffline = useCrmOffline();
+        this.notification = usePlugin(NotificationPlugin);
         this.state = proxy({
             name: "",
             contact_name: "",
@@ -292,6 +327,11 @@ export class CrmMobileQuickCreate extends Component {
      *   displays its stage, as after a card move, so that the user sees the new card (pending or
      *   not); see `displayCreatedStage`. A sheet dismissed during the call, or an answer without
      *   an id, leaves the displayed stage as it is.
+     * - When the pipeline could not show that lead because the connection was lost afterwards
+     *   (`onCreated` rejects with a `ConnectionLostError`), nothing is queued, since the server
+     *   holds the lead: a notification names it as saved, and the reload that follows the
+     *   reconnection shows it. It is shown also when the sheet was dismissed during the call.
+     *   The displayed stage is then left as it is, since no card was handed to the pipeline.
      */
     async save() {
         if (this.state.saving) {
@@ -369,8 +409,23 @@ export class CrmMobileQuickCreate extends Component {
                     const liveGroup = list.groups?.find(
                         (group) => group.serverValue === stageValue
                     );
-                    await onCreated(resId, liveGroup);
-                    this.displayCreatedStage(list, stageValue);
+                    try {
+                        await onCreated(resId, liveGroup);
+                        this.displayCreatedStage(list, stageValue);
+                    } catch (error) {
+                        if (!(error instanceof ConnectionLostError)) {
+                            throw error;
+                        }
+                        // The lead exists, but its card could not be read: say it was saved, so
+                        // that the user does not enter it again.
+                        this.notification.add(
+                            _t(
+                                '"%(lead)s" was saved. It will show in the pipeline once the connection is back.',
+                                { lead: name }
+                            ),
+                            { type: "info" }
+                        );
+                    }
                 }
             }
         } finally {
@@ -458,6 +513,21 @@ export class CrmMobileQuickCreate extends Component {
             expected_revenue: this.revenueRef,
         };
         return refs[fieldName]?.() ?? null;
+    }
+
+    /**
+     * Names the bottom sheet hosting the content after its "New Lead" title, and declares it
+     * modal, as it is: it traps the focus and sits over a backdrop. The framework sheet renders an
+     * unnamed `role="dialog"` and manages neither attribute, so they are set once on this
+     * instance's own host, which is removed with it. Nothing is set outside a dialog.
+     */
+    nameHostingSheet() {
+        const dialogEl = this.rootRef()?.closest('[role="dialog"]');
+        if (!dialogEl) {
+            return;
+        }
+        dialogEl.setAttribute("aria-labelledby", TITLE_ID);
+        dialogEl.setAttribute("aria-modal", "true");
     }
 
     /**

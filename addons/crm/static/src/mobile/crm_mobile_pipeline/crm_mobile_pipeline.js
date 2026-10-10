@@ -74,10 +74,14 @@ const SWIPE_THRESHOLD = 50;
  *   kwargs: Object, extras: Object } }} QueueEntry an entry of the framework offline queue,
  *   exactly as the framework stores it
  * @typedef {{ cards: RelationalRecord[], pendingCreates: QueueEntry[], count: number,
- *   revenueAdjustments: number[] }} StageSummary what a stage displays: its cards (its own
+ *   revenueAdjustments: number[], isAdjusted: boolean, loadedCount: number,
+ *   addedCurrencies: number[] }} StageSummary what a stage displays: its cards (its own
  *   records first, then the records a queued write places there), its queued lead creates, its
  *   pending-aware lead count, and the signed sum-field amounts added, in order, to its loaded
- *   aggregate. The arrays are shared by every reader and must not be mutated.
+ *   aggregate; whether a displaced record (in or out) or a queued create adjusts its totals at
+ *   all, how many of the records its loaded aggregate counts it still displays, and the distinct
+ *   currencies of the amounts added to it (a monetary sum field with a currency field only). The
+ *   arrays are shared by every reader and must not be mutated.
  * @typedef {{ placement: Map<string, number | false | undefined>,
  *   groupsByValue: Map<number | false, Group[]>, byGroupId: Map<string, StageSummary> }}
  *   StageProjection the displayed stage of every loaded record (by record datapoint id), the
@@ -195,6 +199,28 @@ function leadName(name) {
     return name || _t("Unnamed lead");
 }
 
+/**
+ * The order of `loadLeadActivities` (`date_deadline ASC, id ASC`, an activity without deadline
+ * last, as the database sorts null values in ascending order), so the rows the server sent keep
+ * their place among those a confirmed write adds, and a bounded read tells which activities its
+ * page would list.
+ *
+ * @param {{ id: number, date_deadline?: string | false }} a
+ * @param {{ id: number, date_deadline?: string | false }} b
+ * @returns {number}
+ */
+function compareLeadActivities(a, b) {
+    const deadlineA = a.date_deadline || null;
+    const deadlineB = b.date_deadline || null;
+    if (deadlineA !== deadlineB) {
+        if (deadlineA === null || deadlineB === null) {
+            return deadlineA === null ? 1 : -1;
+        }
+        return deadlineA < deadlineB ? -1 : 1;
+    }
+    return a.id - b.id;
+}
+
 // -----------------------------------------------------------------------------
 // Renderer
 // -----------------------------------------------------------------------------
@@ -245,6 +271,19 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
              * offline). A lead without an entry is read with the loader's default request.
              */
             activityLimitsByLead: {},
+            /**
+             * Activity writes of the cards that the server confirmed online and that no activity
+             * read of the lead has reflected yet, by lead id: an array in the order the server
+             * confirmed them, each `{ created, delta: 1 }` (the activity created, in the loader's
+             * record shape) or `{ doneId, row, delta: -1 }` (the activity marked done, with the
+             * row the card showed for it, `undefined` when it showed none). The cards show them
+             * over the stored page (`activitiesFor`, `activityTotalFor`), so a write whose
+             * re-read loses the connection, or is answered by the cache with the rows from
+             * before it, stays visible offline, across remounts and stage navigation, until a
+             * read reflects it (`_forgetReadActivityWrites`). In memory only, never persisted,
+             * and kept for the loaded leads only (`_pruneActivities`).
+             */
+            activityWritesByLead: {},
             /** Cached creatable activity types, `null` until read (or when not cached). */
             activityTypes: null,
             /**
@@ -261,6 +300,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
              */
             announcement: { message: "", sequence: 0 },
         });
+        /**
+         * What `activitiesFor` and `activityTotalFor` derived for a lead with confirmed writes,
+         * by the writes it was derived from, with the stored page and total it was derived over:
+         * `{ stored, storedTotal, rows, total }`. Every card render reuses it until one of them
+         * changes, so a card's props keep their identity. Not reactive, never persisted.
+         *
+         * @type {WeakMap<Object, Object>}
+         */
+        this._activityOverlays = new WeakMap();
         /**
          * Ids of the stage groups whose Load more is in flight (`onLoadMoreClick`), each mapped to
          * `true` until its load settles. Transient presentation state: the button is disabled and
@@ -280,6 +328,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
          */
         this.pendingFocus = null;
         onPatched(() => this._applyPendingFocus());
+        /**
+         * The card moves in flight (see `onCardMove`), in the order they started: each
+         * `{ record, targetGroup }` from just before the framework move is called until it
+         * returns. Transient and never persisted; a signal holding the moves as given (never made
+         * reactive), so the displayed stage follows their start and end (see `currentGroup`).
+         *
+         * @type {() => Array<{ record: RelationalRecord, targetGroup: Group }>}
+         */
+        this._cardMoves = signal([]);
         /**
          * `[key, name]` of the queued lead creates the status region last compared (see
          * `_readPendingLeadCreates`), or `null` before the first comparison in the mobile
@@ -339,6 +396,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
          */
         this.helperFocus = null;
 
+        this._setupAggregateRegistration();
         this._setupActivityRevalidation();
         this._setupActivityPruning();
         this._setupSyncReconciliation();
@@ -365,9 +423,29 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         return this._orderedStageGroups();
     }
 
-    /** @returns {Group | undefined} the displayed stage, always defined while the gate holds */
+    /**
+     * The displayed stage: the stored one (`stageState`), except while a card move that the
+     * framework has already made in memory is in flight, when it is that move's target stage (the
+     * latest such move's). The framework moves the card into its target group before its save
+     * returns, and the stored stage changes only once the move returns (see `onCardMove`): in
+     * between, the source stage would show without the card. A move the framework undoes (an
+     * online save rejected, a record refused) puts the card back in its group, and the stored
+     * stage shows again; a move it does not make changes nothing.
+     *
+     * @returns {Group | undefined} always defined while the gate holds
+     */
     get currentGroup() {
-        return resolveDisplayedGroup(this.props.list, this.stageState.serverValue);
+        // Resolved first, so that every render reads the stored stage, also while a move in
+        // flight overrides it: its change when the move returns renders again.
+        const stored = resolveDisplayedGroup(this.props.list, this.stageState.serverValue);
+        const moves = this._cardMoves();
+        for (let index = moves.length - 1; index >= 0; index--) {
+            const { record, targetGroup } = moves[index];
+            if (record.group === targetGroup && this.props.list.groups?.includes(targetGroup)) {
+                return targetGroup;
+            }
+        }
+        return stored;
     }
 
     /** @returns {number} index of the displayed stage in `stageGroups`, -1 if none */
@@ -537,8 +615,16 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * `_stageRevenue`: same cards in the same order, same count, and the same revenue additions
      * and subtractions in the same order.
      *
+     * An amount added to a stage also brings its currency, for a monetary sum field with a
+     * currency field (the only one whose aggregate carries currencies): a displaced record's own,
+     * and for a queued create the one its pending card formats its amount with (the stage's first
+     * loaded lead's, else the user's company's), the values of a queued create carrying none.
+     * Without them, a stage the server reports empty, whose aggregate carries no currency, would
+     * show the amounts a pending write adds to it without the currency its synced header shows.
+     *
      * Pure: it reads framework state and writes none (in particular, the progress bar state's
-     * `getGroupInfo`, which registers aggregates, is called by `_stageAggregate`, outside).
+     * `getGroupInfo`, which registers aggregates, is called outside, by
+     * `_setupAggregateRegistration` and `_stageAggregate`).
      *
      * @private
      * @returns {StageProjection}
@@ -546,9 +632,14 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     _computeStageProjection() {
         const groups = this.props.list.groups ?? [];
         const entries = this.stageEntries;
-        const sumFieldName = this.hasRevenue
-            ? this.props.progressBarState.progressAttributes.sumField.name
+        const sumField = this.hasRevenue
+            ? this.props.progressBarState.progressAttributes.sumField
             : null;
+        const sumFieldName = sumField ? sumField.name : null;
+        const currencyField =
+            sumField?.type === "monetary" && sumField.currency_field
+                ? sumField.currency_field
+                : null;
         /** @type {Map<number | false, Group[]>} */
         const groupsByValue = new Map();
         const tallies = new Map();
@@ -559,7 +650,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             } else {
                 groupsByValue.set(group.serverValue, [group]);
             }
-            tallies.set(group.id, { own: [], placed: [], removed: 0, adjustments: [] });
+            tallies.set(group.id, {
+                own: [],
+                placed: [],
+                removed: 0,
+                adjustments: [],
+                displacedIn: 0,
+                displacedOut: 0,
+                currencies: new Set(),
+            });
         }
         const latestStageWriteOf = (resId) => this.crmOffline.latestStageWrite(resId, entries);
 
@@ -577,20 +676,30 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                     (target.id === group.id ? targetTally.own : targetTally.placed).push(record);
                 }
                 // Displaced: out of the aggregate of its server stage (an empty group's aggregate
-                // is already 0), into the stage it is displayed in.
-                if (
-                    sumFieldName !== null &&
-                    this._tracksStage(record) &&
-                    stageValue !== record.serverStageId
-                ) {
-                    const recordValue = Number(record.data[sumFieldName]) || 0;
+                // is already 0), into the stage it is displayed in, with its currency.
+                if (this._tracksStage(record) && stageValue !== record.serverStageId) {
+                    const recordValue =
+                        sumFieldName !== null ? Number(record.data[sumFieldName]) || 0 : 0;
                     for (const source of groupsByValue.get(record.serverStageId) ?? []) {
-                        if (source.count !== 0) {
-                            tallies.get(source.id).adjustments.push(-recordValue);
+                        const sourceTally = tallies.get(source.id);
+                        sourceTally.displacedOut++;
+                        if (sumFieldName !== null && source.count !== 0) {
+                            sourceTally.adjustments.push(-recordValue);
                         }
                     }
+                    const currencyId =
+                        currencyField !== null
+                            ? record.data[currencyField]?.id ?? user.activeCompany?.currency_id
+                            : null;
                     for (const target of groupsByValue.get(stageValue) ?? []) {
-                        tallies.get(target.id).adjustments.push(recordValue);
+                        const targetTally = tallies.get(target.id);
+                        targetTally.displacedIn++;
+                        if (sumFieldName !== null) {
+                            targetTally.adjustments.push(recordValue);
+                        }
+                        if (currencyId) {
+                            targetTally.currencies.add(currencyId);
+                        }
                     }
                 }
             }
@@ -600,7 +709,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         /** @type {Map<string, StageSummary>} */
         const byGroupId = new Map();
         for (const group of groups) {
-            const { own, placed, removed, adjustments } = tallies.get(group.id);
+            const { own, placed, removed, adjustments, displacedIn, displacedOut, currencies } =
+                tallies.get(group.id);
             let pendingCreates = this.crmOffline.pendingLeadCreates(group.serverValue, entries);
             if (isShownPending) {
                 pendingCreates = pendingCreates.filter(isShownPending);
@@ -610,14 +720,29 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                     adjustments.push(Number(entry.value.args?.[1]?.[sumFieldName]) || 0);
                 }
             }
+            if (currencyField !== null && pendingCreates.length) {
+                // The currency the pending cards of this stage format their amounts with.
+                const currencyId =
+                    group.list.records?.[0]?.data?.[currencyField]?.id ??
+                    user.activeCompany?.currency_id;
+                if (currencyId) {
+                    currencies.add(currencyId);
+                }
+            }
+            const count = Math.max(
+                0,
+                (group.count || 0) - removed + placed.length + pendingCreates.length
+            );
             byGroupId.set(group.id, {
                 cards: [...own, ...placed],
                 pendingCreates,
-                count: Math.max(
-                    0,
-                    (group.count || 0) - removed + placed.length + pendingCreates.length
-                ),
+                count,
                 revenueAdjustments: adjustments,
+                isAdjusted: displacedIn > 0 || displacedOut > 0 || pendingCreates.length > 0,
+                // The displayed leads the loaded aggregate counts: the count less the queued
+                // creates and the records displaced here, i.e. the loaded leads not displaced away.
+                loadedCount: Math.max(0, count - pendingCreates.length - displacedIn),
+                addedCurrencies: [...currencies],
             });
         }
         return { placement, groupsByValue, byGroupId };
@@ -659,7 +784,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /**
      * The projection's summary of a stage. A group the current list does not hold (a datapoint of
      * a list a reload replaced, which no template renders) displays nothing: no card, no queued
-     * create, a count of 0 and no revenue adjustment.
+     * create, a count of 0 and no revenue adjustment, so its revenue is its loaded aggregate.
      *
      * @private
      * @param {Group} group
@@ -672,6 +797,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 pendingCreates: [],
                 count: 0,
                 revenueAdjustments: [],
+                isAdjusted: false,
+                loadedCount: 0,
+                addedCurrencies: [],
             }
         );
     }
@@ -757,10 +885,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * The loaded aggregate of a stage for the sum field, `{ value, currencies }`.
+     * The loaded aggregate of a stage for the sum field, `{ value, currencies }`: the sum and the
+     * currencies of the records the server counts in the stage, so an empty stage carries no
+     * currency, as on the desktop header.
      *
      * It is read exactly as the desktop column header reads it: `getGroupInfo` first, which
-     * registers the group's loaded aggregates in the progress bar state, then `getAggregateValue`.
+     * registers the group's loaded aggregates in the progress bar state (already done at render
+     * for every stage, see `_setupAggregateRegistration`), then `getAggregateValue`.
      * The progress bar counts (`read_progress_bar`) are not part of the framework disk cache, so
      * when the pipeline was loaded offline they are missing and `getGroupInfo` registers nothing:
      * `getAggregateValue` would then answer 0 whatever the loaded data. In that case only (no
@@ -802,6 +933,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * from the stage projection; the aggregate is read here, outside it, because `getGroupInfo`
      * writes the progress bar state.
      *
+     * Currencies are those the header of the synced stage would carry, so the pending-aware sum is
+     * formatted as the desktop header formats it once the writes are on the server:
+     * - nothing pending adjusts the stage: the loaded aggregate's, exactly as on desktop;
+     * - otherwise, the loaded aggregate's while the stage still displays a lead it counts, joined
+     *   with those of the amounts pending writes add here (see `_computeStageProjection`). A stage
+     *   the server reports empty thus shows a moved or queued amount in its currency, and a stage
+     *   whose counted leads all moved away carries none, as an empty stage on desktop.
+     * Only a monetary sum field with a currency field has currencies.
+     *
      * @private
      * @param {Group} group
      * @returns {{ value: number, currencies?: number[] }}
@@ -810,12 +950,21 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         if (!group || !this.hasRevenue) {
             return { value: 0 };
         }
-        const { value: loadedValue, currencies } = this._stageAggregate(group);
+        const { value: loadedValue, currencies: loadedCurrencies } = this._stageAggregate(group);
+        const { revenueAdjustments, isAdjusted, loadedCount, addedCurrencies } =
+            this._stageSummary(group);
         let value = loadedValue;
-        for (const adjustment of this._stageSummary(group).revenueAdjustments) {
+        for (const adjustment of revenueAdjustments) {
             value += adjustment;
         }
-        return { value, currencies };
+        if (!isAdjusted) {
+            return { value, currencies: loadedCurrencies };
+        }
+        const currencies = new Set(loadedCount > 0 ? loadedCurrencies ?? [] : []);
+        for (const currencyId of addedCurrencies) {
+            currencies.add(currencyId);
+        }
+        return currencies.size ? { value, currencies: [...currencies] } : { value };
     }
 
     /**
@@ -828,7 +977,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * The revenue sum of a stage, formatted exactly as the desktop column header formats it
-     * (`AnimatedNumber.format`), so currency semantics are unchanged.
+     * (`AnimatedNumber.format`), so currency semantics are unchanged: in the stage's single
+     * currency, in the user's company currency when it holds several, and as a plain integer when
+     * it carries none (an empty stage, a sum field without currency). The currencies of a
+     * pending-aware sum are those of the synced stage (see `_stageRevenue`).
      *
      * @param {Group} group
      * @returns {string}
@@ -983,6 +1135,45 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     // -------------------------------------------------------------------------
 
     /**
+     * Registration of every stage's loaded aggregates in the progress bar state, at each render.
+     *
+     * The progress bar state seeds a group's aggregates from the group's loaded ones at the first
+     * `getGroupInfo` of that group, replacing whatever it holds for the stage. The desktop kanban
+     * calls it for every column as it first renders it, and the progress bar refresh registers
+     * the unfolded groups only. The mobile pipeline renders one stage at a time, so a stage first
+     * displayed after an aggregate refresh (a folded won stage displayed by an online mark-won,
+     * whose save refreshes the aggregates) would have its refreshed aggregates replaced by the
+     * stale loaded ones, and keep them until the next load. So, before the template reads any
+     * aggregate, every stage of the pipeline, folded ones included, is registered as the desktop
+     * columns are: once per group datapoint (later calls only answer), from the data the model
+     * holds (an active progress bar filter left without lead is cleared, as a desktop column
+     * clears it at its first render). The progress bar state keeps one aggregate entry per stage
+     * id, so a stage the server answers in several groups is registered through its first group
+     * only: registering the others would replace that entry with theirs. While the progress bar
+     * data are missing (a pipeline loaded offline), nothing is registered, and the loaded
+     * aggregates are read instead (see `_stageAggregate`). Runs inside the render, so the
+     * registration follows the progress bar data and the groups it reads. Outside the stage
+     * pipeline, or without progress bar, it does nothing, so desktop is unchanged.
+     *
+     * @private
+     */
+    _setupAggregateRegistration() {
+        onWillRender(() => {
+            const progressBarState = this.props.progressBarState;
+            if (!progressBarState || !this.isMobilePipeline) {
+                return;
+            }
+            const registeredStages = new Set();
+            for (const group of this.props.list.groups) {
+                if (!registeredStages.has(group.serverValue)) {
+                    registeredStages.add(group.serverValue);
+                    progressBarState.getGroupInfo(group);
+                }
+            }
+        });
+    }
+
+    /**
      * Activity and activity-type revalidation.
      *
      * One effect with four dependencies, compared with those of its previous run: the gate; the
@@ -1093,16 +1284,17 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Forgets the activities, and their total counts, of the leads no group of the pipeline holds
-     * any more. The limit an online "Show all" chose for a lead (`activityLimitsByLead`) is kept,
-     * so a lead loaded again reissues the same expanded request, which the cache answers offline.
+     * Forgets the activities, their total counts and their confirmed writes not read yet, of the
+     * leads no group of the pipeline holds any more. The limit an online "Show all" chose for a
+     * lead (`activityLimitsByLead`) is kept, so a lead loaded again reissues the same expanded
+     * request, which the cache answers offline.
      *
      * @private
      */
     _pruneActivities() {
         const loadedIds = new Set(this.allLoadedRecords().map((record) => record.resId));
-        const { activitiesByLead, activityTotalsByLead } = this.mobileState;
-        for (const byLead of [activitiesByLead, activityTotalsByLead]) {
+        const { activitiesByLead, activityTotalsByLead, activityWritesByLead } = this.mobileState;
+        for (const byLead of [activitiesByLead, activityTotalsByLead, activityWritesByLead]) {
             for (const resId of Object.keys(byLead)) {
                 if (!loadedIds.has(Number(resId))) {
                     delete byLead[resId];
@@ -1456,19 +1648,37 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Reloads the pipeline through the framework model for a lead created online that no live
-     * group received (see `onQuickCreated`). A lost connection leaves the pipeline as it is: the
-     * lead exists on the server, and the next load shows it.
+     * group received (see `onQuickCreated`). A lost connection leaves the pipeline as it is (the
+     * lead exists on the server, and the next load shows it) and rejects with a
+     * `ConnectionLostError`, so the quick create tells the user the lead was saved:
+     * - the reload itself lost the connection;
+     * - offline, the disk cache answered it with data from before the lead.
+     * A pipeline destroyed or outside the stage pipeline once the reload ends shows no lead to
+     * miss: it returns quietly.
      *
      * @private
+     * @param {() => boolean} isLoaded whether a group of the pipeline holds the created lead
      * @returns {Promise<void>}
      */
-    async _reloadAfterQuickCreate() {
+    async _reloadAfterQuickCreate(isLoaded) {
         try {
             await this.props.list.load();
         } catch (error) {
-            if (!(error instanceof ConnectionLostError)) {
-                throw error;
+            if (
+                error instanceof ConnectionLostError &&
+                (status(this) === "destroyed" || !this.isMobilePipeline)
+            ) {
+                return;
             }
+            throw error;
+        }
+        if (
+            status(this) !== "destroyed" &&
+            this.isMobilePipeline &&
+            this.crmOffline.isOffline() &&
+            !isLoaded()
+        ) {
+            throw new ConnectionLostError();
         }
     }
 
@@ -1645,7 +1855,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * Stores a lead's activities and their total count. A result arriving after the gate turned
      * false, after the pipeline was destroyed, or for a lead no group of the pipeline holds any
      * more (another filter or a reload replaced it), is dropped; `null` (connection lost, nothing
-     * cached) keeps what is displayed.
+     * cached) keeps what is displayed. The confirmed writes the result reflects are forgotten
+     * (`_forgetReadActivityWrites`).
      *
      * @private
      * @param {number} resId
@@ -1660,9 +1871,205 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         }
         const records = this._normalizeRecords(result);
         if (records) {
+            const total = this._normalizeLength(result, records);
+            this._forgetReadActivityWrites(resId, records, total);
             this.mobileState.activitiesByLead[resId] = records;
-            this.mobileState.activityTotalsByLead[resId] = this._normalizeLength(result, records);
+            this.mobileState.activityTotalsByLead[resId] = total;
         }
+    }
+
+    /**
+     * Forgets the confirmed activity writes of a lead (`activityWritesByLead`) that a read about
+     * to be stored reflects, before its page and total replace the stored ones.
+     *
+     * A read (or the cache entry that answers it) holds every write the server confirmed before
+     * it was issued, and maybe some confirmed while it was in flight: it reflects the first `k`
+     * writes of the lead, in their order, for some `k`. The writes are therefore judged
+     * together, never one by one:
+     * - the rows prove the writes up to the last one they show reflected: an activity created
+     *   that the read lists, or one the stored page held, marked done, that the read no longer
+     *   lists although its page would (`withinPage`);
+     * - `k` is the largest count, from there, that both the rows allow (`reflects`: each activity
+     *   the writes touch is listed exactly when it exists after them and the page would list it)
+     *   and the total confirms (the stored total plus the deltas of those writes is the total
+     *   read);
+     * - with no such count (activities changed elsewhere meanwhile), or before any total was
+     *   stored, the writes the rows prove reflected.
+     * The others stay, in order. So a read the cache answered with the page from before the
+     * writes keeps them all, a fresh read after them forgets them all, and a read issued between
+     * two writes forgets only the first, whether its bounded page shows them or not.
+     *
+     * @private
+     * @param {number} resId
+     * @param {Object[]} records the activities read
+     * @param {number} total the total count read with them
+     */
+    _forgetReadActivityWrites(resId, records, total) {
+        const writes = this.mobileState.activityWritesByLead[resId];
+        if (!writes) {
+            return;
+        }
+        const readIds = new Set(records.map((activity) => activity.id));
+        const lastRead = records.at(-1);
+        // Whether the read would list an existing activity of that row: its page holds them all,
+        // or the row sorts before the last one it lists. An activity marked done whose row the
+        // card did not show (`undefined`) counts as within the page.
+        const withinPage = (row) =>
+            !row ||
+            records.length >= total ||
+            (lastRead !== undefined && compareLeadActivities(row, lastRead) < 0);
+        // Each activity the writes touch: the index of the write that created it (-1: one the
+        // stored page held), of the write that marked it done (-1: none), and its row.
+        const touched = new Map();
+        writes.forEach((write, index) => {
+            const id = write.created ? write.created.id : write.doneId;
+            const activity = touched.get(id) ?? { createdAt: -1, doneAt: -1, row: undefined };
+            if (write.created) {
+                activity.createdAt = index;
+                activity.row = write.created;
+            } else {
+                activity.doneAt = index;
+                activity.row ??= write.row;
+            }
+            touched.set(id, activity);
+        });
+        // whether the rows read are those of the first `count` writes
+        const reflects = (count) =>
+            [...touched].every(([id, { createdAt, doneAt, row }]) => {
+                const exists = createdAt < count && !(doneAt >= 0 && doneAt < count);
+                return readIds.has(id) ? exists : !exists || !withinPage(row);
+            });
+        let proven = 0;
+        for (const [id, { createdAt, doneAt, row }] of touched) {
+            if (readIds.has(id) && createdAt >= 0) {
+                proven = Math.max(proven, createdAt + 1);
+            } else if (!readIds.has(id) && createdAt < 0 && withinPage(row)) {
+                proven = Math.max(proven, doneAt + 1);
+            }
+        }
+        let count = proven;
+        const storedTotal = this.mobileState.activityTotalsByLead[resId] ?? null;
+        if (storedTotal !== null) {
+            // `totals[n]`: the total once the first `n` writes are reflected
+            const totals = [storedTotal];
+            for (const write of writes) {
+                totals.push(totals.at(-1) + write.delta);
+            }
+            for (let candidate = writes.length; candidate >= proven; candidate--) {
+                if (totals[candidate] === total && reflects(candidate)) {
+                    count = candidate;
+                    break;
+                }
+            }
+        }
+        if (!count) {
+            return;
+        }
+        if (count < writes.length) {
+            this.mobileState.activityWritesByLead[resId] = writes.slice(count);
+        } else {
+            delete this.mobileState.activityWritesByLead[resId];
+        }
+    }
+
+    /**
+     * Records an activity write a card made online and the server confirmed, after the lead's
+     * earlier ones, so the card shows it at once, whatever the re-read that follows answers (see
+     * `activityWritesByLead`). Only for a lead a group of the pipeline holds: the write is
+     * forgotten with its lead.
+     * - `created`: the activity created; the same activity is recorded once.
+     * - `doneId`: the activity marked done, with the row the card shows for it, which tells
+     *   whether a bounded read would list it (`_forgetReadActivityWrites`). Marking done again an
+     *   activity already marked done changes nothing on the server, so it is recorded once. An
+     *   activity created by an earlier write keeps both writes: it is no longer shown, and their
+     *   deltas cancel out.
+     *
+     * @private
+     * @param {number} resId
+     * @param {{ created?: Object, doneId?: number } | undefined} write
+     */
+    _recordActivityWrite(resId, write) {
+        if (!write || !this.allLoadedRecords().some((record) => record.resId === resId)) {
+            return;
+        }
+        const writes = this.mobileState.activityWritesByLead[resId] ?? [];
+        let recorded;
+        if (write.created?.id) {
+            if (writes.some((entry) => entry.created?.id === write.created.id)) {
+                return;
+            }
+            recorded = { created: write.created, delta: 1 };
+        } else if (write.doneId) {
+            if (writes.some((entry) => entry.doneId === write.doneId)) {
+                return;
+            }
+            const row = this.activitiesFor(resId)?.find((activity) => activity.id === write.doneId);
+            recorded = { doneId: write.doneId, row, delta: -1 };
+        } else {
+            return;
+        }
+        this.mobileState.activityWritesByLead[resId] = [...writes, recorded];
+    }
+
+    /**
+     * The lead's activities a card shows, in the loader's order (deadline, then id): the stored
+     * page less the activities marked done, plus the activities created and not marked done,
+     * by the writes no read reflected yet (see `activityWritesByLead`). The stored page itself
+     * when there is no such write.
+     *
+     * @param {number} resId
+     * @returns {Object[] | null} `null` when nothing was read and nothing was created
+     */
+    activitiesFor(resId) {
+        const overlay = this._activityOverlay(resId);
+        return overlay ? overlay.rows : this.mobileState.activitiesByLead[resId] ?? null;
+    }
+
+    /**
+     * The lead's total count of activities a card shows: the stored total plus the deltas of the
+     * writes no read reflected yet (one per activity created, minus one per activity marked
+     * done), never below 0.
+     *
+     * @param {number} resId
+     * @returns {number | null} `null` while no total was read
+     */
+    activityTotalFor(resId) {
+        const overlay = this._activityOverlay(resId);
+        return overlay ? overlay.total : this.mobileState.activityTotalsByLead[resId] ?? null;
+    }
+
+    /**
+     * @private
+     * @param {number} resId
+     * @returns {{ rows: Object[] | null, total: number | null } | null} the activities and total
+     *   shown with the lead's confirmed writes applied, `null` when it has none
+     */
+    _activityOverlay(resId) {
+        const writes = this.mobileState.activityWritesByLead[resId];
+        if (!writes) {
+            return null;
+        }
+        const stored = this.mobileState.activitiesByLead[resId] ?? null;
+        const storedTotal = this.mobileState.activityTotalsByLead[resId] ?? null;
+        const memo = this._activityOverlays.get(writes);
+        if (memo && memo.stored === stored && memo.storedTotal === storedTotal) {
+            return memo;
+        }
+        const storedIds = new Set((stored ?? []).map((activity) => activity.id));
+        const doneIds = new Set(
+            writes.filter((write) => !write.created).map((write) => write.doneId)
+        );
+        const added = writes
+            .map((write) => write.created)
+            .filter((row) => row && !storedIds.has(row.id) && !doneIds.has(row.id));
+        const kept = (stored ?? []).filter((activity) => !doneIds.has(activity.id));
+        const rows =
+            stored || added.length ? [...kept, ...added].sort(compareLeadActivities) : null;
+        const delta = writes.reduce((sum, write) => sum + write.delta, 0);
+        const total = storedTotal === null ? null : Math.max(0, storedTotal + delta);
+        const overlay = { stored, storedTotal, rows, total };
+        this._activityOverlays.set(writes, overlay);
+        return overlay;
     }
 
     /**
@@ -2029,11 +2436,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Moves the focus requested by `onCardMove` (see `pendingFocus`) once the stage body is
-     * patched, or at once when the move leaves the stage body as it is: the Stage button of the
-     * lead's card, looked up in the displayed stage. Only in the mobile pipeline; a request whose
-     * element is not rendered (another stage displayed, a reload that dropped the card) is
-     * dropped, and the focus stays where it is.
+     * Moves the focus requested by `onCardMove` (see `pendingFocus`) once the pipeline is patched
+     * after the move: the Stage button of the lead's card, looked up in the displayed stage. Only
+     * in the mobile pipeline; a request whose element is not rendered (another stage displayed, a
+     * reload that dropped the card) is dropped, and the focus stays where it is.
      *
      * @private
      */
@@ -2063,7 +2469,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * A connection loss raised by the framework's reload of a truncated source group, after the
      * save was queued, leaves the queued save and the in-memory move in place. When the framework
      * did make the move, the target stage becomes the displayed one, so the moved card and its
-     * pending badge are visible at once; a move it did not make changes nothing.
+     * pending badge are visible at once: from the framework's in-memory move on, while its save
+     * is still running (the move is held in flight, see `currentGroup`), and as the stored stage
+     * once the move returns. A move it did not make changes nothing, and a move it undid (an
+     * online save rejected, a record refused) displays the source stage again.
      *
      * The moved card is a new card in the target stage, which takes its badge as its mount state
      * and announces nothing. So when the framework made the move and it left a lead that was not
@@ -2092,20 +2501,23 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             focusedCard && root.contains(focusedCard) && focusedCard.dataset.id === record.id
         );
         const wasPendingSync = this.crmOffline.isRecordPendingSync(record);
+        // In flight until the framework move returns: once the framework has moved the card in
+        // memory, the target stage is displayed with it (see `currentGroup`).
+        const move = { record, targetGroup };
+        this._cardMoves.set([...this._cardMoves(), move]);
         try {
             await this.props.list.moveRecords([record.id], null, targetGroup.id);
         } catch (error) {
             if (!(error instanceof ConnectionLostError)) {
                 throw error;
             }
+        } finally {
+            this._cardMoves.set(this._cardMoves().filter((candidate) => candidate !== move));
         }
         if (status(this) === "destroyed") {
             return;
         }
         const moved = record.group === targetGroup;
-        // Only a change of the displayed stage is certain to patch the stage body from here on;
-        // otherwise the card stays rendered where it is and its Stage button is focused at once.
-        const displayChanges = moved && this.stageState.serverValue !== targetGroup.serverValue;
         if (moved) {
             this.stageState.serverValue = targetGroup.serverValue;
             if (!wasPendingSync && this.crmOffline.isRecordPendingSync(record)) {
@@ -2114,10 +2526,12 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             }
         }
         if (keepCardFocus) {
+            // The end of the move in flight renders the pipeline again (every render reads the
+            // moves in flight, see `currentGroup`), so the focus moves once the stage body is
+            // patched, onto the card wherever it is displayed by then: in the target stage, or
+            // back in its stage after a move the framework undid, whose card the move in flight
+            // had displayed in the target stage.
             this.pendingFocus = { leadId: record.resId, control: "stage" };
-            if (!displayChanges) {
-                this._applyPendingFocus();
-            }
         }
     }
 
@@ -2166,7 +2580,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *   group of that stage is listed, or the sheet found none, the list is reloaded instead.
      * - A reload queued after the wait but before the insertion detaches the group the lead was
      *   added to: when that reload did not load the lead either, the list is reloaded once more.
-     * Nothing is created again; a lost connection during a reload leaves the pipeline as it is.
+     * Nothing is created again. When the connection is lost before the lead could be shown (the
+     * read that adds it, or a reload, see `_reloadAfterQuickCreate`), the pipeline stays as it is
+     * and the promise rejects with that `ConnectionLostError`: the quick create then tells the
+     * user the lead was saved. Every other failure rejects as it is.
      *
      * @param {number} resId the created lead
      * @param {Group | undefined} group the live group of the lead's stage when the call returned
@@ -2188,7 +2605,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 ? group
                 : groups.find((candidate) => candidate.serverValue === group.serverValue));
         if (!liveGroup) {
-            await this._reloadAfterQuickCreate();
+            await this._reloadAfterQuickCreate(isLoaded);
             return;
         }
         await this.validateQuickCreate(resId, "close", liveGroup);
@@ -2198,22 +2615,30 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             !this.props.list.groups.includes(liveGroup) &&
             !isLoaded()
         ) {
-            await this._reloadAfterQuickCreate();
+            await this._reloadAfterQuickCreate(isLoaded);
         }
     }
 
     /**
-     * Called by a card after an online activity create or mark-done: reads the lead's activities
-     * again, with the lead's current request (bounded, or expanded by "Show all"), only while
-     * this pipeline is alive and the displayed stage shows the lead (the same placement the
-     * activity revalidation reads for). A card can call it after it was destroyed (stage
-     * navigation, a filter, a move or a reload re-keyed or removed it): a lead no longer
-     * displayed is not read now, and is read again when a stage displays it.
+     * Called by a card after an online activity create or mark-done, while this pipeline is
+     * alive and shows the stage pipeline:
+     * - the write the server confirmed, when the card gives it, is shown at once on every card
+     *   of a lead a group holds (`_recordActivityWrite`), until a read reflects it, so a re-read
+     *   that loses the connection, or that the cache answers with the rows from before it, never
+     *   hides it;
+     * - the lead's activities are read again, with its current request (bounded, or expanded by
+     *   "Show all"), only when the displayed stage shows the lead (the same placement the
+     *   activity revalidation reads for).
+     * A card can call it after it was destroyed (stage navigation, a filter, a move or a reload
+     * re-keyed or removed it): a lead no longer displayed is not read now, and is read again
+     * when a stage displays it.
      *
      * @param {number} resId
+     * @param {{ created?: Object, doneId?: number }} [write] the activity created, in the loader's
+     *   record shape, or the id of the activity marked done
      * @returns {Promise<{ records: Object[], length: number } | null> | undefined} the read, if any
      */
-    onActivitiesChanged(resId) {
+    onActivitiesChanged(resId, write) {
         if (
             !resId ||
             status(this) === "destroyed" ||
@@ -2222,6 +2647,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         ) {
             return;
         }
+        this._recordActivityWrite(resId, write);
         if (!this.cardsFor(this.currentGroup).some((record) => record.resId === resId)) {
             return;
         }

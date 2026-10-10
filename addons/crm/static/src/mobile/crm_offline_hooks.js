@@ -17,18 +17,19 @@
  * - The patches change nothing online and narrow behaviour only offline, for CRM targets, with
  *   three exceptions. The availability registration (`RelationalModel._setAvailableOffline`) never
  *   registers the forecast views or the activity report, online too, while their online loading
- *   and rendering stay as they are. Two patches widen behaviour, offline only. The partner lookup
- *   (`Many2One` and `Many2XAutocomplete`) applies in `crm.lead` views only: on small screens a
- *   many2one renders the autocomplete instead of the search-dialog input (`dropdown: false` in its
- *   autocomplete props), and that autocomplete keeps the framework's dropdown presentation,
- *   closed until the user opens it; on every screen size, the extra suggestion sources of a lead
- *   many2one (the partner autocomplete's external lookup) offer nothing offline. The CRM search
- *   model's load completes without the team switcher instead of failing when the connection is
- *   lost and the switcher data were never cached.
+ *   and rendering stay as they are; offline, none of their data is loaded and each of their views
+ *   shows the framework's offline action helper (see "Unreachable offline"). Two patches widen
+ *   behaviour, offline only. The partner lookup (`Many2One` and `Many2XAutocomplete`) applies in
+ *   `crm.lead` views only: on small screens a many2one renders the autocomplete instead of the
+ *   search-dialog input (`dropdown: false` in its autocomplete props), and that autocomplete keeps
+ *   the framework's dropdown presentation, closed until the user opens it; on every screen size,
+ *   the extra suggestion sources of a lead many2one (the partner autocomplete's external lookup)
+ *   offer nothing offline. The CRM search model's load completes without the team switcher
+ *   instead of failing when the connection is lost and the switcher data were never cached.
  */
 
 import { CrmSearchModel } from "@crm/views/crm_search_model";
-import { computed, untrack, useEffect, usePlugin } from "@odoo/owl";
+import { Component, computed, untrack, useEffect, usePlugin, useProps, xml } from "@odoo/owl";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { ORM } from "@web/core/orm_plugin";
@@ -38,12 +39,16 @@ import { Record as RelationalRecord } from "@web/model/relational_model/record";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
 import { useEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
+import { extractLayoutComponents, Layout } from "@web/search/layout";
 import { Field } from "@web/views/fields/field";
 import { Many2One } from "@web/views/fields/many2one/many2one";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
 import { StatusBarField } from "@web/views/fields/statusbar/statusbar_field";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
+import { ProgressBarState } from "@web/views/kanban/progress_bar_hook";
 import { ListController } from "@web/views/list/list_controller";
+import { OfflineActionHelper } from "@web/views/offline_action_helper";
+import { View } from "@web/views/view";
 import { MultiRecordViewButton } from "@web/views/view_button/multi_record_view_button";
 import { ViewButton } from "@web/views/view_button/view_button";
 
@@ -140,6 +145,12 @@ const SERVER_BUTTON_TYPES = ["object", "action"];
 
 /** Static Actions-menu items that call the server (copy and export), by item key. */
 const SERVER_STATIC_MENU_ITEMS = ["duplicate", "export"];
+
+/**
+ * View types whose controllers render the framework's offline action helper when their root
+ * cannot be loaded offline; no other view type has one.
+ */
+const OFFLINE_HELPER_VIEW_TYPES = ["kanban", "list"];
 
 /**
  * Activity categories never offered for creation: a meeting needs a calendar round-trip and an
@@ -1214,19 +1225,147 @@ patch(CrmSearchModel.prototype, {
 // -----------------------------------------------------------------------------
 // Unreachable offline
 // -----------------------------------------------------------------------------
+//
+// The forecast views and the activity report are unreachable offline. They are never registered
+// as available offline, so the navbar, menus and view switcher dim them and the action fallback
+// never picks them. A dimmed entry still runs its action when clicked, and so do the browser
+// history and a direct call, while the framework would answer their action, views and data from
+// its RPC disk cache. Offline, none of their data is therefore read, from the cache or the server,
+// and each of their views shows the framework's offline action helper ("There is no data to
+// display offline for the given filters", without Reset Filters: no search of them is registered)
+// under the action's control panel:
+// - a kanban or list view loads as usual, and its root load is refused before any cache read or
+//   RPC, with the `ConnectionLostError` an uncached root raises offline: its controller renders
+//   the helper in place of the data, as for any root it cannot load offline;
+// - any other view type (form, graph, pivot...) has no such helper, so the view is not loaded at
+//   all (no description, no lazy bundle, no controller) and renders the helper itself.
+// Online, and for every other model and view, loading is unchanged.
+
+/**
+ * Whether a model config or a view belongs to the forecast or to the activity report: the forecast
+ * action context sets `forecast_field`, which its kanban, list and form inherit, and the activity
+ * report is the `crm.activity.report` model.
+ *
+ * @param {string | undefined} resModel
+ * @param {Object | undefined} context
+ * @returns {boolean}
+ */
+function isCrmUnreachableOffline(resModel, context) {
+    return Boolean(context?.forecast_field) || resModel === "crm.activity.report";
+}
 
 patch(RelationalModel.prototype, {
     /**
-     * The forecast views (their action context sets `forecast_field`, inherited by their kanban,
-     * list and form) and the activity report are never registered as available offline, so the
-     * navbar, menus, view switcher and action fallback never offer them offline. Online loading
-     * and rendering are unchanged.
+     * The forecast views and the activity report (see `isCrmUnreachableOffline`) are never
+     * registered as available offline, so the navbar, menus, view switcher and action fallback
+     * never offer them offline. Online loading and rendering are unchanged.
      */
     _setAvailableOffline(config, result) {
-        if (config?.context?.forecast_field || config?.resModel === "crm.activity.report") {
+        if (isCrmUnreachableOffline(config?.resModel, config?.context)) {
             return;
         }
         return super._setAvailableOffline(...arguments);
+    },
+    /**
+     * Offline, every load of a forecast or activity-report datapoint is refused before any cache
+     * read or RPC: a root (kanban, list, form or quick create), a group, a record reload and the
+     * forecast's column additions alike. The error is the `ConnectionLostError` an uncached load
+     * raises offline, so on a root load the base `load` sets `couldNotLoadRootOffline` and a
+     * kanban or list renders the framework's offline action helper instead of cached data. The
+     * offline signal is read last, for those configs only. Online and for every other config the
+     * load is unchanged.
+     */
+    async _loadData(config, cache) {
+        if (
+            isCrmUnreachableOffline(config?.resModel, config?.context) &&
+            this.offlinePlugin.isOffline()
+        ) {
+            throw new ConnectionLostError();
+        }
+        return super._loadData(...arguments);
+    },
+});
+
+patch(ProgressBarState.prototype, {
+    /**
+     * Offline, the progress bar counts of a forecast kanban are not read, as its root load is
+     * refused (see `RelationalModel._loadData` above): the read is issued before that load, and
+     * the counts are left unknown, as the framework leaves them when the read loses the
+     * connection. Online and for every other kanban the read is unchanged.
+     */
+    async loadProgressBar({ context, groupBy, resModel }) {
+        if (
+            groupBy?.length &&
+            isCrmUnreachableOffline(resModel, context) &&
+            isOfflineModel(this.model)
+        ) {
+            this._pbCounts = null;
+            return;
+        }
+        return super.loadProgressBar(...arguments);
+    },
+});
+
+/**
+ * What a forecast or activity-report view whose type has no offline action helper of its own
+ * renders offline in place of its controller: the framework's offline action helper in the
+ * standard layout, under the action's control panel and breadcrumbs, as kanban and list
+ * controllers render it for a root they cannot load offline. It reads nothing.
+ */
+class CrmUnreachableOfflineController extends Component {
+    static template = xml`
+        <div t-att-class="this.props.className">
+            <Layout display="this.props.display">
+                <OfflineActionHelper/>
+            </Layout>
+        </div>`;
+    static components = { Layout, OfflineActionHelper };
+    props = useProps();
+}
+
+patch(View.prototype, {
+    setup() {
+        super.setup(...arguments);
+        // The base setup only registers the `loadView` calls of `onWillStart` and
+        // `onWillUpdateProps`, which run after this assignment.
+        this.crmOffline = useCrmOffline();
+    },
+    /**
+     * Offline, a forecast or activity-report view of any type but kanban and list (the form,
+     * graph, pivot, calendar or activity view) is not loaded: no description is read, no lazy
+     * bundle is loaded and no controller is created, so none of its data is read. It renders
+     * `CrmUnreachableOfflineController` instead, the framework's offline action helper under the
+     * action's control panel, whether it is opened from a menu, the browser history, a record or a
+     * direct call, on the first load or on a props update that changes the view. Its search model
+     * is the framework's, with no search view, so it reads nothing either. Kanban and list views
+     * load as usual: their refused root load shows the same helper (see
+     * `RelationalModel._loadData` above). The offline signal is read last, for those views only.
+     * Online and for every other view the load is unchanged. The call is optional for subclasses
+     * whose `setup` skips this one.
+     *
+     * @param {Object} props the view props
+     */
+    async loadView(props) {
+        if (
+            OFFLINE_HELPER_VIEW_TYPES.includes(props?.type) ||
+            !isCrmUnreachableOffline(props?.resModel, props?.context) ||
+            !this.crmOffline?.isOffline()
+        ) {
+            return super.loadView(...arguments);
+        }
+        const { className, context, display, domain, noBreadcrumbs, resModel, type } = props;
+        Object.assign(this.env.config, {
+            viewType: type,
+            noBreadcrumbs,
+            ...extractLayoutComponents({}),
+        });
+        this.Controller = CrmUnreachableOfflineController;
+        this.componentProps = {
+            className: ["o_view_controller", "o_crm_unreachable_offline", className]
+                .filter(Boolean)
+                .join(" "),
+        };
+        this.withSearchProps = { resModel, context, domain, display };
     },
 });
 

@@ -10,7 +10,10 @@
  *   issued and raise nothing;
  * - existing lead controls usable offline carry the offline-availability attribute (K9);
  * - leads, stages and teams are created, edited and moved through the shared framework queue,
- *   replayed in timestamp order with last-write-wins and parked on rejection (PART 3, gate 8).
+ *   replayed in timestamp order with last-write-wins and parked on rejection (PART 3, gate 8);
+ * - the forecast and the activity report are unreachable offline: never registered, none of their
+ *   data read, every view of them showing the framework's offline action helper (out-of-scope
+ *   item 4).
  *
  * Conventions:
  * - The mock models these tests add (the CRM models and the others their views need) are local
@@ -23,12 +26,15 @@
  * - "Inert" always means: no RPC (stepped by a route watcher registered after `mockOffline()`, so
  *   that it sees the requests the offline mock answers with a 502), no record save, no dialog and
  *   no action. Hoot fails a test on any undeclared error, which is how "no uncaught error" is
- *   asserted. Two kinds of error are declared: those the framework itself produces offline (a read
- *   served from the framework RPC cache while offline still tries the server in the background,
- *   and that refresh rejects with a `ConnectionLostError` nobody awaits; a request in flight when
- *   the connection drops rejects the same way, and the framework's lost-connection handler
- *   silences it in production), and server rejections a test simulates on purpose to check that
- *   they reach the framework unchanged (a group probe and a module lookup the server refuses).
+ *   asserted. Three kinds of error are declared: those the framework itself produces offline (a
+ *   read served from the framework RPC cache while offline still tries the server in the
+ *   background, and that refresh rejects with a `ConnectionLostError` nobody awaits; a request in
+ *   flight when the connection drops rejects the same way, and the framework's lost-connection
+ *   handler silences it in production); the `ConnectionLostError` of a forecast or activity-report
+ *   kanban or list root load that the CRM unreachable rule refuses offline, which the framework
+ *   does not await and silences the same way, as for any root it cannot load offline; and server
+ *   rejections a test simulates on purpose to check that they reach the framework unchanged (a
+ *   group probe and a module lookup the server refuses).
  */
 
 import {
@@ -516,6 +522,8 @@ class CrmActivityReport extends models.Model {
             <list action="action_open_lead" type="object">
                 <field name="name"/>
             </list>`,
+        // The default view of the production activity report action (`graph,pivot,list`).
+        graph: /* xml */ `<graph/>`,
         search: /* xml */ `<search/>`,
     };
 }
@@ -1121,6 +1129,8 @@ const OPPORTUNITY_LIST_ACTION_ID = 8;
 const ARCHIVED_LEAD_FORM_ACTION_ID = 9;
 const LEAD_LOOKUP_ACTION_ID = 10;
 const LEAD_EXTRA_SOURCE_ACTION_ID = 11;
+const FORECAST_WITH_FORM_ACTION_ID = 12;
+const ACTIVITY_REPORT_GRAPH_ACTION_ID = 13;
 
 defineActions([
     {
@@ -1231,6 +1241,31 @@ defineActions([
         res_id: 1,
         type: "ir.actions.act_window",
         views: [["lead_extra_source", "form"]],
+    },
+    // The forecast and the activity report with the views of their production actions that
+    // FORECAST_ACTION_ID and ACTIVITY_REPORT_ACTION_ID leave out: the forecast form, and the
+    // report's default graph.
+    {
+        id: FORECAST_WITH_FORM_ACTION_ID,
+        name: "Forecast",
+        res_model: "crm.lead",
+        type: "ir.actions.act_window",
+        context: { forecast_field: "date_deadline", forecast_filter: 1 },
+        views: [
+            [false, "kanban"],
+            [false, "list"],
+            [false, "form"],
+        ],
+    },
+    {
+        id: ACTIVITY_REPORT_GRAPH_ACTION_ID,
+        name: "Activities",
+        res_model: "crm.activity.report",
+        type: "ir.actions.act_window",
+        views: [
+            [false, "graph"],
+            [false, "list"],
+        ],
     },
     ...BOUND_LEAD_ACTIONS,
 ]);
@@ -1593,9 +1628,7 @@ describe("Kanban moves", () => {
             ACTIVITIES,
             ACTIVITIES,
             TYPES,
-            // the move: New loses Lead 1 (Lead 2), then Won is displayed (Lead 1)
-            ACTIVITIES,
-            TYPES,
+            // the move displays Won (Lead 1)
             ACTIVITIES,
             TYPES,
             // swipes back to New through Qualified (Lead 3, then Lead 2), then to Won again through
@@ -7384,6 +7417,170 @@ describe("Unreachable views", () => {
         await reportController.openRecord(reportController.model.root.records[0]);
         await animationFrame();
         expect.verifySteps([]);
+    });
+
+    /** The message of the `ConnectionLostError` a refused root load raises. */
+    const REFUSED = "Connection couldn't be established or was interrupted";
+    const OFFLINE_HELPER_TEXT = "There is no data to display offline for the given filters";
+
+    test("offline, the forecast and activity report kanban and lists show the offline helper and read nothing", async () => {
+        // Each refused root load rejects with the `ConnectionLostError` an uncached root raises
+        // offline. The framework does not await these loads (the controller is shown first), and
+        // its lost-connection handler silences the rejection in production: the forecast kanban,
+        // its list, the activity report list and the forecast list shown again by Back.
+        expect.errors(4);
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const kanbanControllers = captureInstances(KanbanController);
+        await mountWithCleanup(WebClient);
+        const action = getService("action");
+        // Online, the forecast kanban and list and the activity report list render their records,
+        // so the framework caches their actions, views and data.
+        await action.doAction(FORECAST_ACTION_ID);
+        expect(".o_kanban_record").toHaveCount(4);
+        await action.switchView("list");
+        expect(".o_data_row").toHaveCount(2);
+        await action.doAction(ACTIVITY_REPORT_ACTION_ID);
+        expect(".o_data_row").toHaveCount(1);
+        await action.doAction(STAGE_ACTION_ID, { clearBreadcrumbs: true });
+        expect(".o_data_row").toHaveCount(3);
+
+        await setOffline(true);
+        await visitedReady();
+        watchRpcs([/^crm\.lead\//, /^crm\.activity\.report\//]);
+        // The dimmed Forecast menu entry runs its action: the kanban shows the offline helper,
+        // with no Reset Filters (no search of the forecast is registered), and no card.
+        await action.doAction(FORECAST_ACTION_ID);
+        await animationFrame();
+        expect(".o_kanban_view .o_view_nocontent").toHaveText(OFFLINE_HELPER_TEXT);
+        expect(".o_view_nocontent button").toHaveCount(0);
+        expect(".o_kanban_record").toHaveCount(0);
+        // The forecast list and the activity report list show it too, with no row.
+        await action.switchView("list");
+        await animationFrame();
+        expect(".o_list_view .o_view_nocontent").toHaveText(OFFLINE_HELPER_TEXT);
+        expect(".o_data_row").toHaveCount(0);
+        await action.doAction(ACTIVITY_REPORT_ACTION_ID);
+        await animationFrame();
+        expect(".o_list_view .o_view_nocontent").toHaveText(OFFLINE_HELPER_TEXT);
+        expect(".o_data_row").toHaveCount(0);
+        // Back to the forecast list: the helper again.
+        await action.restore();
+        await animationFrame();
+        expect(".o_list_view .o_view_nocontent").toHaveText(OFFLINE_HELPER_TEXT);
+        expect(".o_data_row").toHaveCount(0);
+        // Nothing reached the network, and nothing was queued.
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifyErrors([REFUSED, REFUSED, REFUSED, REFUSED]);
+
+        // Online, the forecast kanban renders its records again, from the server.
+        await setOffline(false);
+        await action.doAction(FORECAST_ACTION_ID);
+        expect(".o_kanban_record").toHaveCount(4);
+        expect.verifySteps(["crm.lead/read_progress_bar", "crm.lead/web_read_group"]);
+
+        // A forecast kanban shown before the disconnection refuses its next load, as the
+        // framework does for any root it cannot load offline: a column addition
+        // (`list.load()`) and a root reload alike read nothing, from the cache or the server.
+        await setOffline(true);
+        const forecastKanban = kanbanControllers.at(-1);
+        await expect(forecastKanban.model.root.load()).rejects.toThrow(ConnectionLostError);
+        await expect(forecastKanban.model.load()).rejects.toThrow(ConnectionLostError);
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    test("offline, a forecast form and the activity report graph show the offline helper from a menu, a record or Back, and read nothing", async () => {
+        // The forecast kanban and the activity report list refuse their root load, as in the test
+        // above (a rejection the framework does not await, silenced by its lost-connection handler
+        // in production): both shown again by Back, then the forecast kanban opened directly.
+        expect.errors(3);
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        await mountWithCleanup(WebClient);
+        const action = getService("action");
+        // Online, the activity report graph and list, the forecast kanban and a forecast lead form
+        // render their data, so the framework caches their actions, views and data. The stage
+        // list is shown last.
+        await action.doAction(ACTIVITY_REPORT_GRAPH_ACTION_ID);
+        await runAllTimers(); // the router pushes the state
+        expect(".o_graph_view").toHaveCount(1);
+        await action.switchView("list");
+        await runAllTimers();
+        expect(".o_data_row").toHaveCount(1);
+        await action.doAction(FORECAST_WITH_FORM_ACTION_ID, { clearBreadcrumbs: true });
+        await runAllTimers();
+        await contains(".o_kanban_record:contains('Lead 1')").click();
+        await runAllTimers();
+        expect(".o_form_view .o_field_widget[name=name] textarea").toHaveValue("Lead 1");
+        await action.doAction(STAGE_ACTION_ID, { clearBreadcrumbs: true });
+        await runAllTimers();
+        expect(".o_data_row").toHaveCount(3);
+
+        await setOffline(true);
+        await visitedReady();
+        watchRpcs([/^crm\.lead\//, /^crm\.activity\.report\//]);
+        /** The refused view shows the helper under its control panel; no view of it renders. */
+        const expectUnreachableHelper = () => {
+            expect(".o_action_manager .o_crm_unreachable_offline .o_view_nocontent").toHaveText(
+                OFFLINE_HELPER_TEXT
+            );
+            expect(".o_crm_unreachable_offline .o_control_panel").toHaveCount(1);
+            expect(".o_view_nocontent button").toHaveCount(0);
+            expect(".o_graph_view, .o_form_view, .o_data_row, .o_kanban_record").toHaveCount(0);
+        };
+
+        /** Browser Back, once the action manager has loaded the state it leads to. */
+        const goBack = async () => {
+            browser.history.back();
+            await animationFrame();
+            await runAllTimers();
+        };
+
+        // Browser Back through the history visited online: the forecast form, the forecast
+        // kanban, the report list and the report graph each show their offline screen, never
+        // their data and never a blank page (the graph entry has no screen before it).
+        await goBack(); // the forecast form
+        expectUnreachableHelper();
+        await goBack(); // the forecast kanban
+        expect(".o_kanban_view .o_view_nocontent").toHaveText(OFFLINE_HELPER_TEXT);
+        expect(".o_kanban_record").toHaveCount(0);
+        await goBack(); // the activity report list
+        expect(".o_list_view .o_view_nocontent").toHaveText(OFFLINE_HELPER_TEXT);
+        expect(".o_data_row").toHaveCount(0);
+        await goBack(); // the activity report graph
+        expectUnreachableHelper();
+
+        // Reporting > Activities opens the report on its graph: the helper.
+        await action.doAction(ACTIVITY_REPORT_GRAPH_ACTION_ID, { clearBreadcrumbs: true });
+        await animationFrame();
+        expectUnreachableHelper();
+        // A forecast lead opened from the forecast, or directly: the helper, no form to edit.
+        await action.doAction(FORECAST_WITH_FORM_ACTION_ID);
+        await animationFrame();
+        expect(".o_kanban_view .o_view_nocontent").toHaveText(OFFLINE_HELPER_TEXT);
+        await action.switchView("form", { resId: 1 });
+        await animationFrame();
+        expectUnreachableHelper();
+        // Nothing reached the network, and nothing was queued.
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifyErrors([REFUSED, REFUSED, REFUSED]);
+
+        // Online, the report graph and the forecast form render their data again.
+        await setOffline(false);
+        await action.doAction(ACTIVITY_REPORT_GRAPH_ACTION_ID);
+        expect(".o_graph_view").toHaveCount(1);
+        await action.doAction(FORECAST_WITH_FORM_ACTION_ID);
+        await action.switchView("form", { resId: 1 });
+        expect(".o_form_view .o_field_widget[name=name] textarea").toHaveValue("Lead 1");
+        expect.verifySteps([
+            "crm.activity.report/formatted_read_group",
+            "crm.lead/read_progress_bar",
+            "crm.lead/web_read_group",
+            "crm.lead/web_read",
+        ]);
     });
 });
 

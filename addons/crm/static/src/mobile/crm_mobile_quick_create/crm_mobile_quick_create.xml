@@ -19,11 +19,19 @@
         - No `<form>` wrapper and only `type="button"` buttons, so `save()` is the sole create path.
           The framework classes `o_kanban_quick_create` and `o_kanban_add` are not used: they belong
           to the framework kanban quick create, which the upstream mobile main-flow tour drives.
+        - Save and Discard sit in a row pinned to the bottom of the sheet body (see the scss), with
+          its own bottom spacing (`pb-3`). The row and the root take the sheet background through
+          `bg-inherit`, the backend's utility for it, so scrolled fields never show through the row.
+        - The root is a `group` named by the "New Lead" title (`aria-labelledby`), which also names
+          the hosting sheet (see `nameHostingSheet`); it is the `rootRef` the focus trap holds.
         - Comments stay outside the template: Owl renders a comment inside a template into the DOM.
     -->
     <t t-name="crm.CrmMobileQuickCreate">
-        <div class="o_crm_mobile_quick_create d-flex flex-column gap-3 p-3">
-            <h4 class="mb-0">New Lead</h4>
+        <div class="o_crm_mobile_quick_create d-flex flex-column gap-3 p-3 bg-inherit"
+            role="group"
+            aria-labelledby="o_crm_mobile_quick_create_title"
+            t-ref="this.rootRef">
+            <h4 id="o_crm_mobile_quick_create_title" class="mb-0">New Lead</h4>
 
             <div class="o_crm_mobile_quick_create_field">
                 <label class="form-label" for="o_crm_mobile_quick_create_name">Lead Name<span class="text-danger-emphasis ms-1" aria-hidden="true">*</span></label>
@@ -126,7 +134,7 @@
                 </select>
             </div>
 
-            <div class="d-flex gap-2">
+            <div class="o_crm_mobile_quick_create_actions d-flex gap-2 pb-3 bg-inherit">
                 <button type="button"
                     class="btn btn-primary flex-grow-1 o_crm_mobile_quick_create_save"
                     data-available-offline="1"

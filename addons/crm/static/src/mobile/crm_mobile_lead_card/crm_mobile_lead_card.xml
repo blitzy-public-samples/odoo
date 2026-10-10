@@ -17,7 +17,10 @@
         ArrowDown/ArrowUp/Home/End move among the enabled options, Escape closes it and focuses
         Stage again, Enter or Space chooses; the arrow, Home, End and Escape keys stop at the list.
         Cancel, or a completed Save, closing the follow-up form gives the focus back to Follow-up
-        (to Stage while Follow-up is disabled), unless the focus was moved out of the form.
+        (to Stage while Follow-up is disabled), unless the focus was moved out of the form. A panel
+        a toggle opens (stage list, follow-up form, activity list) is scrolled into view, only as
+        far as needed, as it renders; only the stage list then takes the focus, on its active
+        option. Closing a panel scrolls nothing.
 
         The lead name is the first span of the article and a leaf: the upstream mobile main flow
         clicks `.o_kanban_record span:contains(name)`, and the click bubbles through the open button
@@ -164,7 +167,8 @@
                     </div>
                 </div>
 
-                <ul t-if="this.state.activitiesOpen" class="o_crm_mobile_lead_card_activities list-unstyled mt-2 mb-0">
+                <ul t-if="this.state.activitiesOpen" class="o_crm_mobile_lead_card_activities list-unstyled mt-2 mb-0"
+                    t-ref="this.activitiesListRef">
                     <!-- Queued creates have no server id yet: no Mark done. -->
                     <li t-foreach="this.pendingActivityCreates" t-as="entry" t-key="entry.key"
                         class="o_crm_mobile_activity_row o_crm_mobile_activity_pending d-flex align-items-center gap-2 py-1">

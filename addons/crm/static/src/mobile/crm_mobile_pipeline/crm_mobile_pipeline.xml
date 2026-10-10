@@ -152,8 +152,8 @@
                                 record="record"
                                 group="group"
                                 stages="stages"
-                                activities="this.mobileState.activitiesByLead[record.resId] ?? null"
-                                activityTotal="this.mobileState.activityTotalsByLead[record.resId] ?? null"
+                                activities="this.activitiesFor(record.resId)"
+                                activityTotal="this.activityTotalFor(record.resId)"
                                 onShowAllActivities="(resId) => this.onShowAllActivities(resId)"
                                 activityTypes="this.mobileState.activityTypes"
                                 unavailable="this.isCardUnavailable(record)"
@@ -161,7 +161,7 @@
                                 frameworkStageValue="record.group?.serverValue"
                                 onOpen="(r) => this.onCardOpen(r)"
                                 onMove="(r, targetGroup) => this.onCardMove(r, targetGroup)"
-                                onActivitiesChanged="(resId) => this.onActivitiesChanged(resId)"
+                                onActivitiesChanged="(resId, write) => this.onActivitiesChanged(resId, write)"
                             />
                         </t>
                         <!--

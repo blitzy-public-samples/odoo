@@ -16,4 +16,37 @@ $o-crm-mobile-touch: 44px;
         min-height: $o-crm-mobile-touch;
         min-width: $o-crm-mobile-touch;
     }
+
+    // Save and Discard stay pinned to the bottom of the sheet body while the fields scroll
+    // under them, so an inline error or a short screen never pushes them out of reach. The
+    // template gives the row its bottom spacing and the sheet's background (inherited through
+    // the body and the root), so no scrolled field shows through or below it.
+    .o_crm_mobile_quick_create_actions {
+        position: sticky;
+        bottom: 0;
+    }
+}
+
+// The framework bottom sheet opens at its resting height, 90dvh (`BottomSheet.maxHeightPercent`),
+// but lets a taller content grow the sheet up to the full viewport height, so the end of a tall
+// sheet sits below the screen until it is dragged up. The quick-create sheet is held to that
+// resting height instead: it is entirely on screen once it opens, and its body scrolls the fields.
+.o_bottom_sheet_sheet:has(> .o_bottom_sheet_body > .o_crm_mobile_quick_create) {
+    max-height: 90dvh;
+
+    // The framework template renders the sheet body, so its spacing and background are set here
+    // rather than through utility classes, and only from existing tokens and keywords.
+    > .o_bottom_sheet_body {
+        // A sticky box keeps clear of its scroll container's padding: without a bottom padding,
+        // the pinned action row reaches the bottom of the sheet, and its own bottom spacing
+        // replaces this one.
+        padding-bottom: 0;
+        // Hands the sheet background down to the pinned row (`bg-inherit` on the root and row).
+        background-color: inherit;
+        // A field focused from the keyboard (Tab wrapping back to the lead name included) scrolls
+        // fully into view with its focus ring and label: below the top edge by the label's room,
+        // and above the pinned row by its buttons, its bottom spacing and one more spacer.
+        scroll-padding-top: 2 * map-get($spacers, 3);
+        scroll-padding-bottom: $o-crm-mobile-touch + 2 * map-get($spacers, 3);
+    }
 }
