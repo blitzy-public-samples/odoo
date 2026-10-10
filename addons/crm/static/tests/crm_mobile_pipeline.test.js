@@ -1693,8 +1693,8 @@ describe("Mobile pipeline", () => {
             sentence
         );
         expect(description).not.toBeVisible();
-        // Nothing in the stage body is live-announced, and the helper overlay stays positioned
-        // against the stage body.
+        // Nothing in the stage body is live-announced, and the helper stays positioned against
+        // the stage body.
         expect(
             ".o_crm_mobile_pipeline_body[aria-live], .o_crm_mobile_pipeline_body [aria-live]"
         ).toHaveCount(0);

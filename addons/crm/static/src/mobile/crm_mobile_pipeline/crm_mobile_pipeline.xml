@@ -16,13 +16,20 @@
           the framework quick create (`.o_kanban_quick_create`, `.o_kanban_add`) and the cards
           (`.o_kanban_record`, name in a span).
         - Placement and totals come from the renderer's pending-aware getters, not template state.
+        - The header is a start zone (Previous), the title and an end zone (Next, then Add). Both
+          zones always reserve the same width, so the stylesheet keeps the title, short or
+          truncated, centred on the header on every stage.
         - A displayed stage that shows no lead while other stages hold some (emptyStageHint) shows
           a sentence with their count and a button displaying the first of them. It is
           neither a `.o_view_nocontent` nor a card or stage, so no framework selector matches it.
-        - Previous is not rendered on the first stage, nor Next on the last one. When the removed
-          button held the focus, the renderer moves the focus to the first header control (the
-          remaining navigation button, else Add), else to the first control of the pipeline,
-          instead of letting it drop to the document body.
+        - Previous is not rendered on the first stage, nor Next on the last one. A placeholder of
+          the same size, hidden and no control (a span, aria-hidden, never focusable), holds the
+          slot of the absent button. When Add is rendered, a placeholder of Add's size sits between
+          Previous (or its placeholder) and the title, so the start zone balances the end zone's
+          width. The title therefore keeps its place from stage to stage. When the removed button
+          held the focus, the renderer moves the focus to the first header control (the remaining
+          navigation button, else Add), else to the first control of the pipeline, instead of
+          letting it drop to the document body.
         - Space keydowns stop at the root (onPipelineKeydown): the inherited kanban Space hotkey
           would otherwise cancel the native activation of the focused button.
         - The status region (role=status, polite, atomic, visually hidden) is the root's last
@@ -40,46 +47,61 @@
             <t t-set="group" t-value="this.currentGroup"/>
             <div class="o_kanban_renderer o_renderer o_kanban_grouped o_crm_mobile_pipeline d-flex flex-column user-select-none" t-ref="this.rootRef"
                 t-on-keydown="(ev) => this.onPipelineKeydown(ev)">
-                <div class="o_crm_mobile_pipeline_header d-flex align-items-center gap-1 px-2 py-1 bg-view border-bottom">
-                    <button t-if="this.hasPrevStage" type="button"
-                        class="btn btn-light o_crm_mobile_pipeline_prev"
-                        data-available-offline="1"
-                        aria-label="Previous stage"
-                        title="Previous stage"
-                        t-on-click="() => this.onPrev()">
-                        <i class="oi" data-icon="chevron_backward" aria-hidden="true"/>
-                    </button>
-                    <div class="o_crm_mobile_pipeline_title flex-grow-1 min-w-0 text-center" aria-live="polite">
-                        <div class="o_crm_mobile_pipeline_stage_name fw-bold text-truncate">
+                <div class="o_crm_mobile_pipeline_header d-flex align-items-center gap-1 px-3 py-1 bg-view border-bottom">
+                    <div class="o_crm_mobile_pipeline_header_start d-flex align-items-center gap-1">
+                        <button t-if="this.hasPrevStage" type="button"
+                            class="btn btn-secondary o_crm_mobile_pipeline_prev"
+                            data-available-offline="1"
+                            aria-label="Previous stage"
+                            title="Previous stage"
+                            t-on-click="() => this.onPrev()">
+                            <i class="oi" data-icon="chevron_backward" aria-hidden="true"/>
+                        </button>
+                        <span t-else="" class="o_crm_mobile_pipeline_nav_placeholder invisible" aria-hidden="true"/>
+                        <span t-if="this.canAdd" class="o_crm_mobile_pipeline_nav_placeholder invisible" aria-hidden="true"/>
+                    </div>
+                    <div class="o_crm_mobile_pipeline_title min-w-0 text-center" aria-live="polite">
+                        <div class="o_crm_mobile_pipeline_stage_name fs-4 fw-bold text-900 text-truncate" t-att-title="group.displayName">
                             <i t-if="group.isFolded" class="oi me-1 o_crm_mobile_pipeline_folded" data-icon="close_fullscreen" role="img" aria-label="Folded" title="Folded"/>
                             <t t-out="group.displayName"/>
                         </div>
-                        <div class="o_crm_mobile_pipeline_totals small text-muted text-truncate">
+                        <!--
+                            An empty stage is dimmed with text-600, the lightest grey keeping every
+                            totals text at the 4.5:1 WCAG AA contrast on the header; the desktop
+                            header's opacity-25 is not used because it would drop them below it.
+                            The revenue is fw-bolder, the weight of the desktop header's aggregate
+                            (a b element); fw-bold is the lighter medium weight.
+                        -->
+                        <t t-set="isStageEmpty" t-value="!this.stageCount(group)"/>
+                        <div class="o_crm_mobile_pipeline_totals text-truncate" t-att-class="isStageEmpty ? 'text-600' : 'text-700'">
                             <span class="visually-hidden">Leads:</span>
                             <span class="o_crm_mobile_pipeline_count" title="Leads" t-out="this.stageCount(group)"/>
                             <t t-if="this.hasRevenue">
                                 <span class="mx-1" aria-hidden="true">•</span>
                                 <span class="visually-hidden">Expected revenue:</span>
-                                <span class="o_crm_mobile_pipeline_revenue" title="Expected revenue" t-out="this.formatStageRevenue(group)"/>
+                                <span class="o_crm_mobile_pipeline_revenue fw-bolder" t-att-class="{ 'text-body': !isStageEmpty }" title="Expected revenue" t-out="this.formatStageRevenue(group)"/>
                             </t>
                         </div>
                     </div>
-                    <button t-if="this.hasNextStage" type="button"
-                        class="btn btn-light o_crm_mobile_pipeline_next"
-                        data-available-offline="1"
-                        aria-label="Next stage"
-                        title="Next stage"
-                        t-on-click="() => this.onNext()">
-                        <i class="oi" data-icon="chevron_forward" aria-hidden="true"/>
-                    </button>
-                    <button t-if="this.canAdd" type="button"
-                        class="btn btn-primary o_crm_mobile_pipeline_add"
-                        data-available-offline="1"
-                        aria-label="New Lead"
-                        title="New Lead"
-                        t-on-click="(ev) => this.onAddClick(ev)">
-                        <i class="oi" data-icon="add_2" aria-hidden="true"/>
-                    </button>
+                    <div class="o_crm_mobile_pipeline_header_end d-flex align-items-center justify-content-end gap-1">
+                        <button t-if="this.hasNextStage" type="button"
+                            class="btn btn-secondary o_crm_mobile_pipeline_next"
+                            data-available-offline="1"
+                            aria-label="Next stage"
+                            title="Next stage"
+                            t-on-click="() => this.onNext()">
+                            <i class="oi" data-icon="chevron_forward" aria-hidden="true"/>
+                        </button>
+                        <span t-else="" class="o_crm_mobile_pipeline_nav_placeholder invisible" aria-hidden="true"/>
+                        <button t-if="this.canAdd" type="button"
+                            class="btn btn-primary o_crm_mobile_pipeline_add"
+                            data-available-offline="1"
+                            aria-label="New Lead"
+                            title="New Lead"
+                            t-on-click="(ev) => this.onAddClick(ev)">
+                            <i class="oi" data-icon="add_2" aria-hidden="true"/>
+                        </button>
+                    </div>
                 </div>
 
                 <div class="o_kanban_group o_crm_mobile_pipeline_body"
@@ -189,7 +211,7 @@
                         </div>
                         <t t-set="unavailableCount" t-value="this.unavailableMoreCount(group)"/>
                         <div t-if="unavailableCount > 0"
-                            class="o_crm_mobile_pipeline_unavailable_more text-muted small text-center py-2"
+                            class="o_crm_mobile_pipeline_unavailable_more text-700 small text-center py-2"
                             t-out="this.unavailableMoreLabel(group, unavailableCount)"/>
                         <t t-if="!this.crmOffline.isOffline()">
                             <t t-set="unloadedCount" t-value="this.getGroupUnloadedCount(group)"/>

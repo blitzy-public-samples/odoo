@@ -42,6 +42,31 @@ $o-crm-mobile-touch: 44px;
         flex: 0 0 auto;
     }
 
+    // Header layout: a start zone (Previous), the title, an end zone (Next, then Add). Both zones
+    // always reserve the same width, exactly that of their controls: a placeholder holds the slot
+    // of an absent Previous or Next, and, when Add is rendered, a placeholder of Add's size and
+    // the same gap balance it in the start zone. The title takes all the width between the zones,
+    // its text centred, and a longer title truncates: the title, short or truncated, is always
+    // centred on the header, and keeps the same geometry on the first, a middle and the last
+    // stage.
+    .o_crm_mobile_pipeline_header_start,
+    .o_crm_mobile_pipeline_header_end {
+        flex: 0 0 auto;
+    }
+
+    .o_crm_mobile_pipeline_title {
+        flex: 1 1 0;
+    }
+
+    // Same size as the button whose slot it holds or whose width it balances (Previous, Next,
+    // Add). Hidden and no control: `invisible` and `aria-hidden` in the template, and never
+    // focusable.
+    .o_crm_mobile_pipeline_nav_placeholder {
+        flex: 0 0 auto;
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+    }
+
     .o_crm_mobile_pipeline_prev,
     .o_crm_mobile_pipeline_next,
     .o_crm_mobile_pipeline_add,
@@ -52,6 +77,24 @@ $o-crm-mobile-touch: 44px;
         justify-content: center;
         min-width: $o-crm-mobile-touch;
         min-height: $o-crm-mobile-touch;
+
+        // A touch screen leaves `:hover` on the last tapped button until the next tap elsewhere,
+        // which would keep that button alone in its hover colours. Without a hovering pointer the
+        // hover colours (also those of the keyboard focus) are the rest colours; the pressed
+        // (`:active`) colours and the focus ring are unchanged.
+        @media (hover: none) {
+            --#{$prefix}btn-hover-bg: var(--#{$prefix}btn-bg);
+            --#{$prefix}btn-hover-border-color: var(--#{$prefix}btn-border-color);
+            --#{$prefix}btn-hover-color: var(--#{$prefix}btn-color);
+        }
+    }
+
+    // The icon-only header buttons have no inline padding: the icon is centred in the touch
+    // width, so each button is exactly as wide as the placeholder that holds or balances its slot.
+    .o_crm_mobile_pipeline_prev,
+    .o_crm_mobile_pipeline_next,
+    .o_crm_mobile_pipeline_add {
+        --#{$prefix}btn-padding-x: 0;
     }
 
     // Stage body: the only `.o_kanban_group` in the DOM. It fills the width and the height left
@@ -68,16 +111,38 @@ $o-crm-mobile-touch: 44px;
         scroll-snap-align: none;
         // Vertical panning stays native; horizontal gestures are left to the swipe navigation.
         touch-action: pan-y;
-        // Containing block of the offline action helper (`.o_view_nocontent`, absolutely
-        // positioned over its container): it covers the stage body, never the header.
+        // Positioned ancestor (`offsetParent`) of the offline action helper (`.o_view_nocontent`),
+        // whose overflow the body clips: the helper never covers the header.
         position: relative;
+
+        // The framework places the helper absolutely over its whole container. While the body
+        // holds it, the body is a column instead and the helper is in its flow: what precedes it
+        // (the Back row of an unavailable lead, or the framework quick create above a stage whose
+        // data is missing) stays above it, never under it, and the helper fills and centres in
+        // the height left below. When its content is taller than that, it grows and the body
+        // scrolls. `position: relative` keeps the helper's z-index and the body as its
+        // `offsetParent`, and turns the framework's zero insets into no offset.
+        &:has(> .o_view_nocontent) {
+            display: flex;
+            flex-direction: column;
+
+            > .o_view_nocontent {
+                position: relative;
+                flex: 1 0 auto;
+            }
+
+            // What precedes the helper keeps its own height, as in the block flow: the column
+            // never squeezes it to make room for the helper.
+            > :not(.o_view_nocontent) {
+                flex-shrink: 0;
+            }
+        }
     }
 
-    // Back from the offline action helper. Stacked above the helper overlay, whatever its z-index,
-    // so it stays tappable; the stage body clips it, so it never covers the header.
+    // Back from the offline action helper, in its own row above the helper in the stage body's
+    // flow. The two boxes never overlap, so Back needs no stacking order to stay tappable; the
+    // stage body clips it, so it never covers the header.
     .o_crm_mobile_pipeline_back {
-        position: relative;
-        z-index: calc(var(--o-view-nocontent-zindex, 1) + 1);
         display: inline-flex;
         align-items: center;
         justify-content: center;
