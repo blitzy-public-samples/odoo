@@ -2372,7 +2372,8 @@ describe("Mobile pipeline", () => {
         // keys, so "b0000002" (Proposition) is applied after "a0000001" (Qualified) and the server
         // keeps Proposition. A browser's IndexedDB returns the entries in key order, the Hoot
         // IndexedDB mock in insertion order: scheduling them in key order makes the mock replay
-        // them as a browser does.
+        // them as a browser does. Each is shaped as the framework queues a kanban record save, in
+        // a context naming the session user.
         await setOffline(true);
         const timeStamp = Date.now();
         const scheduleStageWrite = (key, stageId, stageName) =>
@@ -2380,7 +2381,7 @@ describe("Mobile pipeline", () => {
                 "crm.lead",
                 "web_save",
                 [[1], { stage_id: stageId }],
-                { context: {}, specification: {} },
+                { context: { uid: serverState.userId }, specification: {} },
                 {
                     id: key,
                     extras: {
@@ -2440,7 +2441,7 @@ describe("Mobile pipeline", () => {
 
         // The tie rule on its own, with no replay: tied keys rank in IndexedDB key order whatever
         // order they are passed in, a key that is an array index ("12345678") ranks before every
-        // other key, and a later timestamp outranks any tie.
+        // other key, and a later timestamp outranks any tie. Each is a call of the session user.
         const stageWrite = (key, stageId, at = timeStamp) => ({
             key,
             value: {
@@ -2448,7 +2449,7 @@ describe("Mobile pipeline", () => {
                 method: "web_save",
                 args: [[1], { stage_id: stageId }],
                 kwargs: {},
-                extras: { timeStamp: at },
+                extras: { timeStamp: at, uid: serverState.userId },
             },
         });
         const keyD = stageWrite("d0000004", 2);
@@ -2758,7 +2759,7 @@ describe("Mobile pipeline", () => {
             "crm.lead",
             "web_save",
             [[3], { stage_id: 1 }],
-            { context: {}, specification: {} },
+            { context: { uid: serverState.userId }, specification: {} },
             { extras: { timeStamp: Date.now(), viewType: "kanban", displayName: "Lead 3" } }
         );
         await animationFrame();
@@ -2816,9 +2817,17 @@ describe("Mobile pipeline", () => {
         const { crmOffline } = renderer;
         const offline = getService(OfflinePlugin);
         const timeStamp = Date.now();
+        // Calls of the session user: each carries its id in the extras, as the calls `runOrQueue`
+        // queues do.
         const schedule = (model, method, args, kwargs, at) =>
             offline.scheduleORM(model, method, args, kwargs, {
-                extras: { timeStamp: at, viewType: "kanban", displayName: "Lead", changes: {} },
+                extras: {
+                    timeStamp: at,
+                    viewType: "kanban",
+                    displayName: "Lead",
+                    changes: {},
+                    uid: serverState.userId,
+                },
             });
 
         // Offline, none of these changes what New (displayed) shows: stage writes of three leads
@@ -2966,7 +2975,8 @@ describe("Mobile pipeline", () => {
 
         // Tied writes rank in replay order (a key that is an array index before any other key,
         // the other keys in key order), the first entry kept on an exact tie; a write of several
-        // leads counts for each; a create whose stage is NaN matches no stage.
+        // leads counts for each; a create whose stage is NaN matches no stage. Each is a call of
+        // the session user.
         const call = (key, args, at = timeStamp, kwargs = {}) => ({
             key,
             value: {
@@ -2974,7 +2984,7 @@ describe("Mobile pipeline", () => {
                 method: "web_save",
                 args,
                 kwargs,
-                extras: { timeStamp: at },
+                extras: { timeStamp: at, uid: serverState.userId },
             },
         });
         const keyD = call("d0000004", [[1], { stage_id: 2 }]);
@@ -5033,7 +5043,8 @@ function holdRequests(route, label) {
 
 /**
  * Queues a `crm.lead` save in the framework offline queue with the extras of a form save made
- * offline in the pipeline action, as another view of the action would queue it.
+ * offline in the pipeline action, as another view of the action would queue it: in a context
+ * naming the session user.
  *
  * @param {number[]} resIds `[]` for a create
  * @param {Object} values
@@ -5044,7 +5055,7 @@ function queueLeadSave(resIds, values) {
         "crm.lead",
         "web_save",
         [resIds, values],
-        { context: {}, specification: {} },
+        { context: { uid: serverState.userId }, specification: {} },
         {
             extras: {
                 actionId: PIPELINE_ACTION_ID,
@@ -14098,7 +14109,7 @@ function pendingCardOf(key) {
 /**
  * Schedules a call in the framework offline queue as another writer of the queue does (a lead
  * form saved offline sends its values only, without the card's display values), with the extras
- * the offline systray reads.
+ * the offline systray reads and the session user's id as `uid`, the origin `runOrQueue` stamps.
  *
  * @param {string} model
  * @param {"web_save" | "action_archive"} method
@@ -14115,6 +14126,7 @@ function scheduleCall(model, method, args, extras = {}) {
             timeStamp: Date.now(),
             displayName: "",
             changes: {},
+            uid: serverState.userId,
             ...extras,
         },
     });
@@ -15040,8 +15052,8 @@ describe("Mobile lead card guards", () => {
  */
 describe("Remaining card branches", () => {
     /**
-     * Queues a call in the framework offline queue as a framework view queues it (the card queues
-     * its own calls through `runOrQueue`).
+     * Queues a call in the framework offline queue as a framework view queues it, in a context
+     * naming the session user (the card queues its own calls through `runOrQueue`).
      *
      * @param {string} model
      * @param {string} method
@@ -15054,7 +15066,7 @@ describe("Remaining card branches", () => {
             model,
             method,
             args,
-            { context: {}, specification: {} },
+            { context: { uid: serverState.userId }, specification: {} },
             {
                 extras: {
                     actionId: PIPELINE_ACTION_ID,
@@ -15746,13 +15758,13 @@ describe("Remaining branches", () => {
         expect(loaded.includes(replacedLead3)).toBe(false);
         expect(loaded.includes(replacedLead2)).toBe(false);
 
-        // Offline, a queued stage write moves Lead 3 from Qualified to New.
+        // Offline, a queued stage write of the session user moves Lead 3 from Qualified to New.
         await setOffline(true);
         getService(OfflinePlugin).scheduleORM(
             "crm.lead",
             "web_save",
             [[3], { stage_id: 1 }],
-            { context: {}, specification: {} },
+            { context: { uid: serverState.userId }, specification: {} },
             { extras: { timeStamp: Date.now(), viewType: "kanban", displayName: "Lead 3" } }
         );
         await animationFrame();
@@ -15814,8 +15826,8 @@ describe("Remaining branches", () => {
         expectHeader("Proposition", 1, 40);
         expect(cardNames()).toEqual(["Lead 4"]);
 
-        // Offline, queued stage writes move Lead 4 to Qualified and Lead 1 from New to
-        // Proposition.
+        // Offline, queued stage writes of the session user move Lead 4 to Qualified and Lead 1
+        // from New to Proposition.
         await setOffline(true);
         const offline = getService(OfflinePlugin);
         const timeStamp = Date.now();
@@ -15827,7 +15839,7 @@ describe("Remaining branches", () => {
                 "crm.lead",
                 "web_save",
                 [[resId], { stage_id: stageId }],
-                { context: {}, specification: {} },
+                { context: { uid: serverState.userId }, specification: {} },
                 {
                     extras: {
                         timeStamp: timeStamp + index,
@@ -18566,8 +18578,9 @@ describe("Reconnections and replays", () => {
 
     /**
      * Writes a `crm.lead` save into the framework's persisted offline queue only, as another tab
-     * (or an earlier session) queues it: the in-memory queue of this tab does not hold it until
-     * the framework reads its persisted queue again, as each sync window begins.
+     * (or an earlier session) of the session user queues it, in a context naming that user: the
+     * in-memory queue of this tab does not hold it until the framework reads its persisted queue
+     * again, as each sync window begins.
      *
      * @param {string} key
      * @param {number[]} resIds `[]` for a create
@@ -18582,7 +18595,7 @@ describe("Reconnections and replays", () => {
                 model: "crm.lead",
                 method: "web_save",
                 args: [resIds, values],
-                kwargs: { context: {}, specification: {} },
+                kwargs: { context: { uid: serverState.userId }, specification: {} },
                 extras: {
                     actionId: PIPELINE_ACTION_ID,
                     actionName: "Pipeline",
@@ -20914,5 +20927,222 @@ describe("Activity read queue", () => {
         await activityReadsDone(renderer);
         expect.verifySteps(["types", "activities:3"]);
         expect(announced.splice(0)).toEqual(["types: silent", "activities:3: silent"]);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Queued calls of other users
+// -----------------------------------------------------------------------------
+
+describe("Queued calls of other users", () => {
+    test.tags("mobile");
+    test("mobile: calls another user or an unknown origin queued in the shared offline queue change nothing the pipeline and its cards show, while the session user's calls show and the queue keeps every call", async () => {
+        const errors = cachedReadErrors([
+            // the session user's stage move of Lead 2 takes it out of New: the types and the
+            // activities of Lead 1, the lead New still shows, both read online
+            TYPES,
+            ACTIVITIES,
+        ]);
+        expect.errors(errors.length);
+        const [activityId] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        const lead1 = cardOf("Lead 1");
+        const doneButton = `${lead1} .o_crm_mobile_activity_row[data-activity-id='${activityId}'] .o_crm_mobile_activity_done`;
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        const PIPELINE_STATUS = ".o_crm_mobile_pipeline > .o_crm_mobile_pipeline_status";
+        const totals = (stageId) => {
+            const renderer = renderers.at(-1);
+            const group = groupOf(renderer, stageId);
+            return [renderer.stageCount(group), renderer.stageRevenueValue(group)];
+        };
+        /** Everything the pipeline and its cards show, and the placement they derive. */
+        const shown = () => {
+            const renderer = renderers.at(-1);
+            return {
+                text: queryOne(".o_crm_mobile_pipeline").textContent,
+                cards: cardNames(),
+                totals: [1, 2, 3, 4].map(totals),
+                stages: [1, 2, 3, 4, 5].map((resId) =>
+                    renderer.displayStage(recordOf(renderer, resId))
+                ),
+                pendingCreates: [1, 2, 3, 4].map(
+                    (stageId) => renderer.pendingCreatesFor(groupOf(renderer, stageId)).length
+                ),
+                pendingSync: [1, 2, 3, 4, 5].map((resId) =>
+                    renderer.crmOffline.isRecordPendingSync(recordOf(renderer, resId))
+                ),
+                status: queryAllTexts(
+                    ".o_crm_mobile_pipeline_status, .o_crm_mobile_lead_card_status"
+                ),
+            };
+        };
+        expectHeader("New", 2, 120);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(1);
+        expect(doneButton).toHaveCount(1);
+        const before = shown();
+
+        // Another user of this browser profile queued, offline: a lead create from the quick
+        // create (that user's group context and stamp), parked when its replay was refused; a
+        // stage move of Lead 1 and an edit of Lead 2, as the framework queues record saves (that
+        // user's context); a follow-up on Lead 1 and the mark done of its activity, as the card
+        // queues them (that user's stamp). Calls of unknown origin, and one whose two markers
+        // disagree, are queued as well.
+        const offline = getService(OfflinePlugin);
+        const otherUid = serverState.userId + 1;
+        const timeStamp = Date.now();
+        const extrasOf = (displayName, changes, at, more = {}) => ({
+            actionId: PIPELINE_ACTION_ID,
+            actionName: "Pipeline",
+            viewType: "kanban",
+            timeStamp: timeStamp + at,
+            displayName,
+            changes,
+            ...more,
+        });
+        const foreignValues = {
+            name: "Foreign lead",
+            contact_name: "Alice Private",
+            phone: "+32472222222",
+            email_from: "alice.private@a-secret.example",
+            expected_revenue: 999,
+            stage_id: 1,
+        };
+        offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[], foreignValues],
+            {
+                context: { default_type: "opportunity", default_stage_id: 1, uid: otherUid },
+                specification: {},
+            },
+            {
+                extras: extrasOf("Foreign lead", foreignValues, 0, {
+                    uid: otherUid,
+                    error: "SessionExpiredException - Session expired",
+                }),
+            }
+        );
+        offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[1], { stage_id: 2 }],
+            { context: { uid: otherUid }, specification: {} },
+            { extras: extrasOf("Lead 1", { stage_id: { id: 2, display_name: "Qualified" } }, 1) }
+        );
+        offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[2], { name: "Lead 2 by another user", expected_revenue: 500 }],
+            { context: { uid: otherUid }, specification: {} },
+            { extras: extrasOf("Lead 2", { name: "Lead 2 by another user" }, 2) }
+        );
+        offline.scheduleORM(
+            "mail.activity",
+            "web_save",
+            [
+                [],
+                {
+                    res_model: "crm.lead",
+                    res_id: 1,
+                    activity_type_id: 1,
+                    summary: "Follow-up by another user",
+                    date_deadline: "2030-01-20",
+                    user_id: otherUid,
+                },
+            ],
+            { context: {}, specification: {} },
+            { extras: extrasOf("Email: Lead 1", {}, 3, { uid: otherUid }) }
+        );
+        offline.scheduleORM(
+            "mail.activity",
+            "action_archive",
+            [[activityId]],
+            {},
+            { extras: extrasOf("Email: Lead 1", {}, 4, { uid: otherUid }) }
+        );
+        offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Unknown lead", expected_revenue: 7, stage_id: 1 }],
+            { context: {}, specification: {} },
+            { extras: extrasOf("Unknown lead", {}, 5) }
+        );
+        offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[2], { stage_id: 3 }],
+            { context: {}, specification: {} },
+            { extras: extrasOf("Lead 2", {}, 6) }
+        );
+        offline.scheduleORM(
+            "crm.lead",
+            "web_save",
+            [[], { name: "Disputed lead", expected_revenue: 3, stage_id: 1 }],
+            { context: { uid: serverState.userId }, specification: {} },
+            { extras: extrasOf("Disputed lead", {}, 7, { uid: otherUid }) }
+        );
+        await animationFrame();
+        expect(queued()).toHaveLength(8);
+        const stored = queueSnapshot();
+        const storedEntries = Object.fromEntries(
+            queued().map((entry) => [entry.key, JSON.stringify(entry)])
+        );
+
+        // None of them shows: no pending card, no value of theirs, the same placement, counts and
+        // revenues, no Pending sync badge, no pending activity row, Mark done still offered, and
+        // nothing announced.
+        expect(shown()).toEqual(before);
+        expectHeader("New", 2, 120);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(".o_crm_mobile_pending_badge").toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(0);
+        expect(doneButton).toHaveCount(1);
+        expect(queryOne(".o_crm_mobile_pipeline").textContent).not.toMatch(
+            /Foreign|Alice|another user|Unknown lead|Disputed|999/
+        );
+        expect(renderers.at(-1).stageEntries).toEqual([]);
+        expect(queueSnapshot()).toBe(stored);
+
+        // The session user's own calls of the same kinds show at once: a quick create, announced
+        // and counted; the mark done of Lead 1's activity; a stage move of Lead 2, which places
+        // it in Qualified with its badge.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Own lead", expected_revenue: "50" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await advanceTime(1000);
+        expect(pendingCardNames()).toEqual(["Own lead"]);
+        expectHeader("New", 3, 170);
+        expect(PIPELINE_STATUS).toHaveText("Own lead: new lead pending sync.");
+        await contains(doneButton).click();
+        await animationFrame();
+        expect(
+            `${lead1} .o_crm_mobile_activity_row[data-activity-id='${activityId}'] .o_crm_mobile_pending_badge`
+        ).toHaveCount(1);
+        expect(doneButton).toHaveCount(0);
+        queueLeadSave([2], { stage_id: 2 });
+        await animationFrame();
+        expect(cardNames()).toEqual(["Own lead", "Lead 1"]);
+        expectHeader("New", 2, 150);
+        expect(totals(2)).toEqual([2, 50]);
+        const renderer = renderers.at(-1);
+        expect(renderer.displayStage(recordOf(renderer, 2))).toBe(2);
+        expect(renderer.crmOffline.isRecordPendingSync(recordOf(renderer, 2))).toBe(true);
+        expect(renderer.displayStage(recordOf(renderer, 1))).toBe(1);
+        expect(queued()).toHaveLength(11);
+
+        // Every call of the other user and of unknown origin is still queued, as it was stored.
+        for (const [key, json] of Object.entries(storedEntries)) {
+            expect(JSON.stringify(getService(OfflinePlugin)._ormToSync()[key])).toBe(json);
+        }
+        await activityReadsDone(renderer);
+        expect.verifyErrors(errors);
     });
 });

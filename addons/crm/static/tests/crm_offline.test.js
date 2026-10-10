@@ -8566,7 +8566,7 @@ describe("Remaining hook branches", () => {
 
         // Offline, Lead 1 is moved to Qualified, then another of its fields is saved from another
         // record instance: two queue entries, the later one without `stage_id`, both shaped as
-        // the framework queues a record save.
+        // the framework queues a record save (its context names the session user).
         await setOffline(true);
         const offline = getService(OfflinePlugin);
         const scheduleLeadSave = (values, changes, originalValues, timeStamp) =>
@@ -8574,7 +8574,7 @@ describe("Remaining hook branches", () => {
                 "crm.lead",
                 "web_save",
                 [[1], values],
-                { context: {}, specification: {} },
+                { context: { uid: user.userId }, specification: {} },
                 {
                     extras: {
                         actionId: undefined,
@@ -8651,15 +8651,15 @@ describe("Remaining hook branches", () => {
         expect(crmOffline.isRecordPendingSync(undefined)).toBe(false);
         expect(crmOffline.isRecordPendingSync(null)).toBe(false);
 
-        // Offline, a lead is created: the framework queues a `web_save` without id and keeps the
-        // entry's key on the new record as its `offlineId`.
+        // Offline, a lead is created: the framework queues a `web_save` without id (in a context
+        // naming the session user) and keeps the entry's key on the new record as its `offlineId`.
         await setOffline(true);
         const offline = getService(OfflinePlugin);
         const createKey = offline.scheduleORM(
             "crm.lead",
             "web_save",
             [[], { name: "Offline lead", stage_id: 1 }],
-            { context: {}, specification: {} },
+            { context: { uid: user.userId }, specification: {} },
             {
                 extras: {
                     actionId: undefined,
@@ -8784,12 +8784,13 @@ describe("Remaining hook branches", () => {
 
         await setOffline(true);
         const offline = getService(OfflinePlugin);
+        // Each in a context naming the session user, as every framework save's context does.
         const scheduleLeadSave = (ids, values, context, timeStamp) =>
             offline.scheduleORM(
                 "crm.lead",
                 "web_save",
                 [ids, values],
-                { context, specification: {} },
+                { context: { ...context, uid: user.userId }, specification: {} },
                 {
                     extras: {
                         actionId: undefined,
@@ -8895,8 +8896,9 @@ describe("Remaining hook branches", () => {
     });
 
     /**
-     * Queues, as the framework queues a kanban record save, a move of Lead 1 (in New) to a stage,
-     * under the given queue key (the `id` option of `scheduleORM`) and timestamp.
+     * Queues, as the framework queues a kanban record save (in a context naming the session
+     * user), a move of Lead 1 (in New) to a stage, under the given queue key (the `id` option of
+     * `scheduleORM`) and timestamp.
      *
      * @param {string | number} key
      * @param {number} stageId
@@ -8909,7 +8911,7 @@ describe("Remaining hook branches", () => {
             "crm.lead",
             "web_save",
             [[1], { stage_id: stageId }],
-            { context: {}, specification: {} },
+            { context: { uid: user.userId }, specification: {} },
             {
                 id: key,
                 extras: {
@@ -9024,7 +9026,7 @@ describe("Remaining hook branches", () => {
             "crm.lead",
             "web_save",
             undefined,
-            { context: {}, specification: {} },
+            { context: { uid: user.userId }, specification: {} },
             {
                 id: "a0000001",
                 extras: kanbanSaveExtras(
@@ -9039,7 +9041,7 @@ describe("Remaining hook branches", () => {
             "crm.lead",
             "web_save",
             [[], { name: "Offline lead", stage_id: 2 }],
-            { context: {}, specification: {} },
+            { context: { uid: user.userId }, specification: {} },
             {
                 id: "c0000003",
                 extras: kanbanSaveExtras(
@@ -9111,15 +9113,17 @@ async function mountHooksHarness() {
 
 /**
  * Schedules a call in the framework offline queue, through the framework, with the extras CRM
- * code gives its calls, and returns its entry exactly as the queue stores it (`{key, value}`).
+ * code gives its calls (the session user's id as `uid` included, unless `extras` gives another),
+ * and returns its entry exactly as the queue stores it (`{key, value}`).
  *
  * @param {string} model
  * @param {string} method
  * @param {any[]} args
  * @param {Object} [kwargs]
+ * @param {Object} [extras] merged over the default extras
  * @returns {{ key: number | string, value: Object }}
  */
-function scheduleQueueFixture(model, method, args, kwargs = {}) {
+function scheduleQueueFixture(model, method, args, kwargs = {}, extras = {}) {
     const offlinePlugin = getService(OfflinePlugin);
     const key = offlinePlugin.scheduleORM(model, method, args, kwargs, {
         extras: {
@@ -9127,6 +9131,8 @@ function scheduleQueueFixture(model, method, args, kwargs = {}) {
             timeStamp: Date.now(),
             displayName: `${model}/${method} ${JSON.stringify(args)}`,
             changes: {},
+            uid: user.userId,
+            ...extras,
         },
     });
     return offlinePlugin._ormToSync()[key];
@@ -9741,6 +9747,223 @@ describe("Shared hooks contract", () => {
         expect(crmOffline.pendingLeadCreates(2, [])).toEqual([]);
     });
 
+    test("queue readers present only the session user's calls: calls of another user, of no origin or whose origins disagree are left out, live and frozen, and the queue is unchanged", async () => {
+        const setOffline = mockOffline();
+        const crmOffline = await mountHooksHarness();
+        await setOffline(true);
+        const offlinePlugin = getService(OfflinePlugin);
+        const uid = user.userId;
+        const otherUid = uid + 1;
+        let timeStamp = Date.now();
+        /**
+         * Queues a call through the framework with the given origin markers, `contextUid` in the
+         * context of its kwargs and `stampUid` in its extras (each left out when `undefined`),
+         * and returns its entry as the queue stores it.
+         */
+        const schedule = (model, method, args, { contextUid, stampUid, error } = {}) => {
+            const context = contextUid === undefined ? {} : { uid: contextUid };
+            const extras = {
+                ...HARNESS_CONFIG,
+                timeStamp: timeStamp++,
+                displayName: "",
+                changes: {},
+            };
+            if (stampUid !== undefined) {
+                extras.uid = stampUid;
+            }
+            if (error) {
+                extras.error = error;
+            }
+            const key = offlinePlugin.scheduleORM(model, method, args, { context }, { extras });
+            return offlinePlugin._ormToSync()[key];
+        };
+        const activityCreate = (summary) => [[], { res_model: "crm.lead", res_id: 1, summary }];
+
+        // The session user's calls: a marker in the context, in the extras, or in both; a parked
+        // call counts like the others.
+        const ownCreate = schedule("crm.lead", "web_save", [[], { name: "Own", stage_id: 1 }], {
+            contextUid: uid,
+        });
+        const ownStageWrite = schedule("crm.lead", "web_save", [[1], { stage_id: 2 }], {
+            stampUid: uid,
+        });
+        const ownActivity = schedule("mail.activity", "web_save", activityCreate("Own call"), {
+            stampUid: uid,
+        });
+        const ownArchive = schedule("mail.activity", "action_archive", [[21]], {
+            contextUid: uid,
+            stampUid: uid,
+        });
+        const ownParked = schedule("crm.lead", "web_save", [[6], { priority: "1" }], {
+            contextUid: uid,
+            error: "AccessError - refused",
+        });
+        // Another user's calls, the later stage write of Lead 1 included, and a parked create
+        // holding that user's values.
+        const foreignCreate = schedule(
+            "crm.lead",
+            "web_save",
+            [
+                [],
+                {
+                    name: "Foreign",
+                    contact_name: "Alice Private",
+                    expected_revenue: 999,
+                    stage_id: 1,
+                },
+            ],
+            { contextUid: otherUid, stampUid: otherUid, error: "SessionExpiredException - expired" }
+        );
+        const foreignStageWrite = schedule("crm.lead", "web_save", [[1], { stage_id: 3 }], {
+            contextUid: otherUid,
+        });
+        const foreignWrite = schedule("crm.lead", "web_save", [[2], { name: "Foreign edit" }], {
+            contextUid: otherUid,
+        });
+        const foreignActivity = schedule("mail.activity", "web_save", activityCreate("Foreign"), {
+            stampUid: otherUid,
+        });
+        const foreignArchive = schedule("mail.activity", "action_archive", [[22]], {
+            stampUid: otherUid,
+        });
+        // Calls of unknown origin: no marker, a context made for no user, an id that is not a
+        // number.
+        const unknownCreate = schedule("crm.lead", "web_save", [[], { name: "?", stage_id: 1 }]);
+        schedule("crm.lead", "web_save", [[3], { stage_id: 2 }]);
+        schedule("mail.activity", "action_archive", [[23]]);
+        schedule("crm.lead", "web_save", [[4], { stage_id: 2 }], { contextUid: false });
+        schedule("crm.lead", "web_save", [[5], { stage_id: 2 }], { stampUid: String(uid) });
+        // Calls whose two markers disagree, the latest stage write of Lead 1 included.
+        const disputedCreate = schedule("crm.lead", "web_save", [[], { name: "!", stage_id: 1 }], {
+            contextUid: uid,
+            stampUid: otherUid,
+        });
+        schedule("crm.lead", "web_save", [[1], { stage_id: 4 }], {
+            contextUid: otherUid,
+            stampUid: uid,
+        });
+        schedule("mail.activity", "action_archive", [[24]], {
+            contextUid: uid,
+            stampUid: otherUid,
+        });
+        const stored = offlinePlugin._ormToSync();
+        const storedJson = JSON.stringify(stored);
+        const allEntries = Object.values(stored);
+        expect(allEntries).toHaveLength(18);
+
+        /** Asserts that `actual` holds exactly the `expected` entries, as stored, in order. */
+        const expectEntries = (actual, expected) => {
+            expect(actual).toHaveLength(expected.length);
+            expected.forEach((entry, index) => expect(actual[index]).toBe(entry));
+        };
+        const own = [ownCreate, ownStageWrite, ownActivity, ownArchive, ownParked];
+        const foreign = [
+            foreignCreate,
+            foreignStageWrite,
+            foreignWrite,
+            foreignActivity,
+            foreignArchive,
+        ];
+        expect(queueKeys(crmOffline.queuedEntries())).toEqual(queueKeys(own));
+        for (const entry of crmOffline.queuedEntries()) {
+            expect(entry).toBe(stored[entry.key]);
+        }
+
+        // Every reader answers from the session user's calls only, from the live queue and from
+        // any array holding every call (malformed ones included), scanned or frozen, in either
+        // order.
+        const malformed = [
+            { key: "m1", value: null },
+            { key: "m2", value: "crm.lead" },
+            {
+                key: "m3",
+                value: { model: "crm.lead", method: "web_save", args: [[], { stage_id: 1 }] },
+            },
+            {
+                key: "m4",
+                value: {
+                    model: "crm.lead",
+                    method: "web_save",
+                    args: [[1], { stage_id: 2 }],
+                    kwargs: null,
+                    extras: null,
+                },
+            },
+        ];
+        const frozenAll = Object.freeze([...allEntries]);
+        const lists = [
+            undefined,
+            [...allEntries],
+            [...allEntries].reverse(),
+            frozenAll,
+            Object.freeze([...allEntries].reverse()),
+            [...malformed, ...allEntries],
+            Object.freeze([...allEntries, ...malformed]),
+        ];
+        const expectOwnAnswers = (list) => {
+            expectEntries(crmOffline.pendingLeadCreates(1, list), [ownCreate]);
+            expect(crmOffline.latestStageWrite(1, list)).toBe(ownStageWrite);
+            for (const resId of [2, 3, 4, 5, 6]) {
+                expect(crmOffline.latestStageWrite(resId, list)).toBe(undefined);
+            }
+            expectEntries(crmOffline.pendingActivityCalls(1, list), [ownActivity, ownArchive]);
+            expectEntries(crmOffline.pendingActivityCalls(2, list), [ownArchive]);
+        };
+        for (const list of lists) {
+            expectOwnAnswers(list);
+        }
+
+        // The pending-sync predicate, by the record's queue key and by a scan of the queue.
+        const isPending = (resModel, resId, offlineId) =>
+            crmOffline.isRecordPendingSync({ resModel, resId, offlineId });
+        expect(isPending("crm.lead", false, ownCreate.key)).toBe(true);
+        expect(isPending("crm.lead", false, foreignCreate.key)).toBe(false);
+        expect(isPending("crm.lead", false, unknownCreate.key)).toBe(false);
+        expect(isPending("crm.lead", false, disputedCreate.key)).toBe(false);
+        expect(isPending("crm.lead", 1)).toBe(true);
+        expect(isPending("crm.lead", 6)).toBe(true);
+        expect(isPending("mail.activity", 21)).toBe(true);
+        for (const resId of [2, 3, 4, 5]) {
+            expect(isPending("crm.lead", resId)).toBe(false, { message: `crm.lead ${resId}` });
+        }
+        for (const resId of [22, 23, 24]) {
+            expect(isPending("mail.activity", resId)).toBe(false, { message: `activity ${resId}` });
+        }
+        // A record that adopted another user's entry under its key: that entry does not count.
+        expect(isPending("crm.lead", 2, foreignWrite.key)).toBe(false);
+        expect(isPending("crm.lead", 1, foreignStageWrite.key)).toBe(true);
+
+        // Another session user in the same browser profile sees that user's calls only, from the
+        // same frozen array too (its index is built again for that user); a session user without
+        // a valid id sees none.
+        serverState.userId = otherUid;
+        expect(queueKeys(crmOffline.queuedEntries())).toEqual(queueKeys(foreign));
+        expectEntries(crmOffline.pendingLeadCreates(1, frozenAll), [foreignCreate]);
+        expect(crmOffline.latestStageWrite(1, frozenAll)).toBe(foreignStageWrite);
+        expectEntries(crmOffline.pendingActivityCalls(1, frozenAll), [
+            foreignActivity,
+            foreignArchive,
+        ]);
+        expect(isPending("crm.lead", 2)).toBe(true);
+        expect(isPending("crm.lead", false, ownCreate.key)).toBe(false);
+        serverState.userId = false;
+        expect(crmOffline.queuedEntries()).toEqual([]);
+        expect(crmOffline.pendingLeadCreates(1, frozenAll)).toEqual([]);
+        expect(crmOffline.latestStageWrite(1, frozenAll)).toBe(undefined);
+        expect(crmOffline.pendingActivityCalls(1, frozenAll)).toEqual([]);
+        expect(isPending("crm.lead", 1)).toBe(false);
+        serverState.userId = uid;
+        for (const list of lists) {
+            expectOwnAnswers(list);
+        }
+
+        // Reading changed nothing in the queue: every call is still there, as it was stored.
+        expect(JSON.stringify(offlinePlugin._ormToSync())).toBe(storedJson);
+        for (const entry of allEntries) {
+            expect(offlinePlugin._ormToSync()[entry.key]).toBe(entry);
+        }
+    });
+
     test("runOrQueue: an invalid call is refused before anything runs, is requested or is queued", async () => {
         const setOffline = mockOffline();
         const requests = watchRequestsFromNowOn();
@@ -9794,6 +10017,7 @@ describe("Shared hooks contract", () => {
             "timeStamp",
             "displayName",
             "changes",
+            "uid",
         ];
         /**
          * Asserts that `outcome` is a queued call whose entry holds `value`, the timestamp being
@@ -9814,7 +10038,12 @@ describe("Shared hooks contract", () => {
             });
             return entry;
         };
-        const defaultExtras = { ...HARNESS_CONFIG, displayName: "", changes: {} };
+        const defaultExtras = {
+            ...HARNESS_CONFIG,
+            displayName: "",
+            changes: {},
+            uid: user.userId,
+        };
 
         const result = [{ id: 9, name: "Quick" }];
         const done = await crmOffline.runOrQueue({
@@ -9881,13 +10110,60 @@ describe("Shared hooks contract", () => {
         });
         const archivedEntry = expectQueued(
             archived,
-            { ...archive, extras: { ...HARNESS_CONFIG, ...extras } },
+            { ...archive, extras: { ...HARNESS_CONFIG, ...extras, uid: user.userId } },
             before
         );
         expect(archived.key).not.toBe(queued.key);
         expect(queueKeys(crmOffline.queuedEntries())).toEqual(
             queueKeys([queuedEntry, archivedEntry])
         );
+        expect.verifySteps([]);
+    });
+
+    test("runOrQueue stamps the session user's id in the extras of the call it queues, never in its kwargs: the replay sends what the online call sends", async () => {
+        const received = [];
+        onRpc("mail.activity", "action_archive", ({ args, kwargs }) => {
+            received.push(JSON.parse(JSON.stringify({ args, kwargs })));
+            return true;
+        });
+        const setOffline = mockOffline();
+        const crmOffline = await mountHooksHarness();
+        const offlinePlugin = getService(OfflinePlugin);
+        const archive = {
+            model: "mail.activity",
+            method: "action_archive",
+            args: [[5]],
+            kwargs: { context: { active_test: false } },
+        };
+
+        // Online, the call itself: what the server receives from it.
+        await crmOffline.orm.call(archive.model, archive.method, archive.args, archive.kwargs);
+        expect(received).toHaveLength(1);
+        const [onlineCall] = received;
+
+        // Offline, it is queued as given, with the session user's id in its extras only, and the
+        // CRM readers present it as the session user's.
+        await setOffline(true);
+        const outcome = await crmOffline.runOrQueue({
+            online: async () => expect.step("online call"),
+            queue: archive,
+        });
+        expect(outcome.queued).toBe(true);
+        const entry = offlinePlugin._ormToSync()[outcome.key];
+        expect(entry.value.extras.uid).toBe(user.userId);
+        expect(copyOrmCall(entry.value)).toEqual(copyOrmCall(archive));
+        expect(entry.value.kwargs).toEqual({ context: { active_test: false } });
+        expect(crmOffline.queuedEntries()).toEqual([entry]);
+        expect(crmOffline.pendingActivityCalls(1)).toEqual([entry]);
+
+        // Reconnect: the replay sends exactly what the online call sent (the session context the
+        // ORM adds to every call included), and no extras.
+        await setOffline(false);
+        await letQueueReplay(1);
+        expect(received).toHaveLength(2);
+        expect(received[1]).toEqual(onlineCall);
+        expect(received[1].kwargs.context.uid).toBe(user.userId);
+        expect(queuedEntries()).toEqual([]);
         expect.verifySteps([]);
     });
 

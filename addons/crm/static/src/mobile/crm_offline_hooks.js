@@ -14,6 +14,9 @@
  *   framework's.
  * - New CRM code queues only `web_save` and `action_archive`: the shared offline systray renders
  *   a status for `web_save`, `unlink`/`web_unlink`, `action_archive` and `action_unarchive` only.
+ * - The framework queue belongs to the browser profile, not to a user: the CRM queue readers
+ *   present only the session user's calls and leave out every call of another or unknown origin
+ *   (see `isCurrentUserCall`), while the shared systray and the replay stay the framework's.
  * - The patches change nothing online and narrow behaviour only offline, for CRM targets, with
  *   three exceptions. The availability registration (`RelationalModel._setAvailableOffline`) never
  *   registers the forecast views or the activity report, online too, while their online loading
@@ -34,6 +37,7 @@ import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { ORM } from "@web/core/orm_plugin";
 import { UIPlugin } from "@web/core/ui/ui_plugin";
+import { user } from "@web/core/user";
 import { patch } from "@web/core/utils/patch";
 import { Record as RelationalRecord } from "@web/model/relational_model/record";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
@@ -369,7 +373,8 @@ export async function loadLeadActivities(orm, resId, onUpdate, options = {}) {
  * @property {() => boolean} isSmall the small-screen signal
  * @property {(actionId: number, viewType?: string, resId?: number) => boolean} isAvailableOffline
  *   whether the framework registered the action, its view or its record as available offline
- * @property {() => QueueEntry[]} queuedEntries the entries of the live queue
+ * @property {() => QueueEntry[]} queuedEntries the entries of the live queue that are the session
+ *   user's calls
  * @property {(record: RelationalRecord | undefined | null) => boolean} isRecordPendingSync
  * @property {(stageValue: number | false, entries?: QueueEntry[]) =>
  *   QueueEntry[]} pendingLeadCreates
@@ -378,6 +383,41 @@ export async function loadLeadActivities(orm, resId, onUpdate, options = {}) {
  * @property {(params: { online: () => Promise<any>, queue: Object }) =>
  *   Promise<{ queued: true, key: string | number } | { queued: false, result: any }>} runOrQueue
  */
+
+/**
+ * Whether a queued call originates from the session user (`user.userId`): the only calls the CRM
+ * queue readers present. The framework offline queue belongs to the browser profile, not to a
+ * user, so on a shared browser profile it may hold calls another user queued, parked or not yet
+ * replayed. The CRM pipeline and its cards present only the session user's calls: no other
+ * user's queued values, pending rows, stage placement, totals, badges or announcements. The
+ * shared offline systray and the replay stay the framework's, and no entry is changed or removed.
+ *
+ * The origin is read from two markers:
+ * - `kwargs.context.uid`: the user the call's context was made for. Every call the framework
+ *   queues for a record or a list carries the record's or list's context, which the user context
+ *   gives a `uid`, and so does the CRM quick create, which queues with its stage group's context.
+ * - `extras.uid`: the session user `runOrQueue` stamps on every call it queues. The replay sends
+ *   only the model, method, args and kwargs, so the stamp never reaches the server and the
+ *   replayed call is exactly the online one.
+ *
+ * Unknown origins fail closed: a call is the session user's only when it carries at least one
+ * marker, every marker it carries is the session user's id, and the session user has a valid id.
+ * A call with no marker, a marker naming another user or no user, or two markers that disagree is
+ * not presented.
+ *
+ * @param {QueuedCall | undefined} value a queued call (an entry's `value`)
+ * @returns {boolean}
+ */
+function isCurrentUserCall(value) {
+    const uid = user.userId;
+    if (!Number.isInteger(uid) || uid <= 0 || !value || typeof value !== "object") {
+        return false;
+    }
+    const markers = [value.kwargs?.context?.uid, value.extras?.uid].filter(
+        (marker) => marker !== undefined
+    );
+    return markers.length > 0 && markers.every((marker) => marker === uid);
+}
 
 /** The greatest array index: a property name that is a canonical integer up to it is an index. */
 const MAX_ARRAY_INDEX = 2 ** 32 - 2;
@@ -444,11 +484,12 @@ function compareReplayOrder(entryA, entryB) {
 }
 
 /**
- * @typedef {{ latestStageWrites: Map<number, QueueEntry>,
+ * @typedef {{ uid: number | false | undefined, latestStageWrites: Map<number, QueueEntry>,
  *   leadCreates: Map<number | false | undefined, QueueEntry[]> }} StageIndex what the stage
- *   readers look up in an array of queue entries: by lead id, the queued `stage_id` write of the
- *   lead that comes last in replay order; by stage id, the queued `crm.lead` creates targeting the
- *   stage, in replay order. It holds the entries themselves.
+ *   readers look up in an array of queue entries, among the calls of `uid`, the session user it
+ *   was built for (see `isCurrentUserCall`): by lead id, the queued `stage_id`
+ *   write of the lead that comes last in replay order; by stage id, the queued `crm.lead` creates
+ *   targeting the stage, in replay order. It holds the entries themselves.
  */
 
 /**
@@ -462,21 +503,27 @@ const stageIndexes = new WeakMap();
 /**
  * Indexes an array of queue entries for the stage readers in one traversal that reads each
  * entry's `value` once. The index answers exactly as the direct scans of `pendingLeadCreates` and
- * `latestStageWrite` do: the same entries, in the same order, stage-write ties resolved by
- * `compareReplayOrder` and the first entry kept on an exact tie. A stage id that is `NaN` is not
- * indexed, because it equals no stage id.
+ * `latestStageWrite` do: only the session user's calls (see `isCurrentUserCall`), the same
+ * entries, in the same order, stage-write ties resolved by `compareReplayOrder` and the first
+ * entry kept on an exact tie. A stage id that is `NaN` is not indexed, because it equals no stage
+ * id.
  *
  * @param {readonly QueueEntry[]} entries
  * @returns {StageIndex}
  */
 function buildStageIndex(entries) {
+    const uid = user.userId;
     /** @type {Map<number, { key: string | number, value: QueuedCall, entry: QueueEntry }>} */
     const latest = new Map();
     /** By stage id, the creates targeting it, each held as `{ key, value, entry }` like above. */
     const creates = new Map();
     for (const entry of entries) {
         const { key, value } = entry;
-        if (value?.model !== "crm.lead" || value.method !== "web_save") {
+        if (
+            !isCurrentUserCall(value) ||
+            value.model !== "crm.lead" ||
+            value.method !== "web_save"
+        ) {
             continue;
         }
         const [ids, vals] = value.args ?? [];
@@ -519,13 +566,14 @@ function buildStageIndex(entries) {
             stageCreates.map(({ entry }) => entry)
         );
     }
-    return { latestStageWrites, leadCreates };
+    return { uid, latestStageWrites, leadCreates };
 }
 
 /**
  * The stage index of a frozen entries array, built on its first use and reused for every later
- * reader call on the same array. A frozen array cannot change, and the framework replaces a queue
- * entry rather than mutating it, so the index cannot go stale.
+ * reader call on the same array while the session user is the one it was built for, and built
+ * again otherwise. A frozen array cannot change, and the framework replaces a queue entry rather
+ * than mutating it, so the index cannot go stale.
  *
  * @param {readonly QueueEntry[]} entries
  * @returns {StageIndex | null} `null` unless `entries` is a frozen array: any other array may
@@ -536,7 +584,7 @@ function frozenStageIndex(entries) {
         return null;
     }
     let index = stageIndexes.get(entries);
-    if (!index) {
+    if (!index || index.uid !== user.userId) {
         index = buildStageIndex(entries);
         stageIndexes.set(entries, index);
     }
@@ -544,10 +592,11 @@ function frozenStageIndex(entries) {
 }
 
 /**
- * @typedef {{ creates: Map<number, { key: string | number, value: QueuedCall,
- *   entry: QueueEntry }[]>, archives: { key: string | number, value: QueuedCall,
- *   entry: QueueEntry }[], byLead: Map<number, QueueEntry[]> }} ActivityIndex what
- *   `pendingActivityCalls` looks up in an array of queue entries: by lead id, the queued
+ * @typedef {{ uid: number | false | undefined, creates: Map<number, { key: string | number,
+ *   value: QueuedCall, entry: QueueEntry }[]>, archives: { key: string | number,
+ *   value: QueuedCall, entry: QueueEntry }[], byLead: Map<number, QueueEntry[]> }} ActivityIndex
+ *   what `pendingActivityCalls` looks up in an array of queue entries, among the calls of `uid`,
+ *   the session user it was built for (see `isCurrentUserCall`): by lead id, the queued
  *   `mail.activity` creates targeting the lead; every queued `mail.activity` archive; and, filled on
  *   the first lookup of each lead, its answer in replay order. Each call is held with the `key` and
  *   `value` read once from its entry, so ranking reads no entry again.
@@ -563,18 +612,20 @@ const activityIndexes = new WeakMap();
 
 /**
  * Indexes an array of queue entries for `pendingActivityCalls` in one traversal that reads each
- * entry's `value` once. The index answers exactly as the direct scan does: the same entries, in
- * the same replay rank. A lead id that is `NaN` is not indexed, because it equals no lead id.
+ * entry's `value` once. The index answers exactly as the direct scan does: only the session
+ * user's calls (see `isCurrentUserCall`), the same entries, in the same replay rank. A lead id
+ * that is `NaN` is not indexed, because it equals no lead id.
  *
  * @param {readonly QueueEntry[]} entries
  * @returns {ActivityIndex}
  */
 function buildActivityIndex(entries) {
+    const uid = user.userId;
     const creates = new Map();
     const archives = [];
     for (const entry of entries) {
         const { key, value } = entry;
-        if (value?.model !== "mail.activity") {
+        if (!isCurrentUserCall(value) || value.model !== "mail.activity") {
             continue;
         }
         if (value.method === "action_archive") {
@@ -595,12 +646,13 @@ function buildActivityIndex(entries) {
             creates.set(vals.res_id, [{ key, value, entry }]);
         }
     }
-    return { creates, archives, byLead: new Map() };
+    return { uid, creates, archives, byLead: new Map() };
 }
 
 /**
  * The activity index of a frozen entries array, built on its first use and reused for every later
- * `pendingActivityCalls` call on the same array, as `frozenStageIndex` does for the stage readers.
+ * `pendingActivityCalls` call on the same array while the session user is the one it was built
+ * for, and built again otherwise, as `frozenStageIndex` does for the stage readers.
  *
  * @param {readonly QueueEntry[]} entries
  * @returns {ActivityIndex | null} `null` unless `entries` is a frozen array
@@ -610,7 +662,7 @@ function frozenActivityIndex(entries) {
         return null;
     }
     let index = activityIndexes.get(entries);
-    if (!index) {
+    if (!index || index.uid !== user.userId) {
         index = buildActivityIndex(entries);
         activityIndexes.set(entries, index);
     }
@@ -620,6 +672,10 @@ function frozenActivityIndex(entries) {
 /**
  * Component hook giving CRM code its offline state. Call it from a component `setup` (or from a
  * patched `setup`, or while a component's setup runs), like any hook.
+ *
+ * Every queue reader answers from the session user's calls only (see `isCurrentUserCall`), from
+ * the live queue and from an explicit `entries` array alike: a call another user queued in the
+ * same browser profile, or one whose origin is unknown, is never presented.
  *
  * A read of the live queue (`queuedEntries`, `isRecordPendingSync`, and the readers that take an
  * `entries` argument, `pendingLeadCreates`, `pendingActivityCalls` and `latestStageWrite`, when
@@ -652,15 +708,19 @@ export function useCrmOffline() {
     const ui = usePlugin(UIPlugin);
     const orm = usePlugin(ORM);
 
-    /** @returns {QueueEntry[]} */
+    /**
+     * @returns {QueueEntry[]} the entries of the live queue that are the session user's calls
+     *   (see `isCurrentUserCall`), as stored, in the queue's enumeration order
+     */
     function queuedEntries() {
-        return Object.values(offline._ormToSync());
+        return Object.values(offline._ormToSync()).filter(({ value }) => isCurrentUserCall(value));
     }
 
     /**
-     * Whether a record has a queued write the server has not received yet. The record's
-     * `offlineId` counts only while that key is still in the queue, because the record keeps it
-     * after replay or a systray discard removed the entry.
+     * Whether a record has a queued write of the session user (see `isCurrentUserCall`) the server
+     * has not received yet. The record's `offlineId` counts only while that key is still in the
+     * queue, because the record keeps it after replay or a systray discard removed the entry, and
+     * only while the entry under it is the session user's call.
      *
      * @param {RelationalRecord | undefined | null} record
      * @returns {boolean}
@@ -671,7 +731,11 @@ export function useCrmOffline() {
         }
         const queue = offline._ormToSync();
         const offlineId = record.offlineId;
-        if (offlineId !== undefined && offlineId !== null && queue[offlineId]) {
+        if (
+            offlineId !== undefined &&
+            offlineId !== null &&
+            isCurrentUserCall(queue[offlineId]?.value)
+        ) {
             return true;
         }
         const { resModel, resId } = record;
@@ -680,7 +744,8 @@ export function useCrmOffline() {
         }
         return Object.values(queue).some(
             ({ value }) =>
-                value?.model === resModel &&
+                isCurrentUserCall(value) &&
+                value.model === resModel &&
                 PENDING_RECORD_METHODS.includes(value.method) &&
                 Array.isArray(value.args?.[0]) &&
                 value.args[0].includes(resId)
@@ -688,12 +753,13 @@ export function useCrmOffline() {
     }
 
     /**
-     * Queued `crm.lead` creates targeting a stage: the stage written in the values, or else the
-     * default stage of the context they were created with.
+     * Queued `crm.lead` creates of the session user (see `isCurrentUserCall`) targeting a stage:
+     * the stage written in the values, or else the default stage of the context they were created
+     * with.
      *
      * @param {number | false} stageValue the stage id (a group's `serverValue`)
      * @param {QueueEntry[]} [entries] defaults to the live queue; a frozen array is indexed once
-     *   (see `frozenStageIndex`)
+     *   (see `frozenStageIndex`); another user's calls in it are left out
      * @returns {QueueEntry[]} a new array on every call, parked entries included, in replay rank
      *   (see `compareReplayOrder`): by `extras.timeStamp`, ties by the enumeration order of their
      *   queue keys rather than the leads' creation order, whatever the order of `entries`
@@ -706,7 +772,11 @@ export function useCrmOffline() {
         }
         return entries
             .filter(({ value }) => {
-                if (value?.model !== "crm.lead" || value.method !== "web_save") {
+                if (
+                    !isCurrentUserCall(value) ||
+                    value.model !== "crm.lead" ||
+                    value.method !== "web_save"
+                ) {
                     return false;
                 }
                 const [ids, vals] = value.args ?? [];
@@ -720,14 +790,16 @@ export function useCrmOffline() {
     }
 
     /**
-     * Queued activity calls of a lead: the `mail.activity` creates targeting it, plus every queued
-     * `mail.activity` archive (mark done), which callers match to an activity by `args[0][0]`.
+     * Queued activity calls of the session user (see `isCurrentUserCall`) for a lead: the
+     * `mail.activity` creates targeting it, plus every queued `mail.activity` archive (mark done),
+     * which callers match to an activity by `args[0][0]`.
      *
      * @param {number} resId the lead id
      * @param {QueueEntry[]} [entries] defaults to the live queue; the mobile pipeline gives its
      *   cards the live queue united with its sync-window copy, so a replayed call keeps its row
      *   until the reload that incorporates it; a frozen array is indexed once (see
-     *   `frozenActivityIndex`), so every card of the pipeline reads each entry once in all
+     *   `frozenActivityIndex`), so every card of the pipeline reads each entry once in all;
+     *   another user's calls in it are left out
      * @returns {QueueEntry[]} a new array, parked entries included, in replay rank (see
      *   `compareReplayOrder`): by `extras.timeStamp`, ties by the enumeration order of their queue
      *   keys rather than the order of the calls
@@ -747,7 +819,7 @@ export function useCrmOffline() {
         }
         return entries
             .filter(({ value }) => {
-                if (value?.model !== "mail.activity") {
+                if (!isCurrentUserCall(value) || value.model !== "mail.activity") {
                     return false;
                 }
                 if (value.method === "action_archive") {
@@ -764,17 +836,17 @@ export function useCrmOffline() {
     }
 
     /**
-     * The latest pending intended stage of a lead: among the queued `crm.lead` writes of `stage_id`
-     * for it, the one ranked last for replay (see `compareReplayOrder`), the greatest
-     * `extras.timeStamp` with ties by the enumeration order of their queue keys. A parked entry
-     * (`extras.error`) counts like the others, although `OfflinePlugin._syncORM` skips it on
-     * replay, so its stage need not reach the server; the server ends with the returned write's
-     * stage only if that write replays successfully. The result does not depend on the order of
-     * `entries`.
+     * The latest pending intended stage of a lead: among the session user's queued `crm.lead`
+     * writes of `stage_id` for it (see `isCurrentUserCall`), the one ranked last for replay (see
+     * `compareReplayOrder`), the greatest `extras.timeStamp` with ties by the enumeration order of
+     * their queue keys. A parked entry (`extras.error`) counts like the others, although
+     * `OfflinePlugin._syncORM` skips it on replay, so its stage need not reach the server; the
+     * server ends with the returned write's stage only if that write replays successfully. The
+     * result does not depend on the order of `entries`.
      *
      * @param {number} resId the lead id
      * @param {QueueEntry[]} [entries] defaults to the live queue; a frozen array is indexed once
-     *   (see `frozenStageIndex`)
+     *   (see `frozenStageIndex`); another user's calls in it are left out
      * @returns {QueueEntry | undefined}
      */
     function latestStageWrite(resId, entries = queuedEntries()) {
@@ -785,7 +857,11 @@ export function useCrmOffline() {
         let latest;
         for (const entry of entries) {
             const { value } = entry;
-            if (value?.model !== "crm.lead" || value.method !== "web_save") {
+            if (
+                !isCurrentUserCall(value) ||
+                value.model !== "crm.lead" ||
+                value.method !== "web_save"
+            ) {
                 continue;
             }
             const [ids, vals] = value.args ?? [];
@@ -809,8 +885,11 @@ export function useCrmOffline() {
      * Only `web_save` (record creation) and `action_archive` may be queued: they are the families
      * the shared offline systray renders. The queued call carries the extras the systray reads:
      * the current action, the view type (overridable), a timestamp taken when the call is
-     * scheduled, a display name and the display values of the changes (always an object). The
-     * framework keys the entry by a hash of its value.
+     * scheduled, a display name and the display values of the changes (always an object). It
+     * also carries `uid`, the session user's id, the origin marker by which the CRM queue readers
+     * tell the session user's calls (see `isCurrentUserCall`); the systray reads no such key, and
+     * the replay sends no extras, so the model, method, args and kwargs replayed are exactly the
+     * ones given. The framework keys the entry by a hash of its value.
      *
      * A `NonSecureContextError` raised by the framework (offline features need a secure context)
      * propagates, as it does for framework record saves.
@@ -857,6 +936,7 @@ export function useCrmOffline() {
                 timeStamp: Date.now(),
                 displayName: queue.extras?.displayName ?? "",
                 changes: queue.extras?.changes ?? {},
+                uid: user.userId,
             };
             const key = offline.scheduleORM(
                 queue.model,
