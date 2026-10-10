@@ -33,7 +33,9 @@
  *   reconnection that is not a recovery reconnection; a loss the framework's check confirms is
  *   recovered from as any other;
  * - activity reads are bounded pages that carry the lead's total, so the card shows the total and
- *   says what the page misses ("Show all" online, a muted count offline);
+ *   says what the page misses ("Show all" online, a muted count offline); until a lead's
+ *   activities are read, its card shows, names and announces no count, and its list says they
+ *   are loading (online) or not available offline;
  * - the lead card (44x44 touch targets, pending-sync badge, stage list, activities), the six-field
  *   bottom-sheet quick create and the activity controls queue their writes offline through the
  *   shared framework queue, and are disabled when their data is missing; the card's stage list
@@ -112,7 +114,7 @@ import {
     toggleSearchBarMenu,
     validateSearch,
 } from "@web/../tests/web_test_helpers";
-import { status } from "@odoo/owl";
+import { onMounted, onWillStart, status } from "@odoo/owl";
 
 import { crmModels, defineCrmModels } from "@crm/../tests/crm_test_helpers";
 import { CrmMobileLeadCard } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
@@ -142,7 +144,7 @@ import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import { deserializeDate, formatDate, serializeDate, today } from "@web/core/l10n/dates";
-import { ConnectionLostError } from "@web/core/network/rpc";
+import { ConnectionLostError, rpcBus } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { UIPlugin } from "@web/core/ui/ui_plugin";
@@ -327,6 +329,22 @@ const TYPES = "mail.activity.type/web_search_read";
 /** Resolves once the offline plugin has read which items are available offline. */
 async function visitedReady() {
     await getService(OfflinePlugin).getVisitedStatus();
+    await animationFrame();
+}
+
+/**
+ * Resolves once a pipeline has sent every activity and type read its revalidation queued (they
+ * go after the next paint, a few at a time) and the server has answered each of them.
+ *
+ * @param {CrmMobilePipeline} renderer
+ */
+async function activityReadsDone(renderer) {
+    await waitUntil(
+        () =>
+            !renderer._activityReadPump &&
+            !renderer._activityReadQueue.length &&
+            !renderer._activityReadsInFlight
+    );
     await animationFrame();
 }
 
@@ -785,6 +803,21 @@ function mountPipeline(params = {}) {
     });
 }
 
+/**
+ * Mounts the pipeline (`mountPipeline`), then resolves once the activity and type reads its first
+ * revalidation queued, sent only after the mounted pipeline's first paint, have all been
+ * answered (`activityReadsDone`): the pipeline as the user sees it once loaded. For tests whose
+ * server answers those reads.
+ *
+ * @param {Object} [params] extra `mountView` params
+ */
+async function mountPipelineWithReads(params) {
+    const renderers = captureInstances(CrmMobilePipeline);
+    const view = await mountPipeline(params);
+    await activityReadsDone(renderers.at(-1));
+    return view;
+}
+
 beforeEach(() => {
     patchWithCleanup(AnimatedNumber, { enableAnimations: false });
 });
@@ -1238,11 +1271,12 @@ describe("Mobile pipeline", () => {
     test.tags("mobile");
     test("mobile: cached stage renders offline; uncached stage and uncached lead show offline action helper", async () => {
         const errors = cachedReadErrors([
-            // the offline reload of the pipeline, then the activities revalidated after it
+            // the offline reload of the pipeline, then the types and the activities revalidated
+            // after it
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
             // the types revalidated on each stage displayed: Qualified, Proposition, Won,
             // Proposition, Qualified (the leads of Qualified and Proposition were never read)
             TYPES,
@@ -1250,10 +1284,10 @@ describe("Mobile pipeline", () => {
             TYPES,
             TYPES,
             TYPES,
-            // back on New: its two leads and the types
-            ACTIVITIES,
-            ACTIVITIES,
+            // back on New: the types and its two leads
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -1653,23 +1687,23 @@ describe("Mobile pipeline", () => {
     test.tags("mobile");
     test("mobile: the uncached lead helper focuses Back, describes it with the helper text and hands the focus back when left", async () => {
         const errors = cachedReadErrors([
-            // two offline reloads while the helper is displayed, each followed by the activities
-            // and the types revalidated on the reloaded stage list
+            // two offline reloads while the helper is displayed, each followed by the types and
+            // the activities revalidated on the reloaded stage list
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
             // the types revalidated when Qualified is displayed (Lead 3's activities were never
             // read, so they are not cached and raise nothing)
             TYPES,
-            // New displayed again: its two leads and the types
-            ACTIVITIES,
-            ACTIVITIES,
+            // New displayed again: the types and its two leads
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -2048,13 +2082,13 @@ describe("Mobile pipeline", () => {
     test.tags("mobile");
     test("mobile: totals follow offline creation and movement", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified: Lead 1's activities (cached) and the types; Lead 3's
+            // the move displays Qualified: the types and Lead 1's activities (cached); Lead 3's
             // activities were never read, so they are not cached and raise nothing
-            ACTIVITIES,
             TYPES,
-            // back on New: Lead 2's activities and the types
             ACTIVITIES,
+            // back on New: the types and Lead 2's activities
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -2088,22 +2122,29 @@ describe("Mobile pipeline", () => {
     test.tags("mobile");
     test("mobile: pending stage placement and totals survive remounts and reloads", async () => {
         const errors = cachedReadErrors([
-            // the first move displays Qualified (Lead 1's activities, the types; Lead 3's were
-            // never cached)
-            ACTIVITIES,
+            // the reads the online back queued go once the connection has dropped: the types and
+            // both leads' activities, answered by the cache
             TYPES,
-            // Lead 1's form, then the pipeline rebuilt from the cache with its activities
+            ACTIVITIES,
+            ACTIVITIES,
+            // the first move displays Qualified: the types and Lead 1's activities (Lead 3's were
+            // never cached)
+            TYPES,
+            ACTIVITIES,
+            // Lead 1's form, then the pipeline rebuilt from the cache, which reads the types and
+            // the activities Qualified shows (Lead 1's; Lead 3's were never cached)
             "crm.lead/web_read",
             LEAD_GROUPS,
-            ACTIVITIES,
             TYPES,
-            // the offline reload, then the activities revalidated after it
+            ACTIVITIES,
+            // the offline reload, then the types and Lead 1's activities revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
             TYPES,
-            // the second move displays Proposition (Lead 1's activities, the types)
             ACTIVITIES,
+            // the second move displays Proposition: the types and Lead 1's activities (Lead 4's
+            // were never cached)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -2115,8 +2156,10 @@ describe("Mobile pipeline", () => {
         const renderers = captureInstances(CrmMobilePipeline);
         await mountWithCleanup(WebClient);
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
-        // Online: the pipeline and Lead 1's form are visited, hence available offline.
+        // Online: the pipeline, with its leads' activities and the types, and Lead 1's form are
+        // visited, hence available offline.
         await getService("action").doAction(PIPELINE_ACTION_ID);
+        await activityReadsDone(renderers[0]);
         await contains(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_name`).click();
         expect(".o_form_view").toHaveCount(1);
         await contains(".o_back_button").click();
@@ -2239,12 +2282,9 @@ describe("Mobile pipeline", () => {
 
     test.tags("mobile");
     test("mobile: a parked stage move keeps its placement and totals after reconciliation, and a systray discard ends them", async () => {
-        const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types)
-            ACTIVITIES,
-            TYPES,
-        ]);
-        expect.errors(errors.length);
+        // Offline, no read raises: the mount's reads go once the connection has dropped, with
+        // nothing cached yet, so the reads of the move's revalidation (the types, Lead 1's and
+        // Lead 3's activities) find nothing cached either.
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
         onRpc("crm.lead", "web_save", () => {
@@ -2302,22 +2342,13 @@ describe("Mobile pipeline", () => {
         expectHeader("New", 2, 120);
         expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
         expect.verifySteps([]);
-        expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
     test("mobile: stage writes of a lead with the same timestamp are placed where the framework replay leaves it", async () => {
-        const errors = cachedReadErrors([
-            // the queued writes take Lead 1 out of New (Lead 2's activities, the types), then
-            // Qualified is displayed (the types; Lead 3's activities were never cached), then
-            // Proposition (Lead 1's activities, the types; Lead 4's were never cached)
-            ACTIVITIES,
-            TYPES,
-            TYPES,
-            ACTIVITIES,
-            TYPES,
-        ]);
-        expect.errors(errors.length);
+        // Offline, no read raises: the mount's reads go once the connection has dropped, with
+        // nothing cached yet, so the reads of the stages displayed then (the types and their
+        // leads' activities) find nothing cached either.
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
         onRpc("crm.lead", "web_save", ({ args }) => {
@@ -2430,7 +2461,6 @@ describe("Mobile pipeline", () => {
         expect(crmOffline.latestStageWrite(1, [indexKey, hashKey])).toBe(hashKey);
         const later = stageWrite("00000000", 4, timeStamp + 1);
         expect(crmOffline.latestStageWrite(1, [keyD, later, keyC, indexKey, hashKey])).toBe(later);
-        expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
@@ -2518,11 +2548,12 @@ describe("Mobile pipeline", () => {
     test.tags("mobile");
     test("mobile: pending cards keep their queue key and leave with their entry", async () => {
         const errors = cachedReadErrors([
-            // a stage back and forth: the types on Qualified, then New's leads and the types
+            // a stage back and forth: the types on Qualified (Lead 3's activities were never
+            // read, so they are not cached and raise nothing), then the types and New's leads
+            TYPES,
             TYPES,
             ACTIVITIES,
             ACTIVITIES,
-            TYPES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -2641,18 +2672,16 @@ describe("Mobile pipeline", () => {
     test.tags("mobile");
     test("mobile: placement and totals are derived once per change and shared by every reader", async () => {
         const errors = cachedReadErrors([
-            // a queued write places Lead 3 in New: Lead 1's and Lead 2's activities (Lead 3's
-            // were never read, so they are not cached and raise nothing) and the types
-            ACTIVITIES,
-            ACTIVITIES,
+            // a queued write places Lead 3 in New, and its discard takes it out again before the
+            // write's reads go, so the discard's reads replace them: the types and the activities
+            // of Lead 1 and Lead 2
             TYPES,
-            // its discard takes Lead 3 out of New again: the same
             ACTIVITIES,
             ACTIVITIES,
+            // a card move displays Qualified: the types and Lead 1's activities (Lead 3's were
+            // never read, so they are not cached and raise nothing)
             TYPES,
-            // a card move displays Qualified (Lead 1's activities, the types)
             ACTIVITIES,
-            TYPES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -2996,10 +3025,16 @@ describe("Mobile pipeline", () => {
     test.tags("mobile");
     test("mobile: activities of leads displayed online stay available offline after navigation, filtering and Load more", async () => {
         const errors = cachedReadErrors([
-            // offline, Qualified then New are displayed again: every lead's activities and the
-            // types were read online, so each read is answered by the cache
+            // offline, Qualified then New are displayed again: the types and every displayed
+            // lead's activities were read online, so each read is answered by the cache
             TYPES,
             ACTIVITIES,
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+            // the offline filter change: the reload, answered by the cache, then the types and
+            // the activities of the leads it displays, answered by the cache as well
+            LEAD_GROUPS,
             TYPES,
             ACTIVITIES,
             ACTIVITIES,
@@ -3024,7 +3059,7 @@ describe("Mobile pipeline", () => {
         });
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
         expect(cardNames()).toEqual(["Lead 1"]);
-        expect.verifySteps(["activities:1"]);
+        await expect.waitForSteps(["activities:1"]);
 
         // Navigation: each displayed lead is read again, with the same request.
         await goToStage("Qualified");
@@ -3052,24 +3087,52 @@ describe("Mobile pipeline", () => {
             "Call Mitchell back"
         );
 
+        // The filter is removed, then applied again: New keeps the page Load more reached, and
+        // each reload reads its leads again.
+        for (let toggle = 0; toggle < 2; toggle++) {
+            await toggleSearchBarMenu();
+            await toggleMenuItem("With Revenue");
+            await toggleSearchBarMenu();
+            expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+            await expect.waitForSteps(["activities:1", "activities:2"]);
+        }
+
         // One stable request per lead, whatever displayed it.
         for (const resId of [1, 2, 3]) {
             expect(new Set(requests.get(resId)).size).toBe(1);
         }
 
-        // Offline: the same requests are answered by the cache.
+        // Offline, the stages displayed again read each of their leads, with the same request,
+        // and the cache answers it with what the server last answered online: Lead 3 on
+        // Qualified, then, on New, Lead 1 and Lead 2, which Load more displayed online.
         await setOffline(true);
         await goToStage("Qualified");
+        await expect.waitForSteps(["activities:3"]);
         await contains(`${cardOf("Lead 3")} .o_crm_mobile_card_activities`).click();
         expect(`${cardOf("Lead 3")} .o_crm_mobile_activity_summary`).toHaveText("Qualify");
         await goToStage("New");
         expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
-        expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
+        await expect.waitForSteps(["activities:1", "activities:2"]);
         await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
         expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_summary`).toHaveText(
             "Call Mitchell back"
         );
         await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_activities`).click();
+        expect(`${cardOf("Lead 2")} .o_crm_mobile_activity_summary`).toHaveText("Send offer");
+
+        // Offline, the filter is removed through the offline search bar: the pipeline is reloaded
+        // from the cache (the search visited online), and New's leads are read again, with the
+        // same requests, and answered by the cache.
+        await contains(".o_offline_search_bar .o_searchview_facet [data-icon='close']").click();
+        await animationFrame();
+        expect(".o_offline_search_bar .o_searchview_facet [data-icon='close']").toHaveCount(0);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        await expect.waitForSteps(["activities:1", "activities:2"]);
+        await animationFrame();
+        // the cards, kept across the reload, still list their activities
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_summary`).toHaveText(
+            "Call Mitchell back"
+        );
         expect(`${cardOf("Lead 2")} .o_crm_mobile_activity_summary`).toHaveText("Send offer");
         for (const resId of [1, 2, 3]) {
             expect(new Set(requests.get(resId)).size).toBe(1);
@@ -3399,7 +3462,7 @@ describe("Mobile pipeline", () => {
         watchActivityReads();
         watchTypeReads();
         const renderers = captureInstances(CrmMobilePipeline);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const [renderer] = renderers;
         expect.verifySteps(["types", "activities:1", "activities:2"]);
         await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
@@ -3474,6 +3537,7 @@ describe("Mobile pipeline", () => {
         });
         await getService("action").doAction(PIPELINE_ACTION_ID);
         expect(".o_crm_mobile_pipeline").toHaveCount(1);
+        await activityReadsDone(renderers[0]);
         restoreTypeRead();
         expect.verifySteps([]);
 
@@ -3484,6 +3548,7 @@ describe("Mobile pipeline", () => {
         await animationFrame();
         expect(renderers).toHaveLength(2);
         const renderer = renderers[1];
+        await activityReadsDone(renderer);
         expect(".o_crm_mobile_pipeline").toHaveCount(1);
         expectHeader("New", 2, 120);
         expect.verifySteps(["types"]);
@@ -3491,12 +3556,14 @@ describe("Mobile pipeline", () => {
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).toHaveAttribute("disabled");
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_follow_up`).toHaveAttribute("disabled");
 
-        // Reconnect: the types are read and both controls are enabled, without a manual reload
-        // (once on the reconnection itself, once after the reconciliation reload that follows).
+        // Reconnect: the types are read and both controls are enabled, without a manual reload.
+        // The reconnection and the reconciliation reload that follows it both revalidate; the
+        // reload's run replaces the reads the first one queued before they went, so the types
+        // are read once.
         await setOffline(false);
         await animationFrame();
-        await animationFrame();
-        expect.verifySteps(["types", "types"]);
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types"]);
         expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_follow_up`).not.toHaveAttribute("disabled");
@@ -3528,6 +3595,12 @@ describe("Mobile pipeline", () => {
             Object.keys(renderer.mobileState.activitiesByLead)
                 .map(Number)
                 .sort((a, b) => a - b);
+        // The reads go once the mounted pipeline has painted: all are sent, only Lead 2's is
+        // still unanswered.
+        await waitUntil(
+            () => !renderer._activityReadQueue.length && renderer._activityReadsInFlight === 1
+        );
+        await animationFrame();
         expect.verifySteps(["activities:1", "activities:2"]);
         expect(leadsInMemory()).toEqual([1]);
         await goToStage("Qualified");
@@ -3667,13 +3740,18 @@ describe("Sync reconciliation", () => {
     test.tags("mobile");
     test("mobile: a pipeline mounted while a sync replays holds the remaining writes and reloads when the window ends", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types; Lead 3's were never
+            // the reads the online back queued go once the connection has dropped: the types and
+            // both leads' activities, answered by the cache
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+            // the move displays Qualified: the types and Lead 1's activities (Lead 3's were never
             // cached)
-            ACTIVITIES,
             TYPES,
-            // New displayed again (Lead 2's activities, the types)
             ACTIVITIES,
+            // New displayed again: the types and Lead 2's activities
             TYPES,
+            ACTIVITIES,
             // Lead 2's form, from the cache
             "crm.lead/web_read",
         ]);
@@ -3700,7 +3778,9 @@ describe("Sync reconciliation", () => {
         await mountWithCleanup(WebClient);
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
         await getService("action").doAction(PIPELINE_ACTION_ID);
-        // Lead 2's form is visited online, so it opens offline.
+        // The pipeline reads its leads' activities and the types online, then Lead 2's form is
+        // visited online, so it opens offline.
+        await activityReadsDone(renderers[0]);
         await contains(`${cardOf("Lead 2")} .o_crm_mobile_lead_card_name`).click();
         expect(".o_form_view").toHaveCount(1);
         await contains(".o_back_button").click();
@@ -3762,11 +3842,11 @@ describe("Sync reconciliation", () => {
     test.tags("mobile");
     test("mobile: a sync that ends outside the stage pipeline owes its reload until the pipeline is shown again", async () => {
         const errors = cachedReadErrors([
-            // the first move displays Qualified (Lead 1's activities, the types; Lead 3's were
+            // the first move displays Qualified: the types and Lead 1's activities (Lead 3's were
             // never cached)
-            ACTIVITIES,
             TYPES,
-            // the second move displays Proposition (the types; Lead 3's and Lead 4's activities
+            ACTIVITIES,
+            // the second move displays Proposition: the types (Lead 3's and Lead 4's activities
             // were never cached)
             TYPES,
         ]);
@@ -3840,10 +3920,14 @@ describe("Sync reconciliation", () => {
     test.tags("mobile");
     test("mobile: a reconciliation reload that lands during the next sync window leaves that window's copy in place", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types; Lead 3's were never
+            // the move displays Qualified: the types and Lead 1's activities (Lead 3's were never
             // cached)
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            // window A's reconnection reads the same, after the next paint, once the connection
+            // has dropped again for window B
+            TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -3935,25 +4019,11 @@ describe("Sync reconciliation", () => {
     test.tags("mobile");
     test("mobile: after an interrupted sync, a systray discard ends the placement and totals of a pending create and of a queued move at once", async () => {
         const errors = cachedReadErrors([
-            // Lead 1's move displays Qualified (Lead 1's activities, the types; Lead 3's were
-            // never cached)
-            ACTIVITIES,
-            TYPES,
-            // New displayed again (Lead 2's activities, the types)
-            ACTIVITIES,
-            TYPES,
-            // Lead 2's move displays Proposition (Lead 2's activities, the types; Lead 4's were
-            // never cached)
-            ACTIVITIES,
-            TYPES,
-            // the offline reload, then the activities revalidated after it
+            // the offline reload; no activity or type read raises: the mount's reads go once the
+            // connection has dropped, so nothing is cached, and every later read until the last
+            // reconnection loses the connection too (the reads of the interrupted sync lose it
+            // before any answer)
             LEAD_GROUPS,
-            ACTIVITIES,
-            TYPES,
-            // after the interrupted sync, the discard of Lead 2's move (Lead 4's activities, read
-            // online during the sync, and the types)
-            ACTIVITIES,
-            TYPES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -4053,30 +4123,27 @@ describe("Sync reconciliation", () => {
     test.tags("mobile");
     test("mobile: a parked write discarded while a sync replays another one stops placing its card at once", async () => {
         const errors = cachedReadErrors([
-            // Lead 4's move displays Qualified (Lead 3's and Lead 4's activities, read online on
-            // the way to Proposition, and the types)
-            ACTIVITIES,
-            ACTIVITIES,
-            TYPES,
-            // Lead 3's move displays Proposition (Lead 3's activities, the types)
-            ACTIVITIES,
-            TYPES,
-            // back to New through Qualified (Lead 4's activities, the types), then New (Lead 1's
-            // and Lead 2's activities, the types)
-            ACTIVITIES,
+            // Lead 4's move displays Qualified: the types and the activities of Lead 4 and Lead 3,
+            // read online on the way to Proposition (the mount's reads, replaced by Qualified's
+            // before they went, never read Lead 1 and Lead 2, so theirs are not cached)
             TYPES,
             ACTIVITIES,
             ACTIVITIES,
+            // Lead 3's move displays Proposition: the types and Lead 3's activities
             TYPES,
-            // Lead 2's move displays Proposition (Lead 3's and Lead 2's activities, the types)
             ACTIVITIES,
+            // back to New through Qualified (the types and Lead 4's activities), then New (the
+            // types)
+            TYPES,
             ACTIVITIES,
             TYPES,
-            // the offline reload, then the activities revalidated after it
+            // Lead 2's move displays Proposition: the types and Lead 3's activities
+            TYPES,
+            ACTIVITIES,
+            // the offline reload, then the types and Lead 3's activities revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -4165,6 +4232,15 @@ describe("Sync reconciliation", () => {
 
     test.tags("mobile");
     test("mobile: a pending create discarded before its replay call, in a sync the connection then interrupts, ends its card and totals at once and for good", async () => {
+        const errors = cachedReadErrors([
+            // the first reconnection's reads go after the next paint, once the connection has
+            // dropped again: the types and both leads' activities, cached at mount, lose it and
+            // are answered by the cache
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+        ]);
+        expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
         const connection = mockConnectionDrop();
@@ -4270,6 +4346,7 @@ describe("Sync reconciliation", () => {
                 .map(({ name }) => name)
                 .sort()
         ).toEqual(["Lead A", "Lead B"]);
+        expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
@@ -4383,7 +4460,7 @@ describe("Mobile activity pages", () => {
             typeReads.push(params.kwargs);
         });
         const requests = watchActivityReads();
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         for (const resId of [1, 2]) {
             expect(requests.get(resId)).toHaveLength(1);
@@ -4407,7 +4484,7 @@ describe("Mobile activity pages", () => {
         await createLeadActivities(1, 45);
         mockActivityTypes(ACTIVITY_TYPES);
         const requests = watchActivityReads();
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         const card = cardOf("Lead 1");
         expect(activityBadgeOf("Lead 1")).toHaveText("45");
@@ -4508,7 +4585,7 @@ describe("Mobile activity pages", () => {
         await createLeadActivities(2, 3);
         mockActivityTypes(ACTIVITY_TYPES);
         const requests = watchActivityReads();
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         expect(JSON.parse(requests.get(1)[0]).kwargs.limit).toBe(40);
         for (const [name, count] of [
@@ -4562,21 +4639,21 @@ describe("Mobile activity pages", () => {
         );
 
         // The connection returns: the reads it triggers (the reconnection itself, then the
-        // reconciliation reload) use the lead's default request, not the expansion that never
-        // landed.
+        // reconciliation reload, whose run replaces the reads the first one queued before they
+        // went) use the lead's default request, not the expansion that never landed.
         await getService(OfflinePlugin).checkConnection();
         await animationFrame();
         await animationFrame();
         expect(getService(OfflinePlugin).isOffline()).toBe(false);
-        expect.verifySteps(["activities:1", "activities:2", "activities:1", "activities:2"]);
-        expect(limitsOf(1)).toEqual([40, 45, 40, 40]);
+        expect.verifySteps(["activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 45, 40]);
 
         // So does a revisit, and Show all is offered again with the same page and total.
         await goToStage("Qualified");
         await goToStage("New");
         await animationFrame();
         expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
-        expect(limitsOf(1)).toEqual([40, 45, 40, 40, 40]);
+        expect(limitsOf(1)).toEqual([40, 45, 40, 40]);
         expect(activityBadgeOf("Lead 1")).toHaveText("45");
         await contains(`${card} .o_crm_mobile_card_activities`).click();
         expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(40);
@@ -4638,21 +4715,23 @@ describe("Mobile activity pages", () => {
             "5 more activities are not available offline"
         );
 
-        // The connection returns: the reads it triggers reissue the previous expansion (45), not
-        // the default request nor the expansion that never landed.
+        // The connection returns: the reads it triggers (the reconnection, then the
+        // reconciliation reload, whose run replaces the reads the first one queued before they
+        // went) reissue the previous expansion (45), not the default request nor the expansion
+        // that never landed.
         await getService(OfflinePlugin).checkConnection();
         await animationFrame();
         await animationFrame();
         expect(getService(OfflinePlugin).isOffline()).toBe(false);
-        expect.verifySteps(["activities:1", "activities:2", "activities:1", "activities:2"]);
-        expect(limitsOf(1)).toEqual([40, 45, 45, 50, 45, 45]);
+        expect.verifySteps(["activities:1", "activities:2"]);
+        expect(limitsOf(1)).toEqual([40, 45, 45, 50, 45]);
 
         // So does a revisit, and Show all is offered again with the same page and total.
         await goToStage("Qualified");
         await goToStage("New");
         await animationFrame();
         expect.verifySteps(["activities:3", "activities:1", "activities:2"]);
-        expect(limitsOf(1)).toEqual([40, 45, 45, 50, 45, 45, 45]);
+        expect(limitsOf(1)).toEqual([40, 45, 45, 50, 45, 45]);
         expect(activityBadgeOf("Lead 1")).toHaveText("50");
         await contains(`${card} .o_crm_mobile_card_activities`).click();
         expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
@@ -4678,7 +4757,7 @@ describe("Mobile activity pages", () => {
         const requests = watchActivityReads();
         const limitsOf = (resId) =>
             requests.get(resId).map((json) => JSON.parse(json).kwargs.limit);
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         const card = cardOf("Lead 1");
         const showAll = `${card} .o_crm_mobile_activities_show_all`;
@@ -4728,6 +4807,190 @@ describe("Mobile activity pages", () => {
         await contains(`${card} .o_crm_mobile_card_activities`).click();
         expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(45);
         expect(showAll).toHaveText("Show all (48)");
+    });
+
+    /**
+     * Holds every activity read of a lead until `release()`; each one then goes on to the next
+     * handler (registered after `mockOffline()`, the offline mock, which answers with a 502 when
+     * the connection is gone by then). `held` counts the reads it held.
+     *
+     * @param {number} leadId
+     * @returns {{ held: number, release: () => void }}
+     */
+    function holdLeadActivityReads(leadId) {
+        const answer = Promise.withResolvers();
+        const holder = { held: 0, release: () => answer.resolve() };
+        onRpc("/web/dataset/call_kw/mail.activity/web_search_read", async (request) => {
+            const { params } = await request.clone().json();
+            const resId = params.kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            if (resId === leadId) {
+                holder.held++;
+                await answer.promise;
+            }
+        });
+        return holder;
+    }
+
+    test.tags("mobile");
+    test("mobile: a card shows no Activities count until its lead's activities are read, its list says they are loading, and the answer shows the count; a lead read with none counts 0", async () => {
+        await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "First" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Second" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const lead1Reads = holdLeadActivityReads(1);
+        await mountPipeline();
+        const lead1 = cardOf("Lead 1");
+        const lead2 = cardOf("Lead 2");
+        // Lead 2's read is answered (it has no activity) while Lead 1's is held.
+        await waitUntil(() => lead1Reads.held > 0 && queryFirst(activityBadgeOf("Lead 2")));
+        expect(activityBadgeOf("Lead 2")).toHaveText("0");
+        expect(`${lead2} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities (0)"
+        );
+
+        // Lead 1 shows no count and names none; its list says its activities are loading.
+        expect(activityBadgeOf("Lead 1")).toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_card_activities`).toHaveText("Activities");
+        expect(`${lead1} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities"
+        );
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_lead_card_activities`).toHaveText("Loading activities…");
+        expect(`${lead1} .o_crm_mobile_lead_card_activities li`).toHaveClass(["text-700", "small"]);
+        await contains(`${lead2} .o_crm_mobile_card_activities`).click();
+        expect(`${lead2} .o_crm_mobile_lead_card_activities`).toHaveText("No activities");
+
+        // The answer lands: the count, its accessible name and the rows. The read is no change
+        // the user made: nothing is announced.
+        lead1Reads.release();
+        await waitUntil(() => queryFirst(activityBadgeOf("Lead 1")));
+        expect(activityBadgeOf("Lead 1")).toHaveText("2");
+        expect(`${lead1} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities (2)"
+        );
+        expect(`${lead1} .o_crm_mobile_activity_row`).toHaveCount(2);
+        expect(
+            `${lead1} .o_crm_mobile_lead_card_activities li:not(.o_crm_mobile_activity_row)`
+        ).toHaveCount(0);
+        expect(queryOne(`${lead1} .o_crm_mobile_lead_card_status`).textContent).toBe("");
+    });
+
+    test.tags("mobile");
+    test("mobile: offline, a card whose lead's activities were never read shows no Activities count and says they are not available offline; an activity queued there is announced without a count", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const lead1Reads = holdLeadActivityReads(1);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const lead1 = cardOf("Lead 1");
+        const lead2 = cardOf("Lead 2");
+        await waitUntil(() => lead1Reads.held > 0 && queryFirst(activityBadgeOf("Lead 2")));
+
+        // The connection drops before Lead 1's read is answered: the read fails, and nothing is
+        // cached for the lead.
+        await setOffline(true);
+        lead1Reads.release();
+        await animationFrame();
+        await animationFrame();
+        expect(activityBadgeOf("Lead 1")).toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities"
+        );
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        expect(`${lead1} .o_crm_mobile_lead_card_activities`).toHaveText(
+            "Activities are not available offline"
+        );
+        // Lead 2's activities were read online: offline, it still counts 0.
+        expect(activityBadgeOf("Lead 2")).toHaveText("0");
+        await contains(`${lead2} .o_crm_mobile_card_activities`).click();
+        expect(`${lead2} .o_crm_mobile_lead_card_activities`).toHaveText("No activities");
+
+        // An offline Log call on Lead 1 is queued and listed, and announced with no count: the
+        // lead's own activities are still unknown, and the list keeps saying so.
+        await contains(`${lead1} .o_crm_mobile_card_log_call`).click();
+        expect(queuedCalls("mail.activity", "web_save")).toHaveLength(1);
+        expect(`${lead1} .o_crm_mobile_lead_card_status`).toHaveText(
+            "Lead 1: new activity pending sync."
+        );
+        expect(activityBadgeOf("Lead 1")).toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities"
+        );
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(1);
+        expect(
+            `${lead1} .o_crm_mobile_lead_card_activities li:not(.o_crm_mobile_activity_row)`
+        ).toHaveText("Activities are not available offline");
+    });
+
+    test.tags("mobile");
+    test("mobile: online Log calls confirmed before their lead's first read are listed with no Activities count, and the read brings the server count, which is announced", async () => {
+        await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "First" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Second" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const lead1Reads = holdLeadActivityReads(1);
+        await mountPipeline();
+        const lead1 = cardOf("Lead 1");
+        const logCall = `${lead1} .o_crm_mobile_card_log_call`;
+        const rows = `${lead1} .o_crm_mobile_activity_row`;
+        // the line the list shows after its rows, while the lead's count is not known
+        const note = `${lead1} .o_crm_mobile_lead_card_activities li:not(.o_crm_mobile_activity_row)`;
+        const status = `${lead1} .o_crm_mobile_lead_card_status`;
+        // Lead 1's read is held; the types are read, so Log call is enabled.
+        await waitUntil(() => lead1Reads.held > 0 && !queryOne(logCall).disabled);
+        await contains(`${lead1} .o_crm_mobile_card_activities`).click();
+        expect(rows).toHaveCount(0);
+        expect(note).toHaveText("Loading activities…");
+
+        // The server saves the call before the lead's read answers: the call is listed as a
+        // server row, but its one row is no more than a lower bound of the lead's count, so no
+        // count is shown, named or announced, and the list still says the activities are loading.
+        await contains(logCall).click();
+        await waitUntil(() => queryAll(rows).length === 1);
+        expect(queryAllTexts(`${rows} .o_crm_mobile_activity_summary`)).toEqual(["Call"]);
+        expect(`${lead1} .o_crm_mobile_activity_pending`).toHaveCount(0);
+        expect(activityBadgeOf("Lead 1")).toHaveCount(0);
+        expect(`${lead1} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities"
+        );
+        expect(note).toHaveText("Loading activities…");
+        expect(queryOne(status).textContent).toBe("");
+
+        // A second call, still before the read: two rows, still no count.
+        await waitUntil(() => !queryOne(logCall).disabled);
+        await contains(logCall).click();
+        await waitUntil(() => queryAll(rows).length === 2);
+        expect(activityBadgeOf("Lead 1")).toHaveCount(0);
+        expect(note).toHaveText("Loading activities…");
+        expect(queryOne(status).textContent).toBe("");
+
+        // The read lands: the server count (the two activities the lead had, and the two calls)
+        // is shown, named and announced, as the change the user's calls made.
+        lead1Reads.release();
+        await waitUntil(() => queryFirst(activityBadgeOf("Lead 1")));
+        expect(activityBadgeOf("Lead 1")).toHaveText("4");
+        expect(`${lead1} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities (4)"
+        );
+        expect(rows).toHaveCount(4);
+        expect(queryAllTexts(`${rows} .o_crm_mobile_activity_summary`).sort()).toEqual([
+            "Call",
+            "Call",
+            "First",
+            "Second",
+        ]);
+        expect(note).toHaveCount(0);
+        expect(status).toHaveText("Lead 1: 4 activities.");
     });
 });
 
@@ -4874,41 +5137,49 @@ describe("Mobile pipeline branches", () => {
         await mountWithCleanup(WebClient);
         await getService("action").doAction(PIPELINE_ACTION_ID);
         await animationFrame();
-        expect.verifySteps(["held activities", "held activities", "held types"]);
+        // Two reads at most are in flight: the types, then Lead 1's activities; Lead 2's wait.
+        expect.verifySteps(["held types", "held activities"]);
         const [renderer] = renderers;
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).toHaveAttribute("disabled");
 
-        // The view is regrouped by salesperson before the answers arrive: they are dropped.
+        // The view is regrouped by salesperson before the answers arrive: they are dropped, and
+        // Lead 2's read, never sent, is not sent at all.
         await toggleSalespersonGrouping();
         expect(renderer.isMobilePipeline).toBe(false);
         activityReads.release();
         typeReads.release();
         await animationFrame();
         await animationFrame();
+        expect.verifySteps([]);
         expect(renderer.mobileState.activitiesByLead).toEqual({});
         expect(renderer.mobileState.activityTypes).toBe(null);
 
         // Grouped by stage again: the answers, cached since, are applied at once (the refreshing
-        // reads are held again).
+        // reads are held again, Lead 2's waiting behind them).
         await toggleSalespersonGrouping();
         await animationFrame();
-        expect.verifySteps(["held activities", "held activities", "held types"]);
+        expect.verifySteps(["held types", "held activities"]);
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_activities .badge`).toHaveText("1");
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
 
         // The server answers change, then the lead's form is opened, which destroys the pipeline,
-        // before the refreshed answers arrive: they are dropped as well.
+        // before the refreshed answers arrive: they are dropped as well, and the destroyed
+        // pipeline keeps no read to send once they are in (Lead 2's was dropped with it).
         MockServer.env["mail.activity"].write([activityId], { summary: "Second summary" });
         activityTypes.records = ACTIVITY_TYPES.filter(({ category }) => category !== "phonecall");
         await contains(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_name`).click();
         await animationFrame();
         expect(".o_form_view").toHaveCount(1);
+        expect(renderer._activityReadQueue).toEqual([]);
         activityReads.active = false;
         typeReads.active = false;
         activityReads.release();
         typeReads.release();
         await animationFrame();
         await animationFrame();
+        expect(renderer._activityReadsInFlight).toBe(0);
+        expect(renderer._activityReadQueue).toEqual([]);
+        expect(renderer._activityReadPump).toBe(null);
         expect(renderer.mobileState.activitiesByLead[1].map(({ summary }) => summary)).toEqual([
             "First summary",
         ]);
@@ -4926,14 +5197,18 @@ describe("Mobile pipeline branches", () => {
     test.tags("mobile");
     test("mobile: a reconciliation reload that loses the connection keeps the sync snapshot, and the next sync window starts from it", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types)
-            ACTIVITIES,
+            // the move displays Qualified: the types and Lead 1's activities (Lead 3's were never
+            // read online, so they are not cached and raise nothing)
             TYPES,
-            // the offline reload, then the activities revalidated after it (Lead 3's activities
-            // were never read online, so they are not cached and raise nothing)
+            ACTIVITIES,
+            // the offline reload, then the types and Lead 1's activities revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            // the reconnection's reads go after the next paint, once the connection is lost
+            // again: the same, answered by the cache
+            TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -5025,9 +5300,10 @@ describe("Mobile pipeline branches", () => {
     test("mobile: a reconciliation reload failing for another reason than the connection propagates its error", async () => {
         const errors = [
             ...cachedReadErrors([
-                // the move displays Qualified (Lead 1's activities, the types)
-                ACTIVITIES,
+                // the move displays Qualified: the types and Lead 1's activities (Lead 3's were
+                // never cached)
                 TYPES,
+                ACTIVITIES,
             ]),
             /The pipeline cannot be reloaded/,
         ];
@@ -5107,9 +5383,10 @@ describe("Mobile pipeline branches", () => {
     test.tags("mobile");
     test("mobile: a reconciliation reload landing after the pipeline is destroyed leaves its sync snapshot alone", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types)
-            ACTIVITIES,
+            // the move displays Qualified: the types and Lead 1's activities (Lead 3's were never
+            // cached)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -5289,13 +5566,13 @@ describe("Mobile pipeline branches", () => {
         expect(".o_crm_mobile_pipeline_count").toHaveText(String(sampleCount + 1));
 
         // The reload lands: sample mode ends and the window closes. The created lead is a server
-        // card, the only one and counted once, and its activities and the types are read.
+        // card, the only one and counted once, and the types and its activities are read.
         reloads.release();
         await animationFrame();
         await animationFrame();
         const created = MockServer.env["crm.lead"].search_read([["name", "=", "Offline lead"]]);
         expect(created).toHaveLength(1);
-        expect.verifySteps([ACTIVITIES, TYPES]);
+        expect.verifySteps([TYPES, ACTIVITIES]);
         expect(renderer.props.list.model.useSampleModel).toBe(false);
         expect(renderer.mobileState.syncEntries).toBe(null);
         expect(".o_view_sample_data").toHaveCount(0);
@@ -5421,11 +5698,11 @@ describe("Mobile pipeline branches", () => {
     test.tags("mobile");
     test("mobile: a sum field without currency formats the stage revenue as an integer, online and offline", async () => {
         const errors = cachedReadErrors([
-            // the offline reload, then the activities and the types revalidated after it
+            // the offline reload, then the types and the activities revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         await makeMockServer();
@@ -5455,17 +5732,18 @@ describe("Mobile pipeline branches", () => {
         );
         expect(".o_crm_mobile_pipeline_revenue").toHaveText(expected);
         expect(renderer.stageRevenueValue(groupOf(renderer, 1))).toBe(7);
+        await activityReadsDone(renderer);
         expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
     test("mobile: a stage revenue in several currencies is formatted in the company currency, online and offline", async () => {
         const errors = cachedReadErrors([
-            // the offline reload, then the activities and the types revalidated after it
+            // the offline reload, then the types and the activities revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         await makeMockServer();
@@ -5489,6 +5767,7 @@ describe("Mobile pipeline branches", () => {
             false
         );
         expectHeader("New", 2, 120);
+        await activityReadsDone(renderer);
         expect.verifyErrors(errors);
     });
 
@@ -5528,6 +5807,14 @@ describe("Mobile pipeline branches", () => {
 
     test.tags("mobile");
     test("mobile: queue entries that collide with or follow a held sync snapshot are placed at once and once each", async () => {
+        const errors = cachedReadErrors([
+            // the reconnection's reads go after the next paint, once the connection has dropped
+            // again during the sync: the types and New's leads' activities, answered by the cache
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+        ]);
+        expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
         // Registered before the holder and the offline mock, so it answers the requests they let
         // through: a held replay released once the connection is lost fails with a lost connection.
@@ -5595,6 +5882,7 @@ describe("Mobile pipeline branches", () => {
         expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
         expect(cardNames()).toEqual(["Lead 1", "Lead 2", "Pending A", "Pending B"]);
         expectHeader("New", 4, 135);
+        expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
@@ -5869,10 +6157,10 @@ describe("Mobile pipeline branches", () => {
     test.tags("mobile");
     test("mobile: an offline move out of a stage it leaves empty subtracts nothing from that stage's zero aggregate", async () => {
         const errors = cachedReadErrors([
-            // the move displays Proposition (Lead 3's activities, the types; Lead 4's were never
-            // read, so they are not cached)
-            ACTIVITIES,
+            // the move displays Proposition: the types and Lead 3's activities (Lead 4's were
+            // never read, so they are not cached)
             TYPES,
+            ACTIVITIES,
             // back on the emptied Qualified: the types
             TYPES,
         ]);
@@ -5910,12 +6198,11 @@ describe("Mobile pipeline branches", () => {
     test.tags("mobile");
     test("mobile: a card move failing for another reason than the connection propagates, and a move ending after the pipeline is destroyed changes nothing", async () => {
         const errors = cachedReadErrors([
-            // offline, the move displays Qualified while the source reload is held: Lead 1's and
-            // Lead 3's activities, read online while the refused move displayed them, and the
-            // types
-            ACTIVITIES,
-            ACTIVITIES,
+            // offline, the move displays Qualified while the source reload is held: the types and
+            // Lead 1's activities (the reads the refused move queued online were replaced before
+            // they went, so Lead 3's are not cached)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -6773,12 +7060,12 @@ describe("Mobile lead card", () => {
     test.tags("mobile");
     test("mobile: offline stage move via card queues web_save and shows pending-sync indicator", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types)
-            ACTIVITIES,
+            // the move displays Qualified (the types, Lead 1's activities)
             TYPES,
-            // the keyboard move displays Proposition (Lead 1's activities, the types)
             ACTIVITIES,
+            // the keyboard move displays Proposition (the types, Lead 1's activities)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -6874,21 +7161,22 @@ describe("Mobile lead card", () => {
         expect(lead1.group).toBe(proposition);
         expectHeader("Proposition", 2, 140);
         expect(`${cardOf("Lead 1")} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        await activityReadsDone(renderer);
         expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
     test("mobile: pending indicator clears after successful replay and after a systray discard", async () => {
         const errors = cachedReadErrors([
-            // first move: Qualified is displayed (Lead 1 and Lead 3, both visited online, and
-            // the types)
-            ACTIVITIES,
-            ACTIVITIES,
+            // first move: Qualified is displayed (the types, then Lead 1 and Lead 3, both
+            // visited online)
             TYPES,
-            // second move: Proposition is displayed (Lead 3, the types; Lead 4's activities
+            ACTIVITIES,
+            ACTIVITIES,
+            // second move: Proposition is displayed (the types, Lead 3; Lead 4's activities
             // were never cached)
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -6940,9 +7228,9 @@ describe("Mobile lead card", () => {
     test.tags("mobile");
     test("mobile: mark won via card stage list offline (no rainbowman), online issues rainbowman", async () => {
         const errors = cachedReadErrors([
-            // the move displays Won (Lead 1, types)
-            ACTIVITIES,
+            // the move displays Won (types, Lead 1)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -6980,12 +7268,12 @@ describe("Mobile lead card", () => {
     test.tags("mobile");
     test("mobile: offline move to a folded won stage shows the won header and the pending card, with no uncached read and no rainbowman call, and the card can move out again", async () => {
         const errors = cachedReadErrors([
-            // the move displays Won (Lead 1, types)
-            ACTIVITIES,
+            // the move displays Won (types, Lead 1)
             TYPES,
-            // the move out of Won displays Qualified (Lead 1, types)
             ACTIVITIES,
+            // the move out of Won displays Qualified (types, Lead 1)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         await makeMockServer();
@@ -8983,7 +9271,7 @@ describe("Mobile quick create", () => {
             await logCall.promise;
         });
         const cards = captureInstances(CrmMobileLeadCard);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const card = cardOf("Lead 1");
         const lead1Card = cards.find(
             (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
@@ -9152,7 +9440,7 @@ describe("Mobile quick create", () => {
             await save.promise;
         });
         const cards = captureInstances(CrmMobileLeadCard);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const card = cardOf("Lead 1");
         const followUp = `${card} .o_crm_mobile_card_follow_up`;
         const form = `${card} .o_crm_mobile_lead_card_follow_up`;
@@ -10010,8 +10298,8 @@ describe("Online writes whose follow-up read loses the connection", () => {
     test.tags("mobile");
     test("mobile: the reload that replaces adding a lead created online rejects with a lost connection when, offline, the cache answers it without the lead; one that loses the connection once the stage pipeline is gone resolves quietly", async () => {
         // offline, the reload is answered by the cache and refreshed in the background, and so
-        // are the activities of New's two leads and the types, read again for its new groups
-        const errors = cachedReadErrors([LEAD_GROUPS, ACTIVITIES, ACTIVITIES, TYPES]);
+        // are the types and the activities of New's two leads, read again for its new groups
+        const errors = cachedReadErrors([LEAD_GROUPS, TYPES, ACTIVITIES, ACTIVITIES]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
@@ -10118,9 +10406,10 @@ describe("Online writes whose follow-up read loses the connection", () => {
         expect(await openActivities("Lead 1")).toEqual(["Call"]);
         expect(row).toHaveCount(1);
 
-        // Back online: the reads list the server row, which takes its place, once.
+        // Back online: the reads list the server row, which takes its place, once. The
+        // reconciliation reload's run replaces the reads the reconnection queued before they went.
         await setOffline(false);
-        await expect.waitForSteps(["activities:1", "activities:2", "activities:1", "activities:2"]);
+        await expect.waitForSteps(["activities:1", "activities:2"]);
         await animationFrame();
         expect(renderer.mobileState.activityWritesByLead).toEqual({});
         expect(renderer.mobileState.activitiesByLead[1].map(({ id }) => id)).toEqual([callId]);
@@ -10318,19 +10607,36 @@ describe("Online writes whose follow-up read loses the connection", () => {
         expect(renderer.onActivitiesChanged(5, { created: won })).toBe(undefined);
         expect(shownIds(5)).toEqual([won.id]);
         expect(renderer.activityTotalFor(5)).toBe(null);
-        // Displayed, its card shows the write while the lead is read; the server row then takes
-        // its place (the stages passed on the way, Qualified and Proposition, read their lead).
+        // Displayed, its card lists the write while the lead is read, with no count: one row is
+        // no more than a lower bound of the lead's count, and the list says the activities are
+        // loading. The server row then takes its place, with the count. The stages passed on the
+        // way, Qualified and Proposition, read their lead, and these two held reads fill the
+        // reads in flight: Won's waits for one to end.
+        const lead5Activities = `${cardOf("Lead 5")} .o_crm_mobile_lead_card_activities`;
+        const lead5Note = `${lead5Activities} li:not(.o_crm_mobile_activity_row)`;
         activityReads.active = true;
         await goToStage("Won");
-        expect.verifySteps(["held activities", "held activities", "held activities"]);
-        expect(badgeOf("Lead 5")).toHaveText("1");
+        expect.verifySteps(["held activities", "held activities"]);
+        expect(badgeOf("Lead 5")).toHaveCount(0);
+        expect(`${cardOf("Lead 5")} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities"
+        );
         expect(await openActivities("Lead 5")).toEqual(["Won follow-up"]);
+        expect(lead5Note).toHaveText("Loading activities…");
         activityReads.active = false;
         activityReads.release();
         await animationFrame();
         expect(5 in mobileState.activityWritesByLead).toBe(false);
         expect(shownIds(5)).toEqual([won.id]);
         expect(renderer.activityTotalFor(5)).toBe(1);
+        expect(badgeOf("Lead 5")).toHaveText("1");
+        expect(`${cardOf("Lead 5")} .o_crm_mobile_card_activities`).toHaveAttribute(
+            "aria-label",
+            "Activities (1)"
+        );
+        expect(await openActivities("Lead 5")).toEqual(["Won follow-up"]);
+        expect(lead5Note).toHaveCount(0);
         await goToStage("New");
         await animationFrame();
         expect(shownIds(2)).toEqual([firstId, secondId]);
@@ -10427,7 +10733,7 @@ describe("Online writes whose follow-up read loses the connection", () => {
             "activities"
         );
         const renderers = captureInstances(CrmMobilePipeline);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const [renderer] = renderers;
         const { mobileState } = renderer;
         const card = cardOf("Lead 1");
@@ -11314,7 +11620,7 @@ describe("Lead card user day and panel reveal", () => {
         onRpc("mail.activity", "web_save", ({ args }) => {
             expect.step(`web_save ${args[1].summary} ${args[1].date_deadline}`);
         });
-        await mountPipeline();
+        await mountPipelineWithReads();
         const card = cardOf("Lead 1");
 
         await contains(`${card} .o_crm_mobile_card_log_call`).click();
@@ -11910,7 +12216,7 @@ describe("Mobile activities", () => {
         });
         watchActivityReads();
         const cards = captureInstances(CrmMobileLeadCard);
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         const lead1Card = cards.find(
             (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
@@ -11966,7 +12272,7 @@ describe("Mobile activities", () => {
         });
         watchActivityReads();
         const cards = captureInstances(CrmMobileLeadCard);
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         const lead1Card = cards.find(
             (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
@@ -12010,8 +12316,9 @@ describe("Mobile activities", () => {
         const renderers = captureInstances(CrmMobilePipeline);
         await mountWithCleanup(WebClient);
         await getService("action").doAction(PIPELINE_ACTION_ID);
-        expect.verifySteps(["activities:1", "activities:2"]);
         const renderer = renderers.at(-1);
+        await expect.waitForSteps(["activities:1", "activities:2"]);
+        await activityReadsDone(renderer);
         expect(renderer.currentGroup.serverValue).toBe(1);
 
         // Lead 3 (Qualified) and Lead 5 (Won) are not displayed; no lead id, no read either.
@@ -12045,7 +12352,7 @@ describe("Mobile activities", () => {
         watchActivityReads();
         const cards = captureInstances(CrmMobileLeadCard);
         const renderers = captureInstances(CrmMobilePipeline);
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         const [renderer] = renderers;
         const card = cardOf("Lead 1");
@@ -12095,7 +12402,7 @@ describe("Mobile activities", () => {
         });
         watchActivityReads();
         const cards = captureInstances(CrmMobileLeadCard);
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         const lead1Card = cards.find(
             (instance) => instance.props.record?.resId === 1 && status(instance) === "mounted"
@@ -12271,7 +12578,7 @@ describe("Mobile activities", () => {
             return true;
         });
         watchRpcs(["mail.activity/web_save", "mail.activity/action_done"]);
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect(queryOne(statusOf("Lead 2")).textContent).toBe("");
 
         await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_log_call`).click();
@@ -13837,7 +14144,8 @@ function untouchedCardState() {
 
 /**
  * Mounts a lead card on its own, with every prop the pipeline can give a record card, so that a
- * guard is the only thing that can stop a handler. Its callbacks are steps.
+ * guard is the only thing that can stop a handler. Its callbacks are steps. Its activities are
+ * given with their total, as the pipeline gives every read it stores.
  *
  * @param {Object} props overrides (`record`, `pendingCall`, ...)
  * @returns {Promise<CrmMobileLeadCard>}
@@ -13859,6 +14167,7 @@ function mountStandaloneCard(props) {
                 },
                 { id: 8, activity_type_id: { id: 2, display_name: "Call" }, summary: "Call back" },
             ],
+            activityTotal: 2,
             activityTypes: ACTIVITY_TYPES.slice(0, 2),
             displayedStageValue: 1,
             frameworkStageValue: 1,
@@ -14203,7 +14512,7 @@ describe("Mobile lead card guards", () => {
         });
         const cards = captureInstances(CrmMobileLeadCard);
         const renderers = captureInstances(CrmMobilePipeline);
-        await mountPipeline();
+        await mountPipelineWithReads();
         expect.verifySteps(["activities:1", "activities:2"]);
         const [renderer] = renderers;
         const card = cardOf("Lead 1");
@@ -14372,7 +14681,7 @@ describe("Mobile lead card guards", () => {
         watchRpcs(["mail.activity/web_save"]);
         const cards = captureInstances(CrmMobileLeadCard);
         const renderers = captureInstances(CrmMobilePipeline);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const [renderer] = renderers;
         const card = cardOf("Lead 1");
         const lead1Card = mountedCardOf(cards, 1);
@@ -15069,7 +15378,7 @@ describe("Remaining card branches", () => {
         });
         const cards = captureInstances(CrmMobileLeadCard);
         const renderers = captureInstances(CrmMobilePipeline);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const [renderer] = renderers;
         const card = cardOf("Lead 1");
         const lead1Card = mountedCard(cards, 1);
@@ -15154,7 +15463,7 @@ describe("Remaining card branches", () => {
             },
         });
         const cards = captureInstances(CrmMobileLeadCard);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const card = cardOf("Lead 1");
         const lead1Card = mountedCard(cards, 1);
 
@@ -15281,7 +15590,7 @@ describe("Remaining card branches", () => {
         });
         const cards = captureInstances(CrmMobileLeadCard);
         const renderers = captureInstances(CrmMobilePipeline);
-        await mountPipeline();
+        await mountPipelineWithReads();
         const [renderer] = renderers;
         const card = cardOf("Lead 1");
         const lead1Card = mountedCard(cards, 1);
@@ -15415,9 +15724,9 @@ describe("Remaining card branches", () => {
 describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a lead datapoint a reload replaced is placed by the rules of the loaded ones: in the stage of its queued stage write, else in its loaded stage", async () => {
-        // the queued write places Lead 3 in New: Lead 1's and Lead 2's activities (Lead 3's were
-        // never read, so they are not cached and raise nothing) and the types
-        const errors = cachedReadErrors([ACTIVITIES, ACTIVITIES, TYPES]);
+        // the queued write places Lead 3 in New: the types, then Lead 1's and Lead 2's
+        // activities (Lead 3's were never read, so they are not cached and raise nothing)
+        const errors = cachedReadErrors([TYPES, ACTIVITIES, ACTIVITIES]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
@@ -15466,9 +15775,9 @@ describe("Remaining branches", () => {
 
     test.tags("mobile");
     test("mobile: a stage the server answers in two groups shows, in each of them, the lead a queued write places in the stage, and not the lead it moves out", async () => {
-        // the queued writes change the lead Proposition displays (Lead 1 for Lead 4): Lead 1's
-        // activities, read online in New, and the types are answered by the cache
-        const errors = cachedReadErrors([ACTIVITIES, TYPES]);
+        // the queued writes change the lead Proposition displays (Lead 1 for Lead 4): the types and
+        // Lead 1's activities, read online in New, are answered by the cache
+        const errors = cachedReadErrors([TYPES, ACTIVITIES]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
         // The server answers Proposition, then a second, empty group of the same stage.
@@ -15545,6 +15854,7 @@ describe("Remaining branches", () => {
         };
         expect(totals(2)).toEqual([["Lead 3", "Lead 4"], 2, 70]);
         expect(totals(1)).toEqual([["Lead 2"], 1, 20]);
+        await activityReadsDone(renderer);
         expect.verifyErrors(errors);
     });
 
@@ -15819,7 +16129,10 @@ describe("Remaining branches", () => {
         const renderers = captureInstances(CrmMobilePipeline);
         await mountPipeline();
         const [renderer] = renderers;
-        expect.verifySteps(["types", "activities:1", "activities:2"]);
+        // Once the mounted pipeline has painted, the types and Lead 1 fill the reads in flight;
+        // Lead 2's waits for one to end.
+        await waitUntil(() => renderer._activityReadsInFlight === 2);
+        await expect.waitForSteps(["types", "activities:1"]);
 
         // The reads are still unanswered when the pipeline is regrouped by salesperson.
         await toggleSearchBarMenu();
@@ -15829,17 +16142,19 @@ describe("Remaining branches", () => {
         answers.resolve();
         await animationFrame();
         await animationFrame();
-        // Their answers arrive outside the stage pipeline: nothing is stored, nothing read.
+        // Their answers arrive outside the stage pipeline: nothing is stored, nothing read,
+        // Lead 2's unsent read included.
         expect(renderer.mobileState.activitiesByLead).toEqual({});
         expect(renderer.mobileState.activityTypes).toBe(null);
+        expect(renderer._activityReadQueue).toEqual([]);
         expect.verifySteps([]);
 
         // Grouped by stage again, the reads are issued again and their answers applied.
         await toggleSearchBarMenu();
         await toggleMenuItem("Salesperson");
         await toggleSearchBarMenu();
-        await animationFrame();
-        expect.verifySteps(["types", "activities:1", "activities:2"]);
+        await expect.waitForSteps(["types", "activities:1", "activities:2"]);
+        await activityReadsDone(renderer);
         expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
         await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
         expect(`${cardOf("Lead 1")} .o_crm_mobile_activity_summary`).toHaveText("Send offer");
@@ -15876,6 +16191,7 @@ describe("Remaining branches", () => {
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
         await getService("action").doAction(PIPELINE_ACTION_ID);
         const [renderer] = renderers;
+        await activityReadsDone(renderer);
         expect(renderer.stageState.serverValue).toBe(null);
         expect(renderer.mobileState.activitiesByLead[1]).toEqual([]);
         expect(typeNames(renderer.mobileState.activityTypes)).toEqual(["Email", "Call"]);
@@ -15889,8 +16205,9 @@ describe("Remaining branches", () => {
             { id: 40, display_name: "Visit", category: "default" },
         ];
         // Online, Lead 1 moves to Qualified: Qualified is displayed with it and Lead 3 as soon as
-        // the framework has moved it, so their activities and the types are read again. The cache
-        // answers at once (Lead 3's were never read), the server's answers wait.
+        // the framework has moved it, so the types and their activities are read again. The cache
+        // answers the types and Lead 1 at once, the server's answers wait, and these two fill the
+        // reads in flight: Lead 3's waits for one to end.
         holdReads = true;
         await chooseStage("Lead 1", 2);
         await expect.waitForSteps(["moved"]);
@@ -15905,15 +16222,14 @@ describe("Remaining branches", () => {
         expect(status(renderer)).toBe("destroyed");
 
         // ...then the changed server answers and the move land: the destroyed pipeline keeps the
-        // activities and types it had, and its stored stage stays unset.
+        // activities and types it had, and its stored stage stays unset. Lead 3's read, never
+        // sent, is dropped with the pipeline.
         readsReleased.resolve();
         moveReleased.resolve();
-        await expect.waitForSteps([
-            "mail.activity answered",
-            "mail.activity answered",
-            "mail.activity.type answered",
-        ]);
+        await expect.waitForSteps(["mail.activity.type answered", "mail.activity answered"]);
         await animationFrame();
+        expect(renderer._activityReadQueue).toEqual([]);
+        expect(renderer._activityReadPump).toBe(null);
         expect(renderer.mobileState.activitiesByLead[1]).toEqual([]);
         expect(renderer.mobileState.activitiesByLead[3]).toBe(undefined);
         expect(typeNames(renderer.mobileState.activityTypes)).toEqual(["Email", "Call"]);
@@ -15926,6 +16242,7 @@ describe("Remaining branches", () => {
         await contains(".o_back_button").click();
         await animationFrame();
         expect(renderers).toHaveLength(2);
+        await activityReadsDone(renderers[1]);
         expectHeader("New", 1, 20);
         expect(cardNames()).toEqual(["Lead 2"]);
         expect(renderers[1].stageCount(groupOf(renderers[1], 2))).toBe(2);
@@ -15935,7 +16252,7 @@ describe("Remaining branches", () => {
             "Visit",
         ]);
         await goToStage("Qualified");
-        await animationFrame();
+        await activityReadsDone(renderers[1]);
         expect(cardNames()).toEqual(["Lead 1", "Lead 3"]);
         expect(renderers[1].mobileState.activitiesByLead[1].map(({ summary }) => summary)).toEqual([
             "Send offer",
@@ -16041,19 +16358,19 @@ describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a reconciliation reload that loses the connection keeps the sync copy, so the replayed move keeps its placement until the next reconnection reloads", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types)
-            ACTIVITIES,
+            // the move displays Qualified (the types, Lead 1's activities; Lead 3's were never
+            // cached)
             TYPES,
-            // the connection lost during the reload: Qualified's two leads, read online on
-            // reconnecting, and the types, answered by the cache
             ACTIVITIES,
-            ACTIVITIES,
+            // the connection lost during the reload: the types and Lead 1's activities, read on
+            // reconnecting, answered by the cache (Lead 3's read goes once the connection is
+            // lost, so they stay uncached)
             TYPES,
-            // the offline reload, then the activities revalidated after it
+            ACTIVITIES,
+            // the offline reload, then the types and Lead 1's activities revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -16112,8 +16429,9 @@ describe("Remaining branches", () => {
         expect(cardNames().sort()).toEqual(["Lead 1", "Lead 3"]);
         expect(totals(1)).toEqual([1, 20]);
 
-        // The next reconnection (nothing queued) reloads at once: the copy ends, the server data
-        // place the lead.
+        // The next reconnection (nothing queued), once the offline reads are answered, reloads at
+        // once: the copy ends, the server data place the lead.
+        await activityReadsDone(renderer);
         await setOffline(false);
         await expect.waitForSteps([LEAD_GROUPS]);
         await animationFrame();
@@ -16159,9 +16477,10 @@ describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a reconciliation reload landing after the pipeline was left leaves its sync copy alone", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types)
-            ACTIVITIES,
+            // the move displays Qualified (the types, Lead 1's activities; Lead 3's were never
+            // cached)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -16188,6 +16507,7 @@ describe("Remaining branches", () => {
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
         await getService("action").doAction(PIPELINE_ACTION_ID);
         const [renderer] = renderers;
+        await activityReadsDone(renderer);
 
         // Offline move of Lead 1 to Qualified, then the connection returns: the move is replayed
         // and the reconciliation reload is made, its answer held.
@@ -16216,17 +16536,19 @@ describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a connection lost during the replay keeps the sync copy, and the next sync window starts from it united with the entries still queued", async () => {
         const errors = cachedReadErrors([
-            // the first move displays Qualified (Lead 1's activities, the types)
+            // the first move displays Qualified (the types, Lead 1's activities; Lead 3's were
+            // never cached)
+            TYPES,
             ACTIVITIES,
+            // the second move displays Proposition (Lead 3's and Lead 4's activities were never
+            // cached: the types)
             TYPES,
-            // the second move displays Proposition (Lead 3's activities were never cached: the
-            // types)
-            TYPES,
-            // the offline reload, then the activities revalidated after it
+            // the offline reload, then the types and Proposition's leads revalidated after it
+            // (both read online on reconnecting)
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -16298,8 +16620,10 @@ describe("Remaining branches", () => {
         expect(totals(1)).toEqual([1, 20]);
         expect(totals(2)).toEqual([1, 100]);
 
-        // Reconnect: the new window starts from the entries still queued united with the kept
-        // copy, so Lead 1 keeps its placement while Lead 3's move is replayed...
+        // Reconnect, once the offline reads are answered: the new window starts from the entries
+        // still queued united with the kept copy, so Lead 1 keeps its placement while Lead 3's
+        // move is replayed...
+        await activityReadsDone(renderer);
         holdLead3 = true;
         await setOffline(false);
         await expect.waitForSteps(['replay [[3],{"stage_id":3}]']);
@@ -16353,11 +16677,11 @@ describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a non-monetary sum field is summed as an integer, online and from the offline cache, a zero sum included", async () => {
         const errors = cachedReadErrors([
-            // the offline reload, then New's leads and the types revalidated after it
+            // the offline reload, then the types and New's leads revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
             // Qualified displayed (Lead 3's activities were never read): the types
             TYPES,
         ]);
@@ -16393,18 +16717,18 @@ describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a stage holding several currencies sums in the company currency, and a stage emptied on the server shows 0 without currency, online and from the offline cache", async () => {
         const errors = cachedReadErrors([
-            // the offline reload, then Qualified's lead and the types revalidated after it
+            // the offline reload, then the types and Qualified's lead revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
             TYPES,
-            // back on New: its two leads and the types
             ACTIVITIES,
-            ACTIVITIES,
+            // back on New: the types and its two leads
             TYPES,
-            // on to Proposition through Qualified (its lead and the types), then Proposition,
+            ACTIVITIES,
+            ACTIVITIES,
+            // on to Proposition through Qualified (the types and its lead), then Proposition,
             // which holds no lead (the types)
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
             TYPES,
         ]);
         expect.errors(errors.length);
@@ -16502,11 +16826,11 @@ describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a monetary sum field the server does not aggregate totals 0 without currency, online and from the offline cache", async () => {
         const errors = cachedReadErrors([
-            // the offline reload, then New's leads and the types revalidated after it
+            // the offline reload, then the types and New's leads revalidated after it
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -16535,18 +16859,19 @@ describe("Remaining branches", () => {
         expect(renderer._stageAggregate(groupOf(renderer, 1))).toEqual({ value: 0 });
         expect(".o_crm_mobile_pipeline_count").toHaveText("2");
         expect(".o_crm_mobile_pipeline_revenue").toHaveText("0");
+        await activityReadsDone(renderer);
         expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
     test("mobile: an offline move of a lead without revenue changes the stage counts only", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 2's activities, the types)
-            ACTIVITIES,
+            // the move displays Qualified (the types, Lead 2's activities)
             TYPES,
-            // back on New: Lead 1's activities and the types
             ACTIVITIES,
+            // back on New: the types and Lead 1's activities
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -16589,9 +16914,9 @@ describe("Remaining branches", () => {
     test.tags("mobile");
     test("mobile: a parked move to a stage deleted on the server leaves the card in its server stage, still pending", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types)
-            ACTIVITIES,
+            // the move displays Qualified (the types, Lead 1's activities)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -16915,11 +17240,11 @@ describe("Remaining branches", () => {
         const errors = cachedReadErrors([
             // the offline reload while regrouped by salesperson
             LEAD_GROUPS,
-            // the stage pipeline restored offline: its groups, New's two leads and the types
+            // the stage pipeline restored offline: its groups, the types and New's two leads
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
             // Qualified displayed (Lead 3's activities were never read, so they are not cached
             // and raise nothing): the types
             TYPES,
@@ -17259,9 +17584,10 @@ describe("Remaining branches", () => {
 
     test.tags("mobile");
     test("mobile: the reload that replaces adding a lead created online whose stage is no longer listed, when it loses the connection, leaves the pipeline as it is, tells the user the lead was saved, and the next load shows the lead", async () => {
-        // the connection lost during the reload: New's two leads and the types, read again
-        // offline and answered by the cache
-        const errors = cachedReadErrors([ACTIVITIES, ACTIVITIES, TYPES]);
+        // the connection lost during the reload: the types and New's two leads, read again for
+        // the reconnection the progress bar answer makes, once the connection is lost again, and
+        // answered by the cache
+        const errors = cachedReadErrors([TYPES, ACTIVITIES, ACTIVITIES]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
@@ -17291,10 +17617,12 @@ describe("Remaining branches", () => {
         expect(stageValues()).toEqual([1, 3, 4]);
 
         // The lead is created; the reload made instead of adding it loses the connection: no
-        // error, nothing added or queued, the pipeline as it was.
+        // error, nothing added or queued, the pipeline as it was. The progress bar answer of that
+        // reload still arrives, which ends the loss for the framework: the reconciliation reload
+        // of that reconnection loses the connection in turn, and the disk cache answers it.
         dropReload = true;
         saves.release();
-        await expect.waitForSteps([LEAD_GROUPS]);
+        await expect.waitForSteps([LEAD_GROUPS, LEAD_GROUPS]);
         await animationFrame();
         expect(getService(OfflinePlugin).isOffline()).toBe(true);
         expect(serverLeads("Unlisted lead")).toHaveLength(1);
@@ -17309,8 +17637,9 @@ describe("Remaining branches", () => {
             '"Unlisted lead" was saved. It will show in the pipeline once the connection is back.'
         );
 
-        // Back online with nothing queued: the reconciliation reload lists Qualified again, with
-        // the lead created.
+        // Back online with nothing queued, once the offline reads are answered: the
+        // reconciliation reload lists Qualified again, with the lead created.
+        await activityReadsDone(renderer);
         await setOffline(false);
         await expect.waitForSteps([LEAD_GROUPS]);
         await animationFrame();
@@ -17678,13 +18007,13 @@ describe("Mobile pipeline status region", () => {
     test.tags("mobile");
     test("mobile: pipeline status region is one stable polite region, silent at mount and after a remount with writes already queued", async () => {
         const errors = cachedReadErrors([
-            // Lead 1's form offline, then the pipeline rebuilt from the cache with New's leads
-            // (both visited online) and the types
+            // Lead 1's form offline, then the pipeline rebuilt from the cache with the types and
+            // New's leads (both visited online)
             "crm.lead/web_read",
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -17697,6 +18026,7 @@ describe("Mobile pipeline status region", () => {
         await contains(`${cardOf("Lead 1")} .o_crm_mobile_lead_card_name`).click();
         expect(".o_form_view").toHaveCount(1);
         await contains(".o_back_button").click();
+        await activityReadsDone(renderers.at(-1));
 
         /** One polite, atomic, visually hidden region on the mobile root, outside every control. */
         const expectSilentRegion = () => {
@@ -17746,6 +18076,7 @@ describe("Mobile pipeline status region", () => {
         await animationFrame();
         // three pipelines: the first visit, the online back, and this offline back
         expect(renderers).toHaveLength(3);
+        await activityReadsDone(renderers.at(-1));
         expect(".o_crm_mobile_lead_card_pending").toHaveCount(1);
         expect(`${cardOf("Lead 2")} .o_crm_mobile_pending_badge`).toHaveCount(1);
         expectSilentRegion();
@@ -17758,17 +18089,17 @@ describe("Mobile pipeline status region", () => {
     test.tags("mobile");
     test("mobile: pipeline status region announces a card stage move that leaves the lead pending sync, mark-won included; an online move or a move of a lead already pending announces nothing", async () => {
         const errors = cachedReadErrors([
-            // mark-won of Lead 2 displays Won (Lead 2's activities, the types; Lead 5's were
+            // mark-won of Lead 2 displays Won (the types, Lead 2's activities; Lead 5's were
             // never read)
-            ACTIVITIES,
             TYPES,
-            // Lead 2's move displays Qualified (Lead 2's activities, the types; Lead 3's were
+            ACTIVITIES,
+            // Lead 2's move displays Qualified (the types, Lead 2's activities; Lead 3's were
             // never read)
-            ACTIVITIES,
             TYPES,
-            // Lead 3's move displays Proposition (Lead 4's activities, the types)
             ACTIVITIES,
+            // Lead 3's move displays Proposition (the types, Lead 4's activities)
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -17822,7 +18153,7 @@ describe("Mobile pipeline status region", () => {
         expect(PIPELINE_STATUS).toHaveText("Lead 3: changes pending sync.");
         expect(announcementNode()).not.toBe(markWonNode);
         expect(queued()).toHaveLength(2);
-        expect.verifyErrors(errors);
+        await expect.waitForErrors(errors);
     });
 
     test.tags("mobile");
@@ -18032,6 +18363,7 @@ describe("Replayed lead creates", () => {
         await contains(`${cardOf("Lead 2")} .o_crm_mobile_lead_card_name`).click();
         expect(".o_form_view").toHaveCount(1);
         await contains(".o_back_button").click();
+        await activityReadsDone(renderers.at(-1));
         expect.verifySteps([LEAD_GROUPS, LEAD_GROUPS]);
         expectHeader("New", 2, 120);
 
@@ -18343,13 +18675,12 @@ describe("Reconnections and replays", () => {
         const offline = getService(OfflinePlugin);
         // The type read loses the connection while the activity reads are still pending, and the
         // next answer (a request of the web client still in flight) brings the client back
-        // online: the pipeline recovers once. It reads the types again (the activity reads share
-        // the pending ones) and reloads once, then reads the types of the reloaded stage. Both
-        // type reads lose the connection again: losses of the recovery itself. Whether the
-        // reload runs at once or after the framework's next reconnection check depends on when
-        // the browser opens the framework's sync window (its cross-tab lock), and whether an
-        // answer in flight or a check ends each loss depends on that too: at most one check per
-        // lost type read.
+        // online: the pipeline recovers once. It reloads once, and queues its reads, the types
+        // first, behind the two activity reads that fill the reads in flight; the reloaded
+        // stage's run replaces them, still recovery reads. Whether the reload runs at once or
+        // after the framework's next reconnection check depends on when the browser opens the
+        // framework's sync window (its cross-tab lock), and whether an answer in flight or a
+        // check ends the loss depends on that too.
         await animationFrame();
         await runAllTimers();
         await waitUntil(() => renderer.reconciledGroups);
@@ -18358,21 +18689,33 @@ describe("Reconnections and replays", () => {
         const { [VERSION_INFO]: checks = 0, ...reads } = requests();
         expect(reads).toEqual({
             ...MOUNT_REQUESTS,
-            [TYPES]: 3,
             [PROGRESS_BAR]: 2,
             [LEAD_GROUPS]: 2,
         });
-        expect(checks).toBeLessThan(4);
+        expect(checks).toBeLessThan(2);
         expect(activities.held).toBe(2);
+        const queuedReads = renderer._activityReadQueue.map(({ resId, recovery }) => [
+            resId,
+            recovery,
+        ]);
+        expect(queuedReads).toEqual([
+            [null, true],
+            [1, true],
+            [2, true],
+        ]);
 
-        // The activity reads answer: nothing more is read or reloaded, whatever brings the client
-        // back.
+        // The activity reads answer, which sends the queued reads: the activity ones join those
+        // answers, and the type read loses the connection again, a loss of the recovery itself,
+        // which an answer or a check ends. Nothing more is read or reloaded.
         activities.release();
         await animationFrame();
         await animationFrame();
         await runAllTimers();
         expect(offline.isOffline()).toBe(false);
-        expect(requests()).toEqual({});
+        const { [VERSION_INFO]: lateChecks = 0, ...lateReads } = requests();
+        expect(lateReads).toEqual({ [TYPES]: 1 });
+        expect(lateChecks).toBeLessThan(2);
+        expect(renderer._activityReadQueue).toEqual([]);
         expect(renderer.mobileState.activityTypes).toBe(null);
         expect(Object.keys(renderer.mobileState.activitiesByLead)).toEqual(["1", "2"]);
         expectActivityControlsDisabled();
@@ -18402,11 +18745,12 @@ describe("Reconnections and replays", () => {
         await animationFrame();
         expect(requests()).toEqual({});
 
-        // That check brings the client back online, and the pipeline recovers once: it reads the
-        // activities and the types again and reloads, then reads the reloaded stage. Each type
-        // read loses the connection again, a loss of the recovery itself, which an answer still
-        // in flight or a check ends (at most one check per lost type read, as in the previous
-        // test): nothing follows, and both controls stay disabled.
+        // That check brings the client back online, and the pipeline recovers once: it reloads,
+        // and the reloaded stage's run, replacing the reconnection's reads before they went,
+        // reads the types and Lead 1, then Lead 2 once one of them ends. The type read loses the
+        // connection again, a loss of the recovery itself; Lead 2's read, sent offline as
+        // online, is answered. An answer still in flight or a check ends that loss (at most one
+        // check per lost type read): nothing follows, and both controls stay disabled.
         await runAllTimers();
         await waitUntil(() => renderer.reconciledGroups);
         await animationFrame();
@@ -18414,13 +18758,13 @@ describe("Reconnections and replays", () => {
         expect(offline.isOffline()).toBe(false);
         const { [VERSION_INFO]: checks = 0, ...reads } = requests();
         expect(reads).toEqual({
-            [ACTIVITIES]: 4,
-            [TYPES]: 2,
+            [ACTIVITIES]: 2,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
         expect(checks).toBeGreaterThan(0);
-        expect(checks).toBeLessThan(4);
+        expect(checks).toBeLessThan(3);
         expect(renderer.mobileState.activityTypes).toBe(null);
         expectActivityControlsDisabled();
         await runAllTimers();
@@ -18446,7 +18790,7 @@ describe("Reconnections and replays", () => {
         await mountPipeline();
         await animationFrame();
         const offline = getService(OfflinePlugin);
-        expect.verifySteps([PROGRESS_BAR, LEAD_GROUPS, ACTIVITIES, ACTIVITIES, TYPES]);
+        await expect.waitForSteps([PROGRESS_BAR, LEAD_GROUPS, TYPES, ACTIVITIES, ACTIVITIES]);
         const [renderer] = renderers;
         await waitUntil(() => Object.keys(renderer.mobileState.activitiesByLead).length === 2);
         await animationFrame();
@@ -18461,23 +18805,21 @@ describe("Reconnections and replays", () => {
         expect(renderer.mobileState.activityTypes).toBe(null);
         expectActivityControlsDisabled();
 
-        // That check brings the client back online: the pipeline reads the activities and the
-        // types again, which enables both controls without a manual reload, reloads once, and
-        // reads the reloaded stage; then nothing more.
+        // That check brings the client back online: the pipeline reloads once, and the reloaded
+        // stage's run, replacing the reconnection's reads before they went, reads the types
+        // first, which enables both controls without a manual reload, then the activities; then
+        // nothing more.
         await runAllTimers();
         await animationFrame();
         expect(offline.isOffline()).toBe(false);
-        expect.verifySteps([
+        await expect.waitForSteps([
             VERSION_INFO,
             "online",
-            ACTIVITIES,
-            ACTIVITIES,
-            TYPES,
             PROGRESS_BAR,
             LEAD_GROUPS,
-            ACTIVITIES,
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
         ]);
         expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
         expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
@@ -18517,10 +18859,11 @@ describe("Reconnections and replays", () => {
         failure.armed = true;
         expect(requests()).toEqual({});
 
-        // Back online: the reconnection reads, and reloads once. Lead 1's read loses the
-        // connection, and the client comes back with an answer still in flight or with the
-        // framework's reconnection check: that loss and that reconnection read and reload
-        // nothing more.
+        // Back online: the pipeline reloads once, and the reloaded stage's run, replacing the
+        // reconnection's reads before they went, reads the types and Lead 1, then Lead 2. Lead
+        // 1's read loses the connection; Lead 2's, sent offline as online, is answered, and the
+        // client comes back with an answer still in flight or with the framework's reconnection
+        // check: that loss and that reconnection read and reload nothing more.
         await setOffline(false);
         await animationFrame();
         await animationFrame();
@@ -18528,8 +18871,8 @@ describe("Reconnections and replays", () => {
         expect(getService(OfflinePlugin).isOffline()).toBe(false);
         expect(requests()).toEqual({
             [VERSION_INFO]: 1,
-            [ACTIVITIES]: 4,
-            [TYPES]: 2,
+            [ACTIVITIES]: 2,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -18558,7 +18901,8 @@ describe("Reconnections and replays", () => {
         expect(requests()).toEqual({ [VERSION_INFO]: 1 });
 
         // The connection returns, as the next check finds: the pipeline reloads once, and reads
-        // its leads' activities and the types on the reconnection and after the reload.
+        // the types and its leads' activities after the reload (the reloaded stage's run replaces
+        // the reconnection's reads before they went).
         connection.offline = false;
         MockServer.env["crm.lead"].write([2], { name: "Lead 2 (renamed)" });
         await offline.checkConnection();
@@ -18568,8 +18912,8 @@ describe("Reconnections and replays", () => {
         expect(offline.isOffline()).toBe(false);
         expect(requests()).toEqual({
             [VERSION_INFO]: 1,
-            [ACTIVITIES]: 4,
-            [TYPES]: 2,
+            [ACTIVITIES]: 2,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -18605,7 +18949,8 @@ describe("Reconnections and replays", () => {
         expect(requests()).toEqual({ [VERSION_INFO]: 1 });
 
         // The connection returns: the pipeline reloads once and reads again, as on any
-        // reconnection.
+        // reconnection (the reloaded stage's run replaces the reconnection's reads before they
+        // went).
         connection.offline = false;
         await offline.checkConnection();
         await animationFrame();
@@ -18614,8 +18959,8 @@ describe("Reconnections and replays", () => {
         expect(offline.isOffline()).toBe(false);
         expect(requests()).toEqual({
             [VERSION_INFO]: 1,
-            [ACTIVITIES]: 2,
-            [TYPES]: 2,
+            [ACTIVITIES]: 1,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -18624,7 +18969,7 @@ describe("Reconnections and replays", () => {
     });
 
     test.tags("mobile");
-    test("mobile: a short outage that only the pipeline's navigation reads report, ended by the framework's first check, is recovered from once: the displayed stage and the types are read again, the pipeline reloads once, and the reloaded stage is read", async () => {
+    test("mobile: a short outage that only the pipeline's navigation reads report, ended by the framework's first check, is recovered from once: the pipeline reloads once, and the reloaded stage and the types are read again", async () => {
         const errors = cachedReadErrors([
             // the types, read at mount, read again on the navigation that meets the outage
             TYPES,
@@ -18650,8 +18995,8 @@ describe("Reconnections and replays", () => {
         expect.verifySteps(["offline"]);
 
         // The connection returns before the framework's first reconnection check, which succeeds:
-        // the pipeline reads again and reloads once, then reads the reloaded stage, and nothing
-        // more.
+        // the pipeline reloads once, then reads the types and the reloaded stage (that run
+        // replaces the reconnection's reads before they went), and nothing more.
         connection.offline = false;
         MockServer.env["crm.lead"].write([3], { name: "Lead 3 (renamed)" });
         await runAllTimers();
@@ -18660,8 +19005,8 @@ describe("Reconnections and replays", () => {
         expect.verifySteps(["online"]);
         expect(requests()).toEqual({
             [VERSION_INFO]: 1,
-            [ACTIVITIES]: 2,
-            [TYPES]: 2,
+            [ACTIVITIES]: 1,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -19133,13 +19478,13 @@ describe("Reconnections and replays", () => {
         expect.verifySteps([PROGRESS_BAR, LEAD_GROUPS]);
 
         for (let round = 0; round < 2; round++) {
-            // Small: the stage pipeline reads its leads' activities and the types, and reloads
+            // Small: the stage pipeline reads the types and its leads' activities, and reloads
             // nothing.
             await resize({ width: 375 });
             await animationFrame();
             expect(renderer.isMobilePipeline).toBe(true);
             await runAllTimers();
-            expect.verifySteps([ACTIVITIES, ACTIVITIES, TYPES]);
+            expect.verifySteps([TYPES, ACTIVITIES, ACTIVITIES]);
             expectHeader("New", 2, 120);
             // Wide again: nothing is read.
             await resize({ width: 1024 });
@@ -19172,20 +19517,13 @@ describe("Reconnections and replays", () => {
         expect(getService(OfflinePlugin).syncingORM()).toBe(false);
         expect(queued()).toHaveLength(0);
 
-        // Small: the owed reload runs, then the reloaded stage is read.
+        // Small: the owed reload runs, then the types and the reloaded stage are read (that run
+        // replaces the reads of the stage shown before the reload, not sent yet).
         await resize({ width: 375 });
         await animationFrame();
         await runAllTimers();
         expect(renderer.isMobilePipeline).toBe(true);
-        expect.verifySteps([
-            ACTIVITIES,
-            ACTIVITIES,
-            TYPES,
-            PROGRESS_BAR,
-            LEAD_GROUPS,
-            ACTIVITIES,
-            TYPES,
-        ]);
+        expect.verifySteps([PROGRESS_BAR, LEAD_GROUPS, TYPES, ACTIVITIES]);
         expect(cardNames()).toEqual(["Lead 1"]);
         expectHeader("New", 1, 100);
 
@@ -19195,7 +19533,7 @@ describe("Reconnections and replays", () => {
         await resize({ width: 375 });
         await animationFrame();
         await runAllTimers();
-        expect.verifySteps([ACTIVITIES, TYPES]);
+        expect.verifySteps([TYPES, ACTIVITIES]);
     });
 
     test.tags("mobile");
@@ -19260,8 +19598,9 @@ describe("Reconnections and replays", () => {
     /**
      * Mounts the pipeline, moves Lead 2 to Qualified offline, and reconnects: the window replays
      * the move, and the reload that ends it has its progress-bar read lose the connection, then
-     * its group read answer (which brings the client back online), so that reload lands online
-     * with server data. The reload does not reconcile the copy, which keeps the replayed move.
+     * its group read answer, once the answers of the reads sent meanwhile (the reconnection's)
+     * have brought the client back online, so that reload lands online with server data. The
+     * reload does not reconcile the copy, which keeps the replayed move.
      *
      * @param {string[]} [laterCachedReadErrors] `"<model>/<method>"` of each cached read the test
      *   then has refreshed while the connection is lost (see `cachedReadErrors`)
@@ -19271,7 +19610,8 @@ describe("Reconnections and replays", () => {
      */
     async function keepCopyAfterLostReload(laterCachedReadErrors = []) {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 2's activities, the types)
+            // the move displays Qualified: Lead 2's activities and the types, sent together, the
+            // type read's loss reported second (Lead 3's were never cached)
             ACTIVITIES,
             TYPES,
             ...laterCachedReadErrors,
@@ -19319,6 +19659,7 @@ describe("Reconnections and replays", () => {
         expectHeader("Qualified", 2, 50);
         const [move] = queued();
         expect(move.value.args).toEqual([[2], { stage_id: 2 }]);
+        await activityReadsDone(renderer);
         requests();
 
         // Back online: the window replays the move and ends with the reload, whose progress-bar
@@ -19329,11 +19670,15 @@ describe("Reconnections and replays", () => {
         await expect.waitForSteps(['replayed [[2],{"stage_id":2}]']);
         await waitUntil(() => reload.heldGroups && offline.isOffline());
         await animationFrame();
+        // The reconnection's reads go while the loss lasts, and their answers bring the client
+        // back online.
+        await activityReadsDone(renderer);
+        expect(offline.isOffline()).toBe(false);
         expect(queued()).toHaveLength(0);
         expect(renderer.mobileState.syncEntries.map(({ key }) => key)).toEqual([move.key]);
 
-        // Its group read answers: the client is back online and the reload lands with server
-        // data, but it lost the connection, so the copy is kept.
+        // Its group read answers: the reload lands online with server data, but it lost the
+        // connection, so the copy is kept.
         reload.heldGroups.resolve();
         await animationFrame();
         await animationFrame();
@@ -19341,7 +19686,8 @@ describe("Reconnections and replays", () => {
         expect(offline.isOffline()).toBe(false);
         expect(offline.syncingORM()).toBe(false);
         expect(requests()).toEqual({
-            // the reconnection, then the reloaded stage
+            // the reconnection's reads, sent while the loss lasts, then those of the reloaded
+            // stage: the types and Qualified's two leads each time
             [ACTIVITIES]: 4,
             [TYPES]: 2,
             [PROGRESS_BAR]: 1,
@@ -19365,7 +19711,8 @@ describe("Reconnections and replays", () => {
 
     /**
      * A direct loss and reconnection (one no answer reported): the pipeline reloads once, which
-     * reconciles the copy, and reads the displayed stage on the reconnection and after the reload.
+     * reconciles the copy, and reads the types and the displayed stage after the reload (that
+     * run replaces the reconnection's reads before they went).
      *
      * @param {Object} params
      * @param {CrmMobilePipeline} params.renderer
@@ -19384,8 +19731,8 @@ describe("Reconnections and replays", () => {
         await runAllTimers();
         expect(getService(OfflinePlugin).isOffline()).toBe(false);
         expect(requests()).toEqual({
-            [ACTIVITIES]: 2 * displayedLeads,
-            [TYPES]: 2,
+            [ACTIVITIES]: displayedLeads,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -19434,9 +19781,9 @@ describe("Reconnections and replays", () => {
         expect.verifySteps(["offline"]);
         expect(setup.requests()).toEqual({ [ACTIVITIES]: 1, [TYPES]: 1 });
 
-        // That check brings the client back, and the pipeline recovers once: it reads the
-        // displayed stage and the types again and reloads, which reconciles the copy, then reads
-        // the reloaded stage; then nothing more.
+        // That check brings the client back, and the pipeline recovers once: it reloads, which
+        // reconciles the copy, then reads the types and the reloaded stage (that run replaces the
+        // reconnection's reads before they went); then nothing more.
         await runAllTimers();
         await animationFrame();
         expect(offline.isOffline()).toBe(false);
@@ -19444,8 +19791,8 @@ describe("Reconnections and replays", () => {
         expect.verifySteps(["online"]);
         expect(setup.requests()).toEqual({
             [VERSION_INFO]: 1,
-            [ACTIVITIES]: 2,
-            [TYPES]: 2,
+            [ACTIVITIES]: 1,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -19512,7 +19859,8 @@ describe("Reconnections and replays", () => {
         expect(requests()).toEqual({ [VERSION_INFO]: 1 });
 
         // The connection returns, as the next check finds: the pipeline reloads once, and reads
-        // its leads' activities and the types on the reconnection and after the reload.
+        // the types and its leads' activities after the reload (the reloaded stage's run replaces
+        // the reconnection's reads before they went).
         connection.offline = false;
         MockServer.env["crm.lead"].write([2], { name: "Lead 2 (renamed)" });
         await offline.checkConnection();
@@ -19522,8 +19870,8 @@ describe("Reconnections and replays", () => {
         expect(offline.isOffline()).toBe(false);
         expect(requests()).toEqual({
             [VERSION_INFO]: 1,
-            [ACTIVITIES]: 4,
-            [TYPES]: 2,
+            [ACTIVITIES]: 2,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -19590,11 +19938,11 @@ describe("Reconnections and replays", () => {
         await waitUntil(() => offline.isOffline());
         const groupsAtLoss = list.groups;
 
-        // The model work ends: the reload runs offline, and the disk cache answers it. The
-        // reloaded stage is read, and those answers bring the client back; the reload's group
-        // read then loses the connection, and the framework's check brings the client back.
-        // Each of these reconnections ends a loss of the pipeline's own requests, with the
-        // pipeline showing what its reload brought, so nothing is reloaded or read again.
+        // The model work ends: the reload runs offline, its requests lose the connection, and
+        // the disk cache answers it. The reloaded stage is read, offline as online, and those
+        // answers bring the client back. That reconnection ends a loss of the pipeline's own
+        // requests, with the pipeline showing what its reload brought, so nothing is reloaded or
+        // read again.
         watchConnectionStatus();
         modelWork.resolve();
         await waitUntil(() => renderer.reconciledGroups);
@@ -19609,15 +19957,15 @@ describe("Reconnections and replays", () => {
             [LEAD_GROUPS]: 1,
             [ACTIVITIES]: 2,
             [TYPES]: 1,
-            [VERSION_INFO]: 1,
         });
-        expect.verifySteps(["online", "offline", "online"]);
+        expect.verifySteps(["online"]);
         await runAllTimers();
         expect(requests()).toEqual({});
         expectHeader("New", 2, 120);
         expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
 
-        // Once that endpoint answers again, a reconnection no answer reported reloads once.
+        // Once that endpoint answers again, a reconnection no answer reported reloads once, then
+        // reads the types and the reloaded stage.
         failure.reload = false;
         await setOffline(true);
         await setOffline(false);
@@ -19626,8 +19974,8 @@ describe("Reconnections and replays", () => {
         await runAllTimers();
         expect(offline.isOffline()).toBe(false);
         expect(requests()).toEqual({
-            [ACTIVITIES]: 4,
-            [TYPES]: 2,
+            [ACTIVITIES]: 2,
+            [TYPES]: 1,
             [PROGRESS_BAR]: 1,
             [LEAD_GROUPS]: 1,
         });
@@ -19696,35 +20044,35 @@ describe("Header totals", () => {
     test.tags("mobile");
     test("mobile: offline moves into stages the server reports empty show the moved revenue in its currency, a zero revenue included; a stage left without a lead it counts, and an empty stage with nothing pending, show 0 without currency", async () => {
         const errors = cachedReadErrors([
-            // Lead 3's move displays Qualified (Lead 3, the types)
-            ACTIVITIES,
+            // Lead 3's move displays Qualified (the types, Lead 3)
             TYPES,
-            // back on New: Leads 1, 2 and 4, the types
             ACTIVITIES,
-            ACTIVITIES,
-            ACTIVITIES,
+            // back on New: the types, Leads 1, 2 and 4
             TYPES,
-            // Lead 2's move displays Proposition (Lead 2, the types)
             ACTIVITIES,
+            ACTIVITIES,
+            ACTIVITIES,
+            // Lead 2's move displays Proposition (the types, Lead 2)
             TYPES,
+            ACTIVITIES,
             // on to Won, whose Lead 5 was never displayed online (the types); Lead 5's move
-            // displays Qualified (Lead 3, the types)
+            // displays Qualified (the types, Lead 3)
+            TYPES,
+            TYPES,
+            ACTIVITIES,
+            // on to Won through Proposition (the types, Lead 2), then Won (the types)
             TYPES,
             ACTIVITIES,
             TYPES,
-            // on to Won through Proposition (Lead 2, the types), then Won (the types)
-            ACTIVITIES,
+            // back to New through Proposition (the types, Lead 2), Qualified (the types, Lead 3)
+            // and New (the types, Leads 1 and 4)
             TYPES,
-            TYPES,
-            // back to New through Proposition (Lead 2, the types), Qualified (Lead 3, the types)
-            // and New (Leads 1 and 4, the types)
             ACTIVITIES,
             TYPES,
             ACTIVITIES,
             TYPES,
             ACTIVITIES,
             ACTIVITIES,
-            TYPES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -19918,10 +20266,10 @@ describe("Header totals", () => {
     test.tags("mobile");
     test("mobile: an offline card move displays the target stage with the moved card as soon as the framework has moved it, before its save is queued, then with its pending badge", async () => {
         const errors = cachedReadErrors([
-            // the move displays Qualified (Lead 1's activities, the types; Lead 3's were never
+            // the move displays Qualified (the types, Lead 1's activities; Lead 3's were never
             // cached), once only
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
         ]);
         expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
@@ -20167,5 +20515,404 @@ describe("Quick create sheet layout and focus", () => {
         expect(named[0]).toBe(root);
         expect.verifySteps([]);
         expect(queued()).toHaveLength(0);
+    });
+});
+
+describe("Activity read queue", () => {
+    /**
+     * Holds every activity and activity-type read while `holder.active` (from the start), in the
+     * order they reach the server; `releaseFirst` answers the oldest one held, `releaseAll` every
+     * one, and holds nothing more.
+     *
+     * @returns {{ active: boolean, held: number, releaseFirst: () => void,
+     *   releaseAll: () => void }}
+     */
+    function holdActivityReads() {
+        const pending = [];
+        const holder = {
+            active: true,
+            get held() {
+                return pending.length;
+            },
+            releaseFirst() {
+                pending.shift().resolve();
+            },
+            releaseAll() {
+                holder.active = false;
+                for (const deferred of pending.splice(0)) {
+                    deferred.resolve();
+                }
+            },
+        };
+        for (const route of [ACTIVITIES, TYPES]) {
+            onRpc(`/web/dataset/call_kw/${route}`, async () => {
+                if (holder.active) {
+                    const deferred = Promise.withResolvers();
+                    pending.push(deferred);
+                    await deferred.promise;
+                }
+            });
+        }
+        return holder;
+    }
+
+    test.tags("mobile");
+    test("mobile: the reads a revalidation queues go after the next animation frame, the activity types first, at most two at a time, each answer sending the next", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        await makeMockServer();
+        for (let index = 1; index <= 3; index++) {
+            MockServer.env["crm.lead"].create({
+                name: `New lead ${index}`,
+                stage_id: 1,
+                expected_revenue: 10,
+            });
+        }
+        const reads = holdActivityReads();
+        watchActivityReads();
+        watchTypeReads();
+        // The run queues its reads and sends none: nothing is in flight when it returns, and the
+        // first reads reach the server after the next animation frame.
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            _queueActivityReads() {
+                super._queueActivityReads(...arguments);
+                const queuedReads = this._activityReadQueue.length;
+                expect.step(`queued ${queuedReads}, ${this._activityReadsInFlight} in flight`);
+                requestAnimationFrame(() => expect.step("next frame"));
+            },
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        const leadIds = renderer.cardsFor(renderer.currentGroup).map((record) => record.resId);
+        expect(leadIds).toHaveLength(5);
+        await waitUntil(() => reads.held === 2);
+        await animationFrame();
+        expect.verifySteps([
+            "queued 6, 0 in flight",
+            "next frame",
+            "types",
+            `activities:${leadIds[0]}`,
+        ]);
+        expect(renderer._activityReadsInFlight).toBe(2);
+        expect(renderer._activityReadQueue.map(({ resId }) => resId)).toEqual(leadIds.slice(1));
+        const logCall = `${cardOf("Lead 1")} .o_crm_mobile_card_log_call`;
+        expect(logCall).toHaveAttribute("disabled");
+
+        // The type read answers first, which enables the activity controls, then each answer
+        // sends the next lead's read, in display order: never more than two in flight.
+        reads.releaseFirst();
+        await expect.waitForSteps([`activities:${leadIds[1]}`]);
+        await waitUntil(() => renderer.mobileState.activityTypes);
+        expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
+        await animationFrame();
+        expect(logCall).not.toHaveAttribute("disabled");
+        for (const resId of leadIds.slice(2)) {
+            expect(reads.held).toBe(2);
+            expect(renderer._activityReadsInFlight).toBe(2);
+            reads.releaseFirst();
+            await expect.waitForSteps([`activities:${resId}`]);
+        }
+        expect(reads.held).toBe(2);
+        expect(renderer._activityReadQueue).toEqual([]);
+        reads.releaseAll();
+        await activityReadsDone(renderer);
+        const byId = (a, b) => a - b;
+        expect(Object.keys(renderer.mobileState.activitiesByLead).map(Number).sort(byId)).toEqual(
+            [...leadIds].sort(byId)
+        );
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: the reads queued for a stage left before they went are never sent, and those of the stage displayed then are", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const reads = holdActivityReads();
+        reads.active = false;
+        const requests = watchActivityReads();
+        watchTypeReads();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:1", "activities:2"]);
+
+        // Held, Qualified's reads fill the reads in flight, so those of Proposition, passed on the
+        // way to Won, are still queued when Won's replace them.
+        reads.active = true;
+        await goToStage("Qualified");
+        await waitUntil(() => reads.held === 2);
+        expect.verifySteps(["types", "activities:3"]);
+        await goToStage("Won");
+        expect(cardNames()).toEqual(["Lead 5"]);
+        expect(renderer._activityReadQueue.map(({ resId }) => resId)).toEqual([null, 5]);
+        await animationFrame();
+        expect.verifySteps([]);
+
+        // The held reads answer: Won's reads go, Proposition's never do. Won's type read, sent
+        // as the held one answers, joins that identical request, so only Lead 5 is read.
+        reads.releaseAll();
+        await activityReadsDone(renderer);
+        expect.verifySteps(["activities:5"]);
+        expect(requests.has(4)).toBe(false);
+        expect(4 in renderer.mobileState.activitiesByLead).toBe(false);
+        expect(Array.isArray(renderer.mobileState.activitiesByLead[5])).toBe(true);
+        expect(Array.isArray(renderer.mobileState.activitiesByLead[3])).toBe(true);
+    });
+
+    test.tags("mobile");
+    test("mobile: offline, every revalidation trigger still reads the types and each displayed lead through the queue, the types first and at most two at a time, and the cache answers: a stage displayed again, a list reloaded, and a lead whose earlier offline read found nothing cached; a reconnection reads them again as recovery requests", async () => {
+        const errors = cachedReadErrors([
+            // offline, Qualified is displayed: the types, read at mount, answered by the cache
+            // (Lead 3's activities, never read online, are not cached and raise nothing)
+            TYPES,
+            // New, displayed again: the types and both leads' activities, answered by the cache
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+            // New's list reloaded offline: the reload, answered by the cache, then the types and
+            // both leads' activities, answered by the cache again
+            LEAD_GROUPS,
+            TYPES,
+            ACTIVITIES,
+            ACTIVITIES,
+            // Qualified displayed again: the types (Lead 3's activities are still not cached)
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        await createActivities([
+            {
+                res_id: 1,
+                activity_type_id: 2,
+                activity_category: "phonecall",
+                summary: "Call Mitchell",
+            },
+            { res_id: 2, activity_type_id: 1, activity_category: "default", summary: "Send offer" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Registered after the offline mock, the holder runs first: it holds a read sent offline
+        // before the mock answers it with a 502.
+        const reads = holdActivityReads();
+        reads.active = false;
+        watchActivityReads();
+        watchTypeReads();
+        // each loader call and whether its request is a recovery request; the value each lead's
+        // read delivers, as the summaries it lists; the most reads ever in flight
+        const loads = [];
+        const answers = [];
+        let mostInFlight = 0;
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            async _loadLeadActivities(resId) {
+                loads.push(`${resId}${this._recoveryReadDepth ? " (recovery)" : ""}`);
+                const value = await super._loadLeadActivities(...arguments);
+                const summaries = value?.records.map(({ summary }) => summary).join(", ");
+                answers.push(`${resId}: ${value ? summaries || "no activity" : "nothing cached"}`);
+                return value;
+            },
+            _loadActivityTypes() {
+                loads.push(`types${this._recoveryReadDepth ? " (recovery)" : ""}`);
+                return super._loadActivityTypes(...arguments);
+            },
+            _sendActivityRead() {
+                super._sendActivityRead(...arguments);
+                mostInFlight = Math.max(mostInFlight, this._activityReadsInFlight);
+            },
+        });
+        const summariesOf = (name) =>
+            queryAllTexts(`${cardOf(name)} .o_crm_mobile_activity_summary`);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:1", "activities:2"]);
+        expect(loads.splice(0)).toEqual(["types", "1", "2"]);
+        expect(answers.splice(0)).toEqual(["1: Call Mitchell", "2: Send offer"]);
+
+        // The connection dropping alone reads nothing.
+        await setOffline(true);
+        await activityReadsDone(renderer);
+        expect.verifySteps([]);
+        expect(loads).toEqual([]);
+
+        // Offline, Qualified is displayed: the types and Lead 3, never read, are read, and the
+        // cache holds nothing for Lead 3.
+        await goToStage("Qualified");
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:3"]);
+        expect(loads.splice(0)).toEqual(["types", "3"]);
+        expect(answers.splice(0)).toEqual(["3: nothing cached"]);
+        expect(3 in renderer.mobileState.activitiesByLead).toBe(false);
+
+        // New is displayed again, its leads in memory: the types and both leads are read again,
+        // the types first and two at a time, each held read keeping its place until its request
+        // answers. The cache answers each read at once with what the server last answered
+        // online, which the cards show.
+        reads.active = true;
+        await goToStage("New");
+        await waitUntil(() => reads.held === 2);
+        expect.verifySteps(["types", "activities:1"]);
+        expect(renderer._activityReadsInFlight).toBe(2);
+        expect(renderer._activityReadQueue.map(({ resId }) => resId)).toEqual([2]);
+        reads.releaseFirst();
+        await expect.waitForSteps(["activities:2"]);
+        expect(renderer._activityReadsInFlight).toBe(2);
+        expect(renderer._activityReadQueue).toEqual([]);
+        reads.releaseAll();
+        await activityReadsDone(renderer);
+        expect(loads.splice(0)).toEqual(["types", "1", "2"]);
+        expect(answers.splice(0)).toEqual(["1: Call Mitchell", "2: Send offer"]);
+        expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
+        await contains(`${cardOf("Lead 1")} .o_crm_mobile_card_activities`).click();
+        await contains(`${cardOf("Lead 2")} .o_crm_mobile_card_activities`).click();
+        expect(summariesOf("Lead 1")).toEqual(["Call Mitchell"]);
+        expect(summariesOf("Lead 2")).toEqual(["Send offer"]);
+
+        // New's list is reloaded offline, its leads unchanged: the cache answers the reload, and
+        // the new list datapoint reads the types and both leads again, which the cache answers.
+        const listBefore = renderer.currentGroup.list;
+        await renderer.props.list.load();
+        await animationFrame();
+        await activityReadsDone(renderer);
+        expect(renderer.currentGroup.list).not.toBe(listBefore);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expect.verifySteps(["types", "activities:1", "activities:2"]);
+        expect(loads.splice(0)).toEqual(["types", "1", "2"]);
+        expect(answers.splice(0)).toEqual(["1: Call Mitchell", "2: Send offer"]);
+        expect(summariesOf("Lead 1")).toEqual(["Call Mitchell"]);
+        expect(summariesOf("Lead 2")).toEqual(["Send offer"]);
+
+        // Qualified is displayed again: Lead 3, whose earlier offline read found nothing cached,
+        // is read again, and the cache still holds nothing for it.
+        await goToStage("Qualified");
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:3"]);
+        expect(loads.splice(0)).toEqual(["types", "3"]);
+        expect(answers.splice(0)).toEqual(["3: nothing cached"]);
+        expect(3 in renderer.mobileState.activitiesByLead).toBe(false);
+        expect(mostInFlight).toBe(2);
+        expect.verifyErrors(errors);
+
+        // Back online on Qualified: the pipeline reloads, then reads the types and Lead 3 again,
+        // as recovery requests.
+        await setOffline(false);
+        await waitUntil(() => renderer.reconciledGroups);
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:3"]);
+        expect(loads.splice(0)).toEqual(["types (recovery)", "3 (recovery)"]);
+        expect(answers.splice(0)).toEqual(["3: no activity"]);
+        expect(Array.isArray(renderer.mobileState.activitiesByLead[3])).toBe(true);
+        expect(mostInFlight).toBe(2);
+    });
+
+    test.tags("mobile");
+    test("mobile: no activity or type read is sent before the pipeline is mounted: the reads its first revalidation queues go after the mounted pipeline's next animation frame", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchActivityReads();
+        watchTypeReads();
+        // The first revalidation run queues its reads during setup; the mount is then held, as
+        // the view's other components and requests hold it in the web client.
+        const mountHeld = Promise.withResolvers();
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            setup() {
+                super.setup(...arguments);
+                const queuedReads = this._activityReadQueue.map(({ resId }) => resId);
+                expect.step(`set up, queued ${JSON.stringify(queuedReads)}`);
+                onWillStart(() => mountHeld.promise);
+                onMounted(() => {
+                    expect.step(`mounted, ${this._activityReadsInFlight} in flight`);
+                    requestAnimationFrame(() => expect.step("next frame"));
+                });
+            },
+        });
+        const renderers = captureInstances(CrmMobilePipeline);
+        const mounting = mountPipeline();
+        await waitUntil(() => renderers.length);
+        const [renderer] = renderers;
+
+        // Frames and timers pass while the mount is held: no read is sent, none is scheduled.
+        await animationFrame();
+        await runAllTimers();
+        await animationFrame();
+        expect.verifySteps(["set up, queued [null,1,2]"]);
+        expect(renderer._activityReadPump).toBe(null);
+        expect(renderer._activityReadsInFlight).toBe(0);
+        expect(renderer._activityReadQueue.map(({ resId }) => resId)).toEqual([null, 1, 2]);
+
+        // Mounted: the queued reads go after the next animation frame, the types first.
+        mountHeld.resolve();
+        await mounting;
+        await activityReadsDone(renderer);
+        expect.verifySteps([
+            "mounted, 0 in flight",
+            "next frame",
+            "types",
+            "activities:1",
+            "activities:2",
+        ]);
+        expect(Object.keys(renderer.mobileState.activitiesByLead).map(Number)).toEqual([1, 2]);
+        expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
+
+        // A run after the mount schedules its reads at once: they go after the next frame.
+        await goToStage("Qualified");
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:3"]);
+    });
+
+    test.tags("mobile");
+    test("mobile: the queued revalidation reads are sent silently, out of the loading indicator, and a card's direct re-read is not", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        // while set, the server holds every activity read until it is resolved
+        let held = null;
+        onRpc(`/web/dataset/call_kw/${ACTIVITIES}`, async () => {
+            await held?.promise;
+        });
+        watchActivityReads();
+        watchTypeReads();
+        // every activity and type request, as the network layer announces it, with its setting
+        const announced = [];
+        const onRequest = ({ detail }) => {
+            const params = detail?.data?.params;
+            if (params?.method !== "web_search_read") {
+                return;
+            }
+            const silent = detail.settings?.silent ? "silent" : "not silent";
+            if (params.model === "mail.activity.type") {
+                announced.push(`types: ${silent}`);
+            } else if (params.model === "mail.activity") {
+                const resId = params.kwargs.domain.find(([field]) => field === "res_id")?.[2];
+                announced.push(`activities:${resId}: ${silent}`);
+            }
+        };
+        rpcBus.addEventListener("RPC:REQUEST", onRequest);
+        after(() => rpcBus.removeEventListener("RPC:REQUEST", onRequest));
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:1", "activities:2"]);
+        expect(announced.splice(0)).toEqual([
+            "types: silent",
+            "activities:1: silent",
+            "activities:2: silent",
+        ]);
+
+        // A card's re-read after its activity write is the user's own request: not silent. It is
+        // the same request, hence the same cache entry, as the silent revalidation read: the
+        // cache answers it with what that read stored while the server still holds it.
+        held = Promise.withResolvers();
+        const result = await renderer.onActivitiesChanged(1);
+        expect(result).toEqual({ records: [], length: 0 });
+        await expect.waitForSteps(["activities:1"]);
+        expect(announced.splice(0)).toEqual(["activities:1: not silent"]);
+        held.resolve();
+        held = null;
+        await animationFrame();
+
+        // Stage navigation's queued reads are silent again.
+        await goToStage("Qualified");
+        await activityReadsDone(renderer);
+        expect.verifySteps(["types", "activities:3"]);
+        expect(announced.splice(0)).toEqual(["types: silent", "activities:3: silent"]);
     });
 });

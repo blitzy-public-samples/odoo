@@ -92,6 +92,7 @@
                         t-on-click.stop="() => this.toggleFollowUp()">
                         <i class="oi oi-fw" data-icon="schedule" aria-hidden="true"/> <span>Follow-up</span>
                     </button>
+                    <!-- No count badge until the lead's activities and their total are known: never a count that is not the lead's. -->
                     <button type="button"
                         class="btn btn-secondary gap-1 o_crm_mobile_card_activities"
                         data-available-offline="1"
@@ -99,7 +100,7 @@
                         t-att-aria-label="this.activitiesLabel"
                         t-att-aria-expanded="this.state.activitiesOpen ? 'true' : 'false'"
                         t-on-click.stop="() => this.toggleActivities()">
-                        <i class="oi oi-fw" data-icon="checklist" aria-hidden="true"/> <span>Activities</span><span class="badge rounded-pill text-bg-light" t-out="this.activityCount"/>
+                        <i class="oi oi-fw" data-icon="checklist" aria-hidden="true"/> <span>Activities</span><span t-if="this.activitiesKnown" class="badge rounded-pill text-bg-light" t-out="this.activityCount"/>
                     </button>
                 </div>
 
@@ -222,7 +223,8 @@
                             t-out="this.showAllActivitiesLabel"/>
                         <span t-else="" class="text-700 small" t-out="this.hiddenActivitiesLabel"/>
                     </li>
-                    <li t-if="!this.activityCount" class="text-700 small" t-out="this.noActivitiesLabel"/>
+                    <!-- Also after the rows shown (pending creates, confirmed writes) while the lead's count is not known. -->
+                    <li t-if="!this.activitiesKnown or !this.activityCount" class="text-700 small" t-out="this.noActivitiesLabel"/>
                 </ul>
             </div>
         </article>

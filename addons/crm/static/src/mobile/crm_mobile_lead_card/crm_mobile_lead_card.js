@@ -19,6 +19,11 @@
  *   the session user: no assignee picker.
  * - Activities are a bounded page with the server total: the list ends with "Show all (N)" online
  *   or "N more activities are not available offline" offline, so nothing is hidden silently.
+ * - The Activities count is displayed, named and announced only once the lead's activities and
+ *   their server total are known (`activitiesKnown`): until then the badge holds no value, and
+ *   the list shows the rows it has (the confirmed writes the pipeline shows before the lead's
+ *   first read), then says the activities are loading (online, where the pipeline reads every
+ *   displayed lead) or not available offline. A loaded empty list counts 0.
  * - The guarded handlers (`onOpenCard`, `toggleStageList`, `onChooseStage`, `onLogCall`,
  *   `toggleFollowUp`, `onSaveFollowUp`, `onMarkDone`, `toggleActivities`) re-check their
  *   predicate, so a direct call is inert while it fails. The follow-up input handlers only copy
@@ -36,8 +41,8 @@
  *   re-reads the lead (only if alive, and showing the lead for the read).
  * - Status region (polite, atomic `role="status"`, empty at mount): it announces queue changes
  *   while the card stays mounted, and the Activities count only after the user's own activity
- *   call (see `_announceSyncChanges`). Card creation, re-keying and destruction, and pending lead
- *   creates, are the pipeline's status region's to announce.
+ *   call, once the count is known (see `_announceSyncChanges`). Card creation, re-keying
+ *   and destruction, and pending lead creates, are the pipeline's status region's to announce.
  */
 
 import {
@@ -131,12 +136,15 @@ export class CrmMobileLeadCard extends Component {
         stages: t.array(),
         /**
          * Cached activities of the lead, a bounded page of them; `null` when not loaded and not
-         * cached.
+         * cached. Before the lead's first read, the activities its confirmed online writes
+         * created, with a `null` `activityTotal`: the list shows them, but they give no count.
          */
         activities: t.or([t.array(), t.literal(null)]).optional(null),
         /**
          * The server's total count of the lead's activities, read with `activities`; `null` when
-         * unknown. When it exceeds the page, the count shows the total and the list says so.
+         * unknown. When it exceeds the page, the count shows the total and the list says so. The
+         * card displays, names and announces a count only when both `activities` and this total
+         * are known (`activitiesKnown`).
          */
         activityTotal: t.or([t.number(), t.literal(null)]).optional(null),
         /** `(resId) => …`: online, the pipeline reads every activity of the lead. */
@@ -241,9 +249,9 @@ export class CrmMobileLeadCard extends Component {
         this._syncBaseline = null;
         /**
          * Whether an online activity create or mark done of this card succeeded and the persisted
-         * rows have not changed since: the next change of those rows (the pipeline showing the
-         * confirmed write, or the re-read it asked for) is the user's own, and its Activities
-         * count is announced (see `_announceSyncChanges`).
+         * rows have not changed since with a known count: the next such change (the pipeline
+         * showing the confirmed write, or the re-read it asked for) is the user's own, and its
+         * Activities count is announced (see `_announceSyncChanges`).
          * A plain in-memory field, never persisted and never rendered.
          *
          * @type {boolean}
@@ -464,6 +472,19 @@ export class CrmMobileLeadCard extends Component {
             )
     );
 
+    /**
+     * Whether the lead's activities and their server total are known (read, or answered by the
+     * cache, which always come with the total): only then does the card know how many the lead
+     * has, so only then is the count displayed, named and announced. Before the lead's first
+     * read, `activities` is `null`, or the activities the lead's confirmed online writes created
+     * with a `null` total: rows the list shows, whose number is no more than a lower bound of the
+     * lead's count. A pending lead create, which has no activity to load, renders no Activities
+     * control.
+     */
+    get activitiesKnown() {
+        return Array.isArray(this.props.activities) && typeof this.props.activityTotal === "number";
+    }
+
     get activityRows() {
         return this.props.activities ?? [];
     }
@@ -476,7 +497,10 @@ export class CrmMobileLeadCard extends Component {
 
     /**
      * Every activity of the lead: its server total (or loaded rows) plus its pending creates
-     * (queued, or replayed during the sync window and not among the rows yet).
+     * (queued, or replayed during the sync window and not among the rows yet). While the lead's
+     * activities or their total are not known (`activitiesKnown` is false), it counts the rows
+     * shown and the pending creates alone, which is not the lead's count: none is then
+     * displayed, named or announced.
      */
     get activityCount() {
         return (
@@ -487,10 +511,14 @@ export class CrmMobileLeadCard extends Component {
 
     /**
      * Accessible name of the Activities button: its visible label, then the count its badge
-     * shows, so the name starts with what is seen and a screen reader hears the count too.
+     * shows, so the name starts with what is seen and a screen reader hears the count too. The
+     * label alone while the count is not known (`activitiesKnown`), as the badge then shows no
+     * count.
      */
     get activitiesLabel() {
-        return _t("Activities (%(count)s)", { count: this.activityCount });
+        return this.activitiesKnown
+            ? _t("Activities (%(count)s)", { count: this.activityCount })
+            : _t("Activities");
     }
 
     get showAllActivitiesLabel() {
@@ -503,10 +531,19 @@ export class CrmMobileLeadCard extends Component {
         });
     }
 
+    /**
+     * The line the activity list shows in place of the lead's activities: "No activities" once
+     * they are known and there is none; while they are not known (`activitiesKnown`), after the
+     * rows it already shows if any, that they are not available offline, or online, where the
+     * pipeline reads every displayed lead, that they are loading.
+     */
     get noActivitiesLabel() {
-        return this.props.activities === null && this.crmOffline.isOffline()
+        if (this.activitiesKnown) {
+            return _t("No activities");
+        }
+        return this.crmOffline.isOffline()
             ? _t("Activities are not available offline")
-            : _t("No activities");
+            : _t("Loading activities…");
     }
 
     // -------------------------------------------------------------------------
@@ -1095,13 +1132,14 @@ export class CrmMobileLeadCard extends Component {
      *
      * @private
      * @returns {{ pendingSync: boolean, createKeys: string[], activityIds: number[],
-     *   total: number | null, doneIds: number[], count: number, activitiesKnown: boolean }} the
-     *   lead badge (always false on a pending lead create, whose badge the card never announces),
-     *   the keys of the pending create rows still in the live queue, the ids of the lead's
-     *   persisted (cached) activity rows, the server's total of them (the rows are a bounded
-     *   page), the ids of those whose mark done is in the live queue (other leads' queued
-     *   archives left out), the displayed Activities count, and whether the lead's activities
-     *   are loaded
+     *   total: number | null, doneIds: number[], count: number | null,
+     *   rowsLoaded: boolean }} the lead badge (always false on a pending lead create, whose badge
+     *   the card never announces), the keys of the pending create rows still in the live queue,
+     *   the ids of the lead's persisted (cached) activity rows, the server's total of them (the
+     *   rows are a bounded page), the ids of those whose mark done is in the live queue (other
+     *   leads' queued archives left out), the displayed Activities count (`null` while it is not
+     *   known, when none is displayed, see `activitiesKnown`), and whether the card has persisted
+     *   rows to list (read, cached, or created by confirmed writes before the lead's first read)
      */
     _readSyncSnapshot() {
         const archivedIds = this.queuedArchivedIds;
@@ -1115,17 +1153,17 @@ export class CrmMobileLeadCard extends Component {
             activityIds,
             total: this.props.activityTotal,
             doneIds: activityIds.filter((id) => archivedIds.has(id)),
-            count: this.activityCount,
-            activitiesKnown: Array.isArray(this.props.activities),
+            count: this.activitiesKnown ? this.activityCount : null,
+            rowsLoaded: Array.isArray(this.props.activities),
         };
     }
 
     /**
      * Announces the changes between the last snapshot and this one, in one sentence naming the
-     * lead. The first snapshot (the state at mount) only becomes the baseline. When the lead's
-     * activities were loaded (or dropped) in between, the activity-derived parts are not
-     * compared: their arrival is no change of the lead. "No longer pending sync" holds whatever
-     * removed the entry, a replay or a systray discard.
+     * lead. The first snapshot (the state at mount) only becomes the baseline. When the card's
+     * persisted rows appeared (or went away) in between (`rowsLoaded`), the activity-derived
+     * parts are not compared: their arrival is no change of the lead. "No longer pending sync"
+     * holds whatever removed the entry, a replay or a systray discard.
      *
      * A pending lead create announces nothing: the pipeline's status region alone tells a queued
      * create appearing and leaving ("new lead pending sync", "new lead no longer pending sync").
@@ -1138,14 +1176,18 @@ export class CrmMobileLeadCard extends Component {
      *   creates or mark dones succeeded (`_expectActivityChange`): the pipeline shows the write
      *   the server confirmed at once, and otherwise (no created id given) the re-read that call
      *   asked for brings it. The expectation ends with that change, so the re-read that then
-     *   reflects the same write announces nothing more.
+     *   reflects the same write announces nothing more. A change made while the count is not
+     *   known (the confirmed write shown before the lead's first read) announces no count and
+     *   keeps the expectation, so the read that brings the count announces it.
      * No other count change is announced. A create or mark done leaving the queue (replay or
      * discard) is told by "no longer pending sync" alone, and a background re-read (activity
      * revalidation, the re-read a replayed activity call asks for, the one after the
      * reconciliation reload, which keeps this card mounted) is no change the user made, so its
      * count never replaces the sync confirmation in the atomic region. A newly queued activity
      * call also ends a pending expectation: the connection dropped before that re-read could
-     * land, and the rows that change next are the reconnection's.
+     * land, and the rows that change next are the reconnection's. While the count is not known
+     * (`activitiesKnown`), no count is announced at all (the snapshot has none): an activity
+     * create queued then is told by "new activity pending sync" alone.
      *
      * @private
      * @param {ReturnType<CrmMobileLeadCard["_readSyncSnapshot"]>} snapshot
@@ -1181,7 +1223,7 @@ export class CrmMobileLeadCard extends Component {
                     : _t("%s new activities no longer pending sync", clearedCreates)
             );
         }
-        if (snapshot.activitiesKnown === previous.activitiesKnown) {
+        if (snapshot.rowsLoaded === previous.rowsLoaded) {
             const queuedDone = countAdded(snapshot.doneIds, previous.doneIds);
             if (queuedDone) {
                 changes.push(
@@ -1203,10 +1245,15 @@ export class CrmMobileLeadCard extends Component {
                 countAdded(snapshot.activityIds, previous.activityIds) > 0 ||
                 countAdded(previous.activityIds, snapshot.activityIds) > 0 ||
                 snapshot.total !== previous.total;
-            if (queuedCreates || (rowsChanged && this._expectActivityChange)) {
+            if (
+                snapshot.count !== null &&
+                (queuedCreates || (rowsChanged && this._expectActivityChange))
+            ) {
                 changes.push(this._activityCountLabel(snapshot.count));
             }
-            if (rowsChanged || queuedCreates || queuedDone) {
+            // A change of the rows while the count is not known keeps the expectation: the
+            // change that brings the count (the lead's read) is the one that announces it.
+            if ((rowsChanged && snapshot.count !== null) || queuedCreates || queuedDone) {
                 this._expectActivityChange = false;
             }
         }

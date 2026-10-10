@@ -1616,24 +1616,23 @@ describe("Kanban moves", () => {
     test.tags("mobile");
     test("mobile: offline pipeline stage move to the won stage, reached by swipe: queued, no rainbowman lookup", async () => {
         // The background refresh of each read served from the RPC cache offline rejects with a
-        // connection loss nobody awaits: the activities of every displayed lead visited online,
-        // then the activity types, each time the displayed leads change. Lead 5 (Won) was never
-        // displayed online, so its uncached read is answered by the caught connection loss.
+        // connection loss nobody awaits: the activity types, then the activities of every
+        // displayed lead visited online, each time the displayed leads change. Lead 5 (Won) was
+        // never displayed online, so its uncached read is answered by the caught connection loss.
         const ACTIVITIES = "mail.activity/web_search_read";
         const TYPES = "mail.activity.type/web_search_read";
         const errors = [
             // offline swipe to Qualified (Lead 3), then back to New (Lead 1, Lead 2)
+            TYPES,
             ACTIVITIES,
             TYPES,
             ACTIVITIES,
             ACTIVITIES,
-            TYPES,
             // the move displays Won (Lead 1)
-            ACTIVITIES,
             TYPES,
+            ACTIVITIES,
             // swipes back to New through Qualified (Lead 3, then Lead 2), then to Won again through
             // Qualified (Lead 3, then Lead 1)
-            ACTIVITIES,
             TYPES,
             ACTIVITIES,
             TYPES,
@@ -1641,6 +1640,7 @@ describe("Kanban moves", () => {
             TYPES,
             ACTIVITIES,
             TYPES,
+            ACTIVITIES,
         ].map((route) => `Connection to "/web/dataset/call_kw/${route}"`);
         expect.errors(errors.length);
         const setOffline = mockOffline();

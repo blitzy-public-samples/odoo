@@ -23,6 +23,12 @@
  *   state. No correction is stored.
  * - Every read is issued only in the small-screen stage pipeline, so desktop RPC sequences are
  *   unchanged.
+ * - The revalidation's activity and type reads wait in one queue (see `_queueActivityReads`):
+ *   sent once the render that asked for them has painted (at mount, once the mounted pipeline
+ *   has), at most `MAX_ACTIVITY_READS_IN_FLIGHT` at a time, and dropped unsent when their lead
+ *   is no longer displayed. The queue only defers, caps and drops: offline as online, every
+ *   revalidation trigger reads the types and each displayed lead through the loaders, so
+ *   offline the disk cache answers.
  *
  * Status-region announcements: see `_setupPendingCreateAnnouncements`, `onCardMove` and
  * `_announce`.
@@ -30,7 +36,9 @@
 
 import {
     computed,
+    onMounted,
     onPatched,
+    onWillDestroy,
     onWillPatch,
     onWillUnmount,
     proxy,
@@ -73,9 +81,17 @@ const SWIPE_THRESHOLD = 50;
 const QUEUED_METHODS = ["web_save", "web_unlink", "unlink", "action_archive", "action_unarchive"];
 
 /**
+ * Most revalidation reads (activities of a lead, activity types) with a request in flight at once,
+ * so the browser's few connections per host stay free for the user's next request and the
+ * framework's own refreshes.
+ */
+const MAX_ACTIVITY_READS_IN_FLIGHT = 2;
+
+/**
  * @typedef {import("@web/model/relational_model/dynamic_group_list").DynamicGroupList} DynamicGroupList
  * @typedef {import("@web/model/relational_model/group").Group} Group
  * @typedef {import("@web/model/relational_model/record").Record} RelationalRecord
+ * @typedef {import("@web/core/orm_plugin").ORM} ORM
  * @typedef {{ key: string | number, value: { model: string, method: string, args: any[],
  *   kwargs: Object, extras: Object } }} QueueEntry an entry of the framework offline queue,
  *   exactly as the framework stores it
@@ -512,6 +528,38 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
          * @type {Array<{ since: number, resolve: () => void }>}
          */
         this._activityRowWaiters = [];
+        /**
+         * The revalidation reads not sent yet, in the order they go (see `_queueActivityReads`):
+         * the activity types (`resId` `null`) first, then each displayed lead in display order;
+         * `recovery` tells a read whose request is a recovery request (see
+         * `_issueRecoveryReads`). Replaced by every revalidation run, emptied outside the gate, in
+         * sample mode and on destroy. Not reactive.
+         *
+         * @type {Array<{ resId: number | null, recovery: boolean }>}
+         */
+        this._activityReadQueue = [];
+        /**
+         * Number of the queued reads whose request is sent and not answered yet, at most
+         * `MAX_ACTIVITY_READS_IN_FLIGHT` (see `_sendActivityRead`). Not reactive.
+         */
+        this._activityReadsInFlight = 0;
+        /**
+         * The dispatch of the queued reads scheduled after the next paint (see
+         * `_scheduleActivityReads`), with the handles of its animation frame and timeout; `null`
+         * when none is, and always before the pipeline is mounted. Not reactive.
+         *
+         * @type {{ frame: number, timeout: number } | null}
+         */
+        this._activityReadPump = null;
+        // The revalidation's first run, during setup, queues reads before the pipeline is in the
+        // document, while the view's own requests are still in flight: their dispatch is
+        // scheduled once mounted, so they go after the mounted pipeline's first paint.
+        onMounted(() => {
+            if (this._activityReadQueue.length) {
+                this._scheduleActivityReads();
+            }
+        });
+        onWillDestroy(() => this._cancelActivityReads());
         /**
          * Queue entries placement, totals and cards are derived from (see `stageEntries`): one
          * frozen array until the queue or the sync-window copy changes. Never read outside the
@@ -1509,7 +1557,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * which the framework reads from its persisted queue only once the window has begun, after
      * the pipeline copied the queue (`_takeSyncSnapshot`). Each replay also starts a new
      * generation (`syncGeneration`): a reconciliation reload already in flight predates that
-     * write. The queue itself is never read here, so desktop does no work.
+     * write. The pipeline's own silent requests, the queued activity and type reads
+     * (`_sendActivityRead`), are reads of other models than the list's, so they are neither
+     * replays nor a reload's requests. The queue itself is never read here, so desktop does no
+     * work.
      *
      * The record is read by the revalidation and reconciliation effects only. The listeners are
      * registered during setup, not at mount, so no answer in between is missed.
@@ -1673,32 +1724,37 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * displayed stage's list datapoint, a new object after every root load, model replacement,
      * filter change or reconciliation reload; the ids of the persisted leads the displayed stage
      * shows (stage navigation, Load more, queued moves); and the offline signal. On each change,
-     * while the gate holds, every displayed lead's activities and the activity types are read
+     * while the gate holds, the activity types and every displayed lead's activities are read
      * again through the framework disk cache: online that refreshes the cache, and a changed
      * server answer is delivered through the cache callback; offline the cache answers. The
-     * per-lead request is the same on every trigger (the loader's bounded default, or the
-     * expansion an online "Show all" chose for that lead), so a lead's activities read online
-     * come back offline whichever stage, filter or page displayed it, and the types are read
-     * again on reconnect, so a cold offline cache miss clears without a manual reload. Each read
-     * carries the lead's total count, so a truncated page is shown as such. The connection
+     * reads are queued, never sent by the run itself (see `_queueActivityReads`): they go once
+     * the render has painted, a few at a time, and a later run replaces the reads still unsent,
+     * so a stage left before its reads went sends none. The per-lead request is the same on
+     * every trigger (the loader's bounded default, or the expansion an online "Show all" chose
+     * for that lead), so a lead's activities read online come back offline whichever stage,
+     * filter or page displayed it, and the types are read again on reconnect, so a cold offline
+     * cache miss clears without a manual reload. Each read carries the lead's total count, so a
+     * truncated page is shown as such. Offline, every trigger still reads the types and each
+     * displayed lead through the loaders, whether memory holds them or not, so the disk cache
+     * answers; the queue only defers, caps and drops what is no longer displayed. The connection
      * dropping alone triggers no read (what is in memory is what the cache would answer).
      *
      * A run that handles a reconnection (its previous run saw the connection lost), or that is
      * the first to read the groups a recovery reload produced (while that reload is in flight,
      * which may commit them before it lands, or once it has landed: `recoveryGroups`), recovers:
      * its reads are recovery requests (`_issueRecoveryReads`, see
-     * `_setupConnectionAttribution`). The connection coming back alone, with nothing else
-     * changed, from a loss that a recovery request reported triggers no read: that would reissue
-     * the retry that just failed, so a read that keeps failing is retried once per failure, never
-     * in a loop. Sample records, whose ids are fake, are never read for. Sample mode suspends the
-     * effect: it forgets the previous dependencies, and leaving sample mode (the reconciliation
-     * reload, the quick create) re-runs it, so the first run on loaded data reads every displayed
-     * lead and the types.
+     * `_setupConnectionAttribution`), whenever the queue sends them. The connection coming back
+     * alone, with nothing else changed, from a loss that a recovery request reported triggers no
+     * read: that would reissue the retry that just failed, so a read that keeps failing is
+     * retried once per failure, never in a loop. Sample records, whose ids are fake, are never
+     * read for. Sample mode suspends the effect: it forgets the previous dependencies and drops
+     * the queued reads, and leaving sample mode (the reconciliation reload, the quick create)
+     * re-runs it, so the first run on loaded data reads every displayed lead and the types.
      *
      * The activities kept in memory are limited to the loaded leads by `_setupActivityPruning`.
      *
-     * Outside the gate the dependencies are constants (plus the offline signal) and nothing is
-     * read, so desktop issues no extra RPC.
+     * Outside the gate the dependencies are constants (plus the offline signal), the queued
+     * reads are dropped and nothing is read, so desktop issues no extra RPC.
      *
      * @private
      */
@@ -1714,6 +1770,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             if (gated && this.props.list.model.useSampleModel) {
                 previous = null;
                 previousGroups = null;
+                this._cancelActivityReads();
                 return;
             }
             const group = gated ? this.currentGroup : null;
@@ -1736,6 +1793,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 const firstOnGroups = groups !== previousGroups;
                 previousGroups = groups;
                 if (!gated) {
+                    this._cancelActivityReads();
                     return;
                 }
                 const onlyConnectionChanged =
@@ -1758,19 +1816,165 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                     firstOnGroups &&
                     (Boolean(this.reconciliation?.recovery) || this.recoveryGroups === groups);
                 this.recoveryGroups = null;
-                const read = () => {
-                    for (const resId of leadIds.split(",").filter(Boolean).map(Number)) {
-                        this._loadLeadActivities(resId);
-                    }
-                    this._loadActivityTypes();
-                };
-                if (reconnection || afterRecoveryReload) {
-                    this._issueRecoveryReads(read);
-                } else {
-                    read();
-                }
+                this._queueActivityReads(
+                    leadIds.split(",").filter(Boolean).map(Number),
+                    reconnection || afterRecoveryReload
+                );
             });
         });
+    }
+
+    /**
+     * Queues the reads of a revalidation run: the activity types first, so the activity controls
+     * enable as early as possible, then each displayed lead in display order. The run's reads
+     * replace those still unsent, so a lead no longer displayed is not read; a read of the
+     * replaced queue that the run reads again keeps being a recovery request when it was one.
+     * The reads go after the next paint (`_scheduleActivityReads`), never in the run's own task
+     * nor before the pipeline is mounted.
+     *
+     * @private
+     * @param {number[]} resIds the displayed persisted leads, in display order
+     * @param {boolean} recovery whether the run recovers (see `_setupActivityRevalidation`)
+     */
+    _queueActivityReads(resIds, recovery) {
+        const unsent = new Map(this._activityReadQueue.map((item) => [item.resId, item.recovery]));
+        this._activityReadQueue = [null, ...resIds].map((resId) => ({
+            resId,
+            recovery: recovery || Boolean(unsent.get(resId)),
+        }));
+        this._scheduleActivityReads();
+    }
+
+    /**
+     * Schedules the dispatch of the queued reads (`_pumpActivityReads`) in the task after the
+     * next animation frame, once the render that queued them has painted; one dispatch is
+     * scheduled at a time. Nothing before the pipeline is mounted: the reads queued until then
+     * (the revalidation's first run, during setup) are scheduled by the mount itself, so none
+     * goes before the mounted pipeline has painted. Nothing once destroyed.
+     *
+     * @private
+     */
+    _scheduleActivityReads() {
+        if (this._activityReadPump || status(this) !== "mounted") {
+            return;
+        }
+        const pump = { frame: 0, timeout: 0 };
+        pump.frame = requestAnimationFrame(() => {
+            pump.frame = 0;
+            pump.timeout = setTimeout(() => {
+                this._activityReadPump = null;
+                this._pumpActivityReads();
+            });
+        });
+        this._activityReadPump = pump;
+    }
+
+    /**
+     * Sends the queued reads, in order, while fewer than `MAX_ACTIVITY_READS_IN_FLIGHT` are in
+     * flight; each answer sends the next ones (`_sendActivityRead`), so a single task sends at
+     * most that many requests. A read that sends no request of its own (the cache joined it to
+     * an identical one in flight) takes no place. Offline every queued read is sent exactly as
+     * online: the cache answers it, and its request's failed answer frees its place at once, so
+     * the queue still drains read by read. Outside the gate, in sample mode or once destroyed,
+     * the queue is dropped.
+     *
+     * @private
+     */
+    _pumpActivityReads() {
+        untrack(() => {
+            if (
+                status(this) === "destroyed" ||
+                !this.isMobilePipeline ||
+                this.props.list.model.useSampleModel
+            ) {
+                this._cancelActivityReads();
+                return;
+            }
+            while (
+                this._activityReadsInFlight < MAX_ACTIVITY_READS_IN_FLIGHT &&
+                this._activityReadQueue.length
+            ) {
+                this._sendActivityRead(this._activityReadQueue.shift());
+            }
+        });
+    }
+
+    /**
+     * Sends one queued read through its loader, as a recovery request when it is one (inside
+     * `_issueRecoveryReads`, which marks the requests announced while the loader is called). The
+     * read is background work, sent silently (`orm.silent`), so the web client's loading
+     * indicator, which shows while any other request is pending, does not stay up while the
+     * queue drains; the cache key, the cache answers and the connection status the framework
+     * derives from every answer are those of any other read. The read holds a place from its
+     * request until the server's answer to that request, success or failure, which the framework
+     * network layer announces once for every request (`RPC:REQUEST`, `RPC:RESPONSE`): the cache
+     * delivers a stored value before that answer, so the read's own promise does not tell when
+     * its connection is free. The answer then sends the next queued reads, unless a dispatch is
+     * already scheduled. The loader's promise is left as the revalidation always left it, so an
+     * error other than a lost connection is still raised.
+     *
+     * @private
+     * @param {{ resId: number | null, recovery: boolean }} item
+     */
+    _sendActivityRead({ resId, recovery }) {
+        const model = resId === null ? "mail.activity.type" : "mail.activity";
+        let request = null;
+        const onRequest = ({ detail }) => {
+            const params = detail?.data?.params;
+            if (!request && params?.model === model && params.method === "web_search_read") {
+                request = detail.data;
+            }
+        };
+        const read = () => {
+            const orm = this.crmOffline.orm.silent;
+            if (resId === null) {
+                this._loadActivityTypes(orm);
+            } else {
+                this._loadLeadActivities(resId, orm);
+            }
+        };
+        rpcBus.addEventListener("RPC:REQUEST", onRequest);
+        try {
+            if (recovery) {
+                this._issueRecoveryReads(read);
+            } else {
+                read();
+            }
+        } finally {
+            rpcBus.removeEventListener("RPC:REQUEST", onRequest);
+        }
+        if (!request) {
+            return;
+        }
+        this._activityReadsInFlight++;
+        const onResponse = ({ detail }) => {
+            if (detail?.data !== request) {
+                return;
+            }
+            rpcBus.removeEventListener("RPC:RESPONSE", onResponse);
+            this._activityReadsInFlight--;
+            if (!this._activityReadPump) {
+                this._pumpActivityReads();
+            }
+        };
+        rpcBus.addEventListener("RPC:RESPONSE", onResponse);
+    }
+
+    /**
+     * Drops the queued reads not sent yet and the scheduled dispatch: outside the gate, in sample
+     * mode and on destroy. The reads in flight are left to their answer, which then sends
+     * nothing.
+     *
+     * @private
+     */
+    _cancelActivityReads() {
+        this._activityReadQueue = [];
+        const pump = this._activityReadPump;
+        if (pump) {
+            this._activityReadPump = null;
+            cancelAnimationFrame(pump.frame);
+            clearTimeout(pump.timeout);
+        }
     }
 
     /**
@@ -2634,10 +2838,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *
      * @private
      * @param {number} resId
+     * @param {ORM} [orm=this.crmOffline.orm] the ORM the request goes through: the pipeline's,
+     *   or its silent variant for a queued revalidation read (see `_sendActivityRead`), whose
+     *   request is the same cache key
      * @returns {Promise<{ records: Object[], length: number } | null>} the value read, `null` when
      *   the connection is lost and nothing is cached
      */
-    async _loadLeadActivities(resId) {
+    async _loadLeadActivities(resId, orm = this.crmOffline.orm) {
         const limit = this.mobileState.activityLimitsByLead[resId];
         const requestKey = `${resId}:${limit ?? ""}`;
         // the number of the request that answers this read, set once the loader is called
@@ -2702,7 +2909,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         rpcBus.addEventListener("RPC:REQUEST", onRequest);
         let loading;
         try {
-            loading = loadLeadActivities(this.crmOffline.orm, resId, onUpdate, {
+            loading = loadLeadActivities(orm, resId, onUpdate, {
                 withLength: true,
                 onSettled: settle,
                 ...(limit ? { limit } : {}),
@@ -2812,10 +3019,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * revalidation run can mark it (see `_issueRecoveryReads`).
      *
      * @private
+     * @param {ORM} [orm=this.crmOffline.orm] the ORM the request goes through: the pipeline's,
+     *   or its silent variant for a queued revalidation read (see `_sendActivityRead`), whose
+     *   request is the same cache key
      * @returns {Promise<void>}
      */
-    async _loadActivityTypes() {
-        const activityTypes = await loadActivityTypes(this.crmOffline.orm, (fresh) =>
+    async _loadActivityTypes(orm = this.crmOffline.orm) {
+        const activityTypes = await loadActivityTypes(orm, (fresh) =>
             this._applyActivityTypes(fresh)
         );
         this._applyActivityTypes(activityTypes);
