@@ -126,6 +126,16 @@
         </xpath>
     </t>
 
+    <!-- Date inputs of empty or focused values; the filled-value <button>s are marked by `web`. -->
+    <t t-inherit="web.DateTimeField" t-inherit-mode="extension">
+        <xpath expr="//input[@t-ref='this.startDateRef']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+        <xpath expr="//input[@t-ref='this.endDateRef']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.props.record?.resModel === 'crm.lead' ? '1' : false</attribute>
+        </xpath>
+    </t>
+
     <!-- Textarea only (the lead name uses `widget="text"`); the placeholder <button> is not. -->
     <t t-inherit="web.TextField" t-inherit-mode="extension">
         <xpath expr="//textarea" position="attributes">

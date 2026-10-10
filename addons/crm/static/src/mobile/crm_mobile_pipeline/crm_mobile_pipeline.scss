@@ -3,11 +3,12 @@
 // The mobile root keeps `o_kanban_renderer o_renderer o_kanban_grouped`: the upstream mobile main
 // flow targets those classes and the base kanban controller saves and restores the scroll of
 // `.o_renderer` and of every unfolded `.o_kanban_group`. On small screens the web kanban styles
-// turn that root into a horizontal snap scroller of 90%-wide columns. Every rule below is nested
-// under the `.o_crm_mobile_pipeline` root, which only the small-screen stage-grouped branch
+// turn that root into a horizontal snap scroller of 90%-wide columns. Every layout rule below is
+// nested under the `.o_crm_mobile_pipeline` root, which only the small-screen stage-grouped branch
 // renders, and overrides those rules for this root alone: the desktop branch (`web.KanbanRenderer`)
 // and every other kanban view keep the web layout. The lead card and the quick create own their
-// stylesheets.
+// stylesheets. The last section, scoped to the pipeline arch class instead, adjusts the offline
+// presentation of the standard cards this view renders on every screen size.
 //
 // Physical properties (`top`, `width`, `min-width`, ...) are used rather than logical ones: each
 // declaration either overrides a physical declaration of the web kanban layout or sets a touch
@@ -87,5 +88,42 @@ $o-crm-mobile-touch: 44px;
     .o_crm_mobile_pipeline_load_more .btn {
         min-width: $o-crm-mobile-touch;
         min-height: $o-crm-mobile-touch;
+    }
+}
+
+// Pipeline cards of leads not visited online, offline, on every screen size.
+//
+// Offline, the framework adds `o_disabled_offline` to every kanban card whose form was not visited
+// online, and its offline stylesheet gives that class `opacity: 0.5`, `pointer-events: auto` and
+// `cursor: not-allowed`, all `!important`. On the lead pipeline that has two effects:
+// - the card-menu toggler, which stays usable offline (`data-available-offline`), inherits the
+//   card's opacity and looks disabled although its menu (Edit, Delete, colors) works;
+// - a dragged card keeps `pointer-events: auto` over the drag hook's `.o_dragged` rule, so it stays
+//   under the pointer, the target column never receives `pointerenter`, and the stage move, which
+//   the framework queues offline, is dropped back into the source column.
+// So the card keeps full opacity and dims its content instead, the toggler excepted, and a dragged
+// card lets the pointer through, as do the controls inside it that the framework disables offline.
+// The card keeps its class and the framework cursor. Scoped to the pipeline arch class
+// (`o_opportunity_kanban`, on the view root, which also holds a card while it is dragged): other
+// kanban views keep the framework presentation, and nothing applies online, where the framework
+// adds no `o_disabled_offline`.
+.o_opportunity_kanban .o_kanban_record {
+    // The drag placeholder, a childless copy of the dragged card (classes included) that the
+    // kanban renderer marks `opacity-50`, keeps that opacity.
+    &.o_disabled_offline:not(.opacity-50) {
+        // The framework opacity is `!important`: only another `!important` overrides it.
+        opacity: 1 !important;
+
+        > :not(.o_dropdown_kanban),
+        &::before,
+        &::after {
+            opacity: 0.5;
+        }
+    }
+
+    // The framework pointer events are `!important`: only another `!important` overrides them.
+    &.o_dragged.o_disabled_offline,
+    &.o_dragged .o_disabled_offline {
+        pointer-events: none !important;
     }
 }

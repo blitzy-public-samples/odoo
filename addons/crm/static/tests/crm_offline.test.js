@@ -64,6 +64,7 @@ import {
     startServer,
     waitStoreFetch,
 } from "@mail/../tests/mail_test_helpers";
+import { getPickerCell } from "@web/../tests/core/datetime/datetime_test_helpers";
 import {
     contains,
     defineActions,
@@ -89,7 +90,7 @@ import {
     toggleKanbanRecordDropdown,
     toggleMenuItem,
 } from "@web/../tests/web_test_helpers";
-import { Component, status, xml } from "@odoo/owl";
+import { Component, status, useProps, xml } from "@odoo/owl";
 
 import {
     CRM_FOREIGN_DISABLED_BUTTONS,
@@ -126,15 +127,21 @@ import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import { RottingStatusBarDurationField } from "@mail/js/rotting_mixin/rotting_statusbar";
 import { LONG_PRESS_DELAY } from "@mail/utils/common/hooks";
+import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 import { NonSecureContextError } from "@web/core/errors/non_secure_context_error";
+import { serializeDate, today } from "@web/core/l10n/dates";
 import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
 import { redirect } from "@web/core/utils/urls";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
-import { Many2One } from "@web/views/fields/many2one/many2one";
+import { computeM2OProps, Many2One } from "@web/views/fields/many2one/many2one";
+import {
+    buildM2OFieldDescription,
+    many2OneFieldProps,
+} from "@web/views/fields/many2one/many2one_field";
 import { StatusBarField } from "@web/views/fields/statusbar/statusbar_field";
 import { FormController } from "@web/views/form/form_controller";
 import { KanbanController } from "@web/views/kanban/kanban_controller";
@@ -185,13 +192,11 @@ function watchRpcs(watched) {
 
 /**
  * Steps, as `"offline:<model>/<method>"` or `"offline:<path>"`, every request issued while the
- * offline plugin reports offline, except the plugin's own reconnection pings and the many2one
- * autocomplete's `web_name_search`. Offline on small screens a lead many2one renders its
- * autocomplete inline, which searches as soon as it is shown; the framework's
- * `Many2XAutocomplete.search` answers that 502 from the relational-field cache. That read is the
- * offline partner lookup, never a DISABLE path. Registered after `mockOffline()`, the watcher sees
- * the requests the offline mock answers with a 502: a DISABLE guard that lets anything reach the
- * network is caught.
+ * offline plugin reports offline, except the plugin's own reconnection pings. Registered after
+ * `mockOffline()`, the watcher sees the requests the offline mock answers with a 502: a DISABLE
+ * guard that lets anything reach the network is caught. A lead many2one that switches to its
+ * cached autocomplete offline on small screens searches only once the user opens it, so a lead
+ * form left untouched issues no request either.
  */
 function watchOfflineRpcs() {
     onRpc("/*", (request) => {
@@ -206,9 +211,6 @@ function watchOfflineRpcs() {
             return;
         }
         const match = path.match(R_CALL_KW);
-        if (match?.groups.method === "web_name_search") {
-            return;
-        }
         expect.step(`offline:${match ? `${match.groups.model}/${match.groups.method}` : path}`);
     });
 }
@@ -681,6 +683,32 @@ const LEAD_CHATTER_FORM_ARCH = /* xml */ `
     </form>`;
 
 /**
+ * Lead form with the customer and salesperson many2one fields, each with an onchange as in
+ * `crm_lead_view_form`, for the offline partner lookup (PART 3c).
+ */
+const LEAD_LOOKUP_FORM_ARCH = /* xml */ `
+    <form js_class="crm_form">
+        <sheet>
+            <field name="name"/>
+            <field name="partner_id" on_change="1"/>
+            <field name="user_id" on_change="1"/>
+        </sheet>
+    </form>`;
+
+/**
+ * Lead form whose customer field has an extra suggestion source, as `crm_lead_view_form` renders
+ * it with the partner autocomplete's `res_partner_many2one` widget (see
+ * `ExtraSourceMany2OneField`).
+ */
+const LEAD_EXTRA_SOURCE_FORM_ARCH = /* xml */ `
+    <form js_class="crm_form">
+        <sheet>
+            <field name="name"/>
+            <field name="partner_id" widget="crm_offline_test_extra_source_many2one"/>
+        </sheet>
+    </form>`;
+
+/**
  * Pipeline kanban mirroring `crm_case_kanban_view_leads` (card menu, color, priority). The
  * card-menu Edit and Delete anchors repeat the production arch's offline attribute, so the tests
  * prove only that the card compiler copies it onto the rendered anchors; the production arch's
@@ -714,6 +742,15 @@ const LEAD_KANBAN_ARCH = /* xml */ `
             </t>
         </templates>
     </kanban>`;
+
+/**
+ * The same pipeline kanban with the production arch's `js_class` and classes: the CRM offline
+ * styles of unavailable cards are scoped to `o_opportunity_kanban`.
+ */
+const PIPELINE_KANBAN_ARCH = LEAD_KANBAN_ARCH.replace(
+    '<kanban js_class="crm_kanban"',
+    '<kanban js_class="crm_mobile_pipeline" class="o_kanban_small_column o_opportunity_kanban"'
+);
 
 /** Leads list mirroring `crm_case_tree_view_leads` (header buttons B12, B13). */
 const LEAD_LIST_ARCH = /* xml */ `
@@ -919,6 +956,8 @@ class CrmLead extends models.Model {
 
     _views = {
         form: LEAD_FORM_ARCH,
+        "form,lead_lookup": LEAD_LOOKUP_FORM_ARCH,
+        "form,lead_extra_source": LEAD_EXTRA_SOURCE_FORM_ARCH,
         kanban: LEAD_KANBAN_ARCH,
         list: LEAD_LIST_ARCH,
         "list,opportunities": OPPORTUNITY_LIST_ARCH,
@@ -1017,6 +1056,8 @@ const TEAM_ACTION_ID = 6;
 const LEAD_FORM_ACTION_ID = 7;
 const OPPORTUNITY_LIST_ACTION_ID = 8;
 const ARCHIVED_LEAD_FORM_ACTION_ID = 9;
+const LEAD_LOOKUP_ACTION_ID = 10;
+const LEAD_EXTRA_SOURCE_ACTION_ID = 11;
 
 defineActions([
     {
@@ -1111,6 +1152,22 @@ defineActions([
         res_id: 4,
         type: "ir.actions.act_window",
         views: [[false, "form"]],
+    },
+    {
+        id: LEAD_LOOKUP_ACTION_ID,
+        name: "Lead lookup",
+        res_model: "crm.lead",
+        res_id: 1,
+        type: "ir.actions.act_window",
+        views: [["lead_lookup", "form"]],
+    },
+    {
+        id: LEAD_EXTRA_SOURCE_ACTION_ID,
+        name: "Lead extra source",
+        res_model: "crm.lead",
+        res_id: 1,
+        type: "ir.actions.act_window",
+        views: [["lead_extra_source", "form"]],
     },
     ...BOUND_LEAD_ACTIONS,
 ]);
@@ -1366,6 +1423,66 @@ describe("Kanban moves", () => {
         expect.verifySteps(["crm.lead/web_save"]);
         expect(".o_kanban_group:eq(0) .o_kanban_record").toHaveCount(1);
         expect(".o_kanban_group:eq(2) .o_kanban_record").toHaveCount(2);
+        const saves = queuedCalls("crm.lead", "web_save");
+        expect(saves).toHaveLength(1);
+        expect(saves[0].args[0]).toEqual([1]);
+        expect(saves[0].args[1]).toMatchObject({ stage_id: 3 });
+        expect(saves[0].extras.viewType).toBe("kanban");
+        expect(".o_reward").toHaveCount(0);
+    });
+
+    test.tags("desktop");
+    test("offline kanban stage move of a card not visited online: the drop goes through and is queued", async () => {
+        const setOffline = mockOffline();
+        watchRpcs(["crm.lead/web_save", "crm.lead/get_rainbowman_message"]);
+        keepPingsFailing();
+        // No lead form was visited online: offline, the framework marks every card unavailable.
+        // The card button stands for the production card's activity and avatar buttons, which the
+        // framework disables offline as well.
+        await mountView({
+            type: "kanban",
+            resModel: "crm.lead",
+            groupBy: ["stage_id"],
+            arch: PIPELINE_KANBAN_ARCH.replace(
+                "</footer>",
+                /* xml */ `
+                    <button name="action_schedule_meeting" type="object"
+                        class="btn btn-link o_crm_card_control">Meeting</button>
+                </footer>`
+            ),
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(".o_opportunity_kanban").toHaveCount(1);
+        expect(".o_kanban_group:eq(0) .o_kanban_record").toHaveCount(2);
+        expect(".o_kanban_group:eq(2) .o_kanban_record").toHaveCount(1);
+
+        await setOffline(true);
+        const card = queryFirst(".o_kanban_group:eq(0) .o_kanban_record");
+        expect(card).toHaveText(/Lead 1/);
+        expect(card).toHaveClass("o_disabled_offline");
+        const cardControl = queryOne(".o_crm_card_control", { root: card });
+        expect(isDisabledOffline(cardControl)).toBe(true);
+        expect(getComputedStyle(cardControl).pointerEvents).toBe("auto");
+        const { drop, moveTo } = await contains(card).drag();
+        await moveTo(".o_kanban_group:eq(2) .o_kanban_record");
+        // While dragged, the card and the controls disabled in it let the pointer through to the
+        // column under it: a real pointer would otherwise keep hitting the card, and the column
+        // would never be entered.
+        expect(card).toHaveClass(["o_dragged", "o_disabled_offline"]);
+        expect(getComputedStyle(card).pointerEvents).toBe("none");
+        expect(getComputedStyle(cardControl).pointerEvents).toBe("none");
+        expect(".o_kanban_group:eq(2)").toHaveClass("o_kanban_hover");
+        // The drag placeholder, a copy of the card's element and classes, keeps its ghost opacity.
+        const placeholder = queryOne(".o_kanban_group:eq(2) .o_kanban_record.opacity-50");
+        expect(placeholder).toHaveClass("o_disabled_offline");
+        expect(getComputedStyle(placeholder).opacity).toBe("0.5");
+        await drop();
+        await animationFrame();
+
+        expect.verifySteps(["crm.lead/web_save"]);
+        expect(".o_kanban_group:eq(0) .o_kanban_record").toHaveCount(1);
+        expect(".o_kanban_group:eq(2) .o_kanban_record").toHaveCount(2);
+        expect(".o_kanban_group:eq(2) .o_kanban_record:contains('Lead 1')").toHaveCount(1);
         const saves = queuedCalls("crm.lead", "web_save");
         expect(saves).toHaveLength(1);
         expect(saves[0].args[0]).toEqual([1]);
@@ -5637,8 +5754,8 @@ describe("SKIP and remaining DISABLE", () => {
         // A lead chatter load whose request loses the connection: no error, the chatter keeps
         // what it shows, nothing is written or queued. The connection stays down for the rest of
         // the test, so every request the now offline form issues fails too: on small screens the
-        // lead's partner field switches to its inline autocomplete, which searches at once and
-        // falls back to the relational-field cache.
+        // lead's partner field switches to its cached autocomplete, which stays closed and
+        // searches nothing until it is used.
         held = holdNextLoad();
         const lostLoad = chatter.load(thread, requestList);
         await expect.waitForSteps(["thread data:crm.lead"]);
@@ -6070,6 +6187,23 @@ async function seedLeadCustomer() {
     return { customerId, otherCustomerId };
 }
 
+/**
+ * @param {HTMLElement} el
+ * @param {HTMLElement} root `el` or one of its ancestors
+ * @returns {number} the opacity `el` renders with inside `root`: the product of the computed
+ *  opacities of `el` and of its ancestors up to `root`, both included
+ */
+function effectiveOpacity(el, root) {
+    let opacity = 1;
+    for (let node = el; node; node = node.parentElement) {
+        opacity *= Number(getComputedStyle(node).opacity);
+        if (node === root) {
+            break;
+        }
+    }
+    return opacity;
+}
+
 describe("K9 attributes", () => {
     test("existing CRM lead controls usable offline carry data-available-offline", async () => {
         const { otherCustomerId } = await seedLeadCustomer();
@@ -6131,8 +6265,8 @@ describe("K9 attributes", () => {
         expect(".o_field_widget[name=partner_id] input").not.toHaveAttribute("readonly");
 
         // The cached customer is suggested; every suggestion entry is usable offline. Suggestions
-        // are read within the partner field: offline on small screens every lead many2one shows
-        // its autocomplete list inline.
+        // are read within the partner field: its autocomplete renders its suggestion list inside
+        // the field, as a positioned dropdown on every screen size.
         const partnerSuggestions =
             ".o_field_widget[name=partner_id] .o-autocomplete--dropdown-item";
         await contains(".o_field_widget[name=partner_id] input").edit("Deco", { confirm: false });
@@ -6194,6 +6328,110 @@ describe("K9 attributes", () => {
         await contains(".modal-footer .btn-danger:contains('Delete')").click();
         expect.verifySteps(["crm.lead/web_unlink"]);
         expect(queuedCalls("crm.lead", "web_unlink").map(({ args }) => args)).toEqual([[[2]]]);
+    });
+
+    test.tags("desktop");
+    test("unavailable lead card offline: content dimmed, K9 card-menu toggler at full opacity and usable", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["crm.lead/web_save"]);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const cardOf = (name) => queryOne(`.o_kanban_record:contains('${name}')`);
+        // The card's first child: the name field, rendered as a <span> by the kanban card.
+        const nameOf = (card) => card.firstElementChild;
+
+        // 1. Another model's kanban, visited online: offline, its unavailable cards keep the
+        // framework presentation, the whole card dimmed.
+        await openView({
+            res_model: "res.partner",
+            views: [[false, "kanban"]],
+            arch: /* xml */ `
+                <kanban>
+                    <templates>
+                        <t t-name="menu">
+                            <a role="menuitem" type="open" class="dropdown-item">Edit</a>
+                        </t>
+                        <t t-name="card">
+                            <field name="name"/>
+                        </t>
+                    </templates>
+                </kanban>`,
+        });
+        expect(".o_kanban_record:not(.o_kanban_ghost)").not.toHaveCount(0);
+        expect(".o_kanban_record.o_disabled_offline").toHaveCount(0);
+        await setOffline(true);
+        expect(".o_opportunity_kanban").toHaveCount(0);
+        const partnerCard = queryFirst(".o_kanban_record:not(.o_kanban_ghost)");
+        expect(partnerCard).toHaveClass("o_disabled_offline");
+        expect(getComputedStyle(partnerCard).opacity).toBe("0.5");
+        expect(nameOf(partnerCard)).not.toHaveClass("o_dropdown_kanban");
+        expect(getComputedStyle(nameOf(partnerCard)).opacity).toBe("1");
+        await setOffline(false);
+
+        // 2. The lead pipeline, online: no card is marked. Of the leads, only the form of Lead 1
+        // was visited online.
+        patchWithCleanup(OfflinePlugin.prototype, {
+            isAvailableOffline(actionId, viewType, resId) {
+                return (viewType === "form" && resId === 1) || super.isAvailableOffline(...arguments);
+            },
+        });
+        await openView({
+            res_model: "crm.lead",
+            views: [[false, "kanban"]],
+            arch: PIPELINE_KANBAN_ARCH,
+        });
+        expect(".o_opportunity_kanban").toHaveCount(1);
+        expect(".o_kanban_record:not(.o_kanban_ghost)").not.toHaveCount(0);
+        expect(".o_kanban_record.o_disabled_offline").toHaveCount(0);
+
+        // 3. Offline, the card of the visited lead stays available: not marked, not dimmed.
+        await setOffline(true);
+        const visitedCard = cardOf("Lead 1");
+        expect(visitedCard).not.toHaveClass("o_disabled_offline");
+        expect(nameOf(visitedCard)).toHaveText("Lead 1");
+        expect(effectiveOpacity(nameOf(visitedCard), visitedCard)).toBe(1);
+
+        // 4. The card of a lead not visited online keeps its mark and the framework cursor, but
+        // reads as dimmed through its content (fields, color stripe, selection overlay) ...
+        const card = cardOf("Lead 2");
+        expect(card).toHaveClass("o_disabled_offline");
+        expect(getComputedStyle(card).cursor).toBe("not-allowed");
+        expect(getComputedStyle(card).opacity).toBe("1");
+        const nameField = nameOf(card);
+        expect(nameField).toHaveText("Lead 2");
+        expect(getComputedStyle(nameField).opacity).toBe("0.5");
+        expect(effectiveOpacity(nameField, card)).toBe(0.5);
+        expect(getComputedStyle(card, "::before").opacity).toBe("0.5");
+        expect(getComputedStyle(card, "::after").opacity).toBe("0.5");
+        // ... while its K9 card-menu toggler, usable offline, renders at full opacity.
+        const toggler = queryOne(".o_dropdown_kanban button", { root: card });
+        expect(toggler.closest(".o_dropdown_kanban").parentElement).toBe(card);
+        expect(toggler).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
+        expect(toggler).toBeEnabled();
+        expect(toggler).not.toHaveClass("o_disabled_offline");
+        expect(effectiveOpacity(toggler, card)).toBe(1);
+
+        // 5. The toggler opens the menu, whose entries are usable: picking a color queues it.
+        await contains(toggler).click();
+        expect(getComputedStyle(queryOne(".o-dropdown--menu")).opacity).toBe("1");
+        for (const label of ["Edit", "Delete"]) {
+            const entry = queryOne(`.o-dropdown--menu a:contains('${label}')`);
+            expect(entry).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
+            expect(entry).not.toHaveClass("disabled");
+            expect(entry).not.toHaveClass("o_disabled_offline");
+        }
+        const colors = queryAll(".o-dropdown--menu .o_kanban_colorpicker button");
+        expect(colors.length).toBeGreaterThan(1);
+        for (const color of colors) {
+            expect(color).toBeEnabled();
+        }
+        await contains(".o-dropdown--menu .o_kanban_colorpicker button:eq(3)").click();
+        expect.verifySteps(["crm.lead/web_save"]);
+        const saves = queuedCalls("crm.lead", "web_save");
+        expect(saves).toHaveLength(1);
+        expect(saves[0].args[0]).toEqual([2]);
+        expect(saves[0].args[1]).toEqual({ color: 3 });
     });
 
     test("existing controls of other models carry no data-available-offline", async () => {
@@ -6387,6 +6625,108 @@ describe("K9 attributes", () => {
         await setOffline(true);
         expect(partnerEditable).not.toHaveAttribute(OFFLINE_ATTRIBUTE);
     });
+
+    test("lead date field inputs carry data-available-offline; other models' do not", async () => {
+        await startServer();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["crm.lead/web_save"]);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        // 1. A lead without dates: the date field and both ends of a range render their <input>.
+        // `date_open` and `date_closed` are read-only on the server: the arch makes the range
+        // editable, so that its empty end input renders on a lead record.
+        await openView({
+            res_model: "crm.lead",
+            res_id: 1,
+            views: [[false, "form"]],
+            arch: /* xml */ `
+                <form js_class="crm_form">
+                    <sheet>
+                        <field name="name"/>
+                        <field name="date_deadline"/>
+                        <field name="date_open" widget="daterange" readonly="0"
+                            options="{'end_date_field': 'date_closed', 'always_range': '1'}"/>
+                    </sheet>
+                </form>`,
+        });
+        const deadlineInput = ".o_field_widget[name=date_deadline] input";
+        const leadInputs = [
+            deadlineInput,
+            ".o_field_widget[name=date_open] input[data-field=date_open]",
+            ".o_field_widget[name=date_open] input[data-field=date_closed]",
+        ];
+        for (const selector of leadInputs) {
+            expect(selector).toHaveCount(1, { message: selector });
+            expect(selector).toHaveValue("", { message: selector });
+            expect(selector).toHaveAttribute(OFFLINE_ATTRIBUTE, "1", { message: selector });
+        }
+        await setOffline(true);
+        for (const selector of leadInputs) {
+            expect(selector).toHaveAttribute(OFFLINE_ATTRIBUTE, "1", { message: selector });
+            expect(queryOne(selector)).not.toHaveAttribute("disabled");
+            expect(selector).not.toHaveClass("o_disabled_offline");
+        }
+
+        // 2. Offline, a date picked in the picker is saved into the queued `web_save`.
+        const pickedDate = serializeDate(today().set({ day: 15 }));
+        await contains(deadlineInput).click();
+        await animationFrame();
+        expect(".o_datetime_picker").toHaveCount(1);
+        await contains(getPickerCell("15")).click();
+        await animationFrame();
+        expect(".o_datetime_picker").toHaveCount(0);
+        await contains(".o_form_button_save").click();
+        expect.verifySteps(["crm.lead/web_save"]);
+        expect(queuedCalls("crm.lead", "web_save").map(({ args }) => args)).toEqual([
+            [[1], { date_deadline: pickedDate }],
+        ]);
+
+        // 3. The filled value renders the framework's marked <button>; focusing it renders the
+        // <input> again, which is marked too.
+        const deadlineButton = ".o_field_widget[name=date_deadline] button";
+        expect(deadlineButton).toHaveAttribute(OFFLINE_ATTRIBUTE);
+        await contains(deadlineButton).click();
+        await animationFrame();
+        expect(deadlineButton).toHaveCount(0);
+        expect(deadlineInput).toHaveAttribute(OFFLINE_ATTRIBUTE, "1");
+        expect(queryOne(deadlineInput)).not.toHaveAttribute("disabled");
+
+        // The queued edit is replayed on reconnect.
+        await setOffline(false);
+        await expect.waitForSteps(["crm.lead/web_save"]);
+        expect(MockServer.env["crm.lead"].browse(1)[0].date_deadline).toBe(pickedDate);
+
+        // 4. Scoping: the inputs of another model's date range carry no attribute, online or
+        // offline. Its filled dates render the framework's <button>s; focusing one renders its
+        // <input>.
+        await openView({
+            res_model: "res.partner",
+            res_id: serverState.partnerId,
+            views: [[false, "form"]],
+            arch: /* xml */ `
+                <form>
+                    <sheet>
+                        <field name="name"/>
+                        <field name="create_date" widget="daterange" readonly="0"
+                            options="{'end_date_field': 'write_date'}"/>
+                    </sheet>
+                </form>`,
+        });
+        for (const offline of [false, true]) {
+            await setOffline(offline);
+            for (const fieldName of ["create_date", "write_date"]) {
+                const input = `.o_field_widget[name=create_date] input[data-field=${fieldName}]`;
+                await contains(
+                    `.o_field_widget[name=create_date] button[data-field=${fieldName}]`
+                ).click();
+                await animationFrame();
+                expect(input).toHaveCount(1, { message: input });
+                expect(input).not.toHaveAttribute(OFFLINE_ATTRIBUTE, null, { message: input });
+            }
+        }
+    });
 });
 
 // -----------------------------------------------------------------------------
@@ -6437,6 +6777,45 @@ describe("Unreachable views", () => {
 // PART 3c: partner lookup from the relational-field cache
 // -----------------------------------------------------------------------------
 
+/**
+ * Opens the form of lead 2 as an action loaded from the server (its views are cached). Its record,
+ * read online, caches the customer `seedLeadCustomer` gives it for the offline partner lookup.
+ */
+async function openSecondLeadForm() {
+    await getService("action").doAction({
+        type: "ir.actions.act_window",
+        res_model: "crm.lead",
+        res_id: 2,
+        views: [[false, "form"]],
+        cache: true,
+    });
+}
+
+/**
+ * A many2one field with an extra suggestion source, as the partner autocomplete's
+ * `res_partner_many2one` widget gives the lead's customer: an external company lookup for
+ * requests of three characters or more, after the cached records. Offline, that lookup never
+ * settles, as the partner autocomplete's does, waiting on a library it cannot load. The
+ * `partner_autocomplete` addon is not a dependency of `crm`, so its widget is not part of this
+ * test bundle.
+ */
+class ExtraSourceMany2OneField extends Component {
+    static template = xml`<Many2One t-props="this.m2oProps"/>`;
+    static components = { Many2One };
+    props = useProps(many2OneFieldProps);
+
+    extraSources = [
+        {
+            placeholder: "Searching Autocomplete...",
+            options: async (request) => (request.length > 2 ? new Promise(() => {}) : []),
+        },
+    ];
+
+    get m2oProps() {
+        return { ...computeM2OProps(this.props), otherSources: this.extraSources };
+    }
+}
+
 describe("Partner lookup", () => {
     test("partner many2one: offline search from cache, no create option", async () => {
         await seedLeadCustomer();
@@ -6465,14 +6844,18 @@ describe("Partner lookup", () => {
         }
 
         await setOffline(true);
-        // Offline, small screens render the autocomplete inline (`dropdown: false`); large screens
-        // keep the framework's props, whose autocomplete already searches the cache.
+        // Offline, small screens render the autocomplete instead of the search-dialog input
+        // (`dropdown: false`); large screens keep the framework's props, whose autocomplete
+        // already searches the cache.
         if (isSmall()) {
             expect(partnerField().many2XAutocompleteProps.dropdown).toBe(false);
         } else {
             expect("dropdown" in partnerField().many2XAutocompleteProps).toBe(false);
         }
-        // Offline, on every screen size, the autocomplete searches the cached partners.
+        // Offline, on every screen size, the autocomplete is a closed dropdown until it is used,
+        // and searches the cached partners.
+        expect(".o_field_widget[name=partner_id] .o-autocomplete").toHaveClass("dropdown");
+        expect(input).toHaveAttribute("aria-expanded", "false");
         expect(input).not.toHaveAttribute("readonly");
         await contains(input).edit("Azure", { confirm: false });
         await runAllTimers();
@@ -6503,6 +6886,249 @@ describe("Partner lookup", () => {
         } else {
             expect(input).not.toHaveAttribute("readonly");
         }
+    });
+
+    test.tags("mobile");
+    test("mobile: offline lead many2one autocompletes stay closed until used, and close on Escape, an outside tap and a pick", async () => {
+        // Back in the lead form offline, the framework serves it from its disk cache, and its
+        // background refresh fails with a `ConnectionLostError`.
+        expect.errors(1);
+        await seedLeadCustomer();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["res.partner/web_name_search", "res.users/web_name_search"]);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await getService("action").doAction(LEAD_LOOKUP_ACTION_ID);
+        const lookupFields = ["partner_id", "user_id"];
+        const input = (name) => `.o_field_widget[name=${name}] input`;
+        const menu = (name) => `.o_field_widget[name=${name}] .o-autocomplete--dropdown-menu`;
+        const partnerOptions = ".o_field_widget[name=partner_id] .o-autocomplete--dropdown-item";
+        // Every lead many2one is a closed dropdown autocomplete that has searched nothing.
+        const expectClosedLookups = async () => {
+            await runAllTimers();
+            for (const name of lookupFields) {
+                expect(input(name)).not.toHaveAttribute("readonly", null, { message: name });
+                expect(`.o_field_widget[name=${name}] .o-autocomplete`).toHaveClass("dropdown");
+                expect(input(name)).toHaveAttribute("aria-expanded", "false", { message: name });
+                expect(menu(name)).toHaveCount(0, { message: name });
+            }
+            expect.verifySteps([]);
+        };
+        // Online, both fields are the read-only inputs that open the search dialog.
+        for (const name of lookupFields) {
+            expect(input(name)).toHaveAttribute("readonly", null, { message: name });
+        }
+        expect(input("partner_id")).toHaveValue("Azure Interior");
+
+        // The connection drops while the form is shown.
+        await setOffline(true);
+        await expectClosedLookups();
+
+        // The form is opened again offline, from the breadcrumb of lead 2's form, which was read
+        // online and so cached lead 2's customer.
+        await setOffline(false);
+        await openSecondLeadForm();
+        expect(input("partner_id")).toHaveValue("Deco Addict");
+        await setOffline(true);
+        await contains(".o_back_button").click();
+        expect(input("partner_id")).toHaveValue("Azure Interior");
+        await expectClosedLookups();
+
+        // A tap opens the customer's suggestions only, as a positioned dropdown: it searches the
+        // cached partners.
+        await contains(input("partner_id")).click();
+        await runAllTimers();
+        expect(menu("partner_id")).toHaveClass("dropdown-menu");
+        expect(menu("partner_id")).not.toHaveClass("list-group");
+        expect(input("partner_id")).toHaveAttribute("aria-expanded", "true");
+        expect(queryAllTexts(partnerOptions)).toEqual(["Azure Interior", "Deco Addict"]);
+        expect(menu("user_id")).toHaveCount(0);
+        expect.verifySteps(["res.partner/web_name_search"]);
+        // Escape closes it, and only it: the form stays.
+        await press("Escape");
+        await animationFrame();
+        expect(menu("partner_id")).toHaveCount(0);
+        expect(input("partner_id")).toHaveAttribute("aria-expanded", "false");
+        expect(".o_form_view").toHaveCount(1);
+        // A tap outside the field closes it too.
+        await contains(input("partner_id")).click();
+        await runAllTimers();
+        expect(menu("partner_id")).toHaveCount(1);
+        await contains(".o_field_widget[name=name] input").click();
+        expect(menu("partner_id")).toHaveCount(0);
+        expect(input("partner_id")).toHaveAttribute("aria-expanded", "false");
+        // A pick closes it and sets the value.
+        await contains(input("partner_id")).edit("Deco", { confirm: false });
+        await runAllTimers();
+        expect(queryAllTexts(partnerOptions)).toEqual(["Deco Addict"]);
+        expect.verifySteps(["res.partner/web_name_search"]);
+        await contains(`${partnerOptions}:contains('Deco Addict') > *`).click();
+        await runAllTimers();
+        expect(menu("partner_id")).toHaveCount(0);
+        expect(input("partner_id")).toHaveAttribute("aria-expanded", "false");
+        expect(input("partner_id")).toHaveValue("Deco Addict");
+        // The salesperson's suggestions open on their own tap, and close on Escape.
+        await contains(input("user_id")).click();
+        await runAllTimers();
+        expect(menu("user_id")).toHaveClass("dropdown-menu");
+        expect(menu("partner_id")).toHaveCount(0);
+        expect.verifySteps(["res.users/web_name_search"]);
+        await press("Escape");
+        await animationFrame();
+        expect(menu("user_id")).toHaveCount(0);
+
+        // Back online, both fields are the search-dialog inputs again.
+        await setOffline(false);
+        for (const name of lookupFields) {
+            expect(input(name)).toHaveAttribute("readonly", null, { message: name });
+            expect(menu(name)).toHaveCount(0, { message: name });
+        }
+        await expect.waitForErrors(["crm.lead/web_read"]);
+    });
+
+    test.tags("mobile");
+    test("mobile: offline inline autocompletes outside lead views keep the framework's inline list", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        await mountView({
+            type: "kanban",
+            resModel: "crm.lead",
+            arch: /* xml */ `
+                <kanban>
+                    <templates>
+                        <t t-name="card">
+                            <field name="name"/>
+                            <footer>
+                                <field name="user_id" widget="many2one_avatar"/>
+                            </footer>
+                        </t>
+                    </templates>
+                </kanban>`,
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        // Lead 2 has no salesperson: its card's quick assign opens the framework's assign
+        // popover, an inline (`dropdown: false`) autocomplete rendered outside the lead view.
+        const popoverAutocomplete = ".o-overlay-container .o-autocomplete";
+        await contains(".o_kanban_record:contains('Lead 2') .o_quick_assign").click();
+        await runAllTimers();
+        expect(popoverAutocomplete).toHaveCount(1);
+        expect(popoverAutocomplete).not.toHaveClass("dropdown");
+        expect(`${popoverAutocomplete} .o-autocomplete--dropdown-menu`).toHaveClass("list-group");
+        // Offline on a small screen, the CRM lookup patch leaves it as the framework renders it.
+        await setOffline(true);
+        await runAllTimers();
+        expect(popoverAutocomplete).toHaveCount(1);
+        expect(popoverAutocomplete).not.toHaveClass("dropdown");
+        expect(`${popoverAutocomplete} .o-autocomplete--dropdown-menu`).toHaveClass("list-group");
+    });
+
+    test("lead many2one extra sources offer nothing offline: no endless loading row, keyboard selection of a cached record", async () => {
+        registry
+            .category("fields")
+            .add(
+                "crm_offline_test_extra_source_many2one",
+                buildM2OFieldDescription(ExtraSourceMany2OneField)
+            );
+        const { otherCustomerId } = await seedLeadCustomer();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        const many2ones = captureInstances(Many2One);
+        const autoCompletes = captureInstances(AutoComplete);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await openSecondLeadForm();
+        await getService("action").doAction(LEAD_EXTRA_SOURCE_ACTION_ID);
+        const partnerField = () =>
+            many2ones.findLast(
+                (m2o) => m2o.props.relation === "res.partner" && status(m2o) === "mounted"
+            );
+        const input = ".o_field_widget[name=partner_id] input";
+        const options = ".o_field_widget[name=partner_id] .o-autocomplete--dropdown-item";
+        expect(input).toHaveValue("Azure Interior");
+        // Online, the extra source reaches the autocomplete as the widget gives it.
+        expect(partnerField().many2XAutocompleteProps.otherSources).toBe(
+            partnerField().props.otherSources
+        );
+
+        await setOffline(true);
+        // Offline, on every screen size, the extra source is kept, in its place, with no option;
+        // small screens also render the autocomplete instead of the search-dialog input.
+        const offlineProps = partnerField().many2XAutocompleteProps;
+        expect(offlineProps.otherSources).toHaveLength(1);
+        expect(offlineProps.otherSources[0].placeholder).toBe("Searching Autocomplete...");
+        expect(offlineProps.otherSources[0].options).toEqual([]);
+        if (isSmall()) {
+            expect(offlineProps.dropdown).toBe(false);
+        } else {
+            expect("dropdown" in offlineProps).toBe(false);
+        }
+        // A request long enough for the external lookup lists the cached partner, with no
+        // loading row.
+        await contains(input).edit("Deco", { confirm: false });
+        await runAllTimers();
+        expect(queryAllTexts(options)).toEqual(["Deco Addict"]);
+        expect(".o_field_widget[name=partner_id] .o_loading").toHaveCount(0);
+        // The extra source is still the last one, and empty: the partner autocomplete adds its
+        // worldwide-search entry only after a last source with options.
+        const partnerAutoComplete = autoCompletes.findLast(
+            (autoComplete) =>
+                status(autoComplete) === "mounted" &&
+                autoComplete.root()?.closest(".o_field_widget[name=partner_id]")
+        );
+        expect(partnerAutoComplete.sources).toHaveLength(2);
+        expect(partnerAutoComplete.sources.at(-1).isLoading).toBe(false);
+        expect(partnerAutoComplete.sources.at(-1).options).toHaveLength(0);
+        // Keyboard selection picks the highlighted cached partner at once.
+        await press("ArrowDown");
+        await press("Enter");
+        await animationFrame();
+        expect(input).toHaveValue("Deco Addict");
+        expect(partnerField().props.value.id).toBe(otherCustomerId);
+        expect(".o_field_widget[name=partner_id] .o-autocomplete--dropdown-menu").toHaveCount(0);
+
+        // Back online, the extra source is the widget's again.
+        await setOffline(false);
+        expect(partnerField().many2XAutocompleteProps.otherSources).toBe(
+            partnerField().props.otherSources
+        );
+    });
+
+    test("lead many2one: picking its current value offline raises no error and changes nothing", async () => {
+        const { customerId } = await seedLeadCustomer();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["crm.lead/onchange"]);
+        const formControllers = captureInstances(FormController);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await getService("action").doAction(LEAD_LOOKUP_ACTION_ID);
+        const record = formControllers.findLast((controller) => status(controller) === "mounted")
+            .model.root;
+        const input = (name) => `.o_field_widget[name=${name}] input`;
+        const option = (name, label) =>
+            `.o_field_widget[name=${name}] .o-autocomplete--dropdown-item:contains('${label}') > *`;
+        const salesperson = record.data.user_id;
+        expect(input("partner_id")).toHaveValue("Azure Interior");
+        expect(input("user_id")).toHaveValue(salesperson.display_name);
+
+        await setOffline(true);
+        // Each field's current value is picked again from its cached suggestions: its onchange
+        // cannot reach the server, and Hoot fails the test on the error it would raise.
+        for (const [name, value] of [
+            ["partner_id", { id: customerId, display_name: "Azure Interior" }],
+            ["user_id", { id: salesperson.id, display_name: salesperson.display_name }],
+        ]) {
+            await contains(input(name)).click();
+            await runAllTimers();
+            await contains(option(name, value.display_name)).click();
+            await runAllTimers();
+            expect.verifySteps(["crm.lead/onchange"]);
+            expect(input(name)).toHaveValue(value.display_name);
+            expect(record.data[name]).toMatchObject(value);
+        }
+        expect(".o_error_dialog").toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
     });
 });
 
