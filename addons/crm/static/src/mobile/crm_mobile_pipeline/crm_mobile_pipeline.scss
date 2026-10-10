@@ -43,7 +43,8 @@ $o-crm-mobile-touch: 44px;
 
     .o_crm_mobile_pipeline_prev,
     .o_crm_mobile_pipeline_next,
-    .o_crm_mobile_pipeline_add {
+    .o_crm_mobile_pipeline_add,
+    .o_crm_mobile_pipeline_empty_stage_target {
         display: inline-flex;
         flex: 0 0 auto;
         align-items: center;

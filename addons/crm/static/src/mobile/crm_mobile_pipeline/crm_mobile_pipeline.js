@@ -146,6 +146,45 @@ export function resolveDisplayedGroup(list, serverValue) {
 }
 
 /**
+ * The displayed-stage state of one pipeline: shared by the controller adapter with the renderer
+ * through the env (`env.crmMobileStage`), or kept by a renderer used without that adapter.
+ * - `serverValue`: the displayed stage (see `resolveDisplayedGroup`).
+ * - `unfolding`: the loads in flight that unfold a folded stage (see `unfoldStage`), so the
+ *   renderer shows that stage as loading whichever control started its load.
+ *
+ * @param {number | false | null} serverValue the stage id, `null` if none
+ * @returns {{ serverValue: number | false | null, unfolding: WeakMap<Object, Promise<void>> }}
+ */
+export function createStageState(serverValue) {
+    return proxy({ serverValue, unfolding: new WeakMap() });
+}
+
+/**
+ * Loads and unfolds a folded stage once: the first request runs `unfold` (the inherited
+ * `toggleGroup`, or `Group.toggle`), and every request for the same stage made while that load
+ * is in flight gets its promise instead of toggling the group again. `Group.toggle` flips the
+ * fold state once its load lands, so a second toggle would fold the stage back.
+ *
+ * The loads are kept in `stageState.unfolding` by the stage's group config, which a reload keeps
+ * while it rebuilds the group datapoints with new ids; each leaves as it settles.
+ *
+ * @param {{ unfolding: WeakMap<Object, Promise<void>> }} stageState see `createStageState`
+ * @param {Group} group a folded stage group
+ * @param {(group: Group) => Promise<void>} unfold
+ * @returns {Promise<void>} the load in flight, resolved or rejected as it settles
+ */
+export function unfoldStage(stageState, group, unfold) {
+    const { unfolding } = stageState;
+    const stage = group.config;
+    let load = unfolding.get(stage);
+    if (!load) {
+        load = Promise.resolve(unfold(group)).finally(() => unfolding.delete(stage));
+        unfolding.set(stage, load);
+    }
+    return load;
+}
+
+/**
  * The name the status region gives a lead: the name its card shows, or a generic label when it
  * has none.
  *
@@ -230,7 +269,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this.loadingMoreGroups = proxy({});
         // Provided by `CrmMobilePipelineController`; a local state keeps the renderer usable on
         // its own (it then starts on the framework's default stage).
-        this.stageState = this.env.crmMobileStage ?? proxy({ serverValue: null });
+        this.stageState = this.env.crmMobileStage ?? createStageState(null);
         /** Touch gesture in progress on the stage body (swipe navigation). */
         this.touch = null;
         /**
@@ -866,6 +905,77 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                     record?.resId
                 )
         );
+    }
+
+    /**
+     * The hint of a displayed stage that shows no lead while other stages hold some, such as after
+     * a search whose only matches are in other stages: the displayed stage is kept across reloads,
+     * so the hint says how many leads the other stages hold and offers to display the first of
+     * them, in display order, that holds a lead. The counts are the pending-aware counts of the
+     * header (`stageCount`).
+     *
+     * Shown online and offline (displaying a stage is local, and a folded stage is never loaded
+     * offline), but only while the stage shows nothing else: no lead, no card, no pending create,
+     * no framework quick create and no unavailable-lead helper. Never with sample data, nor when
+     * the no-content helper covers an empty pipeline. Reads no server data.
+     *
+     * @param {Group} group the displayed stage
+     * @returns {{ target: Group, targetCount: number, otherCount: number } | null} the stage the
+     *   hint displays and its lead count, and the lead count of every other stage together; `null`
+     *   when no hint is shown
+     */
+    emptyStageHint(group) {
+        if (
+            !group ||
+            this.props.list.model.useSampleModel ||
+            this.mobileState.unavailableLeadId ||
+            this.props.quickCreateState?.id === group.id ||
+            this.stageCount(group) !== 0 ||
+            this.cardsFor(group).length > 0 ||
+            this.pendingCreatesFor(group).length > 0 ||
+            this.showNoContentHelper
+        ) {
+            return null;
+        }
+        let target = null;
+        let targetCount = 0;
+        let otherCount = 0;
+        for (const other of this.stageGroups) {
+            const count = other.id === group.id ? 0 : this.stageCount(other);
+            if (count > 0) {
+                if (!target) {
+                    target = other;
+                    targetCount = count;
+                }
+                otherCount += count;
+            }
+        }
+        return target ? { target, targetCount, otherCount } : null;
+    }
+
+    /**
+     * @param {{ otherCount: number }} hint the displayed stage's `emptyStageHint`
+     * @returns {string} the sentence of the hint: the stage has no lead, and how many leads the
+     *   other stages hold
+     */
+    emptyStageHintLabel({ otherCount }) {
+        if (otherCount === 1) {
+            return _t("No lead in this stage. 1 lead is in another stage.");
+        }
+        return _t("No lead in this stage. %(count)s leads are in other stages.", {
+            count: otherCount,
+        });
+    }
+
+    /**
+     * @param {{ target: Group, targetCount: number }} hint the displayed stage's `emptyStageHint`
+     * @returns {string} the label of the hint's button: the stage it displays, with its lead count
+     */
+    emptyStageHintAction({ target, targetCount }) {
+        return _t("Show %(stage)s (%(count)s)", {
+            stage: target.displayName,
+            count: targetCount,
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -1657,10 +1767,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /**
      * Focus of the stage navigation. The previous button is not rendered on the first stage, nor
      * the next button on the last one, so displaying that stage removes the button when it holds
-     * the focus (Next activated to reach the last stage, Previous to reach the first one). After
-     * the patch that removes it, the focus moves to the first header control, which is then the
-     * remaining navigation button, else Add, else the first control of the pipeline, instead of
-     * dropping to the document body.
+     * the focus (Next activated to reach the last stage, Previous to reach the first one). The
+     * button of the empty-stage hint (`emptyStageHint`) leaves with the stage it was shown in, so
+     * activating it removes it as well. After the patch that removes it, the focus moves to the
+     * first header control, which is then the remaining navigation button, else Add, else the
+     * first control of the pipeline, instead of dropping to the document body.
      *
      * Only the removal of the focused navigation button moves the focus, whatever displayed the
      * stage (a button, a key, a swipe or a reload), and only when no other control took the focus
@@ -1676,8 +1787,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         onWillPatch(() => {
             const active = document.activeElement;
             focusedNav =
-                active?.matches(".o_crm_mobile_pipeline_prev, .o_crm_mobile_pipeline_next") &&
-                this.rootRef()?.contains(active)
+                active?.matches(
+                    ".o_crm_mobile_pipeline_prev, .o_crm_mobile_pipeline_next, .o_crm_mobile_pipeline_empty_stage_target"
+                ) && this.rootRef()?.contains(active)
                     ? active
                     : null;
         });
@@ -1737,9 +1849,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Displays a stage. Online, a folded stage is loaded and unfolded through the inherited
-     * `toggleGroup`. Offline, a folded stage is never loaded (no uncached read is attempted) and
-     * its fold state is left alone: it is sent with the next `web_read_group`, so changing it
-     * would change the cached request and break the next offline reload.
+     * `toggleGroup`, once (see `unfoldStage`): entering it again while that load is in flight
+     * awaits the same load. Offline, a folded stage is never loaded (no uncached read is
+     * attempted) and its fold state is left alone: it is sent with the next `web_read_group`, so
+     * changing it would change the cached request and break the next offline reload.
      *
      * @param {Group} group
      * @returns {Promise<void>}
@@ -1752,7 +1865,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this.stageState.serverValue = group.serverValue;
         if (!this.crmOffline.isOffline() && group.isFolded) {
             try {
-                await this.toggleGroup(group);
+                await unfoldStage(this.stageState, group, (folded) => this.toggleGroup(folded));
             } catch (error) {
                 if (!(error instanceof ConnectionLostError)) {
                     throw error;
@@ -1762,20 +1875,25 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Whether the Load more of a stage is in flight: its button is then disabled and busy.
+     * Whether the Load more of a stage is in flight, or a load that unfolds the stage, whichever
+     * control started it (see `unfoldStage`): its button is then disabled and busy.
      *
      * @param {Group} group
      * @returns {boolean}
      */
     isLoadingMore(group) {
-        return Boolean(group && this.loadingMoreGroups[group.id]);
+        return Boolean(
+            group &&
+                (this.loadingMoreGroups[group.id] || this.stageState.unfolding.has(group.config))
+        );
     }
 
     /**
      * Load more, online only, as the template renders it: a folded stage is loaded and unfolded
-     * through the inherited `toggleGroup`, any other stage gets its next page through the inherited
-     * `loadMore`. The stage is marked as loading until the load settles, so its button shows a
-     * spinner, is busy and disabled meanwhile, and a second activation loads nothing. Offline
+     * through the inherited `toggleGroup` (see `unfoldStage`), any other stage gets its next page
+     * through the inherited `loadMore`. The stage is marked as loading until the load settles, so
+     * its button shows a spinner, is busy and disabled meanwhile, and a second activation loads
+     * nothing; so does an activation while a load that unfolds the stage is in flight. Offline
      * nothing is loaded (a folded stage is never loaded offline). A lost connection leaves the
      * stage as it was.
      *
@@ -1790,7 +1908,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         this.loadingMoreGroups[groupId] = true;
         try {
             if (group.isFolded) {
-                await this.toggleGroup(group);
+                await unfoldStage(this.stageState, group, (folded) => this.toggleGroup(folded));
             } else {
                 await this.loadMore(group);
             }
@@ -1899,9 +2017,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Keeps the native Space activation of every control of the mobile pipeline (header
-     * navigation and Add, the offline helpers and Back, Load more, the framework quick create):
-     * the inherited kanban Space hotkeys, scoped to this root, would cancel it. Bound on the
-     * mobile root only, so the desktop kanban keeps its Space record selection.
+     * navigation and Add, the offline helpers and Back, the empty-stage hint, Load more, the
+     * framework quick create): the inherited kanban Space hotkeys, scoped to this root, would
+     * cancel it. Bound on the mobile root only, so the desktop kanban keeps its Space record
+     * selection.
      *
      * @param {KeyboardEvent} ev
      */
@@ -2155,13 +2274,12 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
         super.setup();
         this.crmOffline = useCrmOffline();
         /**
-         * The displayed stage (stage id), shared with the renderer through the env. Seeded from the
-         * restored state, where `false` is the group without stage; `null` when none was saved.
-         * Only read in the mobile pipeline.
+         * The displayed stage (stage id), shared with the renderer through the env, with the loads
+         * in flight that unfold a folded stage (see `createStageState`). Seeded from the restored
+         * state, where `false` is the group without stage; `null` when none was saved. Only read
+         * in the mobile pipeline.
          */
-        this.crmMobileStage = proxy({
-            serverValue: this.props.state?.crmMobileStage ?? null,
-        });
+        this.crmMobileStage = createStageState(this.props.state?.crmMobileStage ?? null);
         useSubEnv({ crmMobileStage: this.crmMobileStage });
 
         // Restored column scroll. The base layout effect restores, once the model is ready (at
@@ -2243,12 +2361,14 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
      * New: in the mobile pipeline, the framework quick create opens in the displayed stage instead
      * of the first unfolded one, so it is visible. Everything else is the base behaviour.
      *
-     * Online, a folded displayed stage is loaded and unfolded first. The view may change while
-     * that load runs, so once it lands the quick create opens only if the controller is still
-     * alive, the mobile pipeline is still rendered and the displayed stage is still the one New
-     * was pressed on; otherwise nothing changes (the stage the user moved to stays displayed). It
-     * then opens in that stage's group of the current root, because a reload during the load
-     * rebuilds the groups with new datapoint ids.
+     * Online, a folded displayed stage is loaded and unfolded first, once (see `unfoldStage`): a
+     * load of that stage already in flight, from the renderer's navigation or Load more, is
+     * awaited instead of a second toggle. The view may change while that load runs, so once it
+     * lands the quick create opens only if the controller is still alive, the mobile pipeline is
+     * still rendered and the displayed stage is still the one New was pressed on; otherwise
+     * nothing changes (the stage the user moved to stays displayed). It then opens in that
+     * stage's group of the current root, because a reload during the load rebuilds the groups
+     * with new datapoint ids.
      *
      * @override
      */
@@ -2260,7 +2380,7 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
         let group = resolveDisplayedGroup(this.model.root, this.crmMobileStage.serverValue);
         if (group.isFolded && !this.crmOffline.isOffline()) {
             const requestedStage = group.serverValue;
-            await group.toggle();
+            await unfoldStage(this.crmMobileStage, group, (folded) => folded.toggle());
             if (status(this) === "destroyed" || !this.isMobilePipeline) {
                 return;
             }

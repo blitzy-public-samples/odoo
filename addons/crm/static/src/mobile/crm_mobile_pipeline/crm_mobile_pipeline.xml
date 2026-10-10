@@ -16,6 +16,9 @@
           the framework quick create (`.o_kanban_quick_create`, `.o_kanban_add`) and the cards
           (`.o_kanban_record`, name in a span).
         - Placement and totals come from the renderer's pending-aware getters, not template state.
+        - A displayed stage that shows no lead while other stages hold some (emptyStageHint) shows
+          a sentence with their count and a button displaying the first of them. It is
+          neither a `.o_view_nocontent` nor a card or stage, so no framework selector matches it.
         - Previous is not rendered on the first stage, nor Next on the last one. When the removed
           button held the focus, the renderer moves the focus to the first header control (the
           remaining navigation button, else Add), else to the first control of the pipeline,
@@ -168,6 +171,22 @@
                             helper in both, while a reload keeps the body and the helper.
                         -->
                         <OfflineActionHelper t-if="this.isStageDataMissing(group)" t-key="'stage_' + group.serverValue"/>
+                        <!--
+                            The stage shows no lead while other stages hold some (a search whose
+                            matches are all in other stages, for instance): a sentence with their
+                            lead count, and a text button displaying the first of them. The
+                            sentence is gray 700, not `text-muted`, whose translucent gray falls
+                            under the 4.5:1 contrast of normal-size text on the stage body.
+                        -->
+                        <t t-set="emptyStageHint" t-value="this.emptyStageHint(group)"/>
+                        <div t-if="emptyStageHint" class="o_crm_mobile_pipeline_empty_stage d-flex flex-column align-items-center gap-2 px-3 py-4 text-center">
+                            <p class="o_crm_mobile_pipeline_empty_stage_text text-700 mb-0" t-out="this.emptyStageHintLabel(emptyStageHint)"/>
+                            <button type="button"
+                                class="btn btn-secondary o_crm_mobile_pipeline_empty_stage_target"
+                                data-available-offline="1"
+                                t-on-click="() => this.goToGroup(emptyStageHint.target)"
+                                t-out="this.emptyStageHintAction(emptyStageHint)"/>
+                        </div>
                         <t t-set="unavailableCount" t-value="this.unavailableMoreCount(group)"/>
                         <div t-if="unavailableCount > 0"
                             class="o_crm_mobile_pipeline_unavailable_more text-muted small text-center py-2"

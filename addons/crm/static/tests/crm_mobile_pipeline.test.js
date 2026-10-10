@@ -13,6 +13,10 @@
  * - an uncached stage or lead shows the framework offline helper; a lead's helper has a Back that
  *   takes the focus once the stage pipeline renders it and hands it back when left; online, Load
  *   more is busy while it loads, and a failed load (a server rejection is raised) leaves it idle;
+ * - a displayed stage left without a lead while other stages hold some (a search whose matches
+ *   are all elsewhere) stays displayed and shows a hint with their pending-aware count and a
+ *   button displaying the first of them, online and offline, reading nothing; never with sample
+ *   data, nor on a pipeline without any lead;
  * - pending stage placement and pending-aware totals are derived from framework state only, survive
  *   remounts and reloads, and end once the write is replayed (or discarded) and reloaded; a
  *   reconnection with nothing queued reloads the pipeline once, at once, before the sync window;
@@ -73,6 +77,7 @@ import {
     defineActions,
     defineModels,
     destroyApp,
+    editSearch,
     fields,
     getService,
     isSmall,
@@ -91,6 +96,7 @@ import {
     swipeRight,
     toggleMenuItem,
     toggleSearchBarMenu,
+    validateSearch,
 } from "@web/../tests/web_test_helpers";
 import { status } from "@odoo/owl";
 
@@ -3209,6 +3215,166 @@ describe("Mobile pipeline", () => {
     });
 
     test.tags("mobile");
+    test("mobile: while entering a folded stage loads it, its Load more is busy and disabled; Load more, entering it again and New neither load nor toggle it again", async () => {
+        await makeMockServer();
+        MockServer.env["crm.stage"].write([4], { fold: true });
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchRpcs(["crm.lead/web_search_read"]);
+        let pendingLoad = null;
+        onRpc("crm.lead", "web_search_read", async () => {
+            await pendingLoad?.promise;
+        });
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            toggleGroup(group) {
+                expect.step(`toggleGroup ${group.serverValue}`);
+                return super.toggleGroup(...arguments);
+            },
+        });
+        const controllers = captureInstances(CrmMobilePipelineController);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [controller] = controllers;
+        const [renderer] = renderers;
+        patchWithCleanup(controller.model.constructor.Group.prototype, {
+            toggle() {
+                expect.step(`toggle ${this.serverValue}`);
+                return super.toggle(...arguments);
+            },
+        });
+        const loadMore = ".o_crm_mobile_pipeline_load_more button";
+        const won = groupOf(renderer, 4);
+        await goToStage("Proposition");
+        expect.verifySteps([]);
+        expect(won.isFolded).toBe(true);
+
+        // Next enters the folded Won: one toggle and one load, during which Load more is busy.
+        pendingLoad = Promise.withResolvers();
+        await contains(".o_crm_mobile_pipeline_next").click();
+        await animationFrame();
+        expect.verifySteps(["toggleGroup 4", "toggle 4", "crm.lead/web_search_read"]);
+        expectHeader("Won", 1, 50);
+        expect(won.isFolded).toBe(true);
+        expect(cardNames()).toEqual([]);
+        expect(renderer.isLoadingMore(won)).toBe(true);
+        expect(loadMore).toHaveText("Load more... (1 remaining)");
+        expect(loadMore).toHaveAttribute("aria-busy", "true");
+        expect(loadMore).toHaveAttribute("disabled");
+        expect(`${loadMore} .oi-spin[aria-hidden='true']`).toHaveCount(1);
+
+        // Load more, by a click or a direct call, entering Won again (directly, or by leaving it
+        // and coming back) and New all wait for that load: no second toggle, no second load.
+        await contains(loadMore).click();
+        await renderer.onLoadMoreClick(won);
+        const reentry = renderer.goToGroup(won);
+        await goToStage("Proposition");
+        await goToStage("Won");
+        expect(loadMore).toHaveAttribute("aria-busy", "true");
+        expect(loadMore).toHaveAttribute("disabled");
+        await contains(".o-kanban-button-new").click();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(controller.quickCreateState.isOpen).toBe(false);
+
+        // Loaded: Won is unfolded, in its config too, with its lead and nothing left to load,
+        // and New's quick create opens in it.
+        pendingLoad.resolve();
+        pendingLoad = null;
+        await reentry;
+        await animationFrame();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(won.isFolded).toBe(false);
+        expect(won.config.isFolded).toBe(false);
+        expect(renderer.isLoadingMore(won)).toBe(false);
+        expectHeader("Won", 1, 50);
+        expect(".o_crm_mobile_pipeline_stage_name .o_crm_mobile_pipeline_folded").toHaveCount(0);
+        expect(cardNames()).toEqual(["Lead 5"]);
+        expect(".o_crm_mobile_pipeline_load_more").toHaveCount(0);
+        expect(controller.quickCreateState.isOpen).toBe(true);
+        expect(controller.quickCreateState.id).toBe(won.id);
+        expect(".o_crm_mobile_pipeline_body .o_kanban_quick_create").toHaveCount(1);
+    });
+
+    test.tags("mobile");
+    test("mobile: while New loads a folded displayed stage, its Load more is busy across a reload; Load more and entering the stage neither load nor toggle it again", async () => {
+        await makeMockServer();
+        MockServer.env["crm.stage"].write([4], { fold: true });
+        mockActivityTypes(ACTIVITY_TYPES);
+        const releaseWonLoad = holdStageLoad(4);
+        patchWithCleanup(CrmMobilePipeline.prototype, {
+            toggleGroup(group) {
+                expect.step(`toggleGroup ${group.serverValue}`);
+                return super.toggleGroup(...arguments);
+            },
+        });
+        const controllers = captureInstances(CrmMobilePipelineController);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [controller] = controllers;
+        const [renderer] = renderers;
+        patchWithCleanup(controller.model.constructor.Group.prototype, {
+            toggle() {
+                expect.step(`toggle ${this.serverValue}`);
+                return super.toggle(...arguments);
+            },
+        });
+        const loadMore = ".o_crm_mobile_pipeline_load_more button";
+        controller.crmMobileStage.serverValue = 4;
+        await animationFrame();
+        expectHeader("Won", 1, 50);
+        expect(loadMore).toHaveAttribute("aria-busy", "false");
+        expect(loadMore).not.toHaveAttribute("disabled");
+
+        // New loads the folded stage: the renderer shows that load on the stage's Load more.
+        await contains(".o-kanban-button-new").click();
+        await animationFrame();
+        expect.verifySteps(["toggle 4", "load 4"]);
+        const staleWon = groupOf(renderer, 4);
+        expect(staleWon.isFolded).toBe(true);
+        expect(renderer.isLoadingMore(staleWon)).toBe(true);
+        expect(loadMore).toHaveAttribute("aria-busy", "true");
+        expect(loadMore).toHaveAttribute("disabled");
+        expect(`${loadMore} .oi-spin[aria-hidden='true']`).toHaveCount(1);
+
+        // A filter reloads the root: the rebuilt group of the stage keeps its config, so it is
+        // still shown loading, and neither its Load more nor entering it toggles it again.
+        await toggleSearchBarMenu();
+        await toggleMenuItem("With Revenue");
+        await toggleSearchBarMenu();
+        const won = groupOf(renderer, 4);
+        expect(won.id).not.toBe(staleWon.id);
+        expect(won.config).toBe(staleWon.config);
+        expect(won.isFolded).toBe(true);
+        expect(renderer.isLoadingMore(won)).toBe(true);
+        expect(".o_crm_mobile_pipeline_body").toHaveAttribute("data-id", won.id);
+        expect(loadMore).toHaveAttribute("aria-busy", "true");
+        expect(loadMore).toHaveAttribute("disabled");
+        await contains(loadMore).click();
+        await renderer.onLoadMoreClick(won);
+        const reentry = renderer.goToGroup(won);
+        await animationFrame();
+        expect.verifySteps([]);
+
+        // Loaded: the stage is unfolded, in its config too, and is idle; New's quick create opens
+        // in its current group.
+        releaseWonLoad();
+        await reentry;
+        await animationFrame();
+        await animationFrame();
+        expect.verifySteps([]);
+        expect(won.isFolded).toBe(false);
+        expect(won.config.isFolded).toBe(false);
+        expect(renderer.isLoadingMore(won)).toBe(false);
+        expect(".o_crm_mobile_pipeline_stage_name .o_crm_mobile_pipeline_folded").toHaveCount(0);
+        expect(controller.crmMobileStage.serverValue).toBe(4);
+        expect(controller.quickCreateState.isOpen).toBe(true);
+        expect(controller.quickCreateState.id).toBe(won.id);
+        expect(".o_crm_mobile_pipeline_body .o_kanban_quick_create").toHaveCount(1);
+    });
+
+    test.tags("mobile");
     test("mobile: activities revalidate on model replacement and revisits", async () => {
         const [activityId] = await createActivities([
             {
@@ -5820,6 +5986,393 @@ describe("Mobile pipeline branches", () => {
         sourceReloads.release();
         await move;
         expect(displayedStage.serverValue).toBe(null);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Empty stage hint
+// -----------------------------------------------------------------------------
+
+/** The hint of a displayed stage that shows no lead while other stages hold some. */
+const EMPTY_STAGE_HINT = ".o_crm_mobile_pipeline_body .o_crm_mobile_pipeline_empty_stage";
+const EMPTY_STAGE_HINT_TEXT = `${EMPTY_STAGE_HINT} .o_crm_mobile_pipeline_empty_stage_text`;
+const EMPTY_STAGE_HINT_BUTTON = `${EMPTY_STAGE_HINT} .o_crm_mobile_pipeline_empty_stage_target`;
+
+/**
+ * Lists every stage in the grouped reads of the lead pipeline, as the CRM stage group expansion
+ * does on the server: the mock server lists only the stages holding a matching lead. A stage
+ * without one answers 0 leads, the server's empty aggregate values (`_read_group_empty_value`),
+ * and an empty record list unless it is folded (the stage's fold, or the opening info the client
+ * sends for it).
+ */
+function expandStageGroups() {
+    onRpc("crm.lead", "web_read_group", async ({ kwargs, parent }) => {
+        const result = await parent();
+        if (kwargs.groupby?.[0] !== "stage_id") {
+            return result;
+        }
+        const emptyValue = (spec) => {
+            if (/:array_agg(_distinct)?$/.test(spec)) {
+                return [];
+            }
+            return /:count(_distinct)?$/.test(spec) ? 0 : false;
+        };
+        const stageSpec = kwargs.groupby_read_specification?.stage_id;
+        const byStage = new Map(
+            result.groups.map((group) => [group.stage_id?.[0] ?? false, group])
+        );
+        const stages = MockServer.env["crm.stage"].search_read([], ["display_name", "fold"]);
+        const groups = stages.map((stage) => {
+            if (byStage.has(stage.id)) {
+                return byStage.get(stage.id);
+            }
+            const opening = kwargs.opening_info?.find((info) => info.value === stage.id);
+            const folded = opening ? opening.folded : stage.fold;
+            return {
+                ...Object.fromEntries(kwargs.aggregates.map((spec) => [spec, emptyValue(spec)])),
+                stage_id: [stage.id, stage.display_name],
+                __count: 0,
+                __extra_domain: [["stage_id", "=", stage.id]],
+                ...(!folded && { __records: [] }),
+                ...(stageSpec && {
+                    __values: MockServer.env["crm.stage"].web_read([stage.id], stageSpec)[0],
+                }),
+            };
+        });
+        if (byStage.has(false)) {
+            groups.unshift(byStage.get(false));
+        }
+        return { groups, length: groups.length };
+    });
+}
+
+/**
+ * Asserts the fixed header of a stage the server lists without any lead (see
+ * `expandStageGroups`): such a stage aggregates no currency, so its revenue sum is formatted as a
+ * plain number, as the desktop column header formats it.
+ *
+ * @param {string} stageName
+ * @param {number} count
+ * @param {number} revenue
+ */
+function expectEmptyStageHeader(stageName, count, revenue) {
+    expect(".o_crm_mobile_pipeline_header .o_crm_mobile_pipeline_stage_name").toHaveText(stageName);
+    expect(".o_crm_mobile_pipeline_header .o_crm_mobile_pipeline_count").toHaveText(String(count));
+    expect(".o_crm_mobile_pipeline_header .o_crm_mobile_pipeline_revenue").toHaveText(
+        formatInteger(revenue, { humanReadable: true, minDigits: 3 })
+    );
+}
+
+/**
+ * Asserts the empty-stage hint of the displayed stage.
+ *
+ * @param {string} text its sentence
+ * @param {string} action the label of its button
+ */
+function expectEmptyStageHint(text, action) {
+    expect(EMPTY_STAGE_HINT).toHaveCount(1);
+    expect(EMPTY_STAGE_HINT_TEXT).toHaveText(text);
+    expect(EMPTY_STAGE_HINT_BUTTON).toHaveText(action);
+}
+
+describe("Empty stage hint", () => {
+    test.tags("mobile");
+    test("mobile: a search whose only match is in another stage keeps the displayed stage, whose hint gives the count and displays the stage holding the match", async () => {
+        expandStageGroups();
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_search_read"]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        expect.verifySteps([LEAD_GROUPS]);
+        expectHeader("New", 2, 120);
+        // A stage holding leads shows no hint.
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        expect(renderer.emptyStageHint(renderer.currentGroup)).toBe(null);
+
+        // A search whose only match, Lead 4, is in Proposition: the server still lists every
+        // stage, and New, the displayed stage, now holds no lead.
+        await editSearch("Lead 4");
+        await validateSearch();
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS]);
+        expect(renderer.stageGroups.map((group) => group.serverValue)).toEqual([1, 2, 3, 4]);
+        expectEmptyStageHeader("New", 0, 0);
+        expect(".o_crm_mobile_pipeline_body .o_crm_mobile_lead_card").toHaveCount(0);
+        // The hint says where the match is, and is no framework helper, stage or card.
+        expectEmptyStageHint(
+            "No lead in this stage. 1 lead is in another stage.",
+            "Show Proposition (1)"
+        );
+        // Gray 700: `text-muted` falls under the 4.5:1 contrast of normal-size text.
+        expect(EMPTY_STAGE_HINT_TEXT).toHaveClass("text-700");
+        expect(EMPTY_STAGE_HINT_TEXT).not.toHaveClass("text-muted");
+        expect(".o_view_nocontent").toHaveCount(0);
+        expect(".o_kanban_group").toHaveCount(1);
+        expect(".o_kanban_record").toHaveCount(0);
+        const button = queryOne(EMPTY_STAGE_HINT_BUTTON);
+        expect(button.tagName).toBe("BUTTON");
+        expect(button).toHaveAttribute("type", "button");
+        expect(button).toHaveAttribute("data-available-offline", "1");
+        expect(button).not.toHaveAttribute("disabled");
+        expectTouchTarget(button, "the empty-stage hint button");
+        // Rendering the hint read nothing.
+        await runAllTimers();
+        expect.verifySteps([]);
+
+        // Its button displays Proposition, already loaded: its card, no read and no hint.
+        await contains(EMPTY_STAGE_HINT_BUTTON).click();
+        await animationFrame();
+        expect.verifySteps([]);
+        expectHeader("Proposition", 1, 40);
+        expect(cardNames()).toEqual(["Lead 4"]);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+
+        // Another empty stage shows the hint as well. Activated by keyboard, its button leaves
+        // with the stage it was shown in, and hands the focus to the first header control.
+        await goToStage("Qualified");
+        expectEmptyStageHeader("Qualified", 0, 0);
+        expectEmptyStageHint(
+            "No lead in this stage. 1 lead is in another stage.",
+            "Show Proposition (1)"
+        );
+        queryOne(EMPTY_STAGE_HINT_BUTTON).focus();
+        await press("Enter");
+        await animationFrame();
+        expectHeader("Proposition", 1, 40);
+        expect(cardNames()).toEqual(["Lead 4"]);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_prev").toBeFocused();
+
+        // The framework quick create open in the empty stage replaces the hint until it closes.
+        await goToStage("New");
+        expect(EMPTY_STAGE_HINT).toHaveCount(1);
+        await contains(".o-kanban-button-new").click();
+        await animationFrame();
+        expect(".o_crm_mobile_pipeline_body .o_kanban_quick_create").toHaveCount(1);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        await contains(
+            ".o_crm_mobile_pipeline_body .o_kanban_quick_create .o_kanban_cancel"
+        ).click();
+        await animationFrame();
+        expect(".o_kanban_quick_create").toHaveCount(0);
+        expectEmptyStageHint(
+            "No lead in this stage. 1 lead is in another stage.",
+            "Show Proposition (1)"
+        );
+
+        // With sample data, or while the unavailable-lead helper is displayed, there is no hint.
+        const group = renderer.currentGroup;
+        const { model } = renderer.props.list;
+        model.useSampleModel = true;
+        expect(renderer.emptyStageHint(group)).toBe(null);
+        model.useSampleModel = false;
+        renderer.mobileState.unavailableLeadId = 4;
+        expect(renderer.emptyStageHint(group)).toBe(null);
+        renderer.mobileState.unavailableLeadId = null;
+        const hint = renderer.emptyStageHint(group);
+        expect(hint.target).toBe(groupOf(renderer, 3));
+        expect(hint.targetCount).toBe(1);
+        expect(hint.otherCount).toBe(1);
+
+        // Without the search, the displayed stage holds leads again: no hint.
+        expect(".o_searchview_facet").toHaveCount(1);
+        await contains(".o_searchview_facet .o_facet_remove").click();
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS]);
+        expectHeader("New", 2, 120);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: a reload whose matches are in several stages counts them all and displays the first one, a folded stage loaded and unfolded online", async () => {
+        await makeMockServer();
+        // Proposition is folded: its leads are loaded only once it is displayed.
+        MockServer.env["crm.stage"].write([3], { fold: true });
+        expandStageGroups();
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_search_read"]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        expect.verifySteps([LEAD_GROUPS]);
+        expectHeader("New", 2, 120);
+
+        // A reload whose domain matches Lead 4 (folded Proposition) and Lead 5 (Won) only.
+        await renderer.props.list.model.load({ domain: [["id", "in", [4, 5]]] });
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS]);
+        expectEmptyStageHeader("New", 0, 0);
+        expect(groupOf(renderer, 3).isFolded).toBe(true);
+        // Both leads are counted; the button displays the first stage holding one.
+        expectEmptyStageHint(
+            "No lead in this stage. 2 leads are in other stages.",
+            "Show Proposition (1)"
+        );
+
+        // Online, the folded stage is loaded and unfolded as every navigation does.
+        await contains(EMPTY_STAGE_HINT_BUTTON).click();
+        await animationFrame();
+        expect.verifySteps(["crm.lead/web_search_read"]);
+        expect(groupOf(renderer, 3).isFolded).toBe(false);
+        expectHeader("Proposition", 1, 40);
+        expect(cardNames()).toEqual(["Lead 4"]);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+
+        // Won holds a lead: no hint there. Qualified holds none: the same hint.
+        await goToStage("Won");
+        expectHeader("Won", 1, 50);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        await goToStage("Qualified");
+        expectEmptyStageHint(
+            "No lead in this stage. 2 leads are in other stages.",
+            "Show Proposition (1)"
+        );
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: no hint when every stage is empty (the framework no-content helper); offline, a queued lead create is counted and its stage displayed with nothing loaded", async () => {
+        const errors = cachedReadErrors([
+            // the types revalidated when Qualified is displayed offline
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        expandStageGroups();
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_search_read", "crm.lead/web_save"]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        expect.verifySteps([LEAD_GROUPS]);
+
+        // A search that matches no lead: every stage is empty, and the framework no-content
+        // helper covers the pipeline instead of any hint.
+        await editSearch("Nobody");
+        await validateSearch();
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS]);
+        expect(renderer.stageGroups.map((group) => group.serverValue)).toEqual([1, 2, 3, 4]);
+        expectEmptyStageHeader("New", 0, 0);
+        expect(".o_crm_mobile_pipeline .o_view_nocontent").toHaveCount(1);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        for (const group of renderer.stageGroups) {
+            expect(renderer.emptyStageHint(group)).toBe(null);
+        }
+        await goToStage("Won");
+        expect(".o_crm_mobile_pipeline .o_view_nocontent").toHaveCount(1);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        await goToStage("New");
+
+        // Offline, a lead create is queued in Qualified: the pending-aware counts place it there,
+        // so New's hint counts it and its button displays Qualified, with nothing loaded.
+        await setOffline(true);
+        queueLeadSave([], { name: "Queued lead", stage_id: 2, expected_revenue: 15 });
+        await animationFrame();
+        expect(".o_view_nocontent").toHaveCount(0);
+        expectEmptyStageHeader("New", 0, 0);
+        expectEmptyStageHint(
+            "No lead in this stage. 1 lead is in another stage.",
+            "Show Qualified (1)"
+        );
+        expect(EMPTY_STAGE_HINT_BUTTON).not.toHaveAttribute("disabled");
+        expect(EMPTY_STAGE_HINT_BUTTON).not.toHaveClass("o_disabled_offline");
+        await contains(EMPTY_STAGE_HINT_BUTTON).click();
+        await animationFrame();
+        expectEmptyStageHeader("Qualified", 1, 15);
+        expect(pendingCardNames()).toEqual(["Queued lead"]);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        expect.verifySteps([]);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: offline, the hint still displays the folded stage holding the match, which is never loaded", async () => {
+        const errors = cachedReadErrors([
+            // the types revalidated when Proposition is displayed offline (its lead was never
+            // loaded, so no activity is read)
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        await makeMockServer();
+        // Proposition is folded: its leads are never loaded online.
+        MockServer.env["crm.stage"].write([3], { fold: true });
+        expandStageGroups();
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        watchRpcs([LEAD_GROUPS, "crm.lead/web_search_read"]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        expect.verifySteps([LEAD_GROUPS]);
+        await editSearch("Lead 4");
+        await validateSearch();
+        await animationFrame();
+        expect.verifySteps([LEAD_GROUPS]);
+        expectEmptyStageHeader("New", 0, 0);
+
+        // The connection drops: the hint stays, usable offline.
+        await setOffline(true);
+        await animationFrame();
+        expectEmptyStageHint(
+            "No lead in this stage. 1 lead is in another stage.",
+            "Show Proposition (1)"
+        );
+        expect(EMPTY_STAGE_HINT_BUTTON).not.toHaveAttribute("disabled");
+        expect(EMPTY_STAGE_HINT_BUTTON).not.toHaveClass("o_disabled_offline");
+
+        // Its button displays Proposition without loading it: the stage stays folded, and the
+        // offline action helper says its lead is not available.
+        await contains(EMPTY_STAGE_HINT_BUTTON).click();
+        await animationFrame();
+        expect.verifySteps([]);
+        expectHeader("Proposition", 1, 40);
+        expect(groupOf(renderer, 3).isFolded).toBe(true);
+        expect(".o_crm_mobile_pipeline_body .o_crm_mobile_lead_card").toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_body .o_view_nocontent").toHaveCount(1);
+        expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: with sample data, no stage shows the hint", async () => {
+        await makeMockServer();
+        MockServer.env["crm.lead"].unlink(MockServer.env["crm.lead"].search([]));
+        expandStageGroups();
+        mockActivityTypes(ACTIVITY_TYPES);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline({
+            arch: PIPELINE_ARCH.replace('archivable="false"', 'archivable="false" sample="1"'),
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const [renderer] = renderers;
+        expect(renderer.props.list.model.useSampleModel).toBe(true);
+        expect(".o_view_sample_data .o_crm_mobile_pipeline").toHaveCount(1);
+        for (const group of renderer.stageGroups) {
+            await renderer.goToGroup(group);
+            await animationFrame();
+            expect(".o_crm_mobile_pipeline_stage_name").toHaveText(group.displayName);
+            expect(renderer.emptyStageHint(group)).toBe(null);
+            expect(EMPTY_STAGE_HINT).toHaveCount(0);
+        }
+    });
+
+    test.tags("desktop");
+    test("desktop: a search whose only match is in another stage renders the standard kanban columns, with no hint", async () => {
+        expandStageGroups();
+        await mountPipeline();
+        await editSearch("Lead 4");
+        await validateSearch();
+        await animationFrame();
+        expect(".o_crm_mobile_pipeline").toHaveCount(0);
+        expect(".o_kanban_renderer .o_kanban_group").toHaveCount(4);
+        expect(".o_kanban_renderer .o_kanban_record:not(.o_kanban_ghost)").toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_empty_stage").toHaveCount(0);
     });
 });
 
