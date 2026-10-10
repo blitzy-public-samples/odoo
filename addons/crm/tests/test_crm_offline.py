@@ -1,5 +1,6 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
+import json
 import mimetypes
 import os
 from datetime import timedelta
@@ -79,9 +80,9 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
     included), the mobile quick create, activity creates and mark-done;
     activity creates as RPC callers send them, over JSON-RPC or through
     ``call_kw`` in the server process (accepted id forms, value validation,
-    access and integrity errors); and the checks that the production views
-    keep the offline wiring and that the pipeline arch fetches the fields it
-    reads.
+    access, integrity and database type errors); and the checks that the
+    production views keep the offline wiring and that the pipeline arch
+    fetches the fields it reads.
 
     Lane 3: the launcher of the ``crm_mobile_offline`` tour, an end-to-end
     offline session on the small-screen pipeline, whose replayed writes are
@@ -1177,6 +1178,90 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         activity = self.env['mail.activity'].browse(call_kw(activities, 'create', [vals], {}))
         self.assertIn(activity, lead.activity_ids)
         self.assertEqual(activity.summary, 'Follow-up after a rejected one')
+        self.assertEqual(self._count_activities(lead), (counts[0] + 1, counts[1] + 1))
+
+    def test_offline_activity_create_invalid_column_values_rpc(self):
+        """ PART 3b: lead activity creates sent over JSON-RPC, as queued or with an explicit lead model id, holding a value the database rejects for its type or range, get a neutral error without trace or database text and create nothing. """
+        lead = self._create_opportunity('Offline Mistyped Activity Lead')
+        queued_vals = {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Mistyped follow-up',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }
+        explicit_vals = {
+            **{key: value for key, value in queued_vals.items() if key != 'res_model'},
+            'res_model_id': self.env['ir.model']._get_id('crm.lead'),
+        }
+        wrong_type = "Invalid activity values: a value does not match the type of its field."
+        no_lead_id = "Invalid activity values: an activity on a lead requires the id of that lead."
+        injection = "'; DROP TABLE crm_lead;--"
+        self.authenticate('user_sales_leads', 'user_sales_leads')
+
+        for shape, vals in (('queued values', queued_vals), ('explicit lead model id', explicit_vals)):
+            for field_name, value, message in (
+                ('user_id', injection, wrong_type),
+                ('user_id', '1 OR 1=1', wrong_type),
+                ('user_id', True, wrong_type),
+                ('user_id', [self.user_sales_leads.id], wrong_type),
+                ('user_id', 2 ** 31, wrong_type),
+                ('activity_type_id', injection, wrong_type),
+                ('res_id', 2 ** 31, no_lead_id),
+                ('res_id', 2 ** 63, no_lead_id),
+                ('calendar_event_id', 'x', wrong_type),
+                ('attachment_ids', [[6, 0, ['a']]], wrong_type),
+            ):
+                with self.subTest(shape=shape, field=field_name, value=value):
+                    counts = self._count_activities(lead)
+                    lead_count = self.env['crm.lead'].with_context(active_test=False).search_count([])
+
+                    with mute_logger('odoo.http', 'odoo.sql_db'):
+                        response = self._activity_rpc('web_save', [[], {**vals, field_name: value}], {
+                            'context': {}, 'specification': {},
+                        })
+
+                    data = self._assert_concealed_error(response, 'odoo.exceptions.ValidationError')
+                    self.assertEqual(data['message'], message)
+                    error = json.dumps(response['error'])
+                    for database_text in ('psycopg2', 'LINE 1', 'INSERT', 'DROP TABLE', 'integer'):
+                        self.assertNotIn(database_text, error)
+                    self.assertEqual(self._count_activities(lead), counts)
+                    self.assertEqual(self.env['crm.lead'].with_context(active_test=False).search_count([]), lead_count)
+
+    def test_offline_activity_create_invalid_column_value_keeps_pending_writes(self):
+        """ PART 3b: a queued lead activity create holding a value the database rejects for its type gets the neutral error and is rolled back alone: a write pending before it is kept, the transaction stays usable and a valid create follows. """
+        lead = self._create_opportunity('Offline Mistyped Pending Write Lead')
+        counts = self._count_activities(lead)
+        vals = {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'summary': 'Follow-up after a mistyped one',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': self.user_sales_leads.id,
+        }
+        activities = self.env['mail.activity'].with_user(self.user_sales_leads)
+        lead_name_query = SQL("SELECT name FROM crm_lead WHERE id = %s", lead.id)
+
+        lead.name = 'Offline Mistyped Pending Write Lead Renamed'
+        self.env.cr.execute(lead_name_query)
+        self.assertEqual(self.env.cr.fetchone()[0], 'Offline Mistyped Pending Write Lead', 'The write is still pending when the create starts')
+
+        # not ``self.assertRaises``: it would flush the pending write itself, in a savepoint of its own
+        with TestCase.assertRaises(self, ValidationError) as caught, mute_logger('odoo.sql_db'):
+            call_kw(activities, 'create', [{**vals, 'user_id': "'; DROP TABLE crm_lead;--"}], {})
+        self.assertEqual(str(caught.exception), "Invalid activity values: a value does not match the type of its field.")
+
+        self.env.cr.execute(lead_name_query)
+        self.assertEqual(self.env.cr.fetchone()[0], 'Offline Mistyped Pending Write Lead Renamed', 'The rejected create drops no earlier write')
+        self.assertEqual(self.env['crm.lead'].search_count([('name', '=', 'Offline Mistyped Pending Write Lead Renamed')]), 1)
+        self.assertEqual(self._count_activities(lead), counts)
+
+        activity = self.env['mail.activity'].browse(call_kw(activities, 'create', [vals], {}))
+        self.assertIn(activity, lead.activity_ids)
+        self.assertEqual(activity.summary, 'Follow-up after a mistyped one')
         self.assertEqual(self._count_activities(lead), (counts[0] + 1, counts[1] + 1))
 
     def test_activity_schedule_keeps_pending_lead_writes_batched(self):

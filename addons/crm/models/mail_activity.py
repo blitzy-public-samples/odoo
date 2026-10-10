@@ -37,10 +37,10 @@ class MailActivity(models.Model):
         ``res_model_id`` key, the context's ``default_res_model`` or
         ``default_res_model_id``, must give a ``res_model_id``, if any, as an
         integer or an ``ir.model`` record, and a ``res_id`` the standard create
-        converts to a positive id (an integer, a numeric string or number, a
-        record; never a boolean), in the values or, without a ``res_id`` key, as
-        the context's ``default_res_id``. These checks raise a
-        ``ValidationError`` that does not repeat the input.
+        converts to a positive id within PostgreSQL's integer range (an integer,
+        a numeric string or number, a record; never a boolean), in the values
+        or, without a ``res_id`` key, as the context's ``default_res_id``. These
+        checks raise a ``ValidationError`` that does not repeat the input.
 
         When the batch holds values targeting ``crm.lead``, every error it
         raises, the standard create's own (access rights, missing records,
@@ -56,8 +56,13 @@ class MailActivity(models.Model):
         whose values all give their model otherwise, through ``res_model_id``
         (as ``activity_schedule`` does) or the context defaults, are created
         with neither flush nor savepoint, so pending ORM writes stay batched
-        and integrity errors are handled as with the standard create. Batches
-        on other models are created as standard. """
+        and integrity errors are handled as with the standard create. In both
+        kinds of lead batch, a value the database rejects for its type or range,
+        such as a string given for a many2one, is raised as a ``ValidationError``
+        that repeats neither the value nor the database text, which the server
+        log still records; without a savepoint, the transaction is left as that
+        database error left it, for the caller to roll back. Batches on other
+        models are created as standard. """
         if not isinstance(vals_list, (list, tuple)) or not all(isinstance(vals, Mapping) for vals in vals_list):
             with conceal_debug_traceback():
                 raise ValidationError(self.env._("Invalid activity values: a list of field values is expected."))
@@ -100,7 +105,8 @@ class MailActivity(models.Model):
                     lead_id = res_id_field.convert_to_column(res_id, self)
                 except (TypeError, ValueError, OverflowError):
                     lead_id = 0
-            if lead_id <= 0:
+            # record ids are PostgreSQL integers: an id outside their range is no lead's
+            if not 0 < lead_id < 2 ** 31:
                 with conceal_debug_traceback():
                     raise ValidationError(self.env._("Invalid activity values: an activity on a lead requires the id of that lead."))
             if vals.get('res_model') == 'crm.lead' and not res_model_id:
@@ -112,7 +118,13 @@ class MailActivity(models.Model):
             if not model_id_resolved:
                 # values that already give their model, such as activity_schedule's: neither flush
                 # nor savepoint, so pending ORM writes stay batched as with the standard create
-                return super().create(vals_list)
+                try:
+                    return super().create(vals_list)
+                except (psycopg2.DataError, psycopg2.ProgrammingError):
+                    # a value of the wrong type or range, without the database text; nothing is
+                    # rolled back here: the caller's rollback (the request's, for RPC) resets the
+                    # transaction the database error aborted
+                    raise ValidationError(self.env._("Invalid activity values: a value does not match the type of its field.")) from None
             # pending ORM writes reach the database before the savepoint, so that its rollback
             # drops nothing else; precommit hooks, mail tracking included, still run at commit
             self.env.flush_all()
@@ -132,6 +144,11 @@ class MailActivity(models.Model):
                     "The operation cannot be completed: %s",
                     model._sql_error_to_message(error),
                 )) from None
+            except (psycopg2.DataError, psycopg2.ProgrammingError):
+                # the savepoint is rolled back: drop what the failed create left in the caches
+                self.env.transaction.clear()
+                # a value of the wrong type or range, without the database text
+                raise ValidationError(self.env._("Invalid activity values: a value does not match the type of its field.")) from None
             except Exception:
                 # the savepoint is rolled back: drop what the failed create left in the caches
                 self.env.transaction.clear()
