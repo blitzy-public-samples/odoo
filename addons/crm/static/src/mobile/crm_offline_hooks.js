@@ -808,7 +808,9 @@ patch(OfflinePlugin, {
 // doing any work (no preventDefault, save, RPC, dialog or action), with or without a DOM event,
 // while offline and only for a CRM target. The Actions menu's queueable Archive, Unarchive and
 // Delete callbacks pass through, and the team dashboard card handles its client-only selection
-// branch directly; every other case calls the original handler with the original arguments.
+// branch directly; every other case calls the original handler with the original arguments. A
+// view button's execution re-checks its click guard when it starts, before the record is saved,
+// which covers a confirmation opened online and confirmed after disconnection.
 
 /**
  * Whether a view button is a DISABLE button: a server button (`object`/`action`) of a CRM model, a
@@ -838,6 +840,53 @@ patch(ViewButton.prototype, {
         // Assigned after the base setup, which may wrap `onClick` in a debounced bound function:
         // that function calls this patched `onClick`, which reads `crmOffline` at click time.
         this.crmOffline = useCrmOffline();
+        // `handleViewButton` is a class field, assigned before `setup` (and declared again by
+        // `MultiRecordViewButton`, which inherits this `setup`), so it is wrapped here: every
+        // execution of a DISABLE button re-checks the click guard when it starts.
+        const handleViewButton = this.handleViewButton;
+        if (typeof handleViewButton === "function") {
+            this.handleViewButton = (params) => handleViewButton(this.crmGuardExecution(params));
+        }
+    },
+    /**
+     * What the click guard of this view button reads: the model it acts on, the framework model
+     * holding the offline state, and its record.
+     *
+     * @returns {{ resModel?: string, model?: RelationalModel, record?: RelationalRecord }}
+     */
+    get crmButtonTarget() {
+        const { record } = this.props;
+        return { resModel: record?.resModel, model: record?.model, record };
+    },
+    /**
+     * The parameters of an execution of this view button, with the click guard of `onClick`
+     * re-checked when the execution starts. A button with a `confirm` attribute starts it from the
+     * confirmation's callback, which never goes through `onClick`: a confirmation opened online
+     * (the team form "Assign Leads") can be confirmed after the connection dropped. For a DISABLE
+     * button, `beforeExecute` therefore returns `false` while offline, so the execution stops
+     * before `beforeExecuteAction` (which saves the record) and `doActionButton`, and the
+     * confirmation closes with nothing done; otherwise it returns what the original
+     * `beforeExecute`, if any, returns. The parameters of every other button are returned as
+     * they are.
+     *
+     * @param {{ clickParams?: Object, beforeExecute?: () => any } | undefined} params
+     * @returns {{ clickParams?: Object, beforeExecute?: () => any } | undefined}
+     */
+    crmGuardExecution(params) {
+        const { resModel, model, record } = this.crmButtonTarget;
+        if (!isCrmDisabledButton(resModel, params?.clickParams, record)) {
+            return params;
+        }
+        const { beforeExecute } = params;
+        return {
+            ...params,
+            beforeExecute: () => {
+                const isOffline = this.crmOffline
+                    ? this.crmOffline.isOffline()
+                    : isOfflineModel(model);
+                return isOffline ? false : beforeExecute?.();
+            },
+        };
     },
     /**
      * Whether this view button is a DISABLE anchor (any tag other than `<button>`) that is
@@ -847,9 +896,10 @@ patch(ViewButton.prototype, {
      * as the framework's selector skips elements that are already disabled: the framework strips
      * the `disabled` attribute from every marked element on reconnection, which would leave such
      * an anchor rendered enabled while it is still disabled. The tag, the predicate and the
-     * anchor's own state are checked before the offline signal is read, so only enabled CRM
-     * DISABLE anchors re-render when the connection drops or returns; that re-render also updates
-     * an anchor shown in an overlay opened before the change (the team dashboard card menu).
+     * anchor's own state are checked before the offline signal is read; with `crmInertOffline`,
+     * which reads it for every CRM DISABLE anchor, only CRM DISABLE anchors re-render when the
+     * connection drops or returns, and that re-render also updates an anchor shown in an overlay
+     * opened before the change (the team dashboard card menu).
      *
      * @returns {boolean}
      */
@@ -859,6 +909,27 @@ patch(ViewButton.prototype, {
             return false;
         }
         if (super.disabled) {
+            return false;
+        }
+        return this.crmOffline ? this.crmOffline.isOffline() : isOfflineModel(record?.model);
+    },
+    /**
+     * Whether this view button is a DISABLE anchor (any tag other than `<button>`) while offline,
+     * under the same predicate as the click guard of `onClick`, whether or not its own state
+     * disables it: its click is inert either way. The click guard returns before the base
+     * `preventDefault`, so the `web.views.ViewButton` extension of `crm_kanban_view.xml` removes
+     * the link itself while this holds: no `href` (the one the template adds or one from the
+     * arch), so no click, Enter or middle click can follow it, and `tabindex="-1"` with
+     * `aria-disabled="true"`, so the anchor leaves the Tab order and is announced as disabled,
+     * as a disabled `<button>` is. `<button>` tags are left to the framework's offline selector.
+     * The tag and the predicate are checked before the offline signal is read, so no other view
+     * button re-renders when the connection drops or returns.
+     *
+     * @returns {boolean}
+     */
+    get crmInertOffline() {
+        const { record, tag } = this.props;
+        if (tag === "button" || !isCrmDisabledButton(record?.resModel, this.clickParams, record)) {
             return false;
         }
         return this.crmOffline ? this.crmOffline.isOffline() : isOfflineModel(record?.model);
@@ -895,6 +966,16 @@ patch(ViewButton.prototype, {
 });
 
 patch(MultiRecordViewButton.prototype, {
+    /**
+     * A header button acts on its list, without a record, as its click guard reads it; the
+     * execution guard of `crmGuardExecution` reads the same.
+     *
+     * @returns {{ resModel?: string, model?: RelationalModel }}
+     */
+    get crmButtonTarget() {
+        const { list } = this.props;
+        return { resModel: list?.resModel, model: list?.model };
+    },
     /**
      * List and kanban header buttons (mass convert, mass mail, Lost). The base method does not call
      * `super`, so it is guarded on its own, before `list.getResIds`.

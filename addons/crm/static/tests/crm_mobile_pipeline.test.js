@@ -7464,6 +7464,20 @@ function quickCreateControls() {
     return queryAll(".o_crm_mobile_quick_create [name]");
 }
 
+/**
+ * @returns {string[]} the labels of the open quick create, in document order, without their
+ *   `aria-hidden` content (the required marker): the names assistive technologies give the controls
+ */
+function quickCreateLabelNames() {
+    return queryAll(".o_crm_mobile_quick_create label").map((label) =>
+        [...label.childNodes]
+            .filter((node) => !(node instanceof Element && node.ariaHidden === "true"))
+            .map((node) => node.textContent)
+            .join("")
+            .trim()
+    );
+}
+
 describe("Mobile quick create", () => {
     test.tags("mobile");
     test("mobile: quick create bottom sheet has exactly six offline-available fields and queues a create", async () => {
@@ -7485,7 +7499,7 @@ describe("Mobile quick create", () => {
         // Exactly six labelled controls, in this order, all usable offline.
         const controls = quickCreateControls();
         expect(controls.map((el) => el.getAttribute("name"))).toEqual(QUICK_CREATE_FIELDS);
-        expect(queryAllTexts(".o_crm_mobile_quick_create label")).toEqual([
+        expect(quickCreateLabelNames()).toEqual([
             "Lead Name",
             "Contact Name",
             "Phone",
@@ -7589,10 +7603,7 @@ describe("Mobile quick create", () => {
         expect(value.extras.actionId).toBe(PIPELINE_ACTION_ID);
         expect(value.extras.displayName).toBe("Mobile lead");
         expect(value.extras.changes.stage_id).toEqual({ id: 2, display_name: "Qualified" });
-        // The displayed stage is unchanged; the pending card is in Qualified.
-        expectHeader("New", 2, 120);
-        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
-        await goToStage("Qualified");
+        // The chosen stage is displayed at once, as after a card move, with the pending card.
         expectHeader("Qualified", 2, 105);
         const pending = `.o_crm_mobile_lead_card[data-pending-key='${key}']`;
         expect(pending).toHaveCount(1);
@@ -7673,11 +7684,15 @@ describe("Mobile quick create", () => {
             { validateQuickCreate: [afterReload.id, "close", 2] },
         ]);
         expect(afterReload.stage_id[0]).toBe(2);
+        // The stage the lead went to is displayed, with its card.
+        expectHeader("Qualified", 2, 30);
+        expect(cardOf("After reload")).toHaveCount(1);
 
-        // A server error leaves the sheet open with its values, ready for another try.
+        // A server error leaves the sheet open with its values, ready for another try, and the
+        // displayed stage (where the sheet opened) as it is.
         expect.errors(1);
         await contains(".o_crm_mobile_pipeline_add").click();
-        await fillQuickCreate({ name: "Rejected lead" });
+        await fillQuickCreate({ name: "Rejected lead", stage_id: "New" });
         await contains(".o_crm_mobile_quick_create_save").click();
         await animationFrame();
         expect.verifySteps([
@@ -7685,6 +7700,7 @@ describe("Mobile quick create", () => {
         ]);
         expect.verifyErrors(["This lead name is reserved"]);
         await contains(".modal .modal-footer .btn-primary").click();
+        expectHeader("Qualified", 2, 30);
         expect(".o_crm_mobile_quick_create").toHaveCount(1);
         expect(".o_crm_mobile_quick_create [name=name]").toHaveValue("Rejected lead");
         expect(".o_crm_mobile_quick_create_save").not.toHaveAttribute("disabled");
@@ -7737,8 +7753,9 @@ describe("Mobile quick create", () => {
         expect(MockServer.env["crm.lead"].search_read([["name", "=", "Dropped lead"]])).toEqual([]);
     });
 
+    const NAME_ERROR = "The lead name is required.";
     const EMAIL_ERROR = "The email address is not valid.";
-    const REVENUE_ERROR = "The expected revenue must be a number of 0 or more.";
+    const REVENUE_ERROR = "The expected revenue must be a number.";
 
     /**
      * Asserts the inline error of a quick-create field and its association with the input.
@@ -7754,6 +7771,7 @@ describe("Mobile quick create", () => {
         expect(`.o_crm_mobile_quick_create #${errorId}`).toHaveClass("text-danger-emphasis");
         expect(input).toHaveAttribute("aria-invalid", "true");
         expect(input).toHaveAttribute("aria-describedby", errorId);
+        expect(input).toHaveClass("is-invalid");
     }
 
     /** @param {string} name the control name of a field shown without an error */
@@ -7762,6 +7780,7 @@ describe("Mobile quick create", () => {
         expect(`#o_crm_mobile_quick_create_${name}_error`).toHaveCount(0);
         expect(input).not.toHaveAttribute("aria-invalid");
         expect(input).not.toHaveAttribute("aria-describedby");
+        expect(input).not.toHaveClass("is-invalid");
     }
 
     /**
@@ -7842,7 +7861,7 @@ describe("Mobile quick create", () => {
     }
 
     test.tags("mobile");
-    test("mobile: quick create rejects a malformed email or expected revenue with associated inline errors and sends nothing", async () => {
+    test("mobile: quick create rejects a malformed email or expected revenue with associated inline errors and sends nothing; a negative revenue is written as typed", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
         onRpc("crm.lead", "web_save", ({ args }) => {
@@ -7852,11 +7871,11 @@ describe("Mobile quick create", () => {
         await mountPipeline();
         await runAllTimers(); // flush the start-up synchronisation of the offline plugin
 
-        // Online, a malformed email and a negative revenue: both errors at once, nothing sent.
+        // Online, a malformed email and an overflowing number: both errors at once, nothing sent.
         await contains(".o_crm_mobile_pipeline_add").click();
         const [sheet] = sheets;
         await fillQuickCreate({ name: "Checked lead", email_from: "not-an-email" });
-        sheet.state.expected_revenue = "-5";
+        sheet.state.expected_revenue = "1e400";
         await animationFrame();
         await contains(".o_crm_mobile_quick_create_save").click();
         expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
@@ -7873,9 +7892,9 @@ describe("Mobile quick create", () => {
         expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
         expectFieldError("expected_revenue", REVENUE_ERROR);
 
-        // A valid email clears its own error only; an overflowing number is still rejected.
+        // A valid email clears its own error only; a lone sign is still rejected.
         await fillQuickCreate({ email_from: "checked@example.com" });
-        sheet.state.expected_revenue = "1e400";
+        sheet.state.expected_revenue = "-";
         await contains(".o_crm_mobile_quick_create_save").click();
         expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
         expectNoFieldError("email_from");
@@ -7920,17 +7939,50 @@ describe("Mobile quick create", () => {
             },
         ]);
 
-        // Offline, the same rules: nothing is queued and the sheet stays open.
+        // A negative number is a valid expected revenue: it is sent as typed, with no error.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Negative lead" });
+        // Entered at once: a lone "-" typed on the way is not a number the input can hold.
+        await contains(".o_crm_mobile_quick_create [name=expected_revenue]").edit("-5", {
+            confirm: false,
+            instantly: true,
+        });
+        expect(".o_crm_mobile_quick_create [name=expected_revenue]").not.toHaveAttribute("min");
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps([
+            { web_save: leadVals({ name: "Negative lead", expected_revenue: -5 }) },
+        ]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(leadsNamed("Negative lead")[0].expected_revenue).toBe(-5);
+
+        // Offline, the same rules: a malformed email is rejected and nothing is queued, while the
+        // negative revenue shows no error; once the email is valid, the create is queued with it.
         await setOffline(true);
         await contains(".o_crm_mobile_pipeline_add").click();
         await fillQuickCreate({ name: "Offline checked", email_from: "still wrong" });
         sheets.at(-1).state.expected_revenue = "-0.5";
         await contains(".o_crm_mobile_quick_create_save").click();
-        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
         expectFieldError("email_from", EMAIL_ERROR);
-        expectFieldError("expected_revenue", REVENUE_ERROR);
+        expectNoFieldError("expected_revenue");
         expect(".o_crm_mobile_quick_create").toHaveCount(1);
         expect(queued()).toHaveLength(0);
+        expect.verifySteps([]);
+        await fillQuickCreate({ email_from: "offline@example.com" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(queuedCalls("crm.lead", "web_save").map((call) => call.args)).toEqual([
+            [
+                [],
+                leadVals({
+                    name: "Offline checked",
+                    email_from: "offline@example.com",
+                    expected_revenue: -0.5,
+                }),
+            ],
+        ]);
         expect.verifySteps([]);
     });
 
@@ -7996,6 +8048,123 @@ describe("Mobile quick create", () => {
     });
 
     test.tags("mobile");
+    test("mobile: quick create errors clear as their field is corrected, invalid inputs are marked, the first takes the focus, and Lead Name shows an aria-hidden required marker", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step({ web_save: args[1] });
+        });
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        const [sheet] = sheets;
+        const nameInput = queryOne(".o_crm_mobile_quick_create [name=name]");
+        // A visual required marker, hidden from assistive technologies: the input is required.
+        const marker =
+            ".o_crm_mobile_quick_create label[for=o_crm_mobile_quick_create_name] > span";
+        expect(marker).toHaveText("*");
+        // The darker danger utility, as the inline errors: text-danger falls below 4.5:1.
+        expect(marker).toHaveClass(["text-danger-emphasis", "ms-1"]);
+        expect(marker).toHaveAttribute("aria-hidden", "true");
+        expect(".o_crm_mobile_quick_create label span").toHaveCount(1);
+        expect(nameInput).toHaveAttribute("required");
+
+        // Nothing is checked before the first Save, whatever is typed.
+        await fillQuickCreate({ email_from: "not-an-email" });
+        sheet.state.expected_revenue = "12junk";
+        await animationFrame();
+        for (const name of ["name", "email_from", "expected_revenue"]) {
+            expectNoFieldError(name);
+        }
+        // Only the name, the email and the revenue are checked, and only they take the focus.
+        expect(sheet.getFieldError("contact_name")).toBe("");
+        expect(sheet.getFieldInput("contact_name")).toBe(null);
+        expect(sheet.getFieldInput("email_from")).toBe(
+            queryOne(".o_crm_mobile_quick_create [name=email_from]")
+        );
+
+        // Save: every invalid field is marked, and the first of them, the name, takes the focus.
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expectFieldError("name", NAME_ERROR);
+        expectFieldError("email_from", EMAIL_ERROR);
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+        expect(nameInput).toBeFocused();
+
+        // A single character typed into the name is one input event, whose `t-model` handler
+        // runs before the re-check: the error clears at once.
+        nameInput.value = "A";
+        nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+        await animationFrame();
+        expect(sheet.state.name).toBe("A");
+        expectNoFieldError("name");
+        expectFieldError("email_from", EMAIL_ERROR);
+
+        // An email still malformed keeps its error; emptied, it is valid and its error clears.
+        const emailInput = queryOne(".o_crm_mobile_quick_create [name=email_from]");
+        emailInput.value = "still-wrong";
+        emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+        await animationFrame();
+        expect(sheet.state.email_from).toBe("still-wrong");
+        expectFieldError("email_from", EMAIL_ERROR);
+        await contains(".o_crm_mobile_quick_create [name=email_from]").clear({ confirm: false });
+        expectNoFieldError("email_from");
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+
+        // The revenue corrected through its input clears its error.
+        await contains(".o_crm_mobile_quick_create [name=expected_revenue]").edit("40", {
+            confirm: false,
+            instantly: true,
+        });
+        expectNoFieldError("expected_revenue");
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(0);
+
+        // A field without an error gets none while typing: an emptied name, a malformed email.
+        await contains(".o_crm_mobile_quick_create [name=name]").clear({ confirm: false });
+        await contains(".o_crm_mobile_quick_create [name=email_from]").edit("bad", {
+            confirm: false,
+        });
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(0);
+        expectNoFieldError("name");
+        expectNoFieldError("email_from");
+
+        // The next Save checks them again, and focuses the first invalid field each time.
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expectFieldError("name", NAME_ERROR);
+        expectFieldError("email_from", EMAIL_ERROR);
+        expectNoFieldError("expected_revenue");
+        expect(nameInput).toBeFocused();
+        await fillQuickCreate({ name: "Corrected lead" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect(".o_crm_mobile_quick_create [name=email_from]").toBeFocused();
+        await fillQuickCreate({ email_from: "corrected@example.com" });
+        sheet.state.expected_revenue = "12junk";
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
+        expectFieldError("expected_revenue", REVENUE_ERROR);
+        expect(".o_crm_mobile_quick_create [name=expected_revenue]").toBeFocused();
+        expect.verifySteps([]);
+
+        // Corrected, the lead is created.
+        await contains(".o_crm_mobile_quick_create [name=expected_revenue]").edit("40", {
+            confirm: false,
+            instantly: true,
+        });
+        expectNoFieldError("expected_revenue");
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps([
+            {
+                web_save: leadVals({
+                    name: "Corrected lead",
+                    email_from: "corrected@example.com",
+                    expected_revenue: 40,
+                }),
+            },
+        ]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+    });
+
+    test.tags("mobile");
     test("mobile: quick create sends a single web_save while a save is pending", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         const saves = holdLeadSaves();
@@ -8022,6 +8191,64 @@ describe("Mobile quick create", () => {
     });
 
     test.tags("mobile");
+    test("mobile: while a quick create saves, Save is busy with a spinner and every control is disabled; a server error makes them usable again", async () => {
+        expect.errors(1);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const saves = holdLeadSaves({
+            answer: () => {
+                throw makeServerError({ message: "This lead name is reserved" });
+            },
+        });
+        await mountPipeline();
+        const save = ".o_crm_mobile_quick_create_save";
+        const discard = ".o_crm_mobile_quick_create_discard";
+        const spinner = `${save} i.oi.oi-spin`;
+        /** @returns {HTMLElement[]} the six controls, Save and Discard */
+        const sheetControls = () => [...quickCreateControls(), queryOne(save), queryOne(discard)];
+
+        await contains(".o_crm_mobile_pipeline_add").click();
+        expect(save).toHaveText("Save");
+        expect(save).toHaveAttribute("aria-busy", "false");
+        expect(spinner).toHaveCount(0);
+
+        await fillQuickCreate({ name: "Busy lead", expected_revenue: "3" });
+        await contains(save).click();
+        expect.verifySteps([{ web_save: leadVals({ name: "Busy lead", expected_revenue: 3 }) }]);
+        // Saving: Save is busy, and no control can be used, each keeping its offline marker and
+        // its touch-target size.
+        expect(save).toHaveText("Saving...");
+        expect(save).toHaveAttribute("aria-busy", "true");
+        expect(spinner).toHaveClass("me-1");
+        expect(spinner).toHaveAttribute("data-icon", "autorenew");
+        expect(spinner).toHaveAttribute("aria-hidden", "true");
+        expect(quickCreateControls()).toHaveLength(6);
+        for (const el of sheetControls()) {
+            expect(el).toHaveAttribute("disabled");
+            expect(el).toHaveAttribute("data-available-offline");
+            expect(el.getBoundingClientRect().height >= 44).toBe(true, {
+                message: `${el.getAttribute("name") ?? el.className} is at least 44px high`,
+            });
+        }
+
+        // The server refuses the lead: its error is raised, and the sheet, still open with its
+        // values, is usable again.
+        saves.release();
+        await animationFrame();
+        expect.verifyErrors(["This lead name is reserved"]);
+        await contains(".modal .modal-footer .btn-primary").click();
+        expect(".o_crm_mobile_quick_create").toHaveCount(1);
+        expect(save).toHaveText("Save");
+        expect(save).toHaveAttribute("aria-busy", "false");
+        expect(spinner).toHaveCount(0);
+        for (const el of sheetControls()) {
+            expect(el).not.toHaveAttribute("disabled");
+        }
+        expect(".o_crm_mobile_quick_create [name=name]").toHaveValue("Busy lead");
+        expect(leadsNamed("Busy lead")).toEqual([]);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
     test("mobile: a lead created online while its sheet is dismissed still reaches the pipeline", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         const saves = holdLeadSaves();
@@ -8034,7 +8261,10 @@ describe("Mobile quick create", () => {
         expect.verifySteps([
             { web_save: leadVals({ name: "Dismissed lead", expected_revenue: 7 }) },
         ]);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        // Discard is disabled while the save runs; the sheet can still be dismissed.
+        expect(".o_crm_mobile_quick_create_discard").toHaveAttribute("disabled");
+        await press("Escape");
+        await animationFrame();
         expect(".o_crm_mobile_quick_create").toHaveCount(0);
         expect(cardOf("Dismissed lead")).toHaveCount(0);
 
@@ -8047,6 +8277,78 @@ describe("Mobile quick create", () => {
         expect(cardOf("Dismissed lead")).toHaveCount(1);
         expectHeader("New", 3, 127);
         expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: the stage a quick-created lead goes to is displayed through the pipeline's shared stage, unless the answer has no id or the sheet was dismissed during the call", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        let held = null;
+        onRpc("crm.lead", "web_save", async ({ args }) => {
+            expect.step(`web_save ${args[1].name}`);
+            await held?.promise;
+            if (args[1].name === "Lead without id") {
+                return [];
+            }
+        });
+        const controllers = captureInstances(CrmMobilePipelineController);
+        const renderers = captureInstances(CrmMobilePipeline);
+        const sheets = captureInstances(CrmMobileQuickCreate);
+        await mountPipeline();
+        const [controller] = controllers;
+
+        // The sheet, opened with the pipeline's scope, sees the displayed stage that the
+        // controller provides to the renderer through the env.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        expect(sheets[0].env.crmMobileStage).toBe(controller.crmMobileStage);
+        expect(renderers[0].stageState).toBe(controller.crmMobileStage);
+
+        // Online, into another stage: once the lead is added, its stage is displayed with its card.
+        await fillQuickCreate({
+            name: "Qualified lead",
+            expected_revenue: "5",
+            stage_id: "Qualified",
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps(["web_save Qualified lead"]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(controller.crmMobileStage.serverValue).toBe(2);
+        expectHeader("Qualified", 2, 35);
+        expect(cardOf("Qualified lead")).toHaveCount(1);
+        expect(`${cardOf("Qualified lead")} .o_crm_mobile_pending_badge`).toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+
+        // An answer without an id adds nothing, and the displayed stage stays.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Lead without id", stage_id: "Won" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect.verifySteps(["web_save Lead without id"]);
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expectHeader("Qualified", 2, 35);
+
+        // Dismissed during the call: the lead reaches its stage, and the stage the user is on
+        // stays displayed.
+        held = Promise.withResolvers();
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({
+            name: "Dismissed lead",
+            expected_revenue: "4",
+            stage_id: "Proposition",
+        });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expect.verifySteps(["web_save Dismissed lead"]);
+        await press("Escape");
+        await animationFrame();
+        expect(status(sheets.at(-1))).toBe("destroyed");
+        held.resolve();
+        await animationFrame();
+        expect(leadsNamed("Dismissed lead")).toHaveLength(1);
+        expect(controller.crmMobileStage.serverValue).toBe(2);
+        expectHeader("Qualified", 2, 35);
+        await goToStage("Proposition");
+        expect(cardOf("Dismissed lead")).toHaveCount(1);
+        expectHeader("Proposition", 2, 44);
     });
 
     test.tags("mobile");
@@ -9294,7 +9596,8 @@ describe("Mobile quick create", () => {
         await fillQuickCreate({ name: "Refused lead", expected_revenue: "9" });
         await contains(".o_crm_mobile_quick_create_save").click();
         expect.verifySteps([{ web_save: leadVals({ name: "Refused lead", expected_revenue: 9 }) }]);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        await press("Escape");
+        await animationFrame();
         expect(".o_crm_mobile_quick_create").toHaveCount(0);
 
         // The refusal arrives after the dismissal: its error is raised once, and nothing else
@@ -9323,7 +9626,8 @@ describe("Mobile quick create", () => {
         await contains(".o_crm_mobile_quick_create_save").click();
         const vals = leadVals({ name: "Dropped after dismissal", expected_revenue: 8 });
         expect.verifySteps([{ web_save: vals }]);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        await press("Escape");
+        await animationFrame();
         expect(".o_crm_mobile_quick_create").toHaveCount(0);
         expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
 
@@ -9349,7 +9653,7 @@ describe("Mobile quick create", () => {
     });
 
     test.tags("mobile");
-    test("mobile: while a created lead is being added, a second save sends nothing and Discard closes the sheet; a later failure is raised once", async () => {
+    test("mobile: while a created lead is being added, a second save sends nothing, Discard is disabled and a dismissal closes the sheet; a later failure is raised once", async () => {
         expect.errors(1);
         mockActivityTypes(ACTIVITY_TYPES);
         onRpc("crm.lead", "web_save", ({ args }) => {
@@ -9382,8 +9686,11 @@ describe("Mobile quick create", () => {
         await sheets[0].save();
         await animationFrame();
         expect.verifySteps([]);
-        // Discard closes the sheet while the card is still being added.
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        // Discard is disabled meanwhile; a dismissal closes the sheet while the card is still
+        // being added.
+        expect(".o_crm_mobile_quick_create_discard").toHaveAttribute("disabled");
+        await press("Escape");
+        await animationFrame();
         expect(".o_crm_mobile_quick_create").toHaveCount(0);
 
         // Adding the card then fails: the error is raised once, and nothing else (closing the
@@ -9399,7 +9706,7 @@ describe("Mobile quick create", () => {
     });
 
     test.tags("mobile");
-    test("mobile: the quick-create sheet focuses its lead name input as it opens, and a later render keeps the user's focus", async () => {
+    test("mobile: the quick-create sheet focuses its lead name input as it opens, a failed save focuses its first invalid field, and a later render keeps the user's focus", async () => {
         mockActivityTypes(ACTIVITY_TYPES);
         await mountPipeline();
 
@@ -9408,14 +9715,31 @@ describe("Mobile quick create", () => {
         expect(".o_crm_mobile_quick_create").toHaveCount(1);
         expect(".o_crm_mobile_quick_create [name=name]").toBeFocused();
 
-        // A render of the open sheet (an inline error) leaves the focus on the control holding it.
+        // A failed save moves the focus from Save to the first invalid field, in form order.
         await contains(".o_crm_mobile_quick_create [name=email_from]").edit("not-an-email", {
             confirm: false,
         });
         await contains(".o_crm_mobile_quick_create_save").click();
         await animationFrame();
         expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(2);
-        expect(".o_crm_mobile_quick_create_save").toBeFocused();
+        expect(".o_crm_mobile_quick_create [name=name]").toBeFocused();
+
+        // A render of the open sheet (an error cleared as the name is typed) leaves the focus on
+        // the control holding it, and the next failed save focuses the field still invalid.
+        await contains(".o_crm_mobile_quick_create [name=name]").edit("Focused lead", {
+            confirm: false,
+        });
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
+        expect(".o_crm_mobile_quick_create [name=name]").toBeFocused();
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create [name=email_from]").toBeFocused();
+        await contains(".o_crm_mobile_quick_create [name=phone]").edit("+32 555 07", {
+            confirm: false,
+        });
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create [name=phone]").toBeFocused();
+        expect(".o_crm_mobile_quick_create [role=alert]").toHaveCount(1);
     });
 
     test.tags("mobile");
@@ -9676,7 +10000,8 @@ describe("Remaining quick create branches", () => {
         await contains(".o_crm_mobile_quick_create_save").click();
         await animationFrame();
         expect.verifySteps(["web_save Dismissed lead"]);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        await press("Escape");
+        await animationFrame();
         expect(".o_crm_mobile_quick_create").toHaveCount(0);
         expect(status(sheets[0])).toBe("destroyed");
         expect(cardOf("Dismissed lead")).toHaveCount(0);
@@ -9744,7 +10069,8 @@ describe("Remaining quick create branches", () => {
         await contains(".o_crm_mobile_quick_create_save").click();
         await animationFrame();
         expect.verifySteps(["web_save Reserved lead"]);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        await press("Escape");
+        await animationFrame();
         expect(status(sheets[0])).toBe("destroyed");
 
         pendingSave.resolve();
@@ -9784,7 +10110,8 @@ describe("Remaining quick create branches", () => {
         await contains(".o_crm_mobile_quick_create_save").click();
         await animationFrame();
         expect.verifySteps(["web_save"]);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        await press("Escape");
+        await animationFrame();
         expect(status(sheets[0])).toBe("destroyed");
 
         connection.offline = true;
@@ -9869,7 +10196,8 @@ describe("Remaining quick create branches", () => {
         const [created] = serverLeads("Late card");
         expect.verifySteps(["crm.lead/web_save", `validateQuickCreate ${created.id}`]);
         expect(".o_crm_mobile_quick_create").toHaveCount(1);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        await press("Escape");
+        await animationFrame();
         expect(".o_crm_mobile_quick_create").toHaveCount(0);
         expect(status(sheets[0])).toBe("destroyed");
 
@@ -14181,6 +14509,16 @@ describe("Remaining branches", () => {
         await contains(".o_crm_mobile_pipeline_next").click();
         expect(renderer.stageState.serverValue).toBe(2);
         expectHeader("Qualified", 1, 30);
+
+        // A quick create into another stage: no displayed stage is shared with the sheet, so the
+        // renderer's own stays.
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Proposition lead", stage_id: "Proposition" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        await animationFrame();
+        expect(".o_crm_mobile_quick_create").toHaveCount(0);
+        expect(renderer.stageState.serverValue).toBe(2);
+        expectHeader("Qualified", 1, 30);
     });
 
     test.tags("mobile");
@@ -14668,7 +15006,8 @@ describe("Remaining branches", () => {
 
     /**
      * Saves a lead (revenue 5) through the mobile quick create of the displayed stage, then
-     * closes the sheet with Discard while its `web_save` is held (see `holdLeadCreates`).
+     * dismisses the sheet (Escape: Discard is disabled while the save runs) while its `web_save`
+     * is held (see `holdLeadCreates`).
      *
      * @param {string} name
      * @param {string} [stageName] the stage chosen in the sheet (the displayed one by default)
@@ -14682,7 +15021,8 @@ describe("Remaining branches", () => {
         });
         await contains(".o_crm_mobile_quick_create_save").click();
         await expect.waitForSteps([`web_save ${name}`]);
-        await contains(".o_crm_mobile_quick_create_discard").click();
+        await press("Escape");
+        await animationFrame();
         expect(".o_crm_mobile_quick_create").toHaveCount(0);
     }
 
@@ -15080,7 +15420,8 @@ describe("Remaining branches", () => {
             await contains(".o_crm_mobile_quick_create_save").click();
             await expect.waitForSteps([`web_save ${name}`, "added to 1"]);
             expect(serverLeads(name)).toHaveLength(1);
-            await contains(".o_crm_mobile_quick_create_discard").click();
+            await press("Escape");
+            await animationFrame();
             expect(".o_crm_mobile_quick_create").toHaveCount(0);
         };
 
@@ -15308,6 +15649,9 @@ describe("Mobile pipeline status region", () => {
 
     test.tags("mobile");
     test("mobile: pipeline status region announces a queued lead create, and its end after a systray discard and as its replay happens", async () => {
+        // offline, Qualified is displayed: the types are cached (Lead 3's activities are not)
+        const errors = cachedReadErrors([TYPES]);
+        expect.errors(errors.length);
         mockActivityTypes(ACTIVITY_TYPES);
         const setOffline = mockOffline();
         const replays = [];
@@ -15323,11 +15667,16 @@ describe("Mobile pipeline status region", () => {
         expect.verifySteps([LEAD_GROUPS]);
         await setOffline(true);
 
-        // A create in another stage than the displayed one: no card shows it here, the pipeline
-        // announces it all the same.
-        await queueQuickCreate("Mobile lead", "Qualified");
-        expectHeader("New", 2, 120);
-        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        // A create in another stage than the displayed one: that stage is displayed with the
+        // pending card, which stays silent; the pipeline announces the create.
+        const firstKey = await queueQuickCreate("Mobile lead", "Qualified");
+        expectHeader("Qualified", 2, 40);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(1);
+        expect(
+            queryOne(
+                `.o_crm_mobile_lead_card[data-pending-key='${firstKey}'] .o_crm_mobile_lead_card_status`
+            ).textContent
+        ).toBe("");
         expect(PIPELINE_STATUS).toHaveText("Mobile lead: new lead pending sync.");
         const firstNode = announcementNode();
         await advanceTime(1000);
@@ -15347,7 +15696,8 @@ describe("Mobile pipeline status region", () => {
         // The systray's discard removes the entry: its card leaves, the pipeline tells it.
         getService(OfflinePlugin).removeScheduledORM(secondKey);
         await animationFrame();
-        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(`.o_crm_mobile_lead_card[data-pending-key='${secondKey}']`).toHaveCount(0);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(1);
         expect(PIPELINE_STATUS).toHaveText("Second lead: new lead no longer pending sync.");
         const discardNode = announcementNode();
         expect(queued()).toHaveLength(1);
@@ -15370,12 +15720,13 @@ describe("Mobile pipeline status region", () => {
         await expect.waitForSteps([LEAD_GROUPS]);
         await animationFrame();
         expect(announcementNode()).toBe(replayNode);
-        await goToStage("Qualified");
+        expect(".o_crm_mobile_pipeline_stage_name").toHaveText("Qualified");
         expect(cardNames()).toEqual(["Lead 3", "Mobile lead"]);
         expect(`${cardOf("Mobile lead")} .o_crm_mobile_pending_badge`).toHaveCount(0);
         expect(announcementNode()).toBe(replayNode);
         const created = MockServer.env["crm.lead"].search_read([["name", "=", "Mobile lead"]]);
         expect(created).toHaveLength(1);
+        expect.verifyErrors(errors);
     });
 
     test.tags("mobile");

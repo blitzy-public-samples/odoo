@@ -180,6 +180,27 @@
     </t>
 
     <!--
+        CRM DISABLE view-button anchors offline (probability anchors, team dashboard and card-menu
+        anchors, the UTM campaign leads badge). Their click guard in `crm_offline_hooks.js` returns
+        before the base `preventDefault`, and `t-custom-click.stop` keeps window-level link
+        handlers away, so the link is removed at its source while `crmInertOffline` holds: no
+        `href` (the template's own, and one from the arch, which `t-att` applies first), so a
+        click, Enter or middle click follows nothing and pushes no history entry; `tabindex="-1"`
+        takes the anchor out of the Tab order; `aria-disabled="true"` announces it as disabled.
+        Otherwise, online and for every other view button, each expression renders what the base
+        template does, so the markup is unchanged: `href` and `tabindex` are the template's own
+        expressions, and `aria-disabled` is the arch's own value from `props.attrs` (absent when
+        the arch sets none), which this expression would otherwise override.
+    -->
+    <t t-inherit="web.views.ViewButton" t-inherit-mode="extension">
+        <xpath expr="//t[@t-tag='this.props.tag']" position="attributes">
+            <attribute name="t-att-href">this.crmInertOffline ? false : (this.props.tag === 'a' and '#')</attribute>
+            <attribute name="t-att-tabindex">this.crmInertOffline ? '-1' : this.props.tabindex</attribute>
+            <attribute name="t-att-aria-disabled">this.crmInertOffline ? 'true' : this.props.attrs['aria-disabled']</attribute>
+        </xpath>
+    </t>
+
+    <!--
         Lead chatter Files toggler. With attachments, the button only opens and closes the
         read-only Files panel, so the cached attachments stay viewable offline. Without
         attachments, the same button is the `FileUploader` toggler that launches an upload: it

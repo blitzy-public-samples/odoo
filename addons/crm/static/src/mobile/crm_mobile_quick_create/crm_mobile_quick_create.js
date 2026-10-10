@@ -9,7 +9,8 @@
  *   offline. No user or assignee is sent either: the server applies the session user.
  * - It registers nothing and has no offline machinery of its own. Only the mobile pipeline opens
  *   it, with `withScope`, so the sheet shares the pipeline's plugin manager, hence its env and
- *   action config: the queued call is listed in the systray under the pipeline's action.
+ *   action config: the queued call is listed in the systray under the pipeline's action, and the
+ *   stage the lead goes to becomes the pipeline's displayed stage (`env.crmMobileStage`).
  * - The sheet focuses its lead name input as it opens; the pipeline moves the focus back to its
  *   Add button as the sheet closes (`onClose`).
  *
@@ -46,6 +47,9 @@ const QUEUED_VIEW_TYPE = "kanban";
 /** Char values of the sheet, in the order they are written. */
 const CHAR_FIELDS = ["name", "contact_name", "phone", "email_from"];
 
+/** Fields checked before a create, in form order: a failed save focuses the first invalid one. */
+const VALIDATED_FIELDS = ["name", "email_from", "expected_revenue"];
+
 /**
  * @param {unknown} value an input value bound to the sheet state
  * @returns {string} the trimmed text, empty for a missing value
@@ -68,8 +72,9 @@ const R_FLOAT = /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?$/;
  * @param {string} text the expected revenue as typed, trimmed
  * @param {boolean} badInput whether the revenue input holds a text the browser cannot parse: a
  *   number input then reports an empty value
- * @returns {number | null} the amount, 0 when nothing is typed; `null` when the text is not a
- *   finite number of 0 or more
+ * @returns {number | null} the amount as typed, negative ones included (the field takes any
+ *   float), 0 when nothing is typed; `null` when the text cannot be written as a float: not a
+ *   number as a whole, unparsable by the browser, or not finite
  */
 function toRevenue(text, badInput) {
     if (!text) {
@@ -79,7 +84,7 @@ function toRevenue(text, badInput) {
         return null;
     }
     const value = Number(text);
-    return Number.isFinite(value) && value >= 0 ? value : null;
+    return Number.isFinite(value) ? value : null;
 }
 
 /**
@@ -136,6 +141,9 @@ export class CrmMobileQuickCreate extends Component {
     /** The lead name input, the sheet's first field. */
     nameRef = signal.ref();
 
+    /** The email input, focused when a save fails on it. */
+    emailRef = signal.ref();
+
     setup() {
         // The sheet is modal: as it opens, the focus moves from the pipeline's Add button to the
         // first field, once, so later renders leave the user's focus alone. `mobile` focuses it
@@ -152,6 +160,7 @@ export class CrmMobileQuickCreate extends Component {
             stageGroupId: this.props.group.id,
             /** Inline error of each validated field, empty when the field is valid. */
             errors: { name: "", email_from: "", expected_revenue: "" },
+            /** True while a save runs: Save is busy and every control is disabled. */
             saving: false,
         });
 
@@ -247,41 +256,61 @@ export class CrmMobileQuickCreate extends Component {
      */
     onRevenueInput(ev) {
         this.state.expected_revenue = ev.target.value;
+        this.onFieldInput("expected_revenue");
+    }
+
+    /**
+     * Re-checks a validated field as it is edited, while it shows an error: the error clears as
+     * soon as the value is valid. A field without an error gets none before the next Save, so
+     * typing is never interrupted. The name and email inputs call it after their `t-model`
+     * handler, which Owl runs first on the same element: the state already holds the new value.
+     *
+     * @param {"name" | "email_from" | "expected_revenue"} fieldName
+     */
+    onFieldInput(fieldName) {
+        if (this.state.errors[fieldName]) {
+            this.state.errors[fieldName] = this.getFieldError(fieldName);
+        }
     }
 
     /**
      * Creates the lead online, or queues its creation when offline or when the connection drops
      * during the call (planned entry point N1 of the offline inventory).
      * - Invalid fields (an empty name, a malformed email, an expected revenue that is not a finite
-     *   number of 0 or more) each show an inline error, and nothing is sent or queued.
+     *   number) each show an inline error and are marked invalid, the first of them in form order
+     *   takes the focus (the browser scrolls it into view), and nothing is sent or queued. A
+     *   negative revenue is written as typed, as the server takes it.
+     * - While it runs (`state.saving`), Save is busy and every control of the sheet is disabled;
+     *   the sheet can still be dismissed.
      * - An error of the call itself (a server validation error, `NonSecureContextError`)
      *   propagates to the framework error handling and leaves the sheet open with its values.
      * - Once the lead exists (created or queued), the sheet closes even if adding its card fails;
      *   that failure propagates after the sheet is closed.
      * - A lead created online is handed to the pipeline (`onCreated`) with the live group of its
      *   stage, even when the sheet was dismissed during the call.
+     * - Once the lead is queued, or created online and handed to the pipeline, the pipeline
+     *   displays its stage, as after a card move, so that the user sees the new card (pending or
+     *   not); see `displayCreatedStage`. A sheet dismissed during the call, or an answer without
+     *   an id, leaves the displayed stage as it is.
      */
     async save() {
         if (this.state.saving) {
             return;
         }
+        // Every invalid field shows its own error at once, and nothing is sent or queued.
+        const errors = Object.fromEntries(
+            VALIDATED_FIELDS.map((fieldName) => [fieldName, this.getFieldError(fieldName)])
+        );
+        this.state.errors = errors;
+        const invalidField = VALIDATED_FIELDS.find((fieldName) => errors[fieldName]);
+        if (invalidField) {
+            this.getFieldInput(invalidField)?.focus();
+            return;
+        }
         const name = toText(this.state.name);
         const email = toText(this.state.email_from);
         const revenueText = toText(this.state.expected_revenue);
-        const revenue = toRevenue(revenueText, Boolean(this.revenueRef()?.validity?.badInput));
-        // Checked here rather than by the inputs' native constraints, which nothing invokes (no
-        // form is submitted), so that a direct call is held to the same rules. Every invalid
-        // field shows its own error at once, and nothing is sent or queued.
-        const errors = {
-            name: name ? "" : _t("The lead name is required."),
-            email_from: !email || isEmail(email) ? "" : _t("The email address is not valid."),
-            expected_revenue:
-                revenue === null ? _t("The expected revenue must be a number of 0 or more.") : "",
-        };
-        this.state.errors = errors;
-        if (Object.values(errors).some(Boolean)) {
-            return;
-        }
+        const revenue = this.getRevenue();
 
         const targetGroup = this.targetGroup;
         // Exactly the six captured values. Empty chars are written as `false`, as the framework
@@ -329,7 +358,9 @@ export class CrmMobileQuickCreate extends Component {
         // adding the card fails, so that a second tap cannot create it twice. A lead created
         // online reaches the pipeline even when the sheet was dismissed during the call.
         try {
-            if (!outcome.queued) {
+            if (outcome.queued) {
+                this.displayCreatedStage(list, stageValue);
+            } else {
                 // `web_save` answers with the saved records, not with an id.
                 const resId = outcome.result?.[0]?.id;
                 if (resId) {
@@ -339,6 +370,7 @@ export class CrmMobileQuickCreate extends Component {
                         (group) => group.serverValue === stageValue
                     );
                     await onCreated(resId, liveGroup);
+                    this.displayCreatedStage(list, stageValue);
                 }
             }
         } finally {
@@ -355,6 +387,78 @@ export class CrmMobileQuickCreate extends Component {
     // -------------------------------------------------------------------------
     // Private
     // -------------------------------------------------------------------------
+
+    /**
+     * Inline error of a validated field for its current value, empty when the value is valid.
+     * Checked here rather than by the inputs' native constraints, which nothing invokes (no form
+     * is submitted), so that a direct call of `save()` is held to the same rules.
+     *
+     * @param {"name" | "email_from" | "expected_revenue"} fieldName
+     * @returns {string}
+     */
+    getFieldError(fieldName) {
+        switch (fieldName) {
+            case "name":
+                return toText(this.state.name) ? "" : _t("The lead name is required.");
+            case "email_from": {
+                const email = toText(this.state.email_from);
+                return !email || isEmail(email) ? "" : _t("The email address is not valid.");
+            }
+            case "expected_revenue":
+                return this.getRevenue() === null
+                    ? _t("The expected revenue must be a number.")
+                    : "";
+            default:
+                return "";
+        }
+    }
+
+    /**
+     * @returns {number | null} the expected revenue to write (see `toRevenue`), read from the
+     *   state and from the input's own parse failure; `null` when it cannot be written
+     */
+    getRevenue() {
+        return toRevenue(
+            toText(this.state.expected_revenue),
+            Boolean(this.revenueRef()?.validity?.badInput)
+        );
+    }
+
+    /**
+     * Displays the stage a lead was just created or queued in, through the displayed stage the
+     * pipeline controller shares in the env (`crmMobileStage`), which the sheet inherits from the
+     * pipeline's scope: the same switch the pipeline makes after a card move. Only while the sheet
+     * is open (a sheet dismissed during the call leaves the stage the user is on), only when the
+     * pipeline shares its displayed stage, and only when a group of that stage is listed. Nothing
+     * is loaded or unfolded: offline, a folded stage is never read.
+     *
+     * @param {Object} list the pipeline's stage list
+     * @param {number | false} stageValue the stage id written
+     */
+    displayCreatedStage(list, stageValue) {
+        const displayedStage = this.env.crmMobileStage;
+        if (
+            status(this) === "destroyed" ||
+            !displayedStage ||
+            !list.groups?.some((group) => group.serverValue === stageValue)
+        ) {
+            return;
+        }
+        displayedStage.serverValue = stageValue;
+    }
+
+    /**
+     * @param {"name" | "email_from" | "expected_revenue"} fieldName
+     * @returns {HTMLInputElement | null} the input of a validated field, `null` when not rendered
+     */
+    getFieldInput(fieldName) {
+        const refs = {
+            name: this.nameRef,
+            email_from: this.emailRef,
+            expected_revenue: this.revenueRef,
+        };
+        return refs[fieldName]?.() ?? null;
+    }
 
     /**
      * Display values of a queued create, shown in the offline systray tooltip: the filled values

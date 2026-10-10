@@ -151,6 +151,7 @@ import { ListController } from "@web/views/list/list_controller";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
 import { MultiRecordViewButton } from "@web/views/view_button/multi_record_view_button";
 import { ViewButton } from "@web/views/view_button/view_button";
+import { provideViewButtonHandler } from "@web/views/view_button/view_button_hook";
 import { ShareTargetItem } from "@web/webclient/share_target/share_target_item";
 import { shareTargetService } from "@web/webclient/share_target/share_target_service";
 import { WebClient } from "@web/webclient/webclient";
@@ -296,6 +297,68 @@ async function visitedReady() {
 function isDisabledOffline(target) {
     const el = typeof target === "string" ? queryOne(target) : target;
     return el.hasAttribute("disabled") && el.classList.contains("o_disabled_offline");
+}
+
+/**
+ * The link attributes of a view-button anchor: its `href`, `tabindex` and `aria-disabled`, each
+ * `null` when absent. Offline, a CRM DISABLE anchor has no link, leaves the Tab order and is
+ * announced as disabled: `{ href: null, tabindex: "-1", ariaDisabled: "true" }`.
+ *
+ * @param {HTMLElement | string} target
+ */
+function linkAttributesOf(target) {
+    const el = typeof target === "string" ? queryOne(target) : target;
+    return {
+        href: el.getAttribute("href"),
+        tabindex: el.getAttribute("tabindex"),
+        ariaDisabled: el.getAttribute("aria-disabled"),
+    };
+}
+
+/** Link attributes of a view-button anchor online, as the base template renders them. */
+const ONLINE_ANCHOR_LINK = Object.freeze({ href: "#", tabindex: null, ariaDisabled: null });
+
+/** Link attributes of an inert offline CRM DISABLE anchor (see `linkAttributesOf`). */
+const INERT_ANCHOR_LINK = Object.freeze({ href: null, tabindex: "-1", ariaDisabled: "true" });
+
+/**
+ * Records the clicks and middle clicks (`auxclick`) an anchor receives, each with whether the
+ * browser follows the anchor's link: the anchor has an `href` and no handler prevented the
+ * default action. The listeners are on the anchor itself, so they run after the view button's
+ * own handler, whose `.stop` modifier hides the event from every ancestor (window-level link
+ * handlers included).
+ *
+ * @param {HTMLElement} anchor
+ * @returns {{ type: string, follows: boolean }[]} the events received so far
+ */
+function watchAnchorNavigation(anchor) {
+    const events = [];
+    for (const type of ["click", "auxclick"]) {
+        anchor.addEventListener(type, (ev) => {
+            events.push({ type, follows: anchor.hasAttribute("href") && !ev.defaultPrevented });
+        });
+    }
+    return events;
+}
+
+/** Dispatches a middle click on `el`, as the browser does when the wheel button is released. */
+function middleClick(el) {
+    el.dispatchEvent(new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }));
+}
+
+/**
+ * The markup of an element with its attributes as a set: an attribute removed and set again is
+ * appended, so the attribute order of `outerHTML` is not part of what a re-render restores.
+ *
+ * @param {HTMLElement | string} target
+ */
+function markupOf(target) {
+    const el = typeof target === "string" ? queryOne(target) : target;
+    return {
+        tagName: el.tagName,
+        attributes: Object.fromEntries([...el.attributes].map(({ name, value }) => [name, value])),
+        innerHTML: el.innerHTML,
+    };
 }
 
 // -----------------------------------------------------------------------------
@@ -2667,6 +2730,14 @@ describe("DISABLE controls and handler enforcement", () => {
             "doActionButton:action_set_automated_probability",
             "doActionButton:action_set_automated_probability",
         ]);
+        // Online, the anchors are links in the Tab order: Tab from the expected revenue reaches
+        // the first one.
+        for (const anchor of queryAll("a[name='action_set_automated_probability']")) {
+            expect(linkAttributesOf(anchor)).toEqual(ONLINE_ANCHOR_LINK);
+        }
+        queryOne(".o_field_widget[name=expected_revenue] input").focus();
+        await press("Tab");
+        expect("a.o_crm_automated_probability_header").toBeFocused();
 
         // A pending edit: a button that got through would save it first.
         await contains(".o_field_widget[name=name] textarea").edit("Lead 1 (unsaved)");
@@ -2687,19 +2758,41 @@ describe("DISABLE controls and handler enforcement", () => {
         }
 
         // Keyboard: the disabled buttons cannot take the keyboard focus, so neither Enter nor
-        // Space reaches them. The probability anchors are only dimmed: they still take the focus,
-        // and Enter (which clicks a link) and Space on them are inert. The anchors have no hotkey
-        // in the production arch, so there is no hotkey route to exercise for them.
+        // Space reaches them. The probability anchors lose their link, leave the Tab order and
+        // are announced as disabled: Tab from the expected revenue skips them. Focused by a
+        // script, Enter (which clicks an anchor) and Space on them are inert and follow nothing,
+        // and so are a DOM click and a middle click. The anchors have no hotkey in the production
+        // arch, so there is no hotkey route to exercise for them.
         for (const name of LEAD_HEADER_BUTTONS) {
             queryOne(`button[name='${name}']`).focus();
             expect(`button[name='${name}']`).not.toBeFocused();
             await pressEnterAndSpace();
         }
         for (const anchor of anchors) {
+            expect(linkAttributesOf(anchor)).toEqual(INERT_ANCHOR_LINK);
+        }
+        queryOne(".o_field_widget[name=expected_revenue] input").focus();
+        await press("Tab");
+        expect(".o_field_widget[name=expected_revenue] input").not.toBeFocused();
+        for (const anchor of anchors) {
+            expect(anchor).not.toBeFocused();
+        }
+        const url = window.location.href;
+        for (const anchor of anchors) {
+            const navigation = watchAnchorNavigation(anchor);
             anchor.focus();
             expect(anchor).toBeFocused();
             await pressEnterAndSpace();
+            anchor.click();
+            middleClick(anchor);
+            await animationFrame();
+            expect(navigation).toEqual([
+                { type: "click", follows: false },
+                { type: "click", follows: false },
+                { type: "auxclick", follows: false },
+            ]);
         }
+        expect(window.location.href).toBe(url);
 
         const serverButtons = buttons.filter(({ clickParams }) =>
             ["object", "action"].includes(clickParams.type)
@@ -2726,6 +2819,7 @@ describe("DISABLE controls and handler enforcement", () => {
         for (const anchor of queryAll("a[name='action_set_automated_probability']")) {
             expect(anchor).not.toHaveAttribute("disabled");
             expect(anchor).not.toHaveClass("o_disabled_offline");
+            expect(linkAttributesOf(anchor)).toEqual(ONLINE_ANCHOR_LINK);
         }
         // The hotkey runs Won again, after saving the edit kept through the disconnection.
         await press(["alt", "w"]);
@@ -3364,17 +3458,34 @@ describe("DISABLE controls and handler enforcement", () => {
             "doActionButton:action_primary_channel_button",
             "doActionButton:crm.crm_case_form_view_salesteams_lead",
         ]);
+        // Online, the anchors are links in the Tab order: Tab from a card reaches its first one.
+        for (const anchor of queryAll(anchorSelector)) {
+            expect(linkAttributesOf(anchor)).toEqual(ONLINE_ANCHOR_LINK);
+        }
+        queryOne(".o_crm_team_kanban .o_kanban_record:first").focus();
+        await press("Tab");
+        expect(`${anchorSelector}:first`).toBeFocused();
 
         await setOffline(true);
         for (const anchor of queryAll(anchorSelector)) {
             expect(isDisabledOffline(anchor)).toBe(true);
+            expect(linkAttributesOf(anchor)).toEqual(INERT_ANCHOR_LINK);
         }
         for (const card of queryAll(".o_crm_team_kanban .o_kanban_record:not(.o_kanban_ghost)")) {
             expect(isDisabledOffline(card)).toBe(true);
         }
-        // DOM clicks reach the handlers of the dimmed card and anchors, which are inert.
+        // DOM clicks reach the handlers of the dimmed card and anchors, which are inert; the
+        // anchor, which has no link left, follows nothing on a click or a middle click.
+        const url = window.location.href;
+        const firstAnchor = queryOne(`${anchorSelector}:first`);
+        const navigation = watchAnchorNavigation(firstAnchor);
         queryOne(".o_crm_team_kanban .o_kanban_record:first").click();
-        queryOne(`${anchorSelector}:first`).click();
+        firstAnchor.click();
+        middleClick(firstAnchor);
+        expect(navigation).toEqual([
+            { type: "click", follows: false },
+            { type: "auxclick", follows: false },
+        ]);
         // Direct calls, with an event that is not a selection click and without any event. The
         // debounce windows of the anchors clicked above pass first, so that every call reaches the
         // handler.
@@ -3390,10 +3501,12 @@ describe("DISABLE controls and handler enforcement", () => {
         }
         await animationFrame();
         expect.verifySteps([]);
-        // Keyboard: the dimmed cards and anchors still take the keyboard focus, and Enter on them
-        // is inert, on the focused card, on the next card reached with the arrow keys and on
-        // every anchor (once the debounce windows of the direct calls have passed). Neither the
-        // cards nor the anchors have a hotkey, so there is no hotkey route to exercise.
+        // Keyboard: the dimmed cards still take the keyboard focus, and Enter on them is inert,
+        // on the focused card and on the next card reached with the arrow keys. The anchors leave
+        // the Tab order: Tab from the first card skips all of its anchors. Focused by a script,
+        // every anchor is inert on Enter, which clicks it, and follows nothing (once the debounce
+        // windows of the direct calls have passed). Neither the cards nor the anchors have a
+        // hotkey, so there is no hotkey route to exercise.
         await advanceTime(300);
         const cards = queryAll(".o_crm_team_kanban .o_kanban_record:not(.o_kanban_ghost)");
         cards[0].focus();
@@ -3405,12 +3518,18 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(cards[1]).toBeFocused();
         await press("Enter");
         await animationFrame();
+        cards[0].focus();
+        await press("Tab");
+        expect(cards[1]).toBeFocused();
         for (const anchor of queryAll(anchorSelector)) {
+            const anchorNavigation = watchAnchorNavigation(anchor);
             anchor.focus();
             expect(anchor).toBeFocused();
             await press("Enter");
             await animationFrame();
+            expect(anchorNavigation).toEqual([{ type: "click", follows: false }]);
         }
+        expect(window.location.href).toBe(url);
         expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
 
@@ -3418,6 +3537,7 @@ describe("DISABLE controls and handler enforcement", () => {
         for (const anchor of queryAll(anchorSelector)) {
             expect(anchor).not.toHaveAttribute("disabled");
             expect(anchor).not.toHaveClass("o_disabled_offline");
+            expect(linkAttributesOf(anchor)).toEqual(ONLINE_ANCHOR_LINK);
         }
         expect(".o_crm_team_kanban .o_kanban_record.o_disabled_offline").toHaveCount(0);
     });
@@ -3453,8 +3573,11 @@ describe("DISABLE controls and handler enforcement", () => {
             expect(menuAnchor(name)).not.toHaveClass("o_disabled_offline");
         }
         const onlineMarkup = Object.fromEntries(
-            TEAM_MENU_ACTION_NAMES.map((name) => [name, queryOne(menuAnchor(name)).outerHTML])
+            TEAM_MENU_ACTION_NAMES.map((name) => [name, markupOf(menuAnchor(name))])
         );
+        for (const name of TEAM_MENU_ACTION_NAMES) {
+            expect(onlineMarkup[name].attributes.href).toBe("#", { message: name });
+        }
         // Each anchor is drawn by a view button of the team record, the record its click guard
         // reads.
         const menuButtons = buttons.filter(
@@ -3470,12 +3593,16 @@ describe("DISABLE controls and handler enforcement", () => {
             expect(button.props.record.resModel).toBe("crm.team");
         }
 
-        // The connection drops with the menu left open: every action anchor is disabled, while
-        // Configuration, which opens the cached team form, stays usable.
+        // The connection drops with the menu left open: every action anchor is disabled, loses its
+        // link and leaves the Tab order, while Configuration, which opens the cached team form,
+        // stays usable.
         await setOffline(true);
         expect(menu).toHaveCount(1);
         for (const name of TEAM_MENU_ACTION_NAMES) {
             expect(isDisabledOffline(menuAnchor(name))).toBe(true, { message: name });
+            expect(linkAttributesOf(menuAnchor(name))).toEqual(INERT_ANCHOR_LINK, {
+                message: name,
+            });
         }
         expect(configuration).not.toHaveAttribute("disabled");
         expect(configuration).not.toHaveClass("o_disabled_offline");
@@ -3496,47 +3623,62 @@ describe("DISABLE controls and handler enforcement", () => {
         for (const name of TEAM_MENU_ACTION_NAMES) {
             expect(menuAnchor(name)).not.toHaveAttribute("disabled");
             expect(menuAnchor(name)).not.toHaveClass("o_disabled_offline");
-            expect(queryOne(menuAnchor(name)).outerHTML).toBe(onlineMarkup[name]);
+            expect(markupOf(menuAnchor(name))).toEqual(onlineMarkup[name], { message: name });
         }
 
-        // The connection drops again, the menu still open: the anchors are disabled again. The
-        // dimmed anchors still take the keyboard focus, and Enter on one is inert once the
+        // The connection drops again, the menu still open: the anchors are disabled again and
+        // have no link. Focused by a script, Enter on one (which clicks it) is inert once the
         // debounce window of the direct calls has passed (the anchors have no hotkey, so there
-        // is no hotkey route to exercise). The guard returns before `preventDefault`, so the
-        // anchor's `#` link is followed, and that navigation closes the menu like any popover.
+        // is no hotkey route to exercise); with no link to follow, nothing navigates and the
+        // menu stays open.
         await setOffline(true);
         expect(menu).toHaveCount(1);
         for (const name of TEAM_MENU_ACTION_NAMES) {
             expect(isDisabledOffline(menuAnchor(name))).toBe(true, { message: name });
+            expect(linkAttributesOf(menuAnchor(name))).toEqual(INERT_ANCHOR_LINK, {
+                message: name,
+            });
         }
         await advanceTime(300);
+        const url = window.location.href;
         const focusedAnchor = queryOne(menuAnchor("crm.crm_lead_action_open_lead_form"));
+        const focusedNavigation = watchAnchorNavigation(focusedAnchor);
         focusedAnchor.focus();
         expect(focusedAnchor).toBeFocused();
         await press("Enter");
         await animationFrame();
-        expect(menu).toHaveCount(0);
+        expect(focusedNavigation).toEqual([{ type: "click", follows: false }]);
+        expect(menu).toHaveCount(1);
         expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
 
-        // A DOM click on an anchor of a menu opened online and left open at disconnection is
-        // inert too, and closes the menu in the same way.
-        await setOffline(false);
-        await toggleKanbanRecordDropdown(0);
-        await setOffline(true);
-        expect(isDisabledOffline(menuAnchor("crm.crm_case_form_view_salesteams_lead"))).toBe(true);
-        queryOne(menuAnchor("crm.crm_case_form_view_salesteams_lead")).click();
+        // A DOM click and a middle click on another anchor of this menu, opened online and left
+        // open at disconnection, are inert and follow nothing too: the menu stays open.
+        const clickedAnchor = queryOne(menuAnchor("crm.crm_case_form_view_salesteams_lead"));
+        const clickedNavigation = watchAnchorNavigation(clickedAnchor);
+        expect(isDisabledOffline(clickedAnchor)).toBe(true);
+        clickedAnchor.click();
         await animationFrame();
-        expect(menu).toHaveCount(0);
+        await advanceTime(300);
+        middleClick(clickedAnchor);
+        await animationFrame();
+        expect(clickedNavigation).toEqual([
+            { type: "click", follows: false },
+            { type: "auxclick", follows: false },
+        ]);
+        expect(window.location.href).toBe(url);
+        expect(menu).toHaveCount(1);
         expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
 
-        // Online, a menu opened again has usable anchors, which run their action.
+        // Online, the menu still open has usable anchors with their link back, which run their
+        // action.
         await setOffline(false);
-        await toggleKanbanRecordDropdown(0);
+        expect(menu).toHaveCount(1);
         for (const name of TEAM_MENU_ACTION_NAMES) {
             expect(menuAnchor(name)).not.toHaveAttribute("disabled");
             expect(menuAnchor(name)).not.toHaveClass("o_disabled_offline");
+            expect(markupOf(menuAnchor(name))).toEqual(onlineMarkup[name], { message: name });
         }
         await contains(menuAnchor("crm.crm_activity_report_action_team")).click();
         expect.verifySteps(["doActionButton:crm.crm_activity_report_action_team"]);
@@ -3602,17 +3744,24 @@ describe("DISABLE controls and handler enforcement", () => {
             "doActionButton:some_other_method",
         ]);
         // Taken once the pointer has shown the anchor's tooltip, which blanks its native title.
-        const onlineMarkup = queryOne(crmAnchor).outerHTML;
+        // The arch's own `href="#"` reaches the anchor through the view button's attributes.
+        const onlineMarkup = markupOf(crmAnchor);
+        expect(linkAttributesOf(crmAnchor)).toEqual(ONLINE_ANCHOR_LINK);
 
-        // Offline, only the CRM anchor is disabled, and it keeps its own classes.
+        // Offline, only the CRM anchor is disabled, and it keeps its own classes. It loses its
+        // link, the arch's `href` included, leaves the Tab order and is announced as disabled.
         await setOffline(true);
         expect(isDisabledOffline(crmAnchor)).toBe(true);
         expect(crmAnchor).toHaveClass(["btn-outline-primary", "rounded-pill"]);
+        expect(linkAttributesOf(crmAnchor)).toEqual(INERT_ANCHOR_LINK);
         expect(otherAnchor).not.toHaveAttribute("disabled");
         expect(otherAnchor).not.toHaveClass("o_disabled_offline");
-        // The CRM anchor is inert by DOM click, by Enter on the focused anchor (it has no hotkey)
-        // and by a direct call without any DOM event, each once the previous debounce window has
-        // passed.
+        expect(linkAttributesOf(otherAnchor)).toEqual(ONLINE_ANCHOR_LINK);
+        // The CRM anchor is inert by DOM click, by Enter on the focused anchor (it has no hotkey),
+        // by a middle click and by a direct call without any DOM event, each once the previous
+        // debounce window has passed; neither event follows a link.
+        const url = window.location.href;
+        const navigation = watchAnchorNavigation(queryOne(crmAnchor));
         await advanceTime(300);
         queryOne(crmAnchor).click();
         await animationFrame();
@@ -3622,21 +3771,102 @@ describe("DISABLE controls and handler enforcement", () => {
         await press("Enter");
         await animationFrame();
         await advanceTime(300);
+        middleClick(queryOne(crmAnchor));
+        await animationFrame();
+        await advanceTime(300);
         await crmButton.onClick();
         await animationFrame();
+        expect(navigation).toEqual([
+            { type: "click", follows: false },
+            { type: "click", follows: false },
+            { type: "auxclick", follows: false },
+        ]);
+        expect(window.location.href).toBe(url);
         expect(".modal").toHaveCount(0);
         expect.verifySteps([]);
         // The other campaign anchor keeps its framework handling.
         await contains(otherAnchor).click();
         expect.verifySteps(["doActionButton:some_other_method"]);
 
-        // Back online, the CRM anchor is usable and rendered as before.
+        // Back online, the CRM anchor is usable and rendered as before, its link back.
         await setOffline(false);
         expect(crmAnchor).not.toHaveAttribute("disabled");
         expect(crmAnchor).not.toHaveClass("o_disabled_offline");
-        expect(queryOne(crmAnchor).outerHTML).toBe(onlineMarkup);
+        expect(markupOf(crmAnchor)).toEqual(onlineMarkup);
         await advanceTime(300);
         await contains(crmAnchor).click();
+        expect.verifySteps(["doActionButton:action_redirect_to_leads_opportunities"]);
+    });
+
+    test.tags("desktop");
+    test("UTM campaign leads anchor first rendered offline: its arch href is removed too, and restored online", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["utm.campaign/web_save", "utm.campaign/action_redirect_to_leads_opportunities"]);
+        mockViewButtonActions();
+        // The campaign card was visited online: the framework does not dim it as uncached.
+        patchWithCleanup(OfflinePlugin.prototype, {
+            isAvailableOffline() {
+                return true;
+            },
+        });
+        const records = captureInstances(KanbanRecord);
+        // The production badge carries its own `href="#"`; here it is shown only once the
+        // campaign's flag is set, so that its first render happens offline.
+        await mountView({
+            type: "kanban",
+            resModel: "utm.campaign",
+            arch: /* xml */ `
+                <kanban>
+                    <field name="is_auto_campaign"/>
+                    <templates>
+                        <t t-name="card">
+                            <field name="name"/>
+                            <a t-if="record.is_auto_campaign.raw_value" href="#" title="Leads"
+                                role="button" type="object"
+                                name="action_redirect_to_leads_opportunities" class="o_test_late">
+                                <span class="badge">Leads</span>
+                            </a>
+                        </t>
+                    </templates>
+                </kanban>`,
+        });
+        const anchor = ".o_kanban_record a.o_test_late";
+        expect(anchor).toHaveCount(0);
+        const [card] = mountedInstances(records);
+        expect(card.props.record.resModel).toBe("utm.campaign");
+
+        // Created while offline, the anchor gets the arch's `href` from the view button's
+        // attributes, which apply before its own link attribute; that one removes it.
+        await setOffline(true);
+        await card.props.record.update({ is_auto_campaign: true });
+        await animationFrame();
+        expect.verifySteps(["utm.campaign/web_save"]); // answered offline, then queued
+        expect(anchor).toHaveCount(1);
+        expect(isDisabledOffline(anchor)).toBe(true);
+        expect(linkAttributesOf(anchor)).toEqual(INERT_ANCHOR_LINK);
+        const url = window.location.href;
+        const navigation = watchAnchorNavigation(queryOne(anchor));
+        queryOne(anchor).click();
+        await animationFrame();
+        await advanceTime(300);
+        middleClick(queryOne(anchor));
+        await animationFrame();
+        expect(navigation).toEqual([
+            { type: "click", follows: false },
+            { type: "auxclick", follows: false },
+        ]);
+        expect(window.location.href).toBe(url);
+        expect.verifySteps([]);
+
+        // Back online, the anchor has the arch's link again and runs its method.
+        await setOffline(false);
+        await expect.waitForSteps(["utm.campaign/web_save"]); // replayed on reconnect
+        expect(anchor).not.toHaveAttribute("disabled");
+        expect(anchor).not.toHaveClass("o_disabled_offline");
+        expect(linkAttributesOf(anchor)).toEqual(ONLINE_ANCHOR_LINK);
+        await advanceTime(300);
+        await contains(anchor).click();
         expect.verifySteps(["doActionButton:action_redirect_to_leads_opportunities"]);
     });
 
@@ -3678,24 +3908,193 @@ describe("DISABLE controls and handler enforcement", () => {
         const crmAnchor = ".o_kanban_record a[name='action_view_opportunity']";
         expect(customAnchor).toHaveCount(1);
         expect(crmAnchor).toHaveCount(1);
+        // Online, both anchors render the markup of the base view button template, attribute
+        // order included.
+        expect(queryOne(crmAnchor).outerHTML).toBe(
+            `<a class="oe_kanban_action" name="action_view_opportunity" href="#" type="object">Opportunities</a>`
+        );
+        const customOuterHTML = queryOne(customAnchor).outerHTML;
+        expect(customOuterHTML).toBe(
+            `<a class="oe_kanban_action" name="action_partner_custom" href="#" type="object">Custom</a>`
+        );
+        for (const anchor of [crmAnchor, customAnchor]) {
+            expect(linkAttributesOf(anchor)).toEqual(ONLINE_ANCHOR_LINK);
+        }
 
         await setOffline(true);
-        // Only the listed CRM method is disabled: the partner's own anchor is untouched.
+        // Only the listed CRM method is disabled and loses its link: the partner's own anchor is
+        // untouched, its markup included.
         expect(isDisabledOffline(crmAnchor)).toBe(true);
+        expect(linkAttributesOf(crmAnchor)).toEqual(INERT_ANCHOR_LINK);
         expect(customAnchor).not.toHaveAttribute("disabled");
         expect(customAnchor).not.toHaveClass("o_disabled_offline");
-        // A click on the partner's anchor still reaches the framework handling; one on the CRM
-        // anchor is inert.
+        expect(linkAttributesOf(customAnchor)).toEqual(ONLINE_ANCHOR_LINK);
+        expect(queryOne(customAnchor).outerHTML).toBe(customOuterHTML);
+        // A click on the partner's anchor still reaches the framework handling, which prevents
+        // its link; one on the CRM anchor is inert and has no link to follow.
+        const customNavigation = watchAnchorNavigation(queryOne(customAnchor));
+        const crmNavigation = watchAnchorNavigation(queryOne(crmAnchor));
         await contains(customAnchor).click();
         queryOne(crmAnchor).click();
         await animationFrame();
         expect.verifySteps(["doActionButton:action_partner_custom"]);
+        expect(customNavigation).toEqual([{ type: "click", follows: false }]);
+        expect(crmNavigation).toEqual([{ type: "click", follows: false }]);
 
         await setOffline(false);
         for (const anchor of [crmAnchor, customAnchor]) {
             expect(anchor).not.toHaveAttribute("disabled");
             expect(anchor).not.toHaveClass("o_disabled_offline");
+            expect(linkAttributesOf(anchor)).toEqual(ONLINE_ANCHOR_LINK);
         }
+    });
+
+    test("CRM DISABLE anchors render the arch's own aria-disabled online, 'true' offline, and the arch's value again after reconnect", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        // Three probability anchors on a lead form: one the arch announces as disabled, one the
+        // arch announces as enabled, and one without the attribute. The arch attribute reaches
+        // the view button through `props.attrs`, as `role` does.
+        const authored = [
+            ["announced_disabled", "true"],
+            ["announced_enabled", "false"],
+            ["unannounced", null],
+        ];
+        await mountView({
+            type: "form",
+            resModel: "crm.lead",
+            resId: 1,
+            arch: /* xml */ `
+                <form>
+                    <sheet>
+                        <field name="expected_revenue"/>
+                        <a type="object" name="action_set_automated_probability" role="button"
+                            class="o_test_announced_disabled" aria-disabled="true">AI</a>
+                        <a type="object" name="action_set_automated_probability" role="button"
+                            class="o_test_announced_enabled" aria-disabled="false">AI</a>
+                        <a type="object" name="action_set_automated_probability" role="button"
+                            class="o_test_unannounced">AI</a>
+                        <field name="probability"/>
+                    </sheet>
+                </form>`,
+        });
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const selectorOf = (name) => `a[name='action_set_automated_probability'].o_test_${name}`;
+        for (const [name] of authored) {
+            expect(selectorOf(name)).toHaveCount(1);
+            expect(selectorOf(name)).toHaveAttribute("role", "button");
+        }
+
+        // Online: each anchor carries exactly the arch's own value, as the base template renders.
+        for (const [name, ariaDisabled] of authored) {
+            expect(linkAttributesOf(selectorOf(name))).toEqual(
+                { ...ONLINE_ANCHOR_LINK, ariaDisabled },
+                { message: name }
+            );
+        }
+        const onlineMarkup = Object.fromEntries(
+            authored.map(([name]) => [name, markupOf(selectorOf(name))])
+        );
+
+        // Offline: every anchor is inert and announced as disabled, whatever the arch says.
+        await setOffline(true);
+        for (const [name] of authored) {
+            expect(linkAttributesOf(selectorOf(name))).toEqual(INERT_ANCHOR_LINK, {
+                message: name,
+            });
+        }
+
+        // Back online: the arch's own value is rendered again, and nothing else of the markup
+        // differs from the online one.
+        await setOffline(false);
+        for (const [name, ariaDisabled] of authored) {
+            expect(linkAttributesOf(selectorOf(name))).toEqual(
+                { ...ONLINE_ANCHOR_LINK, ariaDisabled },
+                { message: name }
+            );
+            expect(markupOf(selectorOf(name))).toEqual(onlineMarkup[name], { message: name });
+        }
+        expect.verifySteps([]);
+    });
+
+    test.tags("desktop");
+    test("aria-disabled authored on view-button anchors: kept online and offline for other models, restored after reconnect for listed CRM buttons", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        mockViewButtonActions();
+        patchWithCleanup(OfflinePlugin.prototype, {
+            isAvailableOffline() {
+                return true;
+            },
+        });
+        // A partner card with two object anchors CRM does not list, one announced as disabled by
+        // the arch and one without the attribute, and the CRM-listed opportunities method
+        // announced as enabled by the arch.
+        await mountView({
+            type: "kanban",
+            resModel: "res.partner",
+            domain: [["id", "=", serverState.partnerId]],
+            arch: /* xml */ `
+                <kanban>
+                    <templates>
+                        <t t-name="card">
+                            <field name="name"/>
+                            <a type="object" name="action_partner_custom"
+                                aria-disabled="true">Custom</a>
+                            <a type="object" name="action_partner_plain">Plain</a>
+                            <a type="object" name="action_view_opportunity"
+                                aria-disabled="false">Opportunities</a>
+                        </t>
+                    </templates>
+                </kanban>`,
+        });
+        const customAnchor = ".o_kanban_record a[name='action_partner_custom']";
+        const plainAnchor = ".o_kanban_record a[name='action_partner_plain']";
+        const crmAnchor = ".o_kanban_record a[name='action_view_opportunity']";
+        // Online, each anchor renders the markup of the base view button template: the arch's
+        // own `aria-disabled`, applied with the other arch attributes before the template's own,
+        // and none when the arch sets none.
+        const customOuterHTML = `<a aria-disabled="true" class="oe_kanban_action" name="action_partner_custom" href="#" type="object">Custom</a>`;
+        const plainOuterHTML = `<a class="oe_kanban_action" name="action_partner_plain" href="#" type="object">Plain</a>`;
+        const crmOuterHTML = `<a aria-disabled="false" class="oe_kanban_action" name="action_view_opportunity" href="#" type="object">Opportunities</a>`;
+        expect(queryOne(customAnchor).outerHTML).toBe(customOuterHTML);
+        expect(queryOne(plainAnchor).outerHTML).toBe(plainOuterHTML);
+        expect(queryOne(crmAnchor).outerHTML).toBe(crmOuterHTML);
+        const crmOnlineMarkup = markupOf(crmAnchor);
+
+        // Offline: the anchors CRM does not list keep their markup, the arch's `aria-disabled`
+        // included, and still reach the framework handling; the listed CRM anchor is inert and
+        // announced as disabled.
+        await setOffline(true);
+        expect(queryOne(customAnchor).outerHTML).toBe(customOuterHTML);
+        expect(queryOne(plainAnchor).outerHTML).toBe(plainOuterHTML);
+        expect(linkAttributesOf(customAnchor)).toEqual({
+            ...ONLINE_ANCHOR_LINK,
+            ariaDisabled: "true",
+        });
+        expect(linkAttributesOf(plainAnchor)).toEqual(ONLINE_ANCHOR_LINK);
+        expect(isDisabledOffline(crmAnchor)).toBe(true);
+        expect(linkAttributesOf(crmAnchor)).toEqual(INERT_ANCHOR_LINK);
+        await contains(plainAnchor).click();
+        queryOne(crmAnchor).click();
+        await animationFrame();
+        expect.verifySteps(["doActionButton:action_partner_plain"]);
+
+        // Back online: every anchor renders its online markup again, the listed CRM anchor with
+        // the arch's own value (its re-added attributes are appended, so it is compared as a set).
+        await setOffline(false);
+        expect(queryOne(customAnchor).outerHTML).toBe(customOuterHTML);
+        expect(queryOne(plainAnchor).outerHTML).toBe(plainOuterHTML);
+        expect(crmAnchor).not.toHaveAttribute("disabled");
+        expect(crmAnchor).not.toHaveClass("o_disabled_offline");
+        expect(linkAttributesOf(crmAnchor)).toEqual({
+            ...ONLINE_ANCHOR_LINK,
+            ariaDisabled: "false",
+        });
+        expect(markupOf(crmAnchor)).toEqual(crmOnlineMarkup);
+        expect.verifySteps([]);
     });
 
     test.tags("desktop");
@@ -3753,19 +4152,38 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(selectorOf("enabled")).not.toHaveAttribute("disabled");
         expect(selectorOf("enabled")).not.toHaveClass("o_disabled_offline");
         const onlineMarkup = Object.fromEntries(
-            allNames.map((name) => [name, queryOne(selectorOf(name)).outerHTML])
+            allNames.map((name) => [name, markupOf(selectorOf(name))])
         );
+        for (const name of allNames) {
+            expect(onlineMarkup[name].attributes.href).toBe("#", { message: name });
+        }
 
-        // Offline: only the enabled anchor is marked; the disabled ones are left as they were.
+        // Offline: only the enabled anchor is marked; the disabled ones keep their own disabled
+        // state. All three lose their link, leave the Tab order and are announced as disabled,
+        // since a click on any of them is inert offline; nothing else of their markup changes.
         await setOffline(true);
         for (const name of disabledNames) {
             expect(selectorOf(name)).toHaveAttribute("disabled");
             expect(selectorOf(name)).not.toHaveClass("o_disabled_offline");
-            expect(queryOne(selectorOf(name)).outerHTML).toBe(onlineMarkup[name]);
+            const offlineAttributes = {
+                ...onlineMarkup[name].attributes,
+                tabindex: "-1",
+                "aria-disabled": "true",
+            };
+            delete offlineAttributes.href;
+            expect(markupOf(selectorOf(name))).toEqual({
+                ...onlineMarkup[name],
+                attributes: offlineAttributes,
+            });
             expect(Boolean(buttonOf(name).disabled)).toBe(true);
         }
         expect(isDisabledOffline(selectorOf("enabled"))).toBe(true);
         expect(buttonOf("enabled").disabled).toBe(true);
+        for (const name of allNames) {
+            expect(linkAttributesOf(selectorOf(name))).toEqual(INERT_ANCHOR_LINK, {
+                message: name,
+            });
+        }
 
         // Back online: the disabled anchors are still disabled and rendered as before, the enabled
         // anchor is cleared; the DOM agrees with every component.
@@ -3779,7 +4197,7 @@ describe("DISABLE controls and handler enforcement", () => {
         expect(selectorOf("enabled")).not.toHaveClass("o_disabled_offline");
         expect(Boolean(buttonOf("enabled").disabled)).toBe(false);
         for (const name of allNames) {
-            expect(queryOne(selectorOf(name)).outerHTML).toBe(onlineMarkup[name]);
+            expect(markupOf(selectorOf(name))).toEqual(onlineMarkup[name], { message: name });
         }
         expect.verifySteps([]);
     });
@@ -4181,6 +4599,202 @@ describe("DISABLE controls and handler enforcement", () => {
         await setOffline(false);
         expect(crmButton).toBeEnabled();
         expect(customButton).toBeEnabled();
+    });
+
+    test.tags("desktop");
+    test("team form Assign Leads confirmation opened online: confirmed offline it saves and runs nothing and closes, confirmed online it runs", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["crm.team/web_save"]);
+        watchOfflineRpcs();
+        mockViewButtonActions();
+        // The production team form header button (inventory B20) with its confirmation.
+        await mountView({
+            type: "form",
+            resModel: "crm.team",
+            resId: 1,
+            arch: /* xml */ `
+                <form>
+                    <header>
+                        <button name="action_assign_leads" type="object" string="Assign Leads"
+                            class="oe_highlight" confirm-label="Assign Leads"
+                            confirm="This will assign leads to all members. Do you want to proceed?"/>
+                    </header>
+                    <sheet>
+                        <field name="name"/>
+                    </sheet>
+                </form>`,
+        });
+        const assignLeads = "button[name='action_assign_leads']";
+        const confirmButton = ".modal .modal-footer button:contains('Assign Leads')";
+        // A pending edit: an execution that got through would save it first.
+        await contains(".o_field_widget[name=name] input").edit("Mushroom Kingdom (edited)");
+
+        // Opened online, the confirmation stays open when the connection drops, and its confirm
+        // button stays usable offline.
+        await contains(assignLeads).click();
+        expect(".modal").toHaveCount(1);
+        expect(".modal .modal-body").toHaveText(
+            "This will assign leads to all members. Do you want to proceed?"
+        );
+        await setOffline(true);
+        expect(".modal").toHaveCount(1);
+        expect(confirmButton).toBeEnabled();
+        // Confirmed offline: no save, no action, nothing queued, and the confirmation closes; the
+        // header button is disabled offline as before.
+        await contains(confirmButton).click();
+        expect(".modal").toHaveCount(0);
+        expect(".o_field_widget[name=name] input").toHaveValue("Mushroom Kingdom (edited)");
+        expect(isDisabledOffline(assignLeads)).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // The connection state is read when the confirmation is confirmed: one opened online,
+        // kept open across a disconnection and confirmed once the connection is back saves the
+        // edit and runs the action, as online.
+        await setOffline(false);
+        await contains(assignLeads).click();
+        expect(".modal").toHaveCount(1);
+        await setOffline(true);
+        await setOffline(false);
+        await contains(confirmButton).click();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps(["crm.team/web_save", "doActionButton:action_assign_leads"]);
+    });
+
+    test.tags("desktop");
+    test("header button confirmation of a CRM list opened online is inert once confirmed offline", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        mockViewButtonActions();
+        const buttons = captureInstances(MultiRecordViewButton);
+        await mountView({
+            type: "list",
+            resModel: "crm.lead",
+            arch: /* xml */ `
+                <list>
+                    <header>
+                        <button name="crm.action_crm_send_mass_convert" type="action"
+                            string="Convert to Opportunities" confirm="Convert the selected leads?"/>
+                    </header>
+                    <field name="name"/>
+                </list>`,
+        });
+        await contains(".o_data_row:first .o_list_record_selector input").click();
+        const convert = "button[name='crm.action_crm_send_mass_convert']";
+        const [convertButton] = mountedInstances(buttons);
+        expect(convertButton.crmButtonTarget.resModel).toBe("crm.lead");
+        expect(convertButton.crmButtonTarget.record).toBe(undefined);
+
+        // Opened online and confirmed after the connection dropped: nothing runs, and the
+        // confirmation closes.
+        await contains(convert).click();
+        expect(".modal").toHaveCount(1);
+        await setOffline(true);
+        await contains(".modal .modal-footer .btn-primary").click();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps([]);
+
+        // Online, the same confirmation runs the action on the selection.
+        await setOffline(false);
+        await contains(convert).click();
+        await contains(".modal .modal-footer .btn-primary").click();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps(["doActionButton:crm.action_crm_send_mass_convert"]);
+    });
+
+    test.tags("desktop");
+    test("view button execution guard is CRM-scoped: other models' confirmations run offline, their parameters untouched", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        mockViewButtonActions();
+        const buttons = captureInstances(ViewButton);
+        await mountView({
+            type: "form",
+            resModel: "res.partner",
+            resId: serverState.partnerId,
+            arch: /* xml */ `
+                <form>
+                    <header>
+                        <button name="action_partner_custom" type="object" string="Custom"
+                            confirm="Run the custom action?"/>
+                    </header>
+                    <field name="name"/>
+                </form>`,
+        });
+        const [custom] = mountedInstances(buttons).filter(
+            ({ clickParams }) => clickParams.name === "action_partner_custom"
+        );
+        // The execution parameters of a button CRM does not guard are passed on as they are.
+        const params = { clickParams: custom.clickParams, beforeExecute: () => "kept" };
+        expect(custom.crmGuardExecution(params)).toBe(params);
+
+        // Offline, the framework disables the button, and a direct call still opens its
+        // confirmation, whose confirm button runs the action.
+        await setOffline(true);
+        expect(isDisabledOffline("button[name='action_partner_custom']")).toBe(true);
+        custom.onClick();
+        await animationFrame();
+        expect(".modal").toHaveCount(1);
+        await contains(".modal .modal-footer .btn-primary").click();
+        expect(".modal").toHaveCount(0);
+        expect.verifySteps(["doActionButton:action_partner_custom"]);
+        await setOffline(false);
+    });
+
+    test.tags("desktop");
+    test("view button execution guard of a CRM button: offline it stops the execution, online it returns the original beforeExecute result", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        const buttons = captureInstances(ViewButton);
+        await mountView({
+            type: "form",
+            resModel: "crm.team",
+            resId: 1,
+            arch: /* xml */ `
+                <form>
+                    <header>
+                        <button name="action_assign_leads" type="object" string="Assign Leads"/>
+                    </header>
+                    <field name="name"/>
+                </form>`,
+        });
+        const [assign] = mountedInstances(buttons).filter(
+            ({ clickParams }) => clickParams.name === "action_assign_leads"
+        );
+        const params = {
+            clickParams: assign.clickParams,
+            getResParams: () => ({}),
+            beforeExecute: () => {
+                expect.step("beforeExecute");
+                return "original";
+            },
+        };
+        const guarded = assign.crmGuardExecution(params);
+        expect(guarded).not.toBe(params);
+        expect(guarded.clickParams).toBe(params.clickParams);
+        expect(guarded.getResParams).toBe(params.getResParams);
+        // Online, the original runs and its result is returned.
+        expect(guarded.beforeExecute()).toBe("original");
+        expect.verifySteps(["beforeExecute"]);
+        // Offline, the execution stops before the original runs; also without the button's hook,
+        // when the record's model is read instead.
+        await setOffline(true);
+        expect(guarded.beforeExecute()).toBe(false);
+        delete assign.crmOffline;
+        expect(isOfflineModel(assign.props.record.model)).toBe(true);
+        expect(assign.crmGuardExecution(params).beforeExecute()).toBe(false);
+        expect.verifySteps([]);
+        await setOffline(false);
+        expect(assign.crmGuardExecution(params).beforeExecute()).toBe("original");
+        // Without an original `beforeExecute`, online it returns nothing, which lets the
+        // execution go on.
+        const { beforeExecute } = assign.crmGuardExecution({ clickParams: assign.clickParams });
+        expect(beforeExecute()).toBe(undefined);
+        expect.verifySteps(["beforeExecute"]);
     });
 });
 
@@ -8800,6 +9414,82 @@ describe("Shared hooks contract", () => {
         expect(isOfflineModel(won.props.record.model)).toBe(false);
         won.onClick();
         expect.verifySteps(["run action_set_won_rainbowman"]);
+    });
+
+    test("ViewButton crmInertOffline: CRM DISABLE anchors only, their own disabled state included; without its hook it reads the record's model", async () => {
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        const buttons = captureInstances(ViewButton);
+        await mountView({
+            type: "form",
+            resModel: "crm.lead",
+            resId: 1,
+            arch: /* xml */ `
+                <form>
+                    <header>
+                        <button name="action_set_won_rainbowman" type="object" string="Won"/>
+                    </header>
+                    <sheet>
+                        <a name="action_set_automated_probability" type="object" role="button"
+                            class="o_test_enabled">AI</a>
+                        <a name="action_set_automated_probability" type="object" role="button"
+                            class="o_test_disabled" disabled="1">AI</a>
+                        <a name="https://www.odoo.com/app/crm" type="url" class="o_test_url">CRM</a>
+                        <field name="name"/>
+                    </sheet>
+                </form>`,
+        });
+        const buttonOf = (cls) =>
+            mountedInstances(buttons).find(({ props }) => props.className.includes(cls));
+        const won = mountedInstances(buttons).find(
+            ({ clickParams }) => clickParams.name === "action_set_won_rainbowman"
+        );
+        const enabled = buttonOf("o_test_enabled");
+        const disabled = buttonOf("o_test_disabled");
+        const url = buttonOf("o_test_url");
+        expect(Boolean(disabled.disabled)).toBe(true);
+        const all = [won, enabled, disabled, url];
+        expect(all.filter(Boolean)).toHaveLength(4);
+        // The form draws a URL anchor as a `<button>`, and its type calls no server method.
+        expect(all.map(({ props }) => props.tag)).toEqual(["button", "a", "a", "button"]);
+        // Online, no view button is inert.
+        expect(all.map((button) => button.crmInertOffline)).toEqual([false, false, false, false]);
+
+        // Offline, both server anchors are, the one disabled by its own state included (which
+        // `crmDisabledOffline` leaves to that state); `<button>` tags, the URL one without a
+        // server type included, are left to the framework's selector.
+        await setOffline(true);
+        expect(all.map((button) => button.crmInertOffline)).toEqual([false, true, true, false]);
+        expect([enabled.crmDisabledOffline, disabled.crmDisabledOffline]).toEqual([true, false]);
+
+        // An instance without its hook (`crmOffline`) reads the record's model instead.
+        delete enabled.crmOffline;
+        expect(enabled.crmOffline).toBe(undefined);
+        expect(enabled.crmInertOffline).toBe(true);
+        await setOffline(false);
+        expect(enabled.crmInertOffline).toBe(false);
+        expect.verifySteps([]);
+    });
+
+    test("ViewButton execution guard: a view button whose view provides no handler is left without one", async () => {
+        const buttons = captureInstances(ViewButton);
+        class NoHandlerParent extends Component {
+            static template = xml`
+                <ViewButton tag="'button'" string="'Assign Leads'"
+                    clickParams="{ type: 'object', name: 'action_assign_leads' }"/>`;
+            static components = { ViewButton };
+
+            setup() {
+                provideViewButtonHandler(undefined);
+            }
+        }
+        await mountWithCleanup(NoHandlerParent);
+        const [button] = mountedInstances(buttons);
+        expect(button.clickParams.name).toBe("action_assign_leads");
+        // Nothing is wrapped: the base keeps the handler the view provides, here none.
+        expect(button.handleViewButton).toBe(undefined);
+        expect(button.crmOffline).not.toBe(undefined);
     });
 
     test.tags("desktop");

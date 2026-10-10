@@ -8,8 +8,14 @@
         - The expected revenue is bound one way (`onRevenueInput`): a number input reports an empty
           value for a text it cannot parse (`1e`), and writing that value back would erase the text
           and its `badInput` state, which `save()` reads to reject it.
+        - A field showing an error is marked `is-invalid` and re-checked on each input
+          (`onFieldInput`), so its error clears once it is corrected. The lead name's `*` marker is
+          `aria-hidden`: its `required` attribute already tells assistive technologies.
         - Every interactive element carries `data-available-offline`: the framework offline UI
           disables each `<button>` without it, and the sheet must stay usable offline.
+        - While a save runs, Save is busy ("Saving...") and every control is disabled through its
+          own `disabled` attribute, which the framework offline UI never re-enables: it re-enables
+          only what it disabled itself. The sheet can still be dismissed (Escape, backdrop, handle).
         - No `<form>` wrapper and only `type="button"` buttons, so `save()` is the sole create path.
           The framework classes `o_kanban_quick_create` and `o_kanban_add` are not used: they belong
           to the framework kanban quick create, which the upstream mobile main-flow tour drives.
@@ -20,20 +26,23 @@
             <h4 class="mb-0">New Lead</h4>
 
             <div class="o_crm_mobile_quick_create_field">
-                <label class="form-label" for="o_crm_mobile_quick_create_name">Lead Name</label>
+                <label class="form-label" for="o_crm_mobile_quick_create_name">Lead Name<span class="text-danger-emphasis ms-1" aria-hidden="true">*</span></label>
                 <input id="o_crm_mobile_quick_create_name"
                     type="text"
                     name="name"
                     class="form-control rounded"
+                    t-att-class="{ 'is-invalid': this.state.errors.name }"
                     required="1"
                     t-ref="this.nameRef"
                     t-model.proxy="this.state.name"
+                    t-on-input="() => this.onFieldInput('name')"
                     t-att-aria-invalid="this.state.errors.name ? 'true' : false"
                     t-att-aria-describedby="this.state.errors.name ? 'o_crm_mobile_quick_create_name_error' : false"
+                    t-att-disabled="this.state.saving"
                     data-available-offline="1"/>
                 <div t-if="this.state.errors.name"
                     id="o_crm_mobile_quick_create_name_error"
-                    class="text-danger-emphasis small"
+                    class="text-danger-emphasis small mt-1"
                     role="alert"
                     t-out="this.state.errors.name"/>
             </div>
@@ -45,6 +54,7 @@
                     name="contact_name"
                     class="form-control rounded"
                     t-model.proxy="this.state.contact_name"
+                    t-att-disabled="this.state.saving"
                     data-available-offline="1"/>
             </div>
 
@@ -55,6 +65,7 @@
                     name="phone"
                     class="form-control rounded"
                     t-model.proxy="this.state.phone"
+                    t-att-disabled="this.state.saving"
                     data-available-offline="1"/>
             </div>
 
@@ -64,13 +75,17 @@
                     type="email"
                     name="email_from"
                     class="form-control rounded"
+                    t-att-class="{ 'is-invalid': this.state.errors.email_from }"
+                    t-ref="this.emailRef"
                     t-model.proxy="this.state.email_from"
+                    t-on-input="() => this.onFieldInput('email_from')"
                     t-att-aria-invalid="this.state.errors.email_from ? 'true' : false"
                     t-att-aria-describedby="this.state.errors.email_from ? 'o_crm_mobile_quick_create_email_from_error' : false"
+                    t-att-disabled="this.state.saving"
                     data-available-offline="1"/>
                 <div t-if="this.state.errors.email_from"
                     id="o_crm_mobile_quick_create_email_from_error"
-                    class="text-danger-emphasis small"
+                    class="text-danger-emphasis small mt-1"
                     role="alert"
                     t-out="this.state.errors.email_from"/>
             </div>
@@ -81,17 +96,18 @@
                     type="number"
                     inputmode="decimal"
                     step="any"
-                    min="0"
                     name="expected_revenue"
                     class="form-control rounded"
+                    t-att-class="{ 'is-invalid': this.state.errors.expected_revenue }"
                     t-on-input="(ev) => this.onRevenueInput(ev)"
                     t-ref="this.revenueRef"
                     t-att-aria-invalid="this.state.errors.expected_revenue ? 'true' : false"
                     t-att-aria-describedby="this.state.errors.expected_revenue ? 'o_crm_mobile_quick_create_expected_revenue_error' : false"
+                    t-att-disabled="this.state.saving"
                     data-available-offline="1"/>
                 <div t-if="this.state.errors.expected_revenue"
                     id="o_crm_mobile_quick_create_expected_revenue_error"
-                    class="text-danger-emphasis small"
+                    class="text-danger-emphasis small mt-1"
                     role="alert"
                     t-out="this.state.errors.expected_revenue"/>
             </div>
@@ -102,6 +118,7 @@
                     name="stage_id"
                     class="form-select"
                     t-model.proxy="this.state.stageGroupId"
+                    t-att-disabled="this.state.saving"
                     data-available-offline="1">
                     <option t-foreach="this.stageGroups" t-as="group" t-key="group.id"
                         t-att-value="group.id"
@@ -114,12 +131,15 @@
                     class="btn btn-primary flex-grow-1 o_crm_mobile_quick_create_save"
                     data-available-offline="1"
                     t-att-disabled="this.state.saving"
+                    t-att-aria-busy="this.state.saving ? 'true' : 'false'"
                     t-on-click="() => this.save()">
-                    Save
+                    <t t-if="this.state.saving"><i class="oi oi-spin me-1" data-icon="autorenew" aria-hidden="true"/>Saving...</t>
+                    <t t-else="">Save</t>
                 </button>
                 <button type="button"
                     class="btn btn-secondary flex-grow-1 o_crm_mobile_quick_create_discard"
                     data-available-offline="1"
+                    t-att-disabled="this.state.saving"
                     t-on-click="() => this.discard()">
                     Discard
                 </button>
