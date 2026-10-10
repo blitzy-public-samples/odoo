@@ -18,8 +18,20 @@
  *   button displaying the first of them, online and offline, reading nothing; never with sample
  *   data, nor on a pipeline without any lead;
  * - pending stage placement and pending-aware totals are derived from framework state only, survive
- *   remounts and reloads, and end once the write is replayed (or discarded) and reloaded; a
- *   reconnection with nothing queued reloads the pipeline once, at once, before the sync window;
+ *   remounts and reloads, and end once the write is replayed (or discarded) and reloaded, a write
+ *   another tab queued and this tab replays included (a discard ends them at once); a
+ *   reconnection with nothing queued reloads the pipeline once, at once, before the sync window,
+ *   and a window that replays writes (another tab's included) reloads it once more as it ends;
+ *   a window that replays nothing owes no reload, so entering the pipeline from a wider screen
+ *   reads only the activities and types;
+ * - a connection loss, one the pipeline's own reads at mount or on navigation report included, is
+ *   recovered from once on reconnection (the activities and types are read again and the pipeline
+ *   reloads once, then the reloaded stage is read), while a loss that only a recovery request
+ *   reports (those reads, that reload, the first read after it), and the reconnection that ends
+ *   it, neither reload nor re-read: a request that keeps failing is retried once per failure,
+ *   never in a loop, and a reload that lost the connection keeps the sync-window copy until a
+ *   reconnection that is not a recovery reconnection; a loss the framework's check confirms is
+ *   recovered from as any other;
  * - activity reads are bounded pages that carry the lead's total, so the card shows the total and
  *   says what the page misses ("Show all" online, a muted count offline);
  * - the lead card (44x44 touch targets, pending-sync badge, stage list, activities), the six-field
@@ -18150,6 +18162,1478 @@ describe("Replayed lead creates", () => {
         expectHeader("New", 4, 230);
         await runAllTimers();
         expect.verifySteps([]);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// Reconnections, the recovery from connection losses, and replays
+// -----------------------------------------------------------------------------
+
+describe("Reconnections and replays", () => {
+    const PROGRESS_BAR = "crm.lead/read_progress_bar";
+    const VERSION_INFO = "/web/webclient/version_info";
+    /** What mounting the pipeline online issues: its load, then its leads' activities and the types. */
+    const MOUNT_REQUESTS = { [PROGRESS_BAR]: 1, [LEAD_GROUPS]: 1, [ACTIVITIES]: 2, [TYPES]: 1 };
+
+    /**
+     * Counts, by `"<model>/<method>"` or path, the pipeline reads and reloads and the framework's
+     * reconnection checks issued since the previous call of the returned function, whatever
+     * their order.
+     *
+     * @returns {() => Object<string, number>}
+     */
+    function countRequests() {
+        const counted = [PROGRESS_BAR, LEAD_GROUPS, ACTIVITIES, TYPES, VERSION_INFO];
+        const calls = [];
+        onRpc("/*", (request) => {
+            const path = new URL(request.url).pathname;
+            const match = path.match(R_CALL_KW);
+            const label = match ? `${match.groups.model}/${match.groups.method}` : path;
+            if (counted.includes(label)) {
+                calls.push(label);
+            }
+        });
+        return () => {
+            const counts = {};
+            for (const label of calls.splice(0)) {
+                counts[label] = (counts[label] ?? 0) + 1;
+            }
+            return counts;
+        };
+    }
+
+    /**
+     * Holds the answers of a route while `holder.active`, until `holder.release()`.
+     *
+     * @param {string} route
+     * @returns {{ active: boolean, held: number, release: () => void }}
+     */
+    function holdRoute(route) {
+        const pending = [];
+        const holder = {
+            active: true,
+            get held() {
+                return pending.length;
+            },
+            release() {
+                holder.active = false;
+                for (const deferred of pending.splice(0)) {
+                    deferred.resolve();
+                }
+            },
+        };
+        onRpc(route, async () => {
+            if (holder.active) {
+                const deferred = Promise.withResolvers();
+                pending.push(deferred);
+                await deferred.promise;
+            }
+        });
+        return holder;
+    }
+
+    /**
+     * Writes a `crm.lead` save into the framework's persisted offline queue only, as another tab
+     * (or an earlier session) queues it: the in-memory queue of this tab does not hold it until
+     * the framework reads its persisted queue again, as each sync window begins.
+     *
+     * @param {string} key
+     * @param {number[]} resIds `[]` for a create
+     * @param {Object} values
+     * @param {number} timeStamp
+     */
+    async function persistOtherTabLeadSave(key, resIds, values, timeStamp) {
+        await getService(OfflinePlugin)._idb.write(
+            OfflinePlugin.ORM_SYNC_TABLE_NAME,
+            key,
+            JSON.stringify({
+                model: "crm.lead",
+                method: "web_save",
+                args: [resIds, values],
+                kwargs: { context: {}, specification: {} },
+                extras: {
+                    actionId: PIPELINE_ACTION_ID,
+                    actionName: "Pipeline",
+                    viewType: "kanban",
+                    timeStamp,
+                    displayName: values.name ?? `Lead ${resIds[0]}`,
+                    changes: values,
+                },
+            })
+        );
+    }
+
+    /** Answers every activity-type read with a 502: the connection drops during the call. */
+    function failTypeReads() {
+        onRpc(
+            "/web/dataset/call_kw/mail.activity.type/web_search_read",
+            () => new Response("", { status: 502 })
+        );
+    }
+
+    /** Steps `"offline"` and `"online"` for every change of the framework's offline status. */
+    function watchConnectionStatus() {
+        patchWithCleanup(OfflinePlugin.prototype, {
+            setOffline(offline) {
+                if (offline !== this.isOffline()) {
+                    expect.step(offline ? "offline" : "online");
+                }
+                return super.setOffline(...arguments);
+            },
+        });
+    }
+
+    /** Asserts that Log call and Follow-up of Lead 1's card are disabled, for want of types. */
+    function expectActivityControlsDisabled() {
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).toHaveAttribute("disabled");
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_follow_up`).toHaveAttribute("disabled");
+    }
+
+    /**
+     * Holds every sync window of the framework until the test opens it. A browser opens one only
+     * once it grants the cross-tab "db-sync" lock: in a later task, or once another tab has
+     * released it.
+     *
+     * @returns {Array<() => Promise<void>>} the windows asked for, in order: calling one opens it
+     */
+    function holdSyncWindows() {
+        const heldSyncs = [];
+        patchWithCleanup(getService(OfflinePlugin), {
+            _syncORM() {
+                return new Promise((resolve) => {
+                    heldSyncs.push(() => {
+                        const run = super._syncORM();
+                        resolve(run);
+                        return run;
+                    });
+                });
+            },
+        });
+        return heldSyncs;
+    }
+
+    /**
+     * What the pipeline presents for a stage, displayed or not: the names on the cards placed
+     * there (loaded leads and pending creates, sorted), its lead count and its revenue.
+     *
+     * @param {CrmMobilePipeline} renderer
+     * @param {number} stageId
+     * @returns {{ cards: string[], count: number, revenue: number }}
+     */
+    function stagePresentation(renderer, stageId) {
+        const group = groupOf(renderer, stageId);
+        return {
+            cards: [
+                ...renderer.cardsFor(group).map((record) => record.data.name),
+                ...renderer.pendingCreatesFor(group).map(({ value }) => value.args[1].name),
+            ].sort(),
+            count: renderer.stageCount(group),
+            revenue: renderer.stageRevenueValue(group),
+        };
+    }
+
+    test.tags("mobile");
+    test("mobile: an activity-type read that keeps losing the connection before the activity reads answer is retried once on reconnection, then neither read nor reloaded again", async () => {
+        failTypeReads();
+        const activities = holdRoute("/web/dataset/call_kw/mail.activity/web_search_read");
+        const requests = countRequests();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        const [renderer] = renderers;
+        const offline = getService(OfflinePlugin);
+        // The type read loses the connection while the activity reads are still pending, and the
+        // next answer (a request of the web client still in flight) brings the client back
+        // online: the pipeline recovers once. It reads the types again (the activity reads share
+        // the pending ones) and reloads once, then reads the types of the reloaded stage. Both
+        // type reads lose the connection again: losses of the recovery itself. Whether the
+        // reload runs at once or after the framework's next reconnection check depends on when
+        // the browser opens the framework's sync window (its cross-tab lock), and whether an
+        // answer in flight or a check ends each loss depends on that too: at most one check per
+        // lost type read.
+        await animationFrame();
+        await runAllTimers();
+        await waitUntil(() => renderer.reconciledGroups);
+        await animationFrame();
+        await runAllTimers();
+        const { [VERSION_INFO]: checks = 0, ...reads } = requests();
+        expect(reads).toEqual({
+            ...MOUNT_REQUESTS,
+            [TYPES]: 3,
+            [PROGRESS_BAR]: 2,
+            [LEAD_GROUPS]: 2,
+        });
+        expect(checks).toBeLessThan(4);
+        expect(activities.held).toBe(2);
+
+        // The activity reads answer: nothing more is read or reloaded, whatever brings the client
+        // back.
+        activities.release();
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({});
+        expect(renderer.mobileState.activityTypes).toBe(null);
+        expect(Object.keys(renderer.mobileState.activitiesByLead)).toEqual(["1", "2"]);
+        expectActivityControlsDisabled();
+        await runAllTimers();
+        expect(requests()).toEqual({});
+    });
+
+    test.tags("mobile");
+    test("mobile: an activity-type read that keeps losing the connection after the activity reads answered is retried once on the framework's reconnection, then neither read nor reloaded again", async () => {
+        failTypeReads();
+        const types = holdRoute("/web/dataset/call_kw/mail.activity.type/web_search_read");
+        const requests = countRequests();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await animationFrame();
+        const offline = getService(OfflinePlugin);
+        const [renderer] = renderers;
+        await waitUntil(() => Object.keys(renderer.mobileState.activitiesByLead).length === 2);
+        await animationFrame();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+
+        // The type read loses the connection once every other request has answered, so the client
+        // stays offline until the framework's reconnection check.
+        types.release();
+        await waitUntil(() => offline.isOffline());
+        await animationFrame();
+        expect(requests()).toEqual({});
+
+        // That check brings the client back online, and the pipeline recovers once: it reads the
+        // activities and the types again and reloads, then reads the reloaded stage. Each type
+        // read loses the connection again, a loss of the recovery itself, which an answer still
+        // in flight or a check ends (at most one check per lost type read, as in the previous
+        // test): nothing follows, and both controls stay disabled.
+        await runAllTimers();
+        await waitUntil(() => renderer.reconciledGroups);
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        const { [VERSION_INFO]: checks = 0, ...reads } = requests();
+        expect(reads).toEqual({
+            [ACTIVITIES]: 4,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect(checks).toBeGreaterThan(0);
+        expect(checks).toBeLessThan(4);
+        expect(renderer.mobileState.activityTypes).toBe(null);
+        expectActivityControlsDisabled();
+        await runAllTimers();
+        expect(requests()).toEqual({});
+    });
+
+    test.tags("mobile");
+    test("mobile: an activity-type read that loses the connection once, with nothing cached, is read again on the framework's reconnection, which enables Log call and Follow-up", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        // The first type read is held until released, then loses the connection; the next ones
+        // answer.
+        const types = { held: null };
+        onRpc("/web/dataset/call_kw/mail.activity.type/web_search_read", async () => {
+            if (!types.held) {
+                types.held = Promise.withResolvers();
+                await types.held.promise;
+                return new Response("", { status: 502 });
+            }
+        });
+        watchRpcs([PROGRESS_BAR, LEAD_GROUPS, ACTIVITIES, TYPES, VERSION_INFO]);
+        watchConnectionStatus();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await animationFrame();
+        const offline = getService(OfflinePlugin);
+        expect.verifySteps([PROGRESS_BAR, LEAD_GROUPS, ACTIVITIES, ACTIVITIES, TYPES]);
+        const [renderer] = renderers;
+        await waitUntil(() => Object.keys(renderer.mobileState.activitiesByLead).length === 2);
+        await animationFrame();
+
+        // The type read loses the connection once every other request has answered: no type is
+        // cached, so Log call and Follow-up are disabled, and the client stays offline until the
+        // framework's reconnection check.
+        types.held.resolve();
+        await waitUntil(() => offline.isOffline());
+        await animationFrame();
+        expect.verifySteps(["offline"]);
+        expect(renderer.mobileState.activityTypes).toBe(null);
+        expectActivityControlsDisabled();
+
+        // That check brings the client back online: the pipeline reads the activities and the
+        // types again, which enables both controls without a manual reload, reloads once, and
+        // reads the reloaded stage; then nothing more.
+        await runAllTimers();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(false);
+        expect.verifySteps([
+            VERSION_INFO,
+            "online",
+            ACTIVITIES,
+            ACTIVITIES,
+            TYPES,
+            PROGRESS_BAR,
+            LEAD_GROUPS,
+            ACTIVITIES,
+            ACTIVITIES,
+            TYPES,
+        ]);
+        expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+        expect(`${cardOf("Lead 1")} .o_crm_mobile_card_follow_up`).not.toHaveAttribute("disabled");
+        await runAllTimers();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a reconnection whose revalidation read loses the connection reloads once, and the status changes that follow read and reload nothing more", async () => {
+        const errors = cachedReadErrors([
+            // Lead 1's activities, read at mount, read again after the reconnection
+            ACTIVITIES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Armed after the connection drops: Lead 1's next activity read loses the connection.
+        const failure = { armed: false };
+        onRpc("/web/dataset/call_kw/mail.activity/web_search_read", async (request) => {
+            if (!failure.armed) {
+                return;
+            }
+            const { params } = await request.clone().json();
+            const resId = params.kwargs.domain.find(([field]) => field === "res_id")?.[2];
+            if (resId === 1) {
+                failure.armed = false;
+                return new Response("", { status: 502 });
+            }
+        });
+        const requests = countRequests();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+
+        await setOffline(true);
+        failure.armed = true;
+        expect(requests()).toEqual({});
+
+        // Back online: the reconnection reads, and reloads once. Lead 1's read loses the
+        // connection, and the client comes back with an answer still in flight or with the
+        // framework's reconnection check: that loss and that reconnection read and reload
+        // nothing more.
+        await setOffline(false);
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [VERSION_INFO]: 1,
+            [ACTIVITIES]: 4,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect(failure.armed).toBe(false);
+        await runAllTimers();
+        expect(requests()).toEqual({});
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: a connection loss another request reports, then a reconnection through the framework's check, reloads once and reads again", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const connection = mockConnectionDrop();
+        const requests = countRequests();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+        const offline = getService(OfflinePlugin);
+
+        // The connection drops: the framework's reconnection check reports the loss.
+        connection.offline = true;
+        await offline.checkConnection();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(true);
+        expect(requests()).toEqual({ [VERSION_INFO]: 1 });
+
+        // The connection returns, as the next check finds: the pipeline reloads once, and reads
+        // its leads' activities and the types on the reconnection and after the reload.
+        connection.offline = false;
+        MockServer.env["crm.lead"].write([2], { name: "Lead 2 (renamed)" });
+        await offline.checkConnection();
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [VERSION_INFO]: 1,
+            [ACTIVITIES]: 4,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2 (renamed)"]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a real outage that a pipeline read reports first, confirmed by the framework's check, reloads and reads again on reconnection", async () => {
+        const errors = cachedReadErrors([
+            // the types, read at mount, read again on the navigation that meets the outage
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const connection = mockConnectionDrop();
+        const requests = countRequests();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+        const offline = getService(OfflinePlugin);
+
+        // The connection drops while the user displays Qualified: its reads report the loss.
+        connection.offline = true;
+        await goToStage("Qualified");
+        await waitUntil(() => offline.isOffline());
+        await animationFrame();
+        expect(requests()).toEqual({ [ACTIVITIES]: 1, [TYPES]: 1 });
+
+        // The framework's reconnection check fails as well: the outage is real.
+        await offline.checkConnection();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(true);
+        expect(requests()).toEqual({ [VERSION_INFO]: 1 });
+
+        // The connection returns: the pipeline reloads once and reads again, as on any
+        // reconnection.
+        connection.offline = false;
+        await offline.checkConnection();
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [VERSION_INFO]: 1,
+            [ACTIVITIES]: 2,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expectHeader("Qualified", 1, 30);
+        expect.verifyErrors(errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: a short outage that only the pipeline's navigation reads report, ended by the framework's first check, is recovered from once: the displayed stage and the types are read again, the pipeline reloads once, and the reloaded stage is read", async () => {
+        const errors = cachedReadErrors([
+            // the types, read at mount, read again on the navigation that meets the outage
+            TYPES,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const connection = mockConnectionDrop();
+        const requests = countRequests();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+        const offline = getService(OfflinePlugin);
+        watchConnectionStatus();
+
+        // The connection drops while the user displays Qualified: its reads report the loss (the
+        // refresh of the cached type read, which nobody awaits, too), and no other request is
+        // sent while it lasts.
+        connection.offline = true;
+        await goToStage("Qualified");
+        await waitUntil(() => offline.isOffline());
+        await expect.waitForErrors(errors);
+        expect(requests()).toEqual({ [ACTIVITIES]: 1, [TYPES]: 1 });
+        expect.verifySteps(["offline"]);
+
+        // The connection returns before the framework's first reconnection check, which succeeds:
+        // the pipeline reads again and reloads once, then reads the reloaded stage, and nothing
+        // more.
+        connection.offline = false;
+        MockServer.env["crm.lead"].write([3], { name: "Lead 3 (renamed)" });
+        await runAllTimers();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(false);
+        expect.verifySteps(["online"]);
+        expect(requests()).toEqual({
+            [VERSION_INFO]: 1,
+            [ACTIVITIES]: 2,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expectHeader("Qualified", 1, 30);
+        expect(cardNames()).toEqual(["Lead 3 (renamed)"]);
+        await runAllTimers();
+        expect(requests()).toEqual({});
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a reconnection whose sync window replays writes another tab queued reloads at once, then once more after the replays", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${args[0].length ? JSON.stringify(args) : args[1].name}`);
+        });
+        watchRpcs([LEAD_GROUPS]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps([LEAD_GROUPS]);
+        expectHeader("New", 2, 120);
+        const [renderer] = renderers;
+        // A browser opens the framework sync window only once it grants the cross-tab "db-sync"
+        // lock: in a later task, or once another tab has released it. Here the window opens only
+        // when the test lets it.
+        const offline = getService(OfflinePlugin);
+        const heldSyncs = [];
+        patchWithCleanup(offline, {
+            _syncORM() {
+                return new Promise((resolve) => {
+                    heldSyncs.push(() => {
+                        const run = super._syncORM();
+                        resolve(run);
+                        return run;
+                    });
+                });
+            },
+        });
+
+        // Offline, another tab moves Lead 2 to Qualified, then creates a lead in New: both writes
+        // are in the persisted queue only, and the in-memory queue of this tab stays empty.
+        await setOffline(true);
+        const now = Date.now();
+        await persistOtherTabLeadSave("other-tab-move", [2], { stage_id: 2 }, now);
+        await persistOtherTabLeadSave(
+            "other-tab-create",
+            [],
+            { name: "Other tab lead", stage_id: 1, expected_revenue: 30 },
+            now + 1
+        );
+        expect(queued()).toHaveLength(0);
+
+        // Back online with nothing queued here: the pipeline reloads at once, before the window.
+        await setOffline(false);
+        await expect.waitForSteps([LEAD_GROUPS]);
+        await animationFrame();
+        expect(heldSyncs).toHaveLength(1);
+        expect(offline.syncingORM()).toBe(false);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+
+        // The window reads the persisted queue and replays both writes, one second apart. They
+        // reach the server after that reload, so the window ends with one more reload.
+        heldSyncs[0]();
+        await letQueueReplay(2);
+        expect.verifySteps([
+            'replayed [[2],{"stage_id":2}]',
+            "replayed Other tab lead",
+            LEAD_GROUPS,
+        ]);
+        await animationFrame();
+        expect(offline.syncingORM()).toBe(false);
+        expect(queued()).toHaveLength(0);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+
+        // The pipeline shows the server state: the created lead is a server card in New, and
+        // Lead 2 is in Qualified.
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardNames().sort()).toEqual(["Lead 1", "Other tab lead"]);
+        expect(cardOf("Other tab lead")).toHaveAttribute("data-id");
+        expectHeader("New", 2, 130);
+        await goToStage("Qualified");
+        expect(cardNames().sort()).toEqual(["Lead 2", "Lead 3"]);
+        expectHeader("Qualified", 2, 50);
+        await runAllTimers();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: writes another tab queued, replayed by a window this tab opens with nothing queued, keep their placement and totals until the reconciliation reload lands", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const replays = holdRoute("/web/dataset/call_kw/crm.lead/web_save");
+        replays.active = false;
+        const reloads = holdRoute(`/web/dataset/call_kw/${LEAD_GROUPS}`);
+        reloads.active = false;
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${args[0].length ? JSON.stringify(args) : args[1].name}`);
+        });
+        watchRpcs([LEAD_GROUPS]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps([LEAD_GROUPS]);
+        const [renderer] = renderers;
+        const offline = getService(OfflinePlugin);
+        const heldSyncs = holdSyncWindows();
+        const heldKeys = () =>
+            (renderer.mobileState.syncEntries ?? []).map(({ key }) => String(key)).sort();
+        // What the sync presents until its reconciliation reload has landed: the created lead in
+        // New, and Lead 2 in Qualified.
+        const expectSyncPresentation = () => {
+            expect(cardNames().sort()).toEqual(["Lead 1", "Other tab lead"]);
+            expectHeader("New", 2, 130);
+            expect(stagePresentation(renderer, 2)).toEqual({
+                cards: ["Lead 2", "Lead 3"],
+                count: 2,
+                revenue: 50,
+            });
+        };
+
+        // Offline, another tab creates a lead in New, then moves Lead 2 to Qualified: both writes
+        // are in the persisted queue only, and the in-memory queue of this tab stays empty.
+        await setOffline(true);
+        const now = Date.now();
+        await persistOtherTabLeadSave(
+            "other-tab-create",
+            [],
+            { name: "Other tab lead", stage_id: 1, expected_revenue: 30 },
+            now
+        );
+        await persistOtherTabLeadSave("other-tab-move", [2], { stage_id: 2 }, now + 1);
+        expect(queued()).toHaveLength(0);
+        expectHeader("New", 2, 120);
+
+        // Back online with nothing queued here: the pipeline reloads at once, and that reload is
+        // still in flight when the window opens.
+        reloads.active = true;
+        await setOffline(false);
+        await waitUntil(() => reloads.held === 1);
+        expect.verifySteps([LEAD_GROUPS]);
+        expect(heldSyncs).toHaveLength(1);
+        expect(offline.syncingORM()).toBe(false);
+
+        // The window reads the persisted queue: both writes join its copy before the first
+        // replay call answers.
+        replays.active = true;
+        heldSyncs[0]();
+        await waitUntil(() => replays.held === 1);
+        await animationFrame();
+        expect(offline.syncingORM()).toBe(true);
+        expect(heldKeys()).toEqual(["other-tab-create", "other-tab-move"]);
+        expectSyncPresentation();
+
+        // The reload in flight lands: it predates both writes, so the copy stays.
+        reloads.release();
+        reloads.active = true;
+        await waitUntil(() => !renderer.reconciliation);
+        await animationFrame();
+        expect(heldKeys()).toEqual(["other-tab-create", "other-tab-move"]);
+        expectSyncPresentation();
+
+        // The create is replayed and leaves the queue: the copy keeps its card, its count and its
+        // revenue.
+        replays.release();
+        await expect.waitForSteps(["replayed Other tab lead"]);
+        await animationFrame();
+        expect(queued().map(({ key }) => String(key))).toEqual(["other-tab-move"]);
+        expect(`.o_crm_mobile_lead_card_pending[data-pending-key='other-tab-create']`).toHaveCount(
+            1
+        );
+        expectSyncPresentation();
+
+        // The move is replayed a second later and the window ends with a reconciliation reload:
+        // until it lands, both writes keep their presentation.
+        await letQueueReplay(1);
+        await waitUntil(() => reloads.held === 1);
+        expect.verifySteps(['replayed [[2],{"stage_id":2}]', LEAD_GROUPS]);
+        expect(offline.syncingORM()).toBe(false);
+        expect(queued()).toHaveLength(0);
+        expect(heldKeys()).toEqual(["other-tab-create", "other-tab-move"]);
+        expectSyncPresentation();
+
+        // The reload lands: the pipeline shows the server records only, each once.
+        reloads.release();
+        await waitUntil(() => !renderer.reconciliation);
+        await animationFrame();
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardOf("Other tab lead")).toHaveAttribute("data-id");
+        expectSyncPresentation();
+        expect(
+            MockServer.env["crm.lead"].search_read([["name", "=", "Other tab lead"]], ["name"])
+        ).toHaveLength(1);
+        await runAllTimers();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: writes another tab queued join the copy of a window that replays a write queued here, and keep their placement and totals until the reconciliation reload lands", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const replays = holdRoute("/web/dataset/call_kw/crm.lead/web_save");
+        replays.active = false;
+        const reloads = holdRoute(`/web/dataset/call_kw/${LEAD_GROUPS}`);
+        reloads.active = false;
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${args[0].length ? JSON.stringify(args) : args[1].name}`);
+        });
+        watchRpcs([LEAD_GROUPS]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps([LEAD_GROUPS]);
+        const [renderer] = renderers;
+        const offline = getService(OfflinePlugin);
+        const heldKeys = () =>
+            (renderer.mobileState.syncEntries ?? []).map(({ key }) => String(key)).sort();
+        const expectSyncPresentation = () => {
+            expect(cardNames().sort()).toEqual(["Lead 1", "Lead X", "Other tab lead"]);
+            expectHeader("New", 3, 180);
+            expect(stagePresentation(renderer, 2)).toEqual({
+                cards: ["Lead 2", "Lead 3"],
+                count: 2,
+                revenue: 50,
+            });
+        };
+
+        // Offline, this tab creates Lead X in New; then another tab creates a lead in New and
+        // moves Lead 2 to Qualified, in the persisted queue only.
+        await setOffline(true);
+        await contains(".o_crm_mobile_pipeline_add").click();
+        await fillQuickCreate({ name: "Lead X", expected_revenue: "50" });
+        await contains(".o_crm_mobile_quick_create_save").click();
+        const [own] = queued();
+        const ownKey = String(own.key);
+        const now = Date.now();
+        await persistOtherTabLeadSave(
+            "other-tab-create",
+            [],
+            { name: "Other tab lead", stage_id: 1, expected_revenue: 30 },
+            now + 1
+        );
+        await persistOtherTabLeadSave("other-tab-move", [2], { stage_id: 2 }, now + 2);
+        expect(queued()).toHaveLength(1);
+        expectHeader("New", 3, 170);
+
+        // Back online: the window copies the write queued here, then reads the persisted queue,
+        // and the other tab's writes join the copy before the first replay call answers.
+        replays.active = true;
+        await setOffline(false);
+        await waitUntil(() => replays.held === 1);
+        await animationFrame();
+        expect(offline.syncingORM()).toBe(true);
+        expect(heldKeys()).toEqual([ownKey, "other-tab-create", "other-tab-move"].sort());
+        expectSyncPresentation();
+
+        // The three writes are replayed one second apart, in their order; after each, the copy
+        // keeps what left the queue.
+        replays.release();
+        await expect.waitForSteps(["replayed Lead X"]);
+        await animationFrame();
+        expect(
+            queued()
+                .map(({ key }) => String(key))
+                .sort()
+        ).toEqual(["other-tab-create", "other-tab-move"]);
+        expectSyncPresentation();
+        await letQueueReplay(1);
+        expect.verifySteps(["replayed Other tab lead"]);
+        expect(queued().map(({ key }) => String(key))).toEqual(["other-tab-move"]);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(2);
+        expectSyncPresentation();
+        reloads.active = true;
+        await letQueueReplay(1);
+        await waitUntil(() => reloads.held === 1);
+        expect.verifySteps(['replayed [[2],{"stage_id":2}]', LEAD_GROUPS]);
+        expect(offline.syncingORM()).toBe(false);
+        expect(queued()).toHaveLength(0);
+        expect(heldKeys()).toEqual([ownKey, "other-tab-create", "other-tab-move"].sort());
+        expectSyncPresentation();
+
+        // The reconciliation reload lands: server records only, each once.
+        reloads.release();
+        await waitUntil(() => !renderer.reconciliation);
+        await animationFrame();
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardOf("Lead X")).toHaveAttribute("data-id");
+        expect(cardOf("Other tab lead")).toHaveAttribute("data-id");
+        expectSyncPresentation();
+        expect(
+            MockServer.env["crm.lead"]
+                .search_read([["name", "in", ["Lead X", "Other tab lead"]]], ["name"])
+                .map(({ name }) => name)
+                .sort()
+        ).toEqual(["Lead X", "Other tab lead"]);
+        await runAllTimers();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a write another tab queued, discarded from the systray during the window that joined it, stops placing its card at once", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${args[0].length ? JSON.stringify(args) : args[1].name}`);
+        });
+        watchRpcs([LEAD_GROUPS]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps([LEAD_GROUPS]);
+        const [renderer] = renderers;
+        const offline = getService(OfflinePlugin);
+        const heldSyncs = holdSyncWindows();
+        const heldKeys = () =>
+            (renderer.mobileState.syncEntries ?? []).map(({ key }) => String(key)).sort();
+        const expectLead2InQualified = () =>
+            expect(stagePresentation(renderer, 2)).toEqual({
+                cards: ["Lead 2", "Lead 3"],
+                count: 2,
+                revenue: 50,
+            });
+
+        // Offline, another tab moves Lead 2 to Qualified, then creates a lead in New, in the
+        // persisted queue only.
+        await setOffline(true);
+        const now = Date.now();
+        await persistOtherTabLeadSave("other-tab-move", [2], { stage_id: 2 }, now);
+        await persistOtherTabLeadSave(
+            "other-tab-create",
+            [],
+            { name: "Other tab lead", stage_id: 1, expected_revenue: 30 },
+            now + 1
+        );
+
+        // Back online with nothing queued here: the pipeline reloads at once; then the window
+        // reads the persisted queue, both writes join its copy, and the move is replayed. The
+        // sync waits a second before the create's call.
+        await setOffline(false);
+        await expect.waitForSteps([LEAD_GROUPS]);
+        await animationFrame();
+        heldSyncs[0]();
+        await expect.waitForSteps(['replayed [[2],{"stage_id":2}]']);
+        await animationFrame();
+        expect(offline.syncingORM()).toBe(true);
+        expect(queued().map(({ key }) => String(key))).toEqual(["other-tab-create"]);
+        expect(heldKeys()).toEqual(["other-tab-create", "other-tab-move"]);
+        expect(cardNames().sort()).toEqual(["Lead 1", "Other tab lead"]);
+        expectHeader("New", 2, 130);
+        expectLead2InQualified();
+
+        // The create, never replayed, is discarded from the systray: its card, count and revenue
+        // end at once, while the replayed move keeps its placement.
+        offline.removeScheduledORM("other-tab-create");
+        await animationFrame();
+        expect(offline.syncingORM()).toBe(true);
+        expect(heldKeys()).toEqual(["other-tab-move"]);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardNames()).toEqual(["Lead 1"]);
+        expectHeader("New", 1, 100);
+        expectLead2InQualified();
+
+        // The framework still sends the call it listed when the window began, and it joins
+        // nothing back: the reconciliation reload that ends the window shows the server state.
+        await letQueueReplay(1);
+        expect.verifySteps(["replayed Other tab lead", LEAD_GROUPS]);
+        await animationFrame();
+        expect(offline.syncingORM()).toBe(false);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(cardNames().sort()).toEqual(["Lead 1", "Other tab lead"]);
+        expect(cardOf("Other tab lead")).toHaveAttribute("data-id");
+        expectHeader("New", 2, 130);
+        expectLead2InQualified();
+        await runAllTimers();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: the only write another tab queued, discarded from the systray while its replay call is pending, ends its card at once, and its answer joins nothing back", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const replays = holdRoute("/web/dataset/call_kw/crm.lead/web_save");
+        replays.active = false;
+        const reloads = holdRoute(`/web/dataset/call_kw/${LEAD_GROUPS}`);
+        reloads.active = false;
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${args[1].name}`);
+        });
+        watchRpcs([LEAD_GROUPS]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect.verifySteps([LEAD_GROUPS]);
+        const [renderer] = renderers;
+        const offline = getService(OfflinePlugin);
+        const heldSyncs = holdSyncWindows();
+
+        // Offline, another tab creates a lead in New, in the persisted queue only.
+        await setOffline(true);
+        await persistOtherTabLeadSave(
+            "other-tab-create",
+            [],
+            { name: "Other tab lead", stage_id: 1, expected_revenue: 30 },
+            Date.now()
+        );
+
+        // Back online with nothing queued here: the pipeline reloads at once; then the window
+        // reads the persisted queue, the create joins its copy, and its replay call is sent.
+        await setOffline(false);
+        await expect.waitForSteps([LEAD_GROUPS]);
+        await animationFrame();
+        replays.active = true;
+        heldSyncs[0]();
+        await waitUntil(() => replays.held === 1);
+        await animationFrame();
+        expect(renderer.mobileState.syncEntries.map(({ key }) => String(key))).toEqual([
+            "other-tab-create",
+        ]);
+        expect(cardNames().sort()).toEqual(["Lead 1", "Lead 2", "Other tab lead"]);
+        expectHeader("New", 3, 150);
+
+        // The create is discarded from the systray while its call is pending: its card, count and
+        // revenue end at once, and no copy is left.
+        offline.removeScheduledORM("other-tab-create");
+        await animationFrame();
+        expect(offline.syncingORM()).toBe(true);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expectHeader("New", 2, 120);
+
+        // The call the framework had sent answers: it joins nothing back, and the window ends with
+        // a reconciliation reload; until that reload lands, the discarded create stays gone.
+        reloads.active = true;
+        replays.release();
+        await waitUntil(() => reloads.held === 1);
+        expect.verifySteps(["replayed Other tab lead", LEAD_GROUPS]);
+        expect(offline.syncingORM()).toBe(false);
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expect(".o_crm_mobile_lead_card_pending").toHaveCount(0);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+        expectHeader("New", 2, 120);
+
+        // The reload shows the server state: the lead the call created, as a server card.
+        reloads.release();
+        await waitUntil(() => !renderer.reconciliation);
+        await animationFrame();
+        expect(cardNames().sort()).toEqual(["Lead 1", "Lead 2", "Other tab lead"]);
+        expect(cardOf("Other tab lead")).toHaveAttribute("data-id");
+        expectHeader("New", 3, 150);
+        await runAllTimers();
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: entering the stage pipeline from a wider screen after a start-up sync window that replayed nothing reads only the activities and types, every time", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        watchRpcs([PROGRESS_BAR, LEAD_GROUPS, ACTIVITIES, TYPES]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await resize({ width: 1024 });
+        await mountPipeline();
+        await runAllTimers(); // the start-up synchronisation of the offline plugin, on a wide screen
+        const [renderer] = renderers;
+        expect(renderer.isMobilePipeline).toBe(false);
+        expect(".o_crm_mobile_pipeline").toHaveCount(0);
+        expect.verifySteps([PROGRESS_BAR, LEAD_GROUPS]);
+
+        for (let round = 0; round < 2; round++) {
+            // Small: the stage pipeline reads its leads' activities and the types, and reloads
+            // nothing.
+            await resize({ width: 375 });
+            await animationFrame();
+            expect(renderer.isMobilePipeline).toBe(true);
+            await runAllTimers();
+            expect.verifySteps([ACTIVITIES, ACTIVITIES, TYPES]);
+            expectHeader("New", 2, 120);
+            // Wide again: nothing is read.
+            await resize({ width: 1024 });
+            await animationFrame();
+            expect(renderer.isMobilePipeline).toBe(false);
+            await runAllTimers();
+            expect.verifySteps([]);
+        }
+    });
+
+    test.tags("mobile");
+    test("mobile: a start-up sync window that replays a write on a wider screen owes the reload, run once the stage pipeline is shown", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${JSON.stringify(args)}`);
+        });
+        watchRpcs([PROGRESS_BAR, LEAD_GROUPS, ACTIVITIES, TYPES]);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await resize({ width: 1024 });
+        await mountPipeline();
+        expect.verifySteps([PROGRESS_BAR, LEAD_GROUPS]);
+        const [renderer] = renderers;
+        expect(renderer.isMobilePipeline).toBe(false);
+
+        // A move of Lead 2 to Qualified, queued by another tab, waits in the persisted queue: the
+        // start-up window replays it while the screen is wide, and nothing is reloaded there.
+        await persistOtherTabLeadSave("other-tab-move", [2], { stage_id: 2 }, Date.now());
+        await runAllTimers(); // the start-up synchronisation of the offline plugin
+        expect.verifySteps(['replayed [[2],{"stage_id":2}]']);
+        expect(getService(OfflinePlugin).syncingORM()).toBe(false);
+        expect(queued()).toHaveLength(0);
+
+        // Small: the owed reload runs, then the reloaded stage is read.
+        await resize({ width: 375 });
+        await animationFrame();
+        await runAllTimers();
+        expect(renderer.isMobilePipeline).toBe(true);
+        expect.verifySteps([
+            ACTIVITIES,
+            ACTIVITIES,
+            TYPES,
+            PROGRESS_BAR,
+            LEAD_GROUPS,
+            ACTIVITIES,
+            TYPES,
+        ]);
+        expect(cardNames()).toEqual(["Lead 1"]);
+        expectHeader("New", 1, 100);
+
+        // Wide and small again: nothing more is owed.
+        await resize({ width: 1024 });
+        await animationFrame();
+        await resize({ width: 375 });
+        await animationFrame();
+        await runAllTimers();
+        expect.verifySteps([ACTIVITIES, TYPES]);
+    });
+
+    test.tags("mobile");
+    test("mobile: a reconciliation reload whose group read keeps losing the connection is issued once per reconnection, and the answers that follow reload and read nothing more", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Once armed, every group read of the pipeline is slow and then loses the connection (a
+        // proxy gives up on that endpoint), while every other request answers.
+        const failure = { armed: false, held: null };
+        onRpc(`/web/dataset/call_kw/${LEAD_GROUPS}`, async () => {
+            if (failure.armed) {
+                failure.held = Promise.withResolvers();
+                await failure.held.promise;
+                return new Response("", { status: 502 });
+            }
+        });
+        const requests = countRequests();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+        const [renderer] = renderers;
+        const offline = getService(OfflinePlugin);
+        failure.armed = true;
+        watchConnectionStatus();
+
+        for (let round = 0; round < 2; round++) {
+            // A real loss and reconnection: the pipeline reads once and tries its reload once.
+            await setOffline(true);
+            expect(requests()).toEqual({});
+            failure.held = null;
+            await setOffline(false);
+            await waitUntil(() => failure.held);
+            await animationFrame();
+            await animationFrame();
+            expect(offline.isOffline()).toBe(false);
+
+            // Once every other request has answered, the reload's group read loses the
+            // connection, and the framework's check brings the client back: that loss was the
+            // reload's own, so nothing is read or reloaded again.
+            failure.held.resolve();
+            await waitUntil(() => offline.isOffline());
+            await runAllTimers();
+            expect(offline.isOffline()).toBe(false);
+            expect(requests()).toEqual({
+                [ACTIVITIES]: 2,
+                [TYPES]: 1,
+                [PROGRESS_BAR]: 1,
+                [LEAD_GROUPS]: 1,
+                [VERSION_INFO]: 1,
+            });
+            expect.verifySteps(["offline", "online", "offline", "online"]);
+            await runAllTimers();
+            expect(requests()).toEqual({});
+            expect.verifySteps([]);
+        }
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        expectHeader("New", 2, 120);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+    });
+
+    /**
+     * Mounts the pipeline, moves Lead 2 to Qualified offline, and reconnects: the window replays
+     * the move, and the reload that ends it has its progress-bar read lose the connection, then
+     * its group read answer (which brings the client back online), so that reload lands online
+     * with server data. The reload does not reconcile the copy, which keeps the replayed move.
+     *
+     * @param {string[]} [laterCachedReadErrors] `"<model>/<method>"` of each cached read the test
+     *   then has refreshed while the connection is lost (see `cachedReadErrors`)
+     * @returns {Promise<{ renderer: CrmMobilePipeline, setOffline: (offline: boolean) => Promise<void>,
+     *   requests: () => Object<string, number>, moveKey: string, errors: string[],
+     *   failTypes: () => void }>}
+     */
+    async function keepCopyAfterLostReload(laterCachedReadErrors = []) {
+        const errors = cachedReadErrors([
+            // the move displays Qualified (Lead 2's activities, the types)
+            ACTIVITIES,
+            TYPES,
+            ...laterCachedReadErrors,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        onRpc("crm.lead", "web_save", ({ args }) => {
+            expect.step(`replayed ${JSON.stringify(args)}`);
+        });
+        // Armed for the reload that ends the window: its progress-bar read loses the connection,
+        // and its group read is held until released.
+        const reload = { progressBar: false, groups: false, heldGroups: null };
+        onRpc(`/web/dataset/call_kw/${PROGRESS_BAR}`, () => {
+            if (reload.progressBar) {
+                reload.progressBar = false;
+                return new Response("", { status: 502 });
+            }
+        });
+        onRpc(`/web/dataset/call_kw/${LEAD_GROUPS}`, async () => {
+            if (reload.groups) {
+                reload.groups = false;
+                reload.heldGroups = Promise.withResolvers();
+                await reload.heldGroups.promise;
+            }
+        });
+        // Armed by `failTypes`: the next type read loses the connection.
+        const types = { armed: false };
+        onRpc("/web/dataset/call_kw/mail.activity.type/web_search_read", () => {
+            if (types.armed) {
+                types.armed = false;
+                return new Response("", { status: 502 });
+            }
+        });
+        const requests = countRequests();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+        const [renderer] = renderers;
+        const offline = getService(OfflinePlugin);
+
+        await setOffline(true);
+        await chooseStage("Lead 2", 2);
+        expectHeader("Qualified", 2, 50);
+        const [move] = queued();
+        expect(move.value.args).toEqual([[2], { stage_id: 2 }]);
+        requests();
+
+        // Back online: the window replays the move and ends with the reload, whose progress-bar
+        // read loses the connection.
+        reload.progressBar = true;
+        reload.groups = true;
+        await setOffline(false);
+        await expect.waitForSteps(['replayed [[2],{"stage_id":2}]']);
+        await waitUntil(() => reload.heldGroups && offline.isOffline());
+        await animationFrame();
+        expect(queued()).toHaveLength(0);
+        expect(renderer.mobileState.syncEntries.map(({ key }) => key)).toEqual([move.key]);
+
+        // Its group read answers: the client is back online and the reload lands with server
+        // data, but it lost the connection, so the copy is kept.
+        reload.heldGroups.resolve();
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        expect(offline.syncingORM()).toBe(false);
+        expect(requests()).toEqual({
+            // the reconnection, then the reloaded stage
+            [ACTIVITIES]: 4,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect(renderer.mobileState.syncEntries.map(({ key }) => key)).toEqual([move.key]);
+        expect(renderer.reconciledGroups).toBe(renderer.props.list.groups);
+        expectHeader("Qualified", 2, 50);
+        expect(cardNames().sort()).toEqual(["Lead 2", "Lead 3"]);
+        return {
+            renderer,
+            setOffline,
+            requests,
+            moveKey: move.key,
+            errors,
+            failTypes: () => {
+                types.armed = true;
+            },
+        };
+    }
+
+    /**
+     * A direct loss and reconnection (one no answer reported): the pipeline reloads once, which
+     * reconciles the copy, and reads the displayed stage on the reconnection and after the reload.
+     *
+     * @param {Object} params
+     * @param {CrmMobilePipeline} params.renderer
+     * @param {(offline: boolean) => Promise<void>} params.setOffline
+     * @param {() => Object<string, number>} params.requests
+     * @param {number} displayedLeads the number of leads the displayed stage shows
+     */
+    async function expectDirectReconnectionReconciles(
+        { renderer, setOffline, requests },
+        displayedLeads
+    ) {
+        await setOffline(true);
+        await setOffline(false);
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(getService(OfflinePlugin).isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [ACTIVITIES]: 2 * displayedLeads,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect(renderer.mobileState.syncEntries).toBe(null);
+        await runAllTimers();
+        expect(requests()).toEqual({});
+    }
+
+    test.tags("mobile");
+    test("mobile: a reconciliation reload whose own request loses the connection keeps the copy, even when another answer brings the client back online before it lands; a direct reconnection reloads once and reconciles it", async () => {
+        const setup = await keepCopyAfterLostReload();
+        // Nothing follows on its own: no chain of reloads or reads.
+        await runAllTimers();
+        expect(setup.requests()).toEqual({});
+        expect(setup.renderer.mobileState.syncEntries.map(({ key }) => key)).toEqual([
+            setup.moveKey,
+        ]);
+
+        await expectDirectReconnectionReconciles(setup, 2);
+        expect(MockServer.env["crm.lead"].browse(2)[0].stage_id).toBe(2);
+        expectHeader("Qualified", 2, 50);
+        expect(cardNames().sort()).toEqual(["Lead 2", "Lead 3"]);
+        expect.verifyErrors(setup.errors);
+    });
+
+    test.tags("mobile");
+    test("mobile: with a copy kept by a reload that lost the connection, a loss a navigation read reports is recovered from once, and that recovery's reload reconciles the copy", async () => {
+        const setup = await keepCopyAfterLostReload([
+            // the types, read at mount, read again on Proposition, where they lose the connection
+            TYPES,
+        ]);
+        const offline = getService(OfflinePlugin);
+        const types = holdRoute("/web/dataset/call_kw/mail.activity.type/web_search_read");
+        watchConnectionStatus();
+
+        // Proposition is displayed and read: its type read loses the connection once its activity
+        // read has answered, so the client stays offline until the framework's check. The refresh
+        // of the cached type read, which nobody awaits, reports that loss meanwhile.
+        setup.failTypes();
+        await goToStage("Proposition");
+        await animationFrame();
+        expect(types.held).toBe(1);
+        types.release();
+        await waitUntil(() => offline.isOffline());
+        await expect.waitForErrors(setup.errors);
+        expect.verifySteps(["offline"]);
+        expect(setup.requests()).toEqual({ [ACTIVITIES]: 1, [TYPES]: 1 });
+
+        // That check brings the client back, and the pipeline recovers once: it reads the
+        // displayed stage and the types again and reloads, which reconciles the copy, then reads
+        // the reloaded stage; then nothing more.
+        await runAllTimers();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(false);
+        expect(offline.syncingORM()).toBe(false);
+        expect.verifySteps(["online"]);
+        expect(setup.requests()).toEqual({
+            [VERSION_INFO]: 1,
+            [ACTIVITIES]: 2,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect(setup.renderer.mobileState.syncEntries).toBe(null);
+        expectHeader("Proposition", 1, 40);
+        await runAllTimers();
+        expect(setup.requests()).toEqual({});
+        expect.verifySteps([]);
+
+        // A reconnection no answer reported reloads once again.
+        await expectDirectReconnectionReconciles(setup, 1);
+        expect.verifySteps(["offline", "online"]);
+        expectHeader("Proposition", 1, 40);
+    });
+
+    test.tags("mobile");
+    test("mobile: a real outage that the reconciliation reload reports first, confirmed by the framework's check, reloads and reads again on reconnection", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const connection = mockConnectionDrop();
+        // Armed for the reload: its group read is held until released, then loses the
+        // connection.
+        const drop = { armed: false, held: null };
+        onRpc(`/web/dataset/call_kw/${LEAD_GROUPS}`, async () => {
+            if (drop.armed) {
+                drop.armed = false;
+                drop.held = Promise.withResolvers();
+                await drop.held.promise;
+                return new Response("", { status: 502 });
+            }
+        });
+        const requests = countRequests();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+        const offline = getService(OfflinePlugin);
+
+        // A loss and reconnection no answer reported: the pipeline reads and reloads.
+        offline.setOffline(true);
+        await animationFrame();
+        drop.armed = true;
+        offline.setOffline(false);
+        await waitUntil(() => drop.held);
+        await animationFrame();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [ACTIVITIES]: 2,
+            [TYPES]: 1,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+
+        // The connection drops during that reload, whose group read reports the loss.
+        connection.offline = true;
+        drop.held.resolve();
+        await waitUntil(() => offline.isOffline());
+        await animationFrame();
+        expect(requests()).toEqual({});
+
+        // The framework's reconnection check fails as well: the outage is real.
+        await offline.checkConnection();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(true);
+        expect(requests()).toEqual({ [VERSION_INFO]: 1 });
+
+        // The connection returns, as the next check finds: the pipeline reloads once, and reads
+        // its leads' activities and the types on the reconnection and after the reload.
+        connection.offline = false;
+        MockServer.env["crm.lead"].write([2], { name: "Lead 2 (renamed)" });
+        await offline.checkConnection();
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [VERSION_INFO]: 1,
+            [ACTIVITIES]: 4,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2 (renamed)"]);
+        await runAllTimers();
+        expect(requests()).toEqual({});
+    });
+
+    test.tags("mobile");
+    test("mobile: a reconciliation reload that the disk cache answers offline, after its own requests lost the connection, does not make the reconnection that ends that loss reload again", async () => {
+        const errors = cachedReadErrors([
+            // the types, read at mount, read again on the reconnection, where they lose the
+            // connection
+            TYPES,
+            // the groups, read at mount, read again by the reload, which the cache answers
+            LEAD_GROUPS,
+        ]);
+        expect.errors(errors.length);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        // Once armed, the reload's requests lose the connection (that endpoint is unreachable),
+        // and the next type read is held, then loses it too.
+        const failure = { reload: false, types: false, heldTypes: null };
+        for (const route of [PROGRESS_BAR, LEAD_GROUPS]) {
+            onRpc(`/web/dataset/call_kw/${route}`, () => {
+                if (failure.reload) {
+                    return new Response("", { status: 502 });
+                }
+            });
+        }
+        onRpc("/web/dataset/call_kw/mail.activity.type/web_search_read", async () => {
+            if (failure.types) {
+                failure.types = false;
+                failure.heldTypes = Promise.withResolvers();
+                await failure.heldTypes.promise;
+                return new Response("", { status: 502 });
+            }
+        });
+        const requests = countRequests();
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        expect(requests()).toEqual(MOUNT_REQUESTS);
+        const [renderer] = renderers;
+        const list = renderer.props.list;
+        const offline = getService(OfflinePlugin);
+
+        // A loss and reconnection no answer reported, while model work is in flight (a stage
+        // load, a save): the pipeline reads, and its reload waits for the model.
+        await setOffline(true);
+        const modelWork = Promise.withResolvers();
+        list.model.mutex.exec(() => modelWork.promise);
+        failure.reload = true;
+        failure.types = true;
+        await setOffline(false);
+        await waitUntil(() => failure.heldTypes);
+        await animationFrame();
+        await animationFrame();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({ [ACTIVITIES]: 2, [TYPES]: 1 });
+
+        // The type read loses the connection: a loss the pipeline's own read reported.
+        failure.heldTypes.resolve();
+        await waitUntil(() => offline.isOffline());
+        const groupsAtLoss = list.groups;
+
+        // The model work ends: the reload runs offline, and the disk cache answers it. The
+        // reloaded stage is read, and those answers bring the client back; the reload's group
+        // read then loses the connection, and the framework's check brings the client back.
+        // Each of these reconnections ends a loss of the pipeline's own requests, with the
+        // pipeline showing what its reload brought, so nothing is reloaded or read again.
+        watchConnectionStatus();
+        modelWork.resolve();
+        await waitUntil(() => renderer.reconciledGroups);
+        expect(list.groups).not.toBe(groupsAtLoss);
+        expect(renderer.reconciledGroups).toBe(list.groups);
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+            [ACTIVITIES]: 2,
+            [TYPES]: 1,
+            [VERSION_INFO]: 1,
+        });
+        expect.verifySteps(["online", "offline", "online"]);
+        await runAllTimers();
+        expect(requests()).toEqual({});
+        expectHeader("New", 2, 120);
+        expect(cardNames()).toEqual(["Lead 1", "Lead 2"]);
+
+        // Once that endpoint answers again, a reconnection no answer reported reloads once.
+        failure.reload = false;
+        await setOffline(true);
+        await setOffline(false);
+        await animationFrame();
+        await animationFrame();
+        await runAllTimers();
+        expect(offline.isOffline()).toBe(false);
+        expect(requests()).toEqual({
+            [ACTIVITIES]: 4,
+            [TYPES]: 2,
+            [PROGRESS_BAR]: 1,
+            [LEAD_GROUPS]: 1,
+        });
+        expect.verifySteps(["offline", "online"]);
+        expect(renderer.reconciledGroups).toBe(list.groups);
+        expect.verifyErrors(errors);
     });
 });
 
