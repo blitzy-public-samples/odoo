@@ -1491,13 +1491,15 @@ patch(Many2One.prototype, {
         super.setup(...arguments);
         this.crmOffline = useCrmOffline();
         /**
-         * Whether the field renders the autocomplete instead of the search-dialog input: offline,
-         * on a small screen, in a `crm.lead` view. Memoized, so its readers (the props getter and
-         * the effect below) only react when the answer changes.
+         * Whether the field renders the autocomplete instead of the search-dialog input: in a
+         * `crm.lead` view, offline, on a small screen. The view test comes first and calls no
+         * plugin, so a field outside a lead view never reads the offline or small-screen signal.
+         * Memoized, so its readers (the props getter and the effect below) only react when the
+         * answer changes.
          */
         this.crmOfflineLookup = computed(
             () =>
-                this.crmOffline.isOffline() && this.crmOffline.isSmall() && isCrmLeadView(this.env)
+                isCrmLeadView(this.env) && this.crmOffline.isOffline() && this.crmOffline.isSmall()
         );
         // Switching between the search-dialog input and the autocomplete discards text typed but
         // not selected. `state.isFloating` is set through `setInputFloats` by the autocomplete's
@@ -1533,14 +1535,15 @@ patch(Many2One.prototype, {
      *   stay in place, emptied rather than removed, so the cached records are not the last source,
      *   which the partner autocomplete would otherwise follow with its worldwide-search entry.
      *
-     * Online and for every other model the props are unchanged. The calls are optional for
+     * Online and for every other model the props are unchanged. The view is tested before the
+     * offline signal, so a field outside a lead view reads no plugin. The calls are optional for
      * subclasses whose `setup` skips this one.
      *
      * @returns {Object}
      */
     get many2XAutocompleteProps() {
         const props = super.many2XAutocompleteProps;
-        if (!this.crmOffline?.isOffline() || !isCrmLeadView(this.env)) {
+        if (!isCrmLeadView(this.env) || !this.crmOffline?.isOffline()) {
             return props;
         }
         const { otherSources } = props;

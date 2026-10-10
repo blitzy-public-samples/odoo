@@ -26,6 +26,12 @@ export class CrmKanbanModel extends RelationalModel {
  * Read only by the mobile pipeline (`@crm/mobile/crm_mobile_pipeline/crm_mobile_pipeline`) to
  * derive pending stage placement and pending-aware totals; desktop never reads it, so desktop
  * behaviour is unchanged.
+ *
+ * It is captured on every screen size, because a record loaded on a large screen must carry it
+ * if the small-screen pipeline is shown later without a reload. It is read and written on the raw
+ * record (`toRaw`), so building a record creates no reactive proxy and notifies nothing. Its
+ * readers still see every new value: `_setData` reassigns `data` through the reactive record in
+ * the same synchronous call, and the pipeline reads `data.stage_id` together with it.
  */
 export class CrmKanbanRecord extends RelationalModel.Record {
     /**
@@ -33,13 +39,17 @@ export class CrmKanbanRecord extends RelationalModel.Record {
      */
     _setData(data, options) {
         super._setData(...arguments);
+        const raw = toRaw(this);
         // The model builds every record from this class, including group records (e.g.
         // `crm.stage`) and x2many records: only leads carry a stage to track.
-        if (this.resModel === "crm.lead") {
-            this.serverStageId = this._values.stage_id?.id ?? false;
+        if (raw.resModel === "crm.lead") {
+            raw.serverStageId = raw._values.stage_id?.id ?? false;
         }
     }
 }
+
+/** Number of group lists whose synchronous folded-record selection is in progress. */
+let foldedSelections = 0;
 
 export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList {
     /**
@@ -50,10 +60,11 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      * `moveRecords` and `_moveRecords`), it also lists the records a folded group holds in memory,
      * such as a card just moved into the folded won stage while offline, so that card stays
      * movable without loading or unfolding its group. The flag lives on the raw object (`toRaw`):
-     * toggling it notifies no observer, and every other read returns the base result.
+     * toggling it notifies no observer. Outside a move's selection (`foldedSelections` is 0), the
+     * getter returns the base result at once, without touching the datapoint.
      */
     get records() {
-        if (toRaw(this)._withFoldedRecords) {
+        if (foldedSelections > 0 && toRaw(this)._withFoldedRecords) {
             return this.groups.flatMap((group) => group.records);
         }
         return super.records;
@@ -76,11 +87,13 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
         // the ones held by a folded group (see `records`)
         let movedLeads;
         toRaw(this)._withFoldedRecords = true;
+        foldedSelections++;
         try {
             movedLeads = this.records.filter(
                 (r) => recordIds.includes(r.id) && r.group !== targetGroup
             );
         } finally {
+            foldedSelections--;
             toRaw(this)._withFoldedRecords = false;
         }
 
@@ -109,9 +122,11 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      */
     _moveRecords(...args) {
         toRaw(this)._withFoldedRecords = true;
+        foldedSelections++;
         try {
             return super._moveRecords(...args);
         } finally {
+            foldedSelections--;
             toRaw(this)._withFoldedRecords = false;
         }
     }
