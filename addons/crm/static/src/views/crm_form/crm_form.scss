@@ -3,3 +3,18 @@
         height: 1rem;
     }
 }
+
+// Message actions of an offline lead chatter: they list nothing and run nothing offline, and stay
+// mounted so that a connection change rebuilds none of them. Hidden rather than removed from the
+// layout, so a hidden button can be neither clicked nor focused.
+.o-mail-Chatter[data-crm-lead-offline] .o-mail-Message-actions {
+    visibility: hidden;
+
+    // A control shown with the `visible` utility, such as the quick reaction toggler of an active
+    // message, would not inherit the hidden state: that utility is `!important`. Only that
+    // utility is targeted, so a connection change restyles these controls, not every element of
+    // the chatter.
+    .visible {
+        visibility: hidden !important;
+    }
+}

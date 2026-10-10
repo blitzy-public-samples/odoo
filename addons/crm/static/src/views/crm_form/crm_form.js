@@ -24,7 +24,7 @@ import { ActivityMarkAsDone } from "@mail/core/web/activity_markasdone_popover";
 import { Follower } from "@mail/core/web/follower";
 import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
-import { computed, status, untrack, useEffect } from "@odoo/owl";
+import { computed, status, toRaw, untrack, useEffect } from "@odoo/owl";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { patch } from "@web/core/utils/patch";
 
@@ -171,8 +171,10 @@ registry.category("views").add("crm_form", {
 // or a template expression close when the connection drops. Reads of what the chatter already
 // holds stay available, and controls that need the server stay disabled by the framework. Every
 // guard acts only while offline and only for a `crm.lead` thread: online, and for every other
-// model, each patched method calls `super`. The mail dialog forms the lead chatter opens are
-// framework views, guarded in `@crm/mobile/crm_offline_hooks`.
+// model, each patched method calls `super`. A lead message lists no action and runs none while
+// offline. In a lead chatter, its action components stay mounted but hidden across a connection
+// change rather than being removed and rebuilt (see `useShownMessageActions`). The mail dialog
+// forms the lead chatter opens are framework views, guarded in `@crm/mobile/crm_offline_hooks`.
 //
 // One path is not patched: removing an attachment from a posted message
 // (`Message.onClickAttachmentUnlink`). It relies on the framework's connection-loss handling
@@ -209,18 +211,28 @@ function isDestroyedComponent(target) {
  *
  * The predicate is a computed over the model accessor and, through it, the offline signal. The
  * effect tracks only that computed, so it re-runs when the predicate flips, not on every change of
- * the model accessor. The close is deferred to a microtask, so an overlay is never removed
+ * the model accessor. Given `isOpen`, the effect tracks only `isOpen` while the overlay is closed,
+ * and the predicate only while it is open: a component whose overlay is closed does no work when
+ * the connection changes. The close is deferred to a microtask, so an overlay is never removed
  * synchronously while it is still being set up, and it runs only if the component is alive and
  * the predicate still holds at that point.
  *
  * @param {Object} holder the patched component or message action holding `crmOffline`
  * @param {() => string | undefined} getModel returns the target model
  * @param {() => void} close closes the overlay
- * @param {Object} [lifecycleOwner=holder] the component whose destruction cancels the close
+ * @param {Object} [options]
+ * @param {Object} [options.lifecycleOwner=holder] the component whose destruction cancels the
+ *   close
+ * @param {() => boolean} [options.isOpen] whether the overlay is open, read reactively. Without
+ *   it, the overlay counts as open for as long as the component lives, as a dialog or a popover
+ *   component does.
  */
-function useCloseOnCrmOffline(holder, getModel, close, lifecycleOwner = holder) {
+function useCloseOnCrmOffline(holder, getModel, close, { lifecycleOwner = holder, isOpen } = {}) {
     const mustClose = computed(() => isCrmLeadOffline(holder, getModel()));
     useEffect(() => {
+        if (isOpen && !isOpen()) {
+            return;
+        }
         if (mustClose()) {
             untrack(() => {
                 Promise.resolve().then(() => {
@@ -348,6 +360,17 @@ patch(Chatter.prototype, {
             return true;
         }
         return super.isDisabled;
+    },
+
+    /**
+     * Whether the chatter shows a lead and the client is offline. The chatter root then carries
+     * `data-crm-lead-offline`, under which the stylesheet hides the message actions; online, and
+     * for every other model, the attribute is not rendered.
+     *
+     * @returns {boolean}
+     */
+    get crmLeadOffline() {
+        return isCrmLeadOffline(this, this.threadModel());
     },
 
     /**
@@ -668,6 +691,22 @@ patch(QuickReactionMenu.prototype, {
     setup() {
         super.setup(...arguments);
         this.crmOffline = useCrmOffline();
+        // A lead chatter keeps this menu mounted offline, hidden with the message actions: its
+        // emoji list and its emoji picker, opened online, close when the connection drops. The
+        // connection is followed only while one of them is open.
+        useCloseOnCrmOffline(
+            this,
+            () => this.props.message?.thread?.model,
+            () => {
+                if (this.dropdown.isOpen) {
+                    this.dropdown.close();
+                }
+                if (this.picker.isOpen) {
+                    this.picker.close();
+                }
+            },
+            { isOpen: () => this.dropdown.isOpen || Boolean(this.picker.isOpen) }
+        );
     },
     onClick() {
         if (isCrmLeadOffline(this, this.props.message?.thread?.model)) {
@@ -901,41 +940,134 @@ function messageComponentModel(component) {
 }
 
 /**
+ * Whether a message component shows a lead message in a chatter. A chatter mounts a new thread
+ * view for each record it shows, so the answer holds for as long as the component lives: it is
+ * read untracked, while the message and its actions are set up.
+ *
+ * @param {Message} component
+ * @returns {boolean}
+ */
+function showsLeadChatterMessage(component) {
+    return (
+        Boolean(component.env.inChatter) &&
+        untrack(() => messageComponentModel(component)) === CRM_LEAD
+    );
+}
+
+/**
+ * The condition of a message action as the action computes it without the CRM patch: what its
+ * own `_condition` returns, or else its definition's condition (see `Action._computeCondition`).
+ *
+ * @param {MessageAction} action
+ * @param {Object} params the action params
+ * @param {*} ownCondition what the `_condition` the CRM patch overrides returned
+ * @returns {*}
+ */
+function definitionCondition(action, params, ownCondition) {
+    const condition = action.definition.condition;
+    return (
+        ownCondition ??
+        (typeof condition === "function" ? condition.call(action, params) : condition ?? true)
+    );
+}
+
+/**
+ * Renders the quick and more actions of a lead message shown in a chatter from the conditions
+ * its actions have without the CRM patch (`crmShownCondition`, see the `MessageAction` patch),
+ * rather than from its action listing. Online, both list the same actions, so the message renders
+ * what it renders without the patch. Offline, the listing lists nothing, while the rendered
+ * actions stay the ones shown online: nothing the message renders follows the connection state,
+ * so a connection change neither re-renders the message nor mounts or unmounts an action
+ * component, and the chatter hides the actions while offline (see `Chatter.crmLeadOffline`). The
+ * lists are composed as the message and its action listing compose theirs
+ * (`Message.quickActions`, `Message.moreMenuActions`, `UseActions._computeActions`).
+ *
+ * @param {Message} message a message component showing a lead message in a chatter
+ */
+function useShownMessageActions(message) {
+    const shownActions = computed(() =>
+        toRaw(message.messageActions)
+            .transformedActions.filter((action) =>
+                action.crmShownCondition ? action.crmShownCondition() : action.condition
+            )
+            .sort((a1, a2) => a1.sequence - a2.sequence)
+    );
+    message.quickActions = computed(() => {
+        const allActions = shownActions();
+        return allActions.slice(
+            0,
+            allActions.length > message.quickActionCount
+                ? message.quickActionCount - 1
+                : message.quickActionCount
+        );
+    });
+    message.moreMenuActions = computed(() => {
+        const allActions = shownActions();
+        return allActions.length > message.quickActionCount
+            ? allActions.slice(message.quickActionCount - 1)
+            : false;
+    });
+}
+
+/**
  * No message action is listed for an offline lead message (see the `MessageAction` patch below),
  * so the message opens no action overlay: no context menu on right-click, which also leaves the
  * message unselected and the browser's own menu shown, as for a message without actions, and no
  * actions sheet on a mobile-OS long press. An overlay opened online closes when the connection
- * drops, instead of staying open empty. Online, and for every other model, each patched method
- * calls `super`.
+ * drops, instead of staying open empty. In a lead chatter, the message keeps rendering the
+ * actions it shows online (see `useShownMessageActions`), which the chatter hides while offline.
+ * Online, and for every other model, each patched method calls `super`.
  */
 patch(Message.prototype, {
     /**
      * Reuses the CRM offline hook result the message's own actions were given while this setup
-     * ran (this message is their owner), or calls the hook when no action was set up.
+     * ran (this message is their owner), or calls the hook when no action was set up. Gives the
+     * message its predicate, `crmLeadOfflineNow`, a computed that only the actions it owns read,
+     * and renders the actions of a lead message shown in a chatter from their conditions without
+     * the CRM patch (`useShownMessageActions`).
      */
     setup() {
         super.setup(...arguments);
         this.crmOffline = crmOfflineByActionOwner.get(this) ?? useCrmOffline();
+        this.crmLeadOfflineNow = computed(() =>
+            isCrmLeadOffline(this, messageComponentModel(this))
+        );
+        this.crmLeadChatterMessage = showsLeadChatterMessage(this);
+        if (this.crmLeadChatterMessage) {
+            useShownMessageActions(this);
+        }
+        // The more menu of a lead chatter message stays mounted offline, so it is closed as well.
+        const shownMoreMenuState = () =>
+            this.crmLeadChatterMessage ? this.moreAction()?.dropdownState : undefined;
         // Each overlay is closed only when open: closing the context menu also clears the
-        // message selection it made.
+        // message selection it made. The connection is followed only while one of them is open.
+        const contextMenuState = this.rightClickMenu.menuProps.dropdownState;
         useCloseOnCrmOffline(
             this,
             () => messageComponentModel(this),
             () => {
-                const contextMenuState = this.rightClickMenu.menuProps.dropdownState;
                 if (contextMenuState.isOpen) {
                     contextMenuState.close();
                 }
                 if (this.optionsDropdown.isOpen) {
                     this.optionsDropdown.close();
                 }
+                const moreMenuState = shownMoreMenuState();
+                if (moreMenuState?.isOpen) {
+                    moreMenuState.close();
+                }
+            },
+            {
+                isOpen: () =>
+                    contextMenuState.isOpen ||
+                    this.optionsDropdown.isOpen ||
+                    Boolean(shownMoreMenuState()?.isOpen),
             }
         );
     },
     /**
-     * Whether the message targets a lead and the client is offline. Read by the empty quick
-     * action template, which then renders no placeholder: the framework's offline look of a
-     * disabled button would make that transparent placeholder visible.
+     * Whether the message targets a lead and the client is offline: read by the context menu and
+     * actions sheet guards when they run.
      *
      * @returns {boolean}
      */
@@ -962,7 +1094,10 @@ patch(MessageAction.prototype, {
     /**
      * Attaches the offline source to the action itself, whatever its owner, before the
      * definition's own setup runs. Actions constructed without setup (the "more" dropdown
-     * action) have no source and are never guarded: they only list the guarded actions.
+     * action) have no source and are never guarded: they only list the guarded actions. An
+     * action of a lead message shown in a chatter also gets `crmShownCondition`: its condition
+     * without this patch, which the message renders its actions from (see
+     * `useShownMessageActions`) and its listing reads.
      */
     setup() {
         const owner = this.owner;
@@ -974,25 +1109,54 @@ patch(MessageAction.prototype, {
             }
         }
         this.crmOffline = crmOffline;
+        if (owner instanceof Message && showsLeadChatterMessage(owner)) {
+            this.crmShownCondition = computed(() => {
+                const params = this.params;
+                return definitionCondition(this, params, super._condition(params));
+            });
+        }
         const result = super.setup(...arguments);
         if (this.id === "reaction") {
             // The definition gives the owner an emoji picker whose `onSelect` reacts directly,
-            // bypassing `onSelected`: the picker closes when the connection drops.
+            // bypassing `onSelected`: the picker closes when the connection drops. The
+            // connection is followed only while the picker is open.
             useCloseOnCrmOffline(
                 this,
                 () => messageActionModel(this),
                 () => this.owner.reactionPicker?.close(),
-                this.owner
+                {
+                    lifecycleOwner: this.owner,
+                    isOpen: () => Boolean(this.owner.reactionPicker?.isOpen),
+                }
             );
         }
         return result;
     },
-    /** No message action is listed for an offline lead message. */
+    /**
+     * No message action is listed for an offline lead message. The action's condition without
+     * this patch is evaluated first (`crmShownCondition` when the action has one), and the
+     * predicate is read only when that condition lists the action: an action that is not listed
+     * anyway does not follow the connection state, so a connection change invalidates only the
+     * listed actions. The actions a message component owns read that message's predicate
+     * (`crmLeadOfflineNow`), which targets the same model by the same rule, so the connection
+     * state has one observer per message rather than one per action. The actions of every other
+     * owner (a context menu, reactions, a messaging-menu item) read the predicate themselves.
+     */
     _condition(params) {
-        if (isCrmLeadOffline(this, messageActionModel(this, params))) {
-            return false;
+        const condition = this.crmShownCondition
+            ? this.crmShownCondition()
+            : definitionCondition(this, params, super._condition(...arguments));
+        if (!condition) {
+            return condition ?? false;
         }
-        return super._condition(...arguments);
+        const ownerPredicate =
+            this.crmOffline && this.owner instanceof Message
+                ? this.owner.crmLeadOfflineNow
+                : undefined;
+        const offline = ownerPredicate
+            ? ownerPredicate()
+            : isCrmLeadOffline(this, messageActionModel(this, params));
+        return offline ? false : condition;
     },
     /**
      * Returning `true` short-circuits the definition's `onSelected`, which also keeps the

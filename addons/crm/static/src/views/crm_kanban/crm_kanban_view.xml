@@ -235,14 +235,15 @@
     </t>
 
     <!--
-        Empty quick action placeholder of a message: a transparent <button> that the framework's
-        offline look of disabled buttons makes visible. An offline lead message lists no action,
-        so it renders no placeholder while the `Message` patch's `crmLeadOffline` holds. Rendered
-        as upstream online, for every other model, and for any other caller of the template.
+        Lead chatter root, marked while the client is offline (the `Chatter` patch's
+        `crmLeadOffline`). Its messages keep their action components mounted across a connection
+        change; under this attribute the stylesheet hides them, the empty quick action placeholders
+        included, which the framework's offline look of disabled buttons would otherwise show.
+        Not rendered online, nor for any other model.
     -->
-    <t t-inherit="mail.Message.emptyQuickAction" t-inherit-mode="extension">
-        <xpath expr="//button" position="attributes">
-            <attribute name="t-if">!this.crmLeadOffline</attribute>
+    <t t-inherit="mail.Chatter" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('o-mail-Chatter')]" position="attributes">
+            <attribute name="t-att-data-crm-lead-offline">this.crmLeadOffline ? '1' : false</attribute>
         </xpath>
     </t>
 </templates>

@@ -43,6 +43,7 @@ import {
     beforeEach,
     describe,
     expect,
+    microTick,
     mockTouch,
     mockUserAgent,
     queryAll,
@@ -5560,10 +5561,12 @@ describe("SKIP and remaining DISABLE", () => {
         expect(mountedMessage("crm.lead").rightClickMenu.menuProps.dropdownState.isOpen).toBe(
             false
         );
-        // Offline, a hovered lead message renders no placeholder glyph next to its (no) actions.
+        // Offline, a hovered lead message shows no placeholder glyph next to its (no) actions: its
+        // actions stay rendered, hidden.
         await hover(leadMessage);
         expect(`${leadMessage} .o-mail-Message-actions`).toHaveCount(1);
-        expect(`${leadMessage} ${placeholder}`).toHaveCount(0);
+        expect(`${leadMessage} .o-mail-Message-actions`).not.toBeVisible();
+        expect(`${leadMessage} ${placeholder}:visible`).toHaveCount(0);
 
         // A partner message offline still opens its context menu, listing its actions.
         await setOffline(false);
@@ -5596,8 +5599,10 @@ describe("SKIP and remaining DISABLE", () => {
         await mailContains(actionsMenu, { count: 0 });
         expect(mountedMessage("crm.lead").optionsDropdown.isOpen).toBe(false);
 
-        // Offline, no placeholder glyph, and neither a long press nor a direct call opens a sheet.
-        expect(`${leadMessage} ${placeholder}`).toHaveCount(0);
+        // Offline, the placeholder glyph stays rendered but is not shown, and neither a long press
+        // nor a direct call opens a sheet.
+        expect(`${leadMessage} ${placeholder}`).toHaveCount(1);
+        expect(`${leadMessage} ${placeholder}:visible`).toHaveCount(0);
         await pointerDown(leadMessage);
         await advanceTime(LONG_PRESS_DELAY);
         mountedMessage("crm.lead").openMobileActions(NO_EVENT);
@@ -5612,10 +5617,247 @@ describe("SKIP and remaining DISABLE", () => {
         await setOffline(true);
         await animationFrame();
         expect(`${partnerMessage} ${placeholder}`).toHaveCount(1);
+        expect(`${partnerMessage} ${placeholder}:visible`).toHaveCount(1);
         await pointerDown(partnerMessage);
         await advanceTime(LONG_PRESS_DELAY);
         await expectActionsMenuListingActions();
         expect(mountedMessage("res.partner").optionsDropdown.isOpen).toBe(true);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+    });
+
+    test("long lead thread: a connection change lists or unlists every message action at once and remounts none; offline they are hidden, and overlays opened online close", async () => {
+        const { pyEnv } = await seedLeadThread();
+        // As on the server, the lead model is a mail thread: its messages accept reactions, so
+        // their actions render the quick reaction menu (the local fixture omits the mixin).
+        const leadModel = pyEnv["crm.lead"];
+        leadModel._inherit = [leadModel._inherit, "mail.thread"].filter(Boolean).join(",");
+        // Lead 1 has a long thread; lead 2 has one message.
+        const LONG_THREAD_SIZE = 25;
+        for (let index = 1; index < LONG_THREAD_SIZE; index++) {
+            pyEnv["mail.message"].create({
+                author_id: serverState.partnerId,
+                body: `Lead note ${index}`,
+                message_type: "comment",
+                model: "crm.lead",
+                res_id: 1,
+            });
+        }
+        pyEnv["mail.message"].create({
+            author_id: serverState.partnerId,
+            body: "Short lead thread",
+            message_type: "comment",
+            model: "crm.lead",
+            res_id: 2,
+        });
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchOfflineRpcs();
+        // Every chatter write is stepped, online or offline: none may be sent.
+        watchRpcs(MAIL_WRITES);
+        const messages = captureInstances(Message);
+        const messageActions = captureInstances(MessageAction);
+        const quickReactionMenus = captureInstances(QuickReactionMenu);
+        const actionButton = ".o-mail-Message .o-mail-ActionList-button";
+        const reactionToggler = ".o-mail-Message-actions .o-mail-QuickReactionMenu-toggler";
+        // Every control of the message actions: buttons, reaction toggler and placeholders.
+        const actionControl = ".o-mail-Message-actions button";
+        const offlineChatter = ".o-mail-Chatter[data-crm-lead-offline='1']";
+        /** @returns {Message[]} the mounted message components showing a lead message */
+        const leadMessages = () =>
+            messages.filter(
+                (message) =>
+                    status(message) === "mounted" &&
+                    message.props.message.thread?.model === "crm.lead"
+            );
+        /** @returns {Message[]} those of them listing at least one action */
+        const listingLeadMessages = () =>
+            leadMessages().filter((message) => message.messageActions.actions.length > 0);
+        /**
+         * @returns {Array<[Message, Object[], Object[] | false]>} each mounted lead message with
+         *   the quick and more action lists it renders
+         */
+        const renderedActionLists = () =>
+            leadMessages().map((message) => [
+                message,
+                message.quickActions(),
+                message.moreMenuActions(),
+            ]);
+        /**
+         * Asserts that every lead message renders the very lists it rendered when `lists` was
+         * taken: nothing it renders changed, so it was not re-rendered for its actions.
+         *
+         * @param {ReturnType<typeof renderedActionLists>} lists
+         */
+        const expectSameActionLists = (lists) => {
+            expect(leadMessages()).toHaveLength(lists.length);
+            for (const [message, quickActions, moreMenuActions] of lists) {
+                expect(message.quickActions()).toBe(quickActions);
+                expect(message.moreMenuActions()).toBe(moreMenuActions);
+            }
+        };
+        /** Asserts that no action owned by a lead message is listed, and that each is inert. */
+        const expectLeadActionsInert = () => {
+            for (const message of leadMessages()) {
+                const ownedActions = messageActions.filter(({ owner }) => owner === message);
+                expect(ownedActions.length).toBeGreaterThan(0);
+                for (const action of ownedActions) {
+                    expect(Boolean(action.condition)).toBe(false, { message: action.id });
+                    expect(action.onSelected()).toBe(true, { message: action.id });
+                }
+            }
+        };
+        /**
+         * Asserts that the elements matching `selector` are exactly `elements`, the same elements
+         * in the same order: none was removed, added or rebuilt.
+         *
+         * @param {string} selector
+         * @param {HTMLElement[]} elements
+         */
+        const expectSameElements = (selector, elements) => {
+            const current = queryAll(selector);
+            expect(current).toHaveLength(elements.length);
+            expect(current.every((element, index) => element === elements[index])).toBe(true, {
+                message: `the same ${selector} elements`,
+            });
+        };
+        await start();
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message", { count: LONG_THREAD_SIZE });
+        expect(leadMessages()).toHaveLength(LONG_THREAD_SIZE);
+        expect(listingLeadMessages()).toHaveLength(LONG_THREAD_SIZE);
+        // Message actions show on hover only: every lead message is shown as hovered.
+        for (const message of leadMessages()) {
+            message.state.isHovered = true;
+        }
+        await animationFrame();
+        for (const message of leadMessages()) {
+            expect(message.rootRef().querySelector(".o-mail-ActionList-button")).not.toBe(null);
+        }
+        const actionButtons = queryAll(actionButton);
+        expect(`${actionButton}:visible`).toHaveCount(actionButtons.length);
+        // The quick reaction toggler of an active message is shown with the `visible` utility.
+        const reactionTogglers = queryAll(reactionToggler);
+        expect(reactionTogglers.length).toBeGreaterThan(0);
+        expect(`${reactionToggler}:visible`).toHaveCount(reactionTogglers.length);
+        expect(".o-mail-Chatter").toHaveCount(1);
+        expect(".o-mail-Chatter").not.toHaveAttribute("data-crm-lead-offline");
+        const onlineLists = renderedActionLists();
+
+        // The connection drops. As soon as the change is processed, no lead message lists an
+        // action, and every action of theirs is inert.
+        const offlineShown = setOffline(true);
+        await microTick();
+        expect(listingLeadMessages()).toHaveLength(0);
+        expectLeadActionsInert();
+        await offlineShown;
+        // Their action components stay mounted, from the lists they rendered online: the same
+        // buttons, and no action control shown.
+        expect(offlineChatter).toHaveCount(1);
+        expect(leadMessages()).toHaveLength(LONG_THREAD_SIZE);
+        expectSameActionLists(onlineLists);
+        expectSameElements(actionButton, actionButtons);
+        expectSameElements(reactionToggler, reactionTogglers);
+        expect(`${actionControl}:visible`).toHaveCount(0);
+        await animationFrame();
+        await animationFrame();
+        expect(listingLeadMessages()).toHaveLength(0);
+        expectSameActionLists(onlineLists);
+        expectSameElements(actionButton, actionButtons);
+        expect(`${actionControl}:visible`).toHaveCount(0);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // Back online, every lead message lists its actions as soon as the change is processed,
+        // and the same buttons show again, from the same lists: none is rebuilt.
+        const onlineShown = setOffline(false);
+        await microTick();
+        expect(listingLeadMessages()).toHaveLength(LONG_THREAD_SIZE);
+        await onlineShown;
+        expect(".o-mail-Chatter").not.toHaveAttribute("data-crm-lead-offline");
+        expectSameActionLists(onlineLists);
+        expectSameElements(actionButton, actionButtons);
+        expect(`${actionButton}:visible`).toHaveCount(actionButtons.length);
+        expectSameElements(reactionToggler, reactionTogglers);
+        expect(`${reactionToggler}:visible`).toHaveCount(reactionTogglers.length);
+        await animationFrame();
+        await animationFrame();
+        expect(listingLeadMessages()).toHaveLength(LONG_THREAD_SIZE);
+        expectSameActionLists(onlineLists);
+        expectSameElements(actionButton, actionButtons);
+        expect(`${actionButton}:visible`).toHaveCount(actionButtons.length);
+        expectSameElements(reactionToggler, reactionTogglers);
+
+        // A more menu opened online closes when the connection drops.
+        const [firstMessage] = leadMessages();
+        const moreMenuState = firstMessage.moreAction()?.dropdownState;
+        expect(Boolean(moreMenuState)).toBe(true, { message: "a lead message more menu" });
+        moreMenuState.open();
+        await mailContains(".o-mail-Message-moreMenu");
+        expect(moreMenuState.isOpen).toBe(true);
+        await setOffline(true);
+        await animationFrame();
+        expect(moreMenuState.isOpen).toBe(false);
+        expect(".o-mail-Message-moreMenu").toHaveCount(0);
+        expectSameElements(actionButton, actionButtons);
+        await setOffline(false);
+        await animationFrame();
+        expectSameActionLists(onlineLists);
+
+        // A quick reaction menu and its emoji picker, opened online, close when the connection
+        // drops, and the menu stays mounted.
+        const quickReactionMenu = quickReactionMenus.find(
+            (menu) => status(menu) === "mounted" && menu.props.message.thread?.model === "crm.lead"
+        );
+        expect(Boolean(quickReactionMenu)).toBe(true, {
+            message: "a quick reaction menu of a lead message",
+        });
+        quickReactionMenu.dropdown.open();
+        await animationFrame();
+        quickReactionMenu.togglePicker();
+        await mailContains(".o-EmojiPicker");
+        expect(quickReactionMenu.dropdown.isOpen).toBe(true);
+        expect(quickReactionMenu.picker.isOpen).toBe(true);
+        await setOffline(true);
+        await animationFrame();
+        expect(quickReactionMenu.dropdown.isOpen).toBe(false);
+        expect(quickReactionMenu.picker.isOpen).toBe(false);
+        expect(".o-mail-QuickReactionMenu").toHaveCount(0);
+        expect(".o-EmojiPicker").toHaveCount(0);
+        expect(status(quickReactionMenu)).toBe("mounted");
+        expectSameElements(actionButton, actionButtons);
+        expect(queuedEntries()).toHaveLength(0);
+        expect.verifySteps([]);
+
+        // A short thread follows the connection the same way, both ways.
+        await setOffline(false);
+        await openFormView("crm.lead", 2, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message:contains('Short lead thread')");
+        expect(leadMessages()).toHaveLength(1);
+        expect(listingLeadMessages()).toHaveLength(1);
+        leadMessages()[0].state.isHovered = true;
+        await animationFrame();
+        const shortActionButtons = queryAll(actionButton);
+        expect(shortActionButtons.length).toBeGreaterThan(0);
+        expect(`${actionButton}:visible`).toHaveCount(shortActionButtons.length);
+        const shortOnlineLists = renderedActionLists();
+        const shortOfflineShown = setOffline(true);
+        await microTick();
+        expect(listingLeadMessages()).toHaveLength(0);
+        expectLeadActionsInert();
+        await shortOfflineShown;
+        expect(offlineChatter).toHaveCount(1);
+        expectSameActionLists(shortOnlineLists);
+        expectSameElements(actionButton, shortActionButtons);
+        expect(`${actionControl}:visible`).toHaveCount(0);
+        const shortOnlineShown = setOffline(false);
+        await microTick();
+        expect(listingLeadMessages()).toHaveLength(1);
+        await shortOnlineShown;
+        expectSameActionLists(shortOnlineLists);
+        expect(".o-mail-Chatter").not.toHaveAttribute("data-crm-lead-offline");
+        expectSameElements(actionButton, shortActionButtons);
+        expect(`${actionButton}:visible`).toHaveCount(shortActionButtons.length);
         expect(queuedEntries()).toHaveLength(0);
         expect.verifySteps([]);
     });
