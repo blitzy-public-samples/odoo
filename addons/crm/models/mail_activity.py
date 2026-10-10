@@ -46,13 +46,18 @@ class MailActivity(models.Model):
         raises, the standard create's own (access rights, missing records,
         invalid values) included, keeps its type and message but has its
         traceback concealed from the HTTP response; the server log still
-        records it. The create then runs in a savepoint: the HTTP layer turns a
-        database integrity error into a new error outside this method, out of
-        reach of that concealment, so such an error is rolled back to the
-        savepoint here and raised as the same standard ``ValidationError``.
-        Pending ORM writes are flushed before the savepoint, so that its
-        rollback only drops this create. Batches on other models are created
-        as standard. """
+        records it. When the batch also holds values in the replayed shape
+        above, whose ``res_model_id`` is resolved here, the create runs in a
+        savepoint: the HTTP layer turns a database integrity error into a new
+        error outside this method, out of reach of that concealment, so such an
+        error is rolled back to the savepoint here and raised as the same
+        standard ``ValidationError``. Pending ORM writes are flushed before the
+        savepoint, so that its rollback only drops this create. Lead batches
+        whose values all give their model otherwise, through ``res_model_id``
+        (as ``activity_schedule`` does) or the context defaults, are created
+        with neither flush nor savepoint, so pending ORM writes stay batched
+        and integrity errors are handled as with the standard create. Batches
+        on other models are created as standard. """
         if not isinstance(vals_list, (list, tuple)) or not all(isinstance(vals, Mapping) for vals in vals_list):
             with conceal_debug_traceback():
                 raise ValidationError(self.env._("Invalid activity values: a list of field values is expected."))
@@ -60,6 +65,7 @@ class MailActivity(models.Model):
         res_id_field = self._fields['res_id']
         context = self.env.context
         on_lead = False
+        model_id_resolved = False
         for vals in vals_list:
             res_model_id = vals.get('res_model_id')
             # a model id is an integer or a single ``ir.model`` record: the ORM stores a string as empty
@@ -99,9 +105,14 @@ class MailActivity(models.Model):
                     raise ValidationError(self.env._("Invalid activity values: an activity on a lead requires the id of that lead."))
             if vals.get('res_model') == 'crm.lead' and not res_model_id:
                 vals['res_model_id'] = lead_model_id
+                model_id_resolved = True
         if not on_lead:
             return super().create(vals_list)
         with conceal_debug_traceback():
+            if not model_id_resolved:
+                # values that already give their model, such as activity_schedule's: neither flush
+                # nor savepoint, so pending ORM writes stay batched as with the standard create
+                return super().create(vals_list)
             # pending ORM writes reach the database before the savepoint, so that its rollback
             # drops nothing else; precommit hooks, mail tracking included, still run at commit
             self.env.flush_all()

@@ -18,7 +18,10 @@ class WebManifest(webmanifest.WebManifest):
         no shortcut at all on ``AccessError`` (anonymous visitors). Using that
         entry as the single eligibility test keeps the parent's access checks
         authoritative: no extra privilege and no ``sudo()`` are needed, as
-        ``env.ref`` only resolves the menu id.
+        only the root menu id is resolved, through the cached xmlid lookup.
+        That lookup runs no query once warm and checks neither existence nor
+        visibility, which the entry itself settles: the parent only lists the
+        existing root menus the user sees, so a stale id never matches.
 
         :param list shortcuts: shortcuts as returned by ``_get_shortcuts``
         :return: True when the CRM app entry is present
@@ -26,10 +29,10 @@ class WebManifest(webmanifest.WebManifest):
         """
         if not shortcuts:
             return False
-        root = request.env.ref('crm.crm_menu_root', raise_if_not_found=False)
-        if not root:
+        root_id = request.env['ir.model.data']._xmlid_to_res_id('crm.crm_menu_root')
+        if not root_id:
             return False
-        crm_app_url = f'/odoo?menu_id={root.id}'
+        crm_app_url = f'/odoo?menu_id={root_id}'
         return any(shortcut.get('url') == crm_app_url for shortcut in shortcuts)
 
     def _get_shortcuts(self):
@@ -44,22 +47,25 @@ class WebManifest(webmanifest.WebManifest):
         shortcuts = super()._get_shortcuts()
         if not self._crm_app_entry_present(shortcuts):
             return shortcuts
-        root = request.env.ref('crm.crm_menu_root')
+        # Both menu ids come from the cached xmlid lookup, without existence
+        # query: the root id is the one the CRM app entry was just matched on.
+        root_id = request.env['ir.model.data']._xmlid_to_res_id('crm.crm_menu_root')
         # "My Pipeline" opens through the legacy ``menu_id`` URL, which the
         # webclient resolves to the menu's action only among the menus it
         # loads (``load_menus``), and otherwise falls back to the default app.
         # A pipeline menu that is removed, archived or not visible to the user
         # (groups, hidden or archived parent, inaccessible action) leaves the
-        # parent's shortcuts untouched rather than publishing a partial CRM set.
-        pipeline_menu = request.env.ref('crm.menu_crm_opportunities', raise_if_not_found=False)
-        if not pipeline_menu:
+        # parent's shortcuts untouched rather than publishing a partial CRM set:
+        # ``load_menus`` only holds the existing menus the user can open.
+        pipeline_menu_id = request.env['ir.model.data']._xmlid_to_res_id('crm.menu_crm_opportunities')
+        if not pipeline_menu_id:
             return shortcuts
         user_menus = request.env['ir.ui.menu'].load_menus(request.session.debug)
-        if not user_menus.get(pipeline_menu.id, {}).get('action_id'):
+        if not user_menus.get(pipeline_menu_id, {}).get('action_id'):
             return shortcuts
         shortcuts.append({
             'name': request.env._("My Pipeline"),
-            'url': f'/odoo?menu_id={pipeline_menu.id}',
+            'url': f'/odoo?menu_id={pipeline_menu_id}',
             'description': request.env._("Open your CRM pipeline"),
             'icons': [{
                 'sizes': '100x100',
@@ -70,7 +76,7 @@ class WebManifest(webmanifest.WebManifest):
         # "New Lead" opens the pipeline action's form view on a new record.
         shortcuts.append({
             'name': request.env._("New Lead"),
-            'url': f'/odoo?menu_id={root.id}&action=crm.crm_lead_action_pipeline&view_type=form',
+            'url': f'/odoo?menu_id={root_id}&action=crm.crm_lead_action_pipeline&view_type=form',
             'description': request.env._("Create a new lead"),
             'icons': [{
                 'sizes': '100x100',

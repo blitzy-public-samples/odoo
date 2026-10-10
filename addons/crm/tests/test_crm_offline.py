@@ -4,12 +4,14 @@ import mimetypes
 import os
 from datetime import timedelta
 from unittest import TestCase
+from unittest.mock import patch
 
 from lxml import etree
 
 from odoo import fields
 from odoo.exceptions import AccessError, ValidationError
 from odoo.service.model import call_kw
+from odoo.sql_db import Cursor
 from odoo.tests import HttpCase, tagged
 from odoo.tools import SQL, config, mute_logger
 from odoo.tools.safe_eval import safe_eval
@@ -426,6 +428,51 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         data = self._get_manifest()
         self.assertEqual(len(data['shortcuts']), 0)
         self.assertCountEqual(data['icons'], ODOO_MANIFEST_ICONS)
+
+    def test_webmanifest_crm_no_repeated_query(self):
+        """ PART 5: a warm manifest request finds the CRM menus through the cached xmlid lookup: no menu existence check, and no menu or xmlid query runs twice. """
+        self.authenticate('user_sales_salesman', 'user_sales_salesman')
+        root = self.env.ref('crm.crm_menu_root')
+        pipeline_menu = self.env.ref('crm.menu_crm_opportunities')
+        # the first request fills the caches the next one reads (xmlids, visible and loaded menus)
+        manifest = self._get_manifest()
+        self.assertEqual(
+            [shortcut['url'] for shortcut in manifest['shortcuts'][-2:]],
+            [
+                f'/odoo?menu_id={pipeline_menu.id}',
+                f'/odoo?menu_id={root.id}&action=crm.crm_lead_action_pipeline&view_type=form',
+            ],
+            'The CRM shortcuts are published',
+        )
+        self.assertEqual(manifest['icons'], CRM_MANIFEST_ICONS)
+
+        # every statement the request sends, with its parameters bound
+        statements = []
+        cursor_execute = Cursor.execute
+
+        def execute(cr, query, params=None, log_exceptions=True):
+            statements.append(cr.mogrify(query, params).decode())
+            return cursor_execute(cr, query, params, log_exceptions)
+
+        with patch.object(Cursor, 'execute', execute):
+            self.assertEqual(self._get_manifest(), manifest, 'A warm request serves the same manifest')
+
+        self.assertTrue(any('"ir_module_module"' in statement for statement in statements),
+                        "The request's SQL is captured, the parent's module search included")
+        for menu in (root, pipeline_menu):
+            existence_check = f'"ir_ui_menu"."id" IN ({menu.id})'
+            self.assertEqual(
+                [statement for statement in statements if existence_check in statement], [],
+                f'No existence check of the menu {menu.id} runs',
+            )
+        menu_statements = [
+            statement for statement in statements
+            if '"ir_ui_menu"' in statement or '"ir_model_data"' in statement
+        ]
+        self.assertEqual(
+            sorted({statement for statement in menu_statements if menu_statements.count(statement) > 1}), [],
+            'No menu or xmlid query runs twice within the request',
+        )
 
     # ------------------------------------------------------------
     # PART 2.2 / 3a: replay of the framework-queued CRM writes
@@ -1131,6 +1178,46 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertIn(activity, lead.activity_ids)
         self.assertEqual(activity.summary, 'Follow-up after a rejected one')
         self.assertEqual(self._count_activities(lead), (counts[0] + 1, counts[1] + 1))
+
+    def test_activity_schedule_keeps_pending_lead_writes_batched(self):
+        """ PART 3b: a lead activity whose model is already given, by ``activity_schedule``, an explicit ``res_model_id`` or the context's ``default_res_model``, is created as standard: a lead write pending before it is not flushed, so ORM write batching is kept. """
+        lead = self._create_opportunity('Batched Write Lead')
+        lead_model_id = self.env['ir.model']._get_id('crm.lead')
+        lead_as_user = lead.with_user(self.user_sales_leads)
+        activities = self.env['mail.activity'].with_user(self.user_sales_leads)
+        document_vals = {
+            'res_id': lead.id,
+            'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
+            'user_id': self.user_sales_leads.id,
+        }
+        lead_name_query = SQL("SELECT name FROM crm_lead WHERE id = %s", lead.id)
+
+        for case, create_activity in (
+            ('activity_schedule', lambda summary: lead_as_user.activity_schedule(
+                'mail.mail_activity_data_todo', summary=summary, user_id=self.user_sales_leads.id)),
+            ('explicit model id', lambda summary: activities.create({
+                **document_vals, 'res_model_id': lead_model_id, 'summary': summary})),
+            ('model from the context', lambda summary: activities.with_context(default_res_model='crm.lead').create({
+                **document_vals, 'summary': summary})),
+        ):
+            with self.subTest(case=case):
+                self.env.flush_all()
+                self.env.cr.execute(lead_name_query)
+                stored_name = self.env.cr.fetchone()[0]
+                new_name = f'Batched Write Lead, {case}'
+                summary = f'Follow-up by {case}'
+
+                lead_as_user.name = new_name
+                activity = create_activity(summary)
+
+                self.env.cr.execute(lead_name_query)
+                self.assertEqual(self.env.cr.fetchone()[0], stored_name, 'The activity create flushes no pending write')
+                self.assertIn(activity, lead.activity_ids)
+                self.assertEqual(activity.res_model_id.id, lead_model_id)
+                self.assertEqual(activity.summary, summary)
+                self.env.flush_all()
+                self.env.cr.execute(lead_name_query)
+                self.assertEqual(self.env.cr.fetchone()[0], new_name, 'The pending write reaches the database at the next flush')
 
     # ------------------------------------------------------------
     # PART 4, N1: replay of the mobile quick create
