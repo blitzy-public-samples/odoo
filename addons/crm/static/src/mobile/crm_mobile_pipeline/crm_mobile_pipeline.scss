@@ -1,0 +1,194 @@
+// Small-screen CRM pipeline (template `crm.CrmMobilePipeline`): one stage at a time.
+//
+// The mobile root keeps `o_kanban_renderer o_renderer o_kanban_grouped`: the upstream mobile main
+// flow targets those classes and the base kanban controller saves and restores the scroll of
+// `.o_renderer` and of every unfolded `.o_kanban_group`. On small screens the web kanban styles
+// turn that root into a horizontal snap scroller of 90%-wide columns. Every layout rule below is
+// nested under the `.o_crm_mobile_pipeline` root, which only the small-screen stage-grouped branch
+// renders, and overrides those rules for this root alone: the desktop branch (`web.KanbanRenderer`)
+// and every other kanban view keep the web layout. The lead card and the quick create own their
+// stylesheets. The last section, scoped to the pipeline arch class instead, adjusts the offline
+// presentation of the standard cards this view renders on every screen size.
+//
+// Physical properties (`top`, `width`, `min-width`, ...) are used rather than logical ones: each
+// declaration either overrides a physical declaration of the web kanban layout or sets a touch
+// target measured as width x height, and the RTL bundle is flipped by the asset pipeline.
+
+// Minimum touch target, in CSS pixels, of every pipeline control. File-local on purpose: it is a
+// requirement of this component, not a theme value.
+$o-crm-mobile-touch: 44px;
+
+// Three classes: more specific than the web `.o_kanban_renderer.o_kanban_grouped` rules.
+.o_kanban_renderer.o_kanban_grouped.o_crm_mobile_pipeline {
+    // The displayed stage takes the full viewport width: no hint of the adjacent columns, which
+    // are not rendered (navigation is through the header buttons and the swipe).
+    --KanbanGroup-width: 100%;
+    --KanbanGroup-max-width: 100%;
+
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    height: 100%;
+    // The web small-screen layout sets `overflow: scroll hidden !important` to scroll the columns
+    // horizontally. An `!important` declaration can only be overridden by another one: here the
+    // root never scrolls, the stage body below is the scroll container.
+    overflow: hidden !important;
+    scroll-snap-type: none;
+
+    .o_crm_mobile_pipeline_header {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        flex: 0 0 auto;
+    }
+
+    // Header layout: a start zone (Previous), the title, an end zone (Next, then Add). Both zones
+    // always reserve the same width, exactly that of their controls: a placeholder holds the slot
+    // of an absent Previous or Next, and, when Add is rendered, a placeholder of Add's size and
+    // the same gap balance it in the start zone. The title takes all the width between the zones,
+    // its text centred, and a longer title truncates: the title, short or truncated, is always
+    // centred on the header, and keeps the same geometry on the first, a middle and the last
+    // stage.
+    .o_crm_mobile_pipeline_header_start,
+    .o_crm_mobile_pipeline_header_end {
+        flex: 0 0 auto;
+    }
+
+    .o_crm_mobile_pipeline_title {
+        flex: 1 1 0;
+    }
+
+    // Same size as the button whose slot it holds or whose width it balances (Previous, Next,
+    // Add). Hidden and no control: `invisible` and `aria-hidden` in the template, and never
+    // focusable.
+    .o_crm_mobile_pipeline_nav_placeholder {
+        flex: 0 0 auto;
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+    }
+
+    .o_crm_mobile_pipeline_prev,
+    .o_crm_mobile_pipeline_next,
+    .o_crm_mobile_pipeline_add,
+    .o_crm_mobile_pipeline_empty_stage_target {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: center;
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+
+        // A touch screen leaves `:hover` on the last tapped button until the next tap elsewhere,
+        // which would keep that button alone in its hover colours. Without a hovering pointer the
+        // hover colours (also those of the keyboard focus) are the rest colours; the pressed
+        // (`:active`) colours and the focus ring are unchanged.
+        @media (hover: none) {
+            --#{$prefix}btn-hover-bg: var(--#{$prefix}btn-bg);
+            --#{$prefix}btn-hover-border-color: var(--#{$prefix}btn-border-color);
+            --#{$prefix}btn-hover-color: var(--#{$prefix}btn-color);
+        }
+    }
+
+    // The icon-only header buttons have no inline padding: the icon is centred in the touch
+    // width, so each button is exactly as wide as the placeholder that holds or balances its slot.
+    .o_crm_mobile_pipeline_prev,
+    .o_crm_mobile_pipeline_next,
+    .o_crm_mobile_pipeline_add {
+        --#{$prefix}btn-padding-x: 0;
+    }
+
+    // Stage body: the only `.o_kanban_group` in the DOM. It fills the width and the height left
+    // by the header, and it is the vertical scroll container whose `scrollTop` the base kanban
+    // controller saves and restores (lead opened, then back).
+    .o_kanban_group.o_crm_mobile_pipeline_body {
+        flex: 1 1 auto;
+        width: 100%;
+        min-width: 100%;
+        max-width: none;
+        min-height: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
+        scroll-snap-align: none;
+        // Vertical panning stays native; horizontal gestures are left to the swipe navigation.
+        touch-action: pan-y;
+        // Positioned ancestor (`offsetParent`) of the offline action helper (`.o_view_nocontent`),
+        // whose overflow the body clips: the helper never covers the header.
+        position: relative;
+
+        // The framework places the helper absolutely over its whole container. While the body
+        // holds it, the body is a column instead and the helper is in its flow: what precedes it
+        // (the Back row of an unavailable lead, or the framework quick create above a stage whose
+        // data is missing) stays above it, never under it, and the helper fills and centres in
+        // the height left below. When its content is taller than that, it grows and the body
+        // scrolls. `position: relative` keeps the helper's z-index and the body as its
+        // `offsetParent`, and turns the framework's zero insets into no offset.
+        &:has(> .o_view_nocontent) {
+            display: flex;
+            flex-direction: column;
+
+            > .o_view_nocontent {
+                position: relative;
+                flex: 1 0 auto;
+            }
+
+            // What precedes the helper keeps its own height, as in the block flow: the column
+            // never squeezes it to make room for the helper.
+            > :not(.o_view_nocontent) {
+                flex-shrink: 0;
+            }
+        }
+    }
+
+    // Back from the offline action helper, in its own row above the helper in the stage body's
+    // flow. The two boxes never overlap, so Back needs no stacking order to stay tappable; the
+    // stage body clips it, so it never covers the header.
+    .o_crm_mobile_pipeline_back {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+    }
+
+    .o_crm_mobile_pipeline_load_more .btn {
+        min-width: $o-crm-mobile-touch;
+        min-height: $o-crm-mobile-touch;
+    }
+}
+
+// Pipeline cards of leads not visited online, offline, on every screen size.
+//
+// Offline, the framework adds `o_disabled_offline` to every kanban card whose form was not visited
+// online, and its offline stylesheet gives that class `opacity: 0.5`, `pointer-events: auto` and
+// `cursor: not-allowed`, all `!important`. On the lead pipeline that has two effects:
+// - the card-menu toggler, which stays usable offline (`data-available-offline`), inherits the
+//   card's opacity and looks disabled although its menu (Edit, Delete, colors) works;
+// - a dragged card keeps `pointer-events: auto` over the drag hook's `.o_dragged` rule, so it stays
+//   under the pointer, the target column never receives `pointerenter`, and the stage move, which
+//   the framework queues offline, is dropped back into the source column.
+// So the card keeps full opacity and dims its content instead, the toggler excepted, and a dragged
+// card lets the pointer through, as do the controls inside it that the framework disables offline.
+// The card keeps its class and the framework cursor. Scoped to the pipeline arch class
+// (`o_opportunity_kanban`, on the view root, which also holds a card while it is dragged): other
+// kanban views keep the framework presentation, and nothing applies online, where the framework
+// adds no `o_disabled_offline`.
+.o_opportunity_kanban .o_kanban_record {
+    // The drag placeholder, a childless copy of the dragged card (classes included) that the
+    // kanban renderer marks `opacity-50`, keeps that opacity.
+    &.o_disabled_offline:not(.opacity-50) {
+        // The framework opacity is `!important`: only another `!important` overrides it.
+        opacity: 1 !important;
+
+        > :not(.o_dropdown_kanban),
+        &::before,
+        &::after {
+            opacity: 0.5;
+        }
+    }
+
+    // The framework pointer events are `!important`: only another `!important` overrides them.
+    &.o_dragged.o_disabled_offline,
+    &.o_dragged .o_disabled_offline {
+        pointer-events: none !important;
+    }
+}

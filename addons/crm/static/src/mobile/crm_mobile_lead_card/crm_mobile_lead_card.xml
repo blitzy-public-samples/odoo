@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Every interactive element is tagged data-available-offline. A control that must stay
+        unusable renders an explicit `disabled` the framework never removes, and its handler
+        re-checks the same predicate. An unavailable card is dimmed with
+        o_crm_mobile_lead_card_unavailable only, because the framework strips its own
+        offline-disabled class from data-available-offline elements.
+
+        The article has no tabindex and no role, so the inherited kanban hotkeys never act on it
+        (Space on a focused .o_kanban_record would toggle record selection). Keyboard users open
+        the lead with the native open button wrapping the name (Enter or Space), whose accessible
+        name is the visible lead name; a tap outside the controls opens it too. Space keydowns stop
+        at the article (onCardKeydown): the window-level kanban Space hotkey would otherwise cancel
+        the native button activation. The stage list is a listbox with a roving tabindex:
+        ArrowDown/ArrowUp/Home/End move among the enabled options, Escape closes it and focuses
+        Stage again, Enter or Space chooses; the arrow, Home, End and Escape keys stop at the list.
+        Cancel, or a completed Save, closing the follow-up form gives the focus back to Follow-up
+        (to Stage while Follow-up is disabled), unless the focus was moved out of the form. A Mark
+        done started from the activity list keeps the focus in the card once its button gives way
+        to "Pending sync" or its row leaves: on its own Mark done if the call failed, else on the
+        next Mark done (or the nearest one before it), else on the Activities toggle, unless the
+        focus was moved meanwhile; a completed Log call gives it back to Log call (to Stage while
+        Log call is disabled), unless it was moved. A panel a toggle opens (stage list, follow-up
+        form, activity list) is scrolled into view, only as far as needed, as it renders; only the
+        stage list then takes the focus, on its active option. Closing a panel scrolls nothing.
+
+        The lead name is the first span of the article and a leaf: the upstream mobile main flow
+        clicks `.o_kanban_record span:contains(name)`, and the click bubbles through the open button
+        to onOpenCard, once. A pending create's name is a plain span with no controls.
+
+        The visually hidden status region is rendered empty from mount, so assistive technologies
+        register it, outside every control and after the name. Its message is a div, never a span,
+        so the name stays the only span with the lead name. In-place queue changes are the card's to
+        announce, pending creates the pipeline's status region's (see _announceSyncChanges).
+    -->
+    <t t-name="crm.CrmMobileLeadCard">
+        <article class="o_kanban_record o_crm_mobile_lead_card card border mb-2 p-2 w-100"
+            data-available-offline="1"
+            t-att-class="{ o_crm_mobile_lead_card_unavailable: this.props.unavailable, o_crm_mobile_lead_card_pending: this.isPending }"
+            t-att-data-id="this.props.record?.id"
+            t-att-data-pending-key="this.props.pendingCall?.key"
+            t-on-click="this.onOpenCard"
+            t-on-keydown="this.onCardKeydown">
+            <div class="o_crm_mobile_lead_card_body d-flex flex-column gap-1">
+                <div class="d-flex align-items-center gap-2">
+                    <!-- No click handler of its own: its click bubbles to the article's onOpenCard. -->
+                    <button t-if="!this.isPending" type="button"
+                        class="o_crm_mobile_lead_card_open d-flex align-items-center flex-grow-1 p-0 border-0 rounded bg-transparent text-reset text-start"
+                        data-available-offline="1">
+                        <span class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-att-title="this.leadLabel" t-out="this.leadLabel"/>
+                        <span t-if="this.props.unavailable" class="visually-hidden"> (not available offline)</span>
+                    </button>
+                    <span t-else="" class="o_crm_mobile_lead_card_name fw-bold fs-5 text-truncate" t-att-title="this.leadLabel" t-out="this.leadLabel"/>
+                    <span t-if="this.isPendingSync" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                </div>
+                <span t-if="this.partnerName" class="o_crm_mobile_lead_card_partner text-700 text-truncate" t-att-title="this.partnerName" t-out="this.partnerName"/>
+                <span t-if="this.revenue" class="o_crm_mobile_lead_card_revenue" t-out="this.revenue"/>
+            </div>
+
+            <!-- Polite status region (see _announceSyncChanges); a new inner node per announcement. -->
+            <div class="o_crm_mobile_lead_card_status visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+                <div t-if="this.state.announcement.message" t-key="this.state.announcement.sequence" t-out="this.state.announcement.message"/>
+            </div>
+
+            <div t-if="!this.isPending" class="o_crm_mobile_lead_card_controls mt-2" t-on-click.stop="">
+                <div class="o_crm_mobile_lead_card_actions d-flex flex-wrap gap-1">
+                    <button type="button"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_stage"
+                        data-available-offline="1"
+                        title="Move to another stage"
+                        aria-label="Stage"
+                        t-att-aria-expanded="this.state.stageListOpen ? 'true' : 'false'"
+                        t-ref="this.stageButtonRef"
+                        t-on-click.stop="() => this.toggleStageList()">
+                        <i class="oi oi-fw" data-icon="swap_vert" aria-hidden="true"/> <span>Stage</span>
+                    </button>
+                    <!-- Disabled for a reason (no call type, no cached type): the title and the hint below say it. -->
+                    <button type="button"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_log_call"
+                        data-available-offline="1"
+                        t-att-title="this.logCallTitle"
+                        aria-label="Log call"
+                        t-att-aria-describedby="this.logCallDisabledReason ? this.actionsHintId : false"
+                        t-att-disabled="!this.canLogCall"
+                        t-ref="this.logCallButtonRef"
+                        t-on-click.stop="() => this.onLogCall()">
+                        <i class="oi oi-fw" data-icon="phone" aria-hidden="true"/> <span>Log call</span>
+                    </button>
+                    <button type="button"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_follow_up"
+                        data-available-offline="1"
+                        t-att-title="this.followUpTitle"
+                        aria-label="Follow-up"
+                        t-att-aria-describedby="this.followUpDisabledReason ? this.actionsHintId : false"
+                        t-att-disabled="!this.canFollowUp"
+                        t-att-aria-expanded="this.state.followUpOpen ? 'true' : 'false'"
+                        t-ref="this.followUpButtonRef"
+                        t-on-click.stop="() => this.toggleFollowUp()">
+                        <i class="oi oi-fw" data-icon="schedule" aria-hidden="true"/> <span>Follow-up</span>
+                    </button>
+                    <!-- No count badge until the lead's activities and their total are known: never a count that is not the lead's. -->
+                    <button type="button"
+                        class="btn btn-secondary gap-1 o_crm_mobile_card_activities"
+                        data-available-offline="1"
+                        title="Show the lead's activities"
+                        t-att-aria-label="this.activitiesLabel"
+                        t-att-aria-expanded="this.state.activitiesOpen ? 'true' : 'false'"
+                        t-ref="this.activitiesButtonRef"
+                        t-on-click.stop="() => this.toggleActivities()">
+                        <i class="oi oi-fw" data-icon="checklist" aria-hidden="true"/> <span>Activities</span><span t-if="this.activitiesKnown" class="badge rounded-pill text-bg-light" t-out="this.activityCount"/>
+                    </button>
+                </div>
+                <!--
+                    Why Log call (and Follow-up) is disabled, visible because touch devices show no
+                    tooltip; the disabled buttons are described by it. A div, never a span (see the
+                    status region). Not interactive.
+                -->
+                <div t-if="this.actionsHint" class="o_crm_mobile_lead_card_actions_hint text-700 small mt-1"
+                    t-att-id="this.actionsHintId"
+                    t-out="this.actionsHint"/>
+
+                <!--
+                    Choosing the won stage is mark-won: the server turns that stage write into won.
+                    Roving tabindex: only the active enabled option is a Tab stop (onStageListKeydown).
+                -->
+                <div t-if="this.state.stageListOpen" class="o_crm_mobile_lead_card_stage_list list-group mt-2" role="listbox" aria-label="Stages"
+                    t-ref="this.stageListRef"
+                    t-on-keydown="this.onStageListKeydown">
+                    <t t-set="activeOption" t-value="this.activeStageOption"/>
+                    <t t-foreach="this.stageOptions" t-as="option" t-key="option.key">
+                        <button type="button"
+                            role="option"
+                            class="list-group-item list-group-item-action o_crm_mobile_stage_option"
+                            t-att-class="{ active: option.selected }"
+                            t-att-aria-selected="option.selected ? 'true' : 'false'"
+                            t-att-tabindex="option.key === activeOption?.key ? '0' : '-1'"
+                            t-att-disabled="option.disabled"
+                            t-att-data-stage-value="option.group.serverValue"
+                            data-available-offline="1"
+                            t-on-click.stop="() => this.onChooseStage(option.group)"
+                            t-out="option.label"/>
+                    </t>
+                </div>
+
+                <!-- No assignee picker (the owner is the session user), no upload, no meeting type. -->
+                <div t-if="this.state.followUpOpen" class="o_crm_mobile_lead_card_follow_up d-flex flex-column gap-2 mt-2"
+                    t-ref="this.followUpFormRef">
+                    <label class="form-label mb-0">Activity type
+                        <select class="form-select o_crm_mobile_follow_up_type"
+                            data-available-offline="1"
+                            t-on-change="this.onFollowUpType">
+                            <option t-foreach="this.creatableTypes" t-as="type" t-key="type.id"
+                                t-att-value="type.id"
+                                t-att-selected="type.id === this.state.typeId"
+                                t-out="type.display_name"/>
+                        </select>
+                    </label>
+                    <label class="form-label mb-0">Summary
+                        <input type="text"
+                            class="form-control rounded o_crm_mobile_follow_up_summary"
+                            placeholder="Summary"
+                            data-available-offline="1"
+                            t-att-value="this.state.summary"
+                            t-on-input="this.onFollowUpSummary"/>
+                    </label>
+                    <label class="form-label mb-0">Due date
+                        <input type="date"
+                            class="form-control o_crm_mobile_follow_up_date"
+                            data-available-offline="1"
+                            t-att-value="this.state.date"
+                            t-on-input="this.onFollowUpDate"/>
+                    </label>
+                    <div class="d-flex gap-2">
+                        <button type="button"
+                            class="btn btn-primary o_crm_mobile_follow_up_save"
+                            data-available-offline="1"
+                            t-att-disabled="!this.canFollowUp"
+                            t-on-click.stop="() => this.onSaveFollowUp()">Save</button>
+                        <button type="button"
+                            class="btn btn-secondary o_crm_mobile_follow_up_cancel"
+                            data-available-offline="1"
+                            t-on-click.stop="() => this.onCancelFollowUp()">Cancel</button>
+                    </div>
+                </div>
+
+                <ul t-if="this.state.activitiesOpen" class="o_crm_mobile_lead_card_activities list-unstyled mt-2 mb-0"
+                    t-ref="this.activitiesListRef">
+                    <!--
+                        Pending creates have no server id yet: no Mark done. "Pending sync" while
+                        the create is in the live queue; one replayed during the sync window keeps
+                        its row, without badge, until its server row replaces it.
+                    -->
+                    <li t-foreach="this.pendingActivityCreates" t-as="entry" t-key="entry.key"
+                        class="o_crm_mobile_activity_row o_crm_mobile_activity_pending d-flex align-items-center gap-2 py-1">
+                        <div class="d-flex flex-column min-w-0">
+                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-att-title="this.pendingCreateTypeLabel(entry)" t-out="this.pendingCreateTypeLabel(entry)"/>
+                            <span t-if="entry.value.args[1].summary" class="o_crm_mobile_activity_summary text-break" t-out="entry.value.args[1].summary"/>
+                            <span t-if="entry.value.args[1].date_deadline" class="o_crm_mobile_activity_deadline text-700 small" t-out="this.formatDeadline(entry.value.args[1].date_deadline)"/>
+                        </div>
+                        <span t-if="this.isActivityCallQueued(entry)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                    </li>
+                    <!--
+                        The mark-done ids, read once for the whole list rather than per row: those
+                        in the live queue show "Pending sync"; those the sync window keeps after
+                        their replay show neither the badge nor Mark done, until the re-read or the
+                        reconciliation reload removes their row.
+                    -->
+                    <t t-set="pendingArchivedIds" t-value="this.pendingArchivedIds"/>
+                    <t t-set="queuedArchivedIds" t-value="this.queuedArchivedIds"/>
+                    <!-- Mark done is offered for every persisted activity, whatever its category. -->
+                    <li t-foreach="this.activityRows" t-as="activity" t-key="activity.id"
+                        class="o_crm_mobile_activity_row d-flex align-items-center gap-2 py-1"
+                        t-att-data-activity-id="activity.id">
+                        <div class="d-flex flex-column min-w-0">
+                            <span class="o_crm_mobile_activity_type fw-bold text-truncate" t-att-title="this.activityLabel(activity)" t-out="this.activityLabel(activity)"/>
+                            <span t-if="activity.summary" class="o_crm_mobile_activity_summary text-break" t-out="activity.summary"/>
+                            <span t-if="activity.date_deadline" class="o_crm_mobile_activity_deadline text-700 small" t-out="this.formatDeadline(activity.date_deadline)"/>
+                        </div>
+                        <span t-if="queuedArchivedIds.has(activity.id)" class="o_crm_mobile_pending_badge badge rounded-pill text-bg-warning gap-1 ms-auto flex-shrink-0"><i class="oi oi-fw" data-icon="cloud_upload" aria-hidden="true"/> Pending sync</span>
+                        <button t-elif="!pendingArchivedIds.has(activity.id)" type="button"
+                            class="btn btn-link d-inline-flex align-items-center gap-1 o_crm_mobile_activity_done ms-auto flex-shrink-0"
+                            data-available-offline="1"
+                            t-att-title="this.markDoneLabel(activity)"
+                            t-att-aria-label="this.markDoneLabel(activity)"
+                            t-att-disabled="this.state.busy"
+                            t-on-click.stop="() => this.onMarkDone(activity)">
+                            <i class="oi oi-fw" data-icon="check" aria-hidden="true"/> <span>Mark done</span>
+                        </button>
+                    </li>
+                    <!-- The page of activities is bounded: what it misses is said, never hidden. -->
+                    <li t-if="this.hiddenActivityCount" class="o_crm_mobile_activities_more py-1">
+                        <button t-if="!this.crmOffline.isOffline()" type="button"
+                            class="btn btn-link o_crm_mobile_activities_show_all"
+                            data-available-offline="1"
+                            t-att-title="this.showAllActivitiesLabel"
+                            t-att-aria-label="this.showAllActivitiesLabel"
+                            t-on-click.stop="() => this.onShowAllActivities()"
+                            t-out="this.showAllActivitiesLabel"/>
+                        <span t-else="" class="text-700 small" t-out="this.hiddenActivitiesLabel"/>
+                    </li>
+                    <!-- Also after the rows shown (pending creates, confirmed writes) while the lead's count is not known. -->
+                    <li t-if="!this.activitiesKnown or !this.activityCount" class="text-700 small" t-out="this.noActivitiesLabel"/>
+                </ul>
+            </div>
+        </article>
+    </t>
+
+</templates>

@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Renderer of the `crm_mobile_pipeline` view. Unless the screen is small and the pipeline
+        is grouped by stage with at least one stage (`isMobilePipeline`), it renders
+        `web.KanbanRenderer` through `t-call`, so desktop and every other grouping keep exactly
+        the kanban DOM.
+
+        Mobile markup:
+        - The root keeps `o_kanban_renderer o_renderer o_kanban_grouped`: the upstream mobile main
+          flow targets `.o_kanban_renderer`, and the base kanban controller restores the scroll of
+          `.o_renderer` without a null guard.
+        - The displayed stage is the only `.o_kanban_group`. It carries the group's `data-id` and
+          never `o_column_folded`, so the base controller saves and restores its scroll. It hosts
+          the framework quick create (`.o_kanban_quick_create`, `.o_kanban_add`) and the cards
+          (`.o_kanban_record`, name in a span).
+        - Placement and totals come from the renderer's pending-aware getters, not template state.
+        - The header is a start zone (Previous), the title and an end zone (Next, then Add). Both
+          zones always reserve the same width, so the stylesheet keeps the title, short or
+          truncated, centred on the header on every stage.
+        - A displayed stage that shows no lead while other stages hold some (emptyStageHint) shows
+          a sentence with their count and a button displaying the first of them. It is
+          neither a `.o_view_nocontent` nor a card or stage, so no framework selector matches it.
+        - Previous is not rendered on the first stage, nor Next on the last one. A placeholder of
+          the same size, hidden and no control (a span, aria-hidden, never focusable), holds the
+          slot of the absent button. When Add is rendered, a placeholder of Add's size sits between
+          Previous (or its placeholder) and the title, so the start zone balances the end zone's
+          width. The title therefore keeps its place from stage to stage. When the removed button
+          held the focus, the renderer moves the focus to the first header control (the remaining
+          navigation button, else Add), else to the first control of the pipeline, instead of
+          letting it drop to the document body.
+        - Space keydowns stop at the root (onPipelineKeydown): the inherited kanban Space hotkey
+          would otherwise cancel the native activation of the focused button.
+        - The status region (role=status, polite, atomic, visually hidden) is the root's last
+          child, outside the stage body and every control, and is rendered empty from mount, so it
+          outlives stage changes and the cards. It announces the queue changes that create, re-key
+          or destroy a card, which no card's own region can tell. Its message is a div
+          outside every .o_kanban_group and .o_kanban_record, so no card or stage selector
+          matches it.
+
+        Offline: every button of this template carries `data-available-offline` (inert online).
+        Load more is rendered online only, so offline no uncached read is attempted.
+    -->
+    <t t-name="crm.CrmMobilePipeline">
+        <t t-if="this.isMobilePipeline">
+            <t t-set="group" t-value="this.currentGroup"/>
+            <div class="o_kanban_renderer o_renderer o_kanban_grouped o_crm_mobile_pipeline d-flex flex-column user-select-none" t-ref="this.rootRef"
+                t-on-keydown="(ev) => this.onPipelineKeydown(ev)">
+                <div class="o_crm_mobile_pipeline_header d-flex align-items-center gap-1 px-3 py-1 bg-view border-bottom">
+                    <div class="o_crm_mobile_pipeline_header_start d-flex align-items-center gap-1">
+                        <button t-if="this.hasPrevStage" type="button"
+                            class="btn btn-secondary o_crm_mobile_pipeline_prev"
+                            data-available-offline="1"
+                            aria-label="Previous stage"
+                            title="Previous stage"
+                            t-on-click="() => this.onPrev()">
+                            <i class="oi" data-icon="chevron_backward" aria-hidden="true"/>
+                        </button>
+                        <span t-else="" class="o_crm_mobile_pipeline_nav_placeholder invisible" aria-hidden="true"/>
+                        <span t-if="this.canAdd" class="o_crm_mobile_pipeline_nav_placeholder invisible" aria-hidden="true"/>
+                    </div>
+                    <div class="o_crm_mobile_pipeline_title min-w-0 text-center" aria-live="polite">
+                        <div class="o_crm_mobile_pipeline_stage_name fs-4 fw-bold text-900 text-truncate" t-att-title="group.displayName">
+                            <i t-if="group.isFolded" class="oi me-1 o_crm_mobile_pipeline_folded" data-icon="close_fullscreen" role="img" aria-label="Folded" title="Folded"/>
+                            <t t-out="group.displayName"/>
+                        </div>
+                        <!--
+                            An empty stage is dimmed with text-600, the lightest grey keeping every
+                            totals text at the 4.5:1 WCAG AA contrast on the header; the desktop
+                            header's opacity-25 is not used because it would drop them below it.
+                            The revenue is fw-bolder, the weight of the desktop header's aggregate
+                            (a b element); fw-bold is the lighter medium weight.
+                        -->
+                        <t t-set="isStageEmpty" t-value="!this.stageCount(group)"/>
+                        <div class="o_crm_mobile_pipeline_totals text-truncate" t-att-class="isStageEmpty ? 'text-600' : 'text-700'">
+                            <span class="visually-hidden">Leads:</span>
+                            <span class="o_crm_mobile_pipeline_count" title="Leads" t-out="this.stageCount(group)"/>
+                            <t t-if="this.hasRevenue">
+                                <span class="mx-1" aria-hidden="true">•</span>
+                                <span class="visually-hidden">Expected revenue:</span>
+                                <span class="o_crm_mobile_pipeline_revenue fw-bolder" t-att-class="{ 'text-body': !isStageEmpty }" title="Expected revenue" t-out="this.formatStageRevenue(group)"/>
+                            </t>
+                        </div>
+                    </div>
+                    <div class="o_crm_mobile_pipeline_header_end d-flex align-items-center justify-content-end gap-1">
+                        <button t-if="this.hasNextStage" type="button"
+                            class="btn btn-secondary o_crm_mobile_pipeline_next"
+                            data-available-offline="1"
+                            aria-label="Next stage"
+                            title="Next stage"
+                            t-on-click="() => this.onNext()">
+                            <i class="oi" data-icon="chevron_forward" aria-hidden="true"/>
+                        </button>
+                        <span t-else="" class="o_crm_mobile_pipeline_nav_placeholder invisible" aria-hidden="true"/>
+                        <button t-if="this.canAdd" type="button"
+                            class="btn btn-primary o_crm_mobile_pipeline_add"
+                            data-available-offline="1"
+                            aria-label="New Lead"
+                            title="New Lead"
+                            t-on-click="(ev) => this.onAddClick(ev)">
+                            <i class="oi" data-icon="add_2" aria-hidden="true"/>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="o_kanban_group o_crm_mobile_pipeline_body"
+                    role="region"
+                    t-att-aria-label="group.displayName"
+                    t-att-data-id="group.id"
+                    t-key="'stage_' + group.serverValue"
+                    t-on-touchstart="(ev) => this.onTouchStart(ev)"
+                    t-on-touchmove="(ev) => this.onTouchMove(ev)"
+                    t-on-touchend="(ev) => this.onTouchEnd(ev)">
+                    <!--
+                        A lead whose form is not available offline was tapped. Back takes the focus
+                        and is described by the helper's sentence, so the reason is announced with
+                        it. The description is a hidden copy of that sentence: the helper markup
+                        also holds an icon whose ligature text and a Reset Filters button would be
+                        read into it. A reload keeps this stage body (keyed by stage), Back and the
+                        helper, so the focus stays where it was. The helper carries the body's key
+                        because component keys are scoped to this template, not to the body's
+                        t-key: when the body is rebuilt for another stage while the helper shows,
+                        a keyless helper would be handed from the old body to the new one, which
+                        Owl cannot mount.
+                    -->
+                    <t t-if="this.mobileState.unavailableLeadId">
+                        <div class="d-flex justify-content-center py-2">
+                            <button type="button"
+                                class="btn btn-secondary o_crm_mobile_pipeline_back"
+                                data-available-offline="1"
+                                aria-label="Back"
+                                title="Back"
+                                aria-describedby="o_crm_mobile_pipeline_unavailable_help"
+                                t-ref="this.backRef"
+                                t-on-click="() => this.onBackFromHelper()">
+                                <i class="oi me-1" data-icon="arrow_back" aria-hidden="true"/> Back
+                            </button>
+                            <span id="o_crm_mobile_pipeline_unavailable_help" hidden="">There is no data to display offline for the given filters</span>
+                        </div>
+                        <OfflineActionHelper t-key="'stage_' + group.serverValue"/>
+                    </t>
+                    <t t-else="">
+                        <!-- Framework quick create (New), props as in web.KanbanRenderer. -->
+                        <t t-if="this.props.quickCreateState and group.id === this.props.quickCreateState.id">
+                            <KanbanRecordQuickCreate
+                                quickCreateState="this.props.quickCreateState"
+                                onValidate="(record, mode) => this.validateQuickCreate(record, mode, group)"
+                                resModel="group.resModel"
+                                context="group.context"
+                            />
+                        </t>
+                        <!-- One ordered stage array, shared by every card of both loops. -->
+                        <t t-set="stages" t-value="this.stageGroups"/>
+                        <!-- Queued lead creates, keyed by queue key: they leave with their entry. -->
+                        <t t-foreach="this.pendingCreatesFor(group)" t-as="entry" t-key="entry.key">
+                            <CrmMobileLeadCard
+                                pendingCall="entry"
+                                group="group"
+                                stages="stages"
+                                displayedStageValue="group.serverValue"
+                            />
+                        </t>
+                        <!--
+                            Records placed in this stage, queued stage writes included. The key
+                            is made of values every reload keeps, the stage id and the lead id
+                            (the datapoint id for a record without one), never the group and
+                            record datapoint ids, which a reload renews: a reload (the
+                            reconciliation after a sync included) patches each card with its new
+                            record and group, so the card keeps its open stage list, follow-up
+                            draft, expanded activities, focus and status region. The key carries
+                            the stage because component keys are scoped to this template, not to
+                            the stage body's t-key, and a card move renders the moved record in
+                            the old and the new stage body in one patch: with the lead alone both
+                            cards would share one key and the moved card would stop reacting to
+                            its own state. Stage navigation, a move, a regroup and a load that no
+                            longer shows the lead in this stage (a filter, for instance) still
+                            destroy the card or re-key it.
+                        -->
+                        <t t-foreach="this.cardsFor(group)" t-as="record" t-key="'stage_' + group.serverValue + ':' + (record.resId || record.id)">
+                            <CrmMobileLeadCard
+                                record="record"
+                                group="group"
+                                stages="stages"
+                                activities="this.activitiesFor(record.resId)"
+                                activityTotal="this.activityTotalFor(record.resId)"
+                                onShowAllActivities="(resId) => this.onShowAllActivities(resId)"
+                                activityTypes="this.mobileState.activityTypes"
+                                queueEntries="this.cardQueueEntries"
+                                unavailable="this.isCardUnavailable(record)"
+                                displayedStageValue="group.serverValue"
+                                frameworkStageValue="record.group?.serverValue"
+                                onOpen="(r) => this.onCardOpen(r)"
+                                onMove="(r, targetGroup) => this.onCardMove(r, targetGroup)"
+                                onActivitiesChanged="(resId, write) => this.onActivitiesChanged(resId, write)"
+                            />
+                        </t>
+                        <!--
+                            Offline, the stage holds leads none of which was loaded online. Keyed
+                            like the stage body, for the reason given for the unavailable-lead
+                            helper: moving between two such stages rebuilds the body with this
+                            helper in both, while a reload keeps the body and the helper.
+                        -->
+                        <OfflineActionHelper t-if="this.isStageDataMissing(group)" t-key="'stage_' + group.serverValue"/>
+                        <!--
+                            The stage shows no lead while other stages hold some (a search whose
+                            matches are all in other stages, for instance): a sentence with their
+                            lead count, and a text button displaying the first of them. The
+                            sentence is gray 700, not `text-muted`, whose translucent gray falls
+                            under the 4.5:1 contrast of normal-size text on the stage body.
+                        -->
+                        <t t-set="emptyStageHint" t-value="this.emptyStageHint(group)"/>
+                        <div t-if="emptyStageHint" class="o_crm_mobile_pipeline_empty_stage d-flex flex-column align-items-center gap-2 px-3 py-4 text-center">
+                            <p class="o_crm_mobile_pipeline_empty_stage_text text-700 mb-0" t-out="this.emptyStageHintLabel(emptyStageHint)"/>
+                            <button type="button"
+                                class="btn btn-secondary o_crm_mobile_pipeline_empty_stage_target"
+                                data-available-offline="1"
+                                t-on-click="() => this.goToGroup(emptyStageHint.target)"
+                                t-out="this.emptyStageHintAction(emptyStageHint)"/>
+                        </div>
+                        <t t-set="unavailableCount" t-value="this.unavailableMoreCount(group)"/>
+                        <div t-if="unavailableCount > 0"
+                            class="o_crm_mobile_pipeline_unavailable_more text-700 small text-center py-2"
+                            t-out="this.unavailableMoreLabel(group, unavailableCount)"/>
+                        <t t-if="!this.crmOffline.isOffline()">
+                            <t t-set="unloadedCount" t-value="this.getGroupUnloadedCount(group)"/>
+                            <div t-if="unloadedCount > 0" class="o_kanban_load_more o_crm_mobile_pipeline_load_more" t-key="unloadedCount">
+                                <button t-if="group.isFolded" type="button"
+                                    class="btn btn-outline-primary w-100 mt-3"
+                                    data-available-offline="1"
+                                    t-att-disabled="this.isLoadingMore(group)"
+                                    t-att-aria-busy="this.isLoadingMore(group) ? 'true' : 'false'"
+                                    t-on-click="() => this.onLoadMoreClick(group)"><i t-if="this.isLoadingMore(group)" class="oi oi-spin me-1" data-icon="autorenew" aria-hidden="true"/>Load more... (<t t-out="unloadedCount"/> remaining)</button>
+                                <button t-else="" type="button"
+                                    class="btn btn-outline-primary w-100 mt-3"
+                                    data-available-offline="1"
+                                    t-att-disabled="this.isLoadingMore(group)"
+                                    t-att-aria-busy="this.isLoadingMore(group) ? 'true' : 'false'"
+                                    t-on-click="() => this.onLoadMoreClick(group)"><i t-if="this.isLoadingMore(group)" class="oi oi-spin me-1" data-icon="autorenew" aria-hidden="true"/>Load more... (<t t-out="unloadedCount"/> remaining)</button>
+                            </div>
+                        </t>
+                    </t>
+                </div>
+
+                <t t-if="this.showNoContentHelper">
+                    <ActionHelper noContentHelp="this.props.noContentHelp"/>
+                </t>
+
+                <!-- Polite status region (see _announce); a new inner node per announcement. -->
+                <div class="o_crm_mobile_pipeline_status visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+                    <div t-if="this.mobileState.announcement.message" t-key="this.mobileState.announcement.sequence" t-out="this.mobileState.announcement.message"/>
+                </div>
+            </div>
+        </t>
+        <t t-else="" t-call="web.KanbanRenderer"/>
+    </t>
+
+</templates>
