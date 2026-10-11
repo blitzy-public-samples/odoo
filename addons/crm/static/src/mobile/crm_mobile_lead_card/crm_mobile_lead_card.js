@@ -16,7 +16,9 @@
  * - Activities need server ids: a pending lead create offers no action, a pending activity create
  *   no Mark done. Meeting and upload types are never offered for creation; Mark done is offered
  *   for every persisted activity, as archiving writes only `active`. The activity owner is always
- *   the session user: no assignee picker.
+ *   the session user: no assignee picker. Log call and Follow-up, disabled for want of a cached
+ *   type, say why in their title and in a muted line under the actions row that describes them
+ *   (see `actionsHint`).
  * - Activities are a bounded page with the server total: the list ends with "Show all (N)" online
  *   or "N more activities are not available offline" offline, so nothing is hidden silently.
  * - The Activities count is displayed, named and announced only once the lead's activities and
@@ -28,9 +30,14 @@
  *   `toggleFollowUp`, `onSaveFollowUp`, `onMarkDone`, `toggleActivities`) re-check their
  *   predicate, so a direct call is inert while it fails. The follow-up input handlers only copy
  *   their event's value; `onCancelFollowUp` resets and closes the form, and gives the focus back
- *   to Follow-up unless it was moved out of the form (see `_focusAfterFollowUp`). A panel a toggle
- *   opens (stage list, follow-up form, activity list) is scrolled into view, only as far as
- *   needed, by the patch that renders it; closing a panel scrolls nothing (see
+ *   to Follow-up unless it was moved out of the form (see `_focusAfterFollowUp`). A Mark done
+ *   started from the activity list keeps the focus in the card once its row changes: on its own
+ *   Mark done if the call failed, else on the next Mark done (or the nearest one before it), else
+ *   on the Activities toggle, unless the user moved it meanwhile (see `_focusAfterMarkDone`).
+ *   A Log call started with the focus on it gives it back to Log call (to Stage while Log call
+ *   is disabled) once its call has ended, unless the user moved it (see `_focusAfterLogCall`).
+ *   A panel a toggle opens (stage list, follow-up form, activity list) is scrolled into view,
+ *   only as far as needed, by the patch that renders it; closing a panel scrolls nothing (see
  *   `revealPanelOnPatch`).
  * - The pipeline keys a record card by stage and lead, values a reload keeps: a reload (the
  *   reconciliation after a sync included) only gives the card its new `record` and `group`, so
@@ -117,6 +124,12 @@ export function stopKanbanSpaceHotkey(ev) {
 const STAGE_LIST_KEYS = ["ArrowDown", "ArrowUp", "Home", "End", "Escape"];
 
 /**
+ * Number of lead cards set up so far. It numbers each card's actions hint (see `actionsHintId`),
+ * whose id must be unique in the document, where many cards render at once.
+ */
+let actionsHintSequence = 0;
+
+/**
  * @typedef {{ key: string | number, value: { model: string, method: string, args: any[],
  *   kwargs: Object, extras: Object } }} QueueEntry an entry of the framework offline queue,
  *   exactly as the framework stores it
@@ -181,15 +194,30 @@ export class CrmMobileLeadCard extends Component {
     stageButtonRef = signal.ref();
     /** The stage listbox, while it is open. */
     stageListRef = signal.ref();
+    /**
+     * The Log call button, which gets the focus back once its call has ended (see
+     * `_focusAfterLogCall`).
+     */
+    logCallButtonRef = signal.ref();
     /** The Follow-up button, which gets the focus back when Cancel or a Save closes the form. */
     followUpButtonRef = signal.ref();
     /** The follow-up form, while it is open. */
     followUpFormRef = signal.ref();
+    /**
+     * The Activities toggle, which takes the focus when a completed Mark done leaves no other
+     * Mark done to focus (see `_focusAfterMarkDone`).
+     */
+    activitiesButtonRef = signal.ref();
     /** The activity list, while it is open. */
     activitiesListRef = signal.ref();
 
     setup() {
         this.crmOffline = useCrmOffline();
+        /**
+         * Id of the hint under the actions row (see `actionsHint`), which the button it explains
+         * points at with `aria-describedby`; unique to this card.
+         */
+        this.actionsHintId = `o_crm_mobile_lead_card_actions_hint_${++actionsHintSequence}`;
         /** Whether the next patch moves the focus into the stage list just opened. */
         this.focusStageListOnPatch = false;
         /**
@@ -197,6 +225,29 @@ export class CrmMobileLeadCard extends Component {
          * follow-up form while it held the focus (see `onCancelFollowUp`).
          */
         this.focusFollowUpOnPatch = false;
+        /**
+         * Focus to restore after a Mark done, remembered when it starts while its button, or the
+         * activity list, holds the focus, or the focus has fallen to the page: the call disables
+         * every Mark done, and its row then loses the button ("Pending sync") or the row itself,
+         * which drops the focus to the page. `activityId` is the activity marked done,
+         * `candidates` the ids of the rows to try next (those after it, then those before it,
+         * nearest first), and `settled` turns true when the call has ended on a live card: the
+         * patch that follows restores the focus (see `_focusAfterMarkDone`). `null` when no focus
+         * is owed. A plain in-memory field, never rendered.
+         *
+         * @type {{ activityId: number, candidates: number[], settled: boolean } | null}
+         */
+        this.focusAfterMarkDone = null;
+        /**
+         * Focus to restore after a Log call, remembered when it starts while its button holds the
+         * focus or the focus has fallen to the page: the call disables Log call, which drops the
+         * focus to the page. `settled` turns true when the call has ended on a live card: the
+         * patch that follows restores the focus (see `_focusAfterLogCall`). `null` when no focus
+         * is owed. A plain in-memory field, never rendered.
+         *
+         * @type {{ settled: boolean } | null}
+         */
+        this.focusAfterLogCall = null;
         /**
          * Ref of the panel a toggle has just opened (the stage list, the follow-up form or the
          * activity list), which the patch that renders it scrolls into view; `null` once that is
@@ -223,6 +274,21 @@ export class CrmMobileLeadCard extends Component {
             if (this.focusFollowUpOnPatch && !this.followUpFormRef()) {
                 this.focusFollowUpOnPatch = false;
                 this._focusAfterFollowUp();
+            }
+            // Only on the patch that follows the end of the call: the one its start triggered
+            // (every Mark done disabled) may patch first.
+            const markDone = this.focusAfterMarkDone;
+            if (markDone?.settled) {
+                this.focusAfterMarkDone = null;
+                this._focusAfterMarkDone(markDone);
+            }
+            // Likewise for a Log call, once its call has ended; dropped when a call started since
+            // that patch was scheduled (`busy` again), which then owns the focus.
+            if (this.focusAfterLogCall?.settled) {
+                this.focusAfterLogCall = null;
+                if (!this.state.busy) {
+                    this._focusAfterLogCall();
+                }
             }
         });
         this.state = proxy({
@@ -370,6 +436,66 @@ export class CrmMobileLeadCard extends Component {
     /** Usable with any creatable type, also when no `phonecall` type is cached. */
     get canFollowUp() {
         return this.isPersisted && this.creatableTypes.length > 0 && !this.state.busy;
+    }
+
+    /**
+     * Why no activity type can be offered for creation, which disables Follow-up and Log call;
+     * `null` when a creatable type is cached. While no type is known at all, the types are not
+     * cached (offline) or still being read (online: the pipeline reads them at mount and on every
+     * reconnection); once they are known, the lead's only types are meeting and upload ones.
+     */
+    get noCreatableTypeReason() {
+        if (this.creatableTypes.length) {
+            return null;
+        }
+        if (!Array.isArray(this.props.activityTypes)) {
+            return this.crmOffline.isOffline()
+                ? _t("Activity types are not available offline")
+                : _t("Loading activity types…");
+        }
+        return _t("No activity type can be created for leads");
+    }
+
+    /**
+     * Why Log call is disabled, given as its title and in the actions hint (see `actionsHint`);
+     * `null` while it is enabled, and while nothing lasting disables it: a lead with no server id
+     * (no activity can target it) or a call of the card in flight, a transient state that keeps
+     * the generic title.
+     */
+    get logCallDisabledReason() {
+        if (!this.isPersisted || this.state.busy || this.phonecallType) {
+            return null;
+        }
+        return this.noCreatableTypeReason ?? _t("No call activity type is available");
+    }
+
+    /** Why Follow-up is disabled, under the rules of `logCallDisabledReason`; `null` otherwise. */
+    get followUpDisabledReason() {
+        if (!this.isPersisted || this.state.busy) {
+            return null;
+        }
+        return this.noCreatableTypeReason;
+    }
+
+    /**
+     * The muted line under the actions row that says why Log call, and Follow-up with it, is
+     * disabled: touch devices show no title tooltip, and the disabled buttons point at it with
+     * `aria-describedby`, so screen readers announce the same text. `null` while no control is
+     * disabled for a reason. One line is enough: Follow-up has a reason only when no creatable
+     * type is cached, and Log call then has the same one.
+     */
+    get actionsHint() {
+        return this.logCallDisabledReason;
+    }
+
+    /** Title of Log call: why it is disabled (see `logCallDisabledReason`), else what it does. */
+    get logCallTitle() {
+        return this.logCallDisabledReason ?? _t("Log a call for today");
+    }
+
+    /** Title of Follow-up: why it is disabled (see `followUpDisabledReason`), else what it does. */
+    get followUpTitle() {
+        return this.followUpDisabledReason ?? _t("Schedule a follow-up activity");
     }
 
     /**
@@ -808,9 +934,11 @@ export class CrmMobileLeadCard extends Component {
      * @param {{ id: number, display_name: string }} type
      * @param {string} summary
      * @param {string} dateDeadline serialized date (`YYYY-MM-DD`)
+     * @param {{ settled: boolean } | null} [focus] the focus restoration a Log call remembered
+     *   (see `focusAfterLogCall`), settled once the call has ended on a live card
      * @returns {Promise<{ queued: boolean }>}
      */
-    async _createActivity(type, summary, dateDeadline) {
+    async _createActivity(type, summary, dateDeadline, focus = null) {
         const record = this.props.record;
         const vals = {
             res_model: "crm.lead",
@@ -875,19 +1003,34 @@ export class CrmMobileLeadCard extends Component {
             return res;
         } finally {
             if (status(this) !== "destroyed") {
+                // Settled before `busy` is reset, as in `onMarkDone`, so the patch that reset
+                // renders restores the focus. Not when a panel toggled meanwhile dropped it.
+                if (focus && this.focusAfterLogCall === focus) {
+                    focus.settled = true;
+                }
                 this.state.busy = false;
             }
         }
     }
 
+    /**
+     * Logs a call for today with the first cached `phonecall` type (see `_createActivity`).
+     *
+     * When the call starts with the focus on Log call or fallen to the page, the patch that
+     * follows its end keeps the focus in the card (see `_focusAfterLogCall`); with the focus
+     * anywhere else, no focus moves.
+     */
     async onLogCall() {
         if (!this.canLogCall) {
             return;
         }
         const type = this.phonecallType;
+        // Read before the patch that disables Log call and, with it, drops the focus.
+        const focus = this._logCallHasFocus() ? { settled: false } : null;
+        this.focusAfterLogCall = focus;
         // A logged call is due on `today()`, the browser's day, by specification; only the
         // follow-up date defaults to the session user's day (`userToday()`).
-        return this._createActivity(type, type.display_name, serializeDate(today()));
+        return this._createActivity(type, type.display_name, serializeDate(today()), focus);
     }
 
     toggleFollowUp() {
@@ -961,6 +1104,10 @@ export class CrmMobileLeadCard extends Component {
      * calendar event and no upload, whatever the activity's category. An activity whose mark done
      * is queued, or was replayed during the sync window, is not marked again.
      *
+     * When the call starts with the focus in the activity list (on this Mark done, typically) or
+     * fallen to the page, the patch that follows its end keeps the focus in the card (see
+     * `_focusAfterMarkDone`); with the focus anywhere else, no focus moves.
+     *
      * @param {Object} activity a cached `mail.activity` record
      */
     async onMarkDone(activity) {
@@ -971,6 +1118,15 @@ export class CrmMobileLeadCard extends Component {
             return;
         }
         const resId = this.props.record.resId;
+        // Read before the patch that disables every Mark done and, with it, drops the focus.
+        const focus = this._activityListHasFocus()
+            ? {
+                  activityId: activity.id,
+                  candidates: this._markDoneFocusCandidates(activity.id),
+                  settled: false,
+              }
+            : null;
+        this.focusAfterMarkDone = focus;
         this.state.busy = true;
         try {
             const res = await this.crmOffline.runOrQueue({
@@ -997,6 +1153,11 @@ export class CrmMobileLeadCard extends Component {
             }
         } finally {
             if (status(this) !== "destroyed") {
+                // Settled before `busy` is reset, so the patch that reset renders (with the row's
+                // new state) restores the focus. Not when a panel toggled meanwhile dropped it.
+                if (focus && this.focusAfterMarkDone === focus) {
+                    focus.settled = true;
+                }
                 this.state.busy = false;
             }
         }
@@ -1035,8 +1196,11 @@ export class CrmMobileLeadCard extends Component {
     // -------------------------------------------------------------------------
 
     _closePanels() {
-        // A panel toggled since the follow-up form closed keeps the focus where the user put it.
+        // A panel toggled since the follow-up form closed, or since a Mark done or a Log call
+        // started, keeps the focus where the user put it.
         this.focusFollowUpOnPatch = false;
+        this.focusAfterMarkDone = null;
+        this.focusAfterLogCall = null;
         // A panel closed before it was rendered is never scrolled to.
         this.revealPanelOnPatch = null;
         this.state.stageListOpen = false;
@@ -1108,6 +1272,108 @@ export class CrmMobileLeadCard extends Component {
             return;
         }
         (button.disabled ? this.stageButtonRef() : button)?.focus();
+    }
+
+    /**
+     * @private
+     * @returns {boolean} whether the Log call button is rendered and holds the focus, or the focus
+     *   has fallen to the page (the document body, or no element)
+     */
+    _logCallHasFocus() {
+        const button = this.logCallButtonRef();
+        if (!button) {
+            return false;
+        }
+        const doc = button.ownerDocument;
+        const active = doc.activeElement;
+        return !active || active === doc.body || active === button;
+    }
+
+    /**
+     * Keeps the focus in the card once a Log call has ended (see `onLogCall`): its button was
+     * disabled during the call, which drops the focus to the page. The focus goes back to Log call
+     * while it is rendered and enabled, else to the Stage button of the same row, which is never
+     * disabled. Nothing when the user moved the focus to another enabled element meanwhile.
+     *
+     * @private
+     */
+    _focusAfterLogCall() {
+        const button = this.logCallButtonRef();
+        const target = button && !button.disabled ? button : this.stageButtonRef();
+        if (!target) {
+            return;
+        }
+        const doc = target.ownerDocument;
+        const active = doc.activeElement;
+        if (active && active !== doc.body && active.isConnected && !active.disabled) {
+            return;
+        }
+        target.focus();
+    }
+
+    /**
+     * @private
+     * @returns {boolean} whether the activity list is rendered and holds the focus (a Mark done
+     *   of it, typically), or the focus has fallen to the page (the document body, or no element)
+     */
+    _activityListHasFocus() {
+        const list = this.activitiesListRef();
+        if (!list) {
+            return false;
+        }
+        const doc = list.ownerDocument;
+        const active = doc.activeElement;
+        return !active || active === doc.body || list.contains(active);
+    }
+
+    /**
+     * The rows whose Mark done takes the focus when the given activity's own is gone: the rows
+     * after it in the list order, then the rows before it, nearest first, so the focus moves on
+     * the way a user reads the list, and back up only at its end. Every row when the activity is
+     * not listed (a direct call).
+     *
+     * @private
+     * @param {number} activityId the activity marked done
+     * @returns {number[]} activity ids, in the order they are tried
+     */
+    _markDoneFocusCandidates(activityId) {
+        const ids = this.activityRows.map((activity) => activity.id);
+        const index = ids.indexOf(activityId);
+        return [...ids.slice(index + 1), ...ids.slice(0, Math.max(index, 0)).reverse()];
+    }
+
+    /**
+     * Keeps the focus in the card once a Mark done has ended (see `onMarkDone`): its button was
+     * disabled during the call and is then replaced by "Pending sync" (queued), or its row is
+     * removed (done online), either of which drops the focus to the page. The focus goes to the
+     * activity's own Mark done while it is still offered and enabled (the call failed), else to
+     * the first offered and enabled Mark done among `candidates`, else to the Activities toggle.
+     * Nothing when the user moved the focus to another enabled element meanwhile.
+     *
+     * @private
+     * @param {{ activityId: number, candidates: number[] }} focus see `focusAfterMarkDone`
+     */
+    _focusAfterMarkDone({ activityId, candidates }) {
+        const toggle = this.activitiesButtonRef();
+        if (!toggle) {
+            return;
+        }
+        const doc = toggle.ownerDocument;
+        const active = doc.activeElement;
+        if (active && active !== doc.body && active.isConnected && !active.disabled) {
+            return;
+        }
+        const list = this.activitiesListRef();
+        for (const id of [activityId, ...candidates]) {
+            const button = list?.querySelector(
+                `[data-activity-id="${id}"] .o_crm_mobile_activity_done`
+            );
+            if (button && !button.disabled) {
+                button.focus();
+                return;
+            }
+        }
+        toggle.focus();
     }
 
     /**

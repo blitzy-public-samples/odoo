@@ -17,10 +17,14 @@
         ArrowDown/ArrowUp/Home/End move among the enabled options, Escape closes it and focuses
         Stage again, Enter or Space chooses; the arrow, Home, End and Escape keys stop at the list.
         Cancel, or a completed Save, closing the follow-up form gives the focus back to Follow-up
-        (to Stage while Follow-up is disabled), unless the focus was moved out of the form. A panel
-        a toggle opens (stage list, follow-up form, activity list) is scrolled into view, only as
-        far as needed, as it renders; only the stage list then takes the focus, on its active
-        option. Closing a panel scrolls nothing.
+        (to Stage while Follow-up is disabled), unless the focus was moved out of the form. A Mark
+        done started from the activity list keeps the focus in the card once its button gives way
+        to "Pending sync" or its row leaves: on its own Mark done if the call failed, else on the
+        next Mark done (or the nearest one before it), else on the Activities toggle, unless the
+        focus was moved meanwhile; a completed Log call gives it back to Log call (to Stage while
+        Log call is disabled), unless it was moved. A panel a toggle opens (stage list, follow-up
+        form, activity list) is scrolled into view, only as far as needed, as it renders; only the
+        stage list then takes the focus, on its active option. Closing a panel scrolls nothing.
 
         The lead name is the first span of the article and a leaf: the upstream mobile main flow
         clicks `.o_kanban_record span:contains(name)`, and the click bubbles through the open button
@@ -72,20 +76,24 @@
                         t-on-click.stop="() => this.toggleStageList()">
                         <i class="oi oi-fw" data-icon="swap_vert" aria-hidden="true"/> <span>Stage</span>
                     </button>
+                    <!-- Disabled for a reason (no call type, no cached type): the title and the hint below say it. -->
                     <button type="button"
                         class="btn btn-secondary gap-1 o_crm_mobile_card_log_call"
                         data-available-offline="1"
-                        title="Log a call for today"
+                        t-att-title="this.logCallTitle"
                         aria-label="Log call"
+                        t-att-aria-describedby="this.logCallDisabledReason ? this.actionsHintId : false"
                         t-att-disabled="!this.canLogCall"
+                        t-ref="this.logCallButtonRef"
                         t-on-click.stop="() => this.onLogCall()">
                         <i class="oi oi-fw" data-icon="phone" aria-hidden="true"/> <span>Log call</span>
                     </button>
                     <button type="button"
                         class="btn btn-secondary gap-1 o_crm_mobile_card_follow_up"
                         data-available-offline="1"
-                        title="Schedule a follow-up activity"
+                        t-att-title="this.followUpTitle"
                         aria-label="Follow-up"
+                        t-att-aria-describedby="this.followUpDisabledReason ? this.actionsHintId : false"
                         t-att-disabled="!this.canFollowUp"
                         t-att-aria-expanded="this.state.followUpOpen ? 'true' : 'false'"
                         t-ref="this.followUpButtonRef"
@@ -99,10 +107,19 @@
                         title="Show the lead's activities"
                         t-att-aria-label="this.activitiesLabel"
                         t-att-aria-expanded="this.state.activitiesOpen ? 'true' : 'false'"
+                        t-ref="this.activitiesButtonRef"
                         t-on-click.stop="() => this.toggleActivities()">
                         <i class="oi oi-fw" data-icon="checklist" aria-hidden="true"/> <span>Activities</span><span t-if="this.activitiesKnown" class="badge rounded-pill text-bg-light" t-out="this.activityCount"/>
                     </button>
                 </div>
+                <!--
+                    Why Log call (and Follow-up) is disabled, visible because touch devices show no
+                    tooltip; the disabled buttons are described by it. A div, never a span (see the
+                    status region). Not interactive.
+                -->
+                <div t-if="this.actionsHint" class="o_crm_mobile_lead_card_actions_hint text-700 small mt-1"
+                    t-att-id="this.actionsHintId"
+                    t-out="this.actionsHint"/>
 
                 <!--
                     Choosing the won stage is mark-won: the server turns that stage write into won.

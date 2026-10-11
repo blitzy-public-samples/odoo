@@ -12156,6 +12156,58 @@ describe("Lead card user day and panel reveal", () => {
 // Mobile activities
 // -----------------------------------------------------------------------------
 
+/** Generic titles of a card's Log call and Follow-up, while nothing lasting disables them. */
+const LOG_CALL_TITLE = "Log a call for today";
+const FOLLOW_UP_TITLE = "Schedule a follow-up activity";
+
+/**
+ * Asserts why a lead card's Log call and Follow-up are disabled: a control disabled for a reason
+ * has it as its title and is described by the card's visible hint, which shows that reason; any
+ * other control keeps its generic title and no description. Both keep their accessible name and
+ * offline attribute. Without any reason, the card shows no hint.
+ *
+ * @param {string} name the lead name
+ * @param {{ logCall?: string, followUp?: string }} reasons the reason of each control disabled
+ *   for one
+ * @returns {string | null} the id of the card's hint, `null` when it shows none
+ */
+function expectActivityControlReasons(name, { logCall = null, followUp = null } = {}) {
+    const card = cardOf(name);
+    const hints = queryAll(`${card} .o_crm_mobile_lead_card_actions_hint`);
+    const reason = logCall ?? followUp;
+    expect(hints).toHaveLength(reason ? 1 : 0);
+    const hint = hints[0] ?? null;
+    if (hint) {
+        // A muted, visible line of its own under the actions row: a div with the reason alone.
+        expect(hint.tagName).toBe("DIV");
+        expect(hint).toHaveClass(["text-700", "small"]);
+        expect(hint).toBeVisible();
+        expect(hint).toHaveText(reason);
+        expect(hint.closest(".o_crm_mobile_lead_card_actions")).toBe(null);
+        expect(hint.previousElementSibling).toHaveClass("o_crm_mobile_lead_card_actions");
+        expect(document.getElementById(hint.id)).toBe(hint);
+    }
+    const controls = [
+        [".o_crm_mobile_card_log_call", "Log call", LOG_CALL_TITLE, logCall],
+        [".o_crm_mobile_card_follow_up", "Follow-up", FOLLOW_UP_TITLE, followUp],
+    ];
+    for (const [selector, label, title, controlReason] of controls) {
+        const button = queryOne(`${card} ${selector}`);
+        expect(button).toHaveAttribute("aria-label", label);
+        expect(button).toHaveAttribute("data-available-offline", "1");
+        expectTouchTarget(button, label);
+        if (controlReason) {
+            expect(button).toHaveAttribute("disabled");
+            expect(button).toHaveAttribute("title", controlReason);
+            expect(button).toHaveAttribute("aria-describedby", hint.id);
+        } else {
+            expect(button).toHaveAttribute("title", title);
+            expect(button).not.toHaveAttribute("aria-describedby");
+        }
+    }
+    return hint?.id ?? null;
+}
+
 describe("Mobile activities", () => {
     test.tags("mobile");
     test("mobile: schedule follow-up and log call offline queue full mail.activity create, shown pending", async () => {
@@ -12467,6 +12519,386 @@ describe("Mobile activities", () => {
     });
 
     test.tags("mobile");
+    test("mobile: an offline Mark done, from the keyboard or a tap, hands the focus to the next Mark done, else to the nearest one before it, else to the Activities toggle", async () => {
+        const activityIds = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "First" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Second" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Third" },
+        ]);
+        const [first, second, third] = activityIds;
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        await setOffline(true);
+        const card = cardOf("Lead 1");
+        const row = (id) => `${card} .o_crm_mobile_activity_row[data-activity-id='${id}']`;
+        const markDone = (id) => `${row(id)} .o_crm_mobile_activity_done`;
+        const toggle = `${card} .o_crm_mobile_card_activities`;
+        await contains(toggle).click();
+        expect(
+            queryAll(`${card} .o_crm_mobile_activity_row`).map((el) =>
+                Number(el.dataset.activityId)
+            )
+        ).toEqual(activityIds);
+
+        // Enter on the first row's Mark done: the row shows "Pending sync" in place of its
+        // button, and the next row's Mark done has the focus, not the page.
+        queryOne(markDone(first)).focus();
+        await press("Enter");
+        await animationFrame();
+        await advanceTime(1000);
+        expect(markDone(first)).toHaveCount(0);
+        expect(`${row(first)} .o_crm_mobile_pending_badge`).toHaveText("Pending sync");
+        expect(markDone(second)).toBeFocused();
+
+        // A tap on the last row's Mark done: no row follows it, so the nearest Mark done before
+        // it takes the focus.
+        await contains(markDone(third)).click();
+        await animationFrame();
+        await advanceTime(1000);
+        expect(markDone(third)).toHaveCount(0);
+        expect(markDone(second)).toBeFocused();
+
+        // The last Mark done offered: the focus goes to the Activities toggle.
+        await press("Enter");
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveCount(0);
+        expect(toggle).toBeFocused();
+        expect(toggle).toHaveAttribute("aria-expanded", "true");
+        // The queued calls are the unchanged state-only archives, one per activity.
+        expect(
+            queuedCalls("mail.activity", "action_archive").map(({ args, kwargs }) => [args, kwargs])
+        ).toEqual([first, third, second].map((id) => [[[id]], {}]));
+        expect(queued()).toHaveLength(3);
+    });
+
+    test.tags("mobile");
+    test("mobile: an online Mark done whose row leaves hands the focus to the next Mark done, else to the Activities toggle; a failed call gives it back to its Mark done; a direct call with the focus elsewhere, or a panel toggled during the call, moves none", async () => {
+        const activityIds = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "First" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Second" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Third" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Fourth" },
+        ]);
+        const [first, second, third, fourth] = activityIds;
+        mockActivityTypes(ACTIVITY_TYPES);
+        let fail = false;
+        let hold = null;
+        onRpc("mail.activity", "action_done", async ({ args }) => {
+            expect.step("mail.activity/action_done");
+            await hold?.promise;
+            if (fail) {
+                throw makeServerError({ message: "This activity is locked" });
+            }
+            MockServer.env["mail.activity"].action_feedback(args[0]);
+            return true;
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipelineWithReads();
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+        const row = (id) => `${card} .o_crm_mobile_activity_row[data-activity-id='${id}']`;
+        const markDone = (id) => `${row(id)} .o_crm_mobile_activity_done`;
+        const toggle = `${card} .o_crm_mobile_card_activities`;
+        await contains(toggle).click();
+        expect(
+            queryAll(`${card} .o_crm_mobile_activity_row`).map((el) =>
+                Number(el.dataset.activityId)
+            )
+        ).toEqual(activityIds);
+
+        // The server rejects the call: the row stays, and its Mark done gets the focus back.
+        fail = true;
+        expect.errors(1);
+        queryOne(markDone(first)).focus();
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps(["mail.activity/action_done"]);
+        expect.verifyErrors(["This activity is locked"]);
+        await contains(".modal .modal-footer .btn-primary").click();
+        expect(markDone(first)).not.toHaveAttribute("disabled");
+        expect(markDone(first)).toBeFocused();
+
+        // Done on the server: the row leaves, and the next row's Mark done has the focus.
+        fail = false;
+        await press("Enter");
+        await animationFrame();
+        expect.verifySteps(["mail.activity/action_done"]);
+        expect(row(first)).toHaveCount(0);
+        expect(markDone(second)).toBeFocused();
+
+        // Called directly while the focus is outside the card: the row leaves, and the focus
+        // stays where it is.
+        queryOne(".o_crm_mobile_pipeline_add").focus();
+        await lead1Card.onMarkDone(lead1Card.activityRows.find(({ id }) => id === second));
+        await animationFrame();
+        expect.verifySteps(["mail.activity/action_done"]);
+        expect(row(second)).toHaveCount(0);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+
+        // A panel toggled while the call runs keeps the focus where it is, even on the page.
+        hold = Promise.withResolvers();
+        queryOne(markDone(third)).focus();
+        await press("Enter");
+        await expect.waitForSteps(["mail.activity/action_done"]);
+        await animationFrame();
+        expect(markDone(third)).toHaveAttribute("disabled");
+        lead1Card.toggleActivities();
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_lead_card_activities`).toHaveCount(0);
+        document.activeElement.blur();
+        hold.resolve();
+        hold = null;
+        await animationFrame();
+        expect(lead1Card.state.busy).toBe(false);
+        expect(document.activeElement).toBe(document.body);
+
+        // The last Mark done offered: once its row leaves, the Activities toggle has the focus.
+        await contains(toggle).click();
+        expect(`${card} .o_crm_mobile_activity_done`).toHaveCount(1);
+        await contains(markDone(fourth)).click();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/action_done"]);
+        expect(`${card} .o_crm_mobile_activity_row`).toHaveCount(0);
+        expect(toggle).toBeFocused();
+        // Online, Mark done is the server's own action_done, and nothing is queued.
+        expect(queued()).toHaveLength(0);
+        expect(
+            MockServer.env["mail.activity"].search_read([["id", "in", activityIds]], ["id"])
+        ).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: an online Log call from the keyboard gives the focus back to its Log call once the save resolves, to Stage when Log call stays disabled; a direct call with the focus elsewhere, or a panel toggled during the call, moves none", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        let hold = null;
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await hold?.promise;
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountPipelineWithReads();
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+        const logCall = `${card} .o_crm_mobile_card_log_call`;
+        const stage = `${card} .o_crm_mobile_card_stage`;
+        const serverCalls = () =>
+            MockServer.env["mail.activity"].search_read(
+                [
+                    ["res_model", "=", "crm.lead"],
+                    ["res_id", "=", 1],
+                ],
+                ["summary"]
+            );
+
+        // Enter on the focused Log call: the button is disabled while its save runs, which drops
+        // the focus to the page; once the save resolves, Log call has the focus again.
+        hold = Promise.withResolvers();
+        queryOne(logCall).focus();
+        queryOne(logCall).addEventListener("focus", () => expect.step("Log call focused"));
+        await press("Enter");
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        await animationFrame();
+        expect(logCall).toHaveAttribute("disabled");
+        // The browser's focus fixup of a disabled focused control, which it may run later.
+        queryOne(logCall).blur();
+        expect(document.activeElement).toBe(document.body);
+        hold.resolve();
+        hold = null;
+        await animationFrame();
+        expect(lead1Card.state.busy).toBe(false);
+        expect(logCall).not.toHaveAttribute("disabled");
+        expect(logCall).toBeFocused();
+        expect.verifySteps(["Log call focused"]);
+        expect(serverCalls().map(({ summary }) => summary)).toEqual(["Call"]);
+
+        // The call type is gone when the save resolves (the types were read again without it):
+        // Log call stays disabled, and the Stage button of its row takes the focus.
+        hold = Promise.withResolvers();
+        await press("Enter");
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        renderers[0].mobileState.activityTypes = ACTIVITY_TYPES.filter(
+            ({ category }) => category !== "phonecall"
+        );
+        hold.resolve();
+        hold = null;
+        await animationFrame();
+        expect(lead1Card.state.busy).toBe(false);
+        expect(logCall).toHaveAttribute("disabled");
+        expect(stage).toBeFocused();
+        expect.verifySteps([]);
+        renderers[0].mobileState.activityTypes = ACTIVITY_TYPES;
+        await animationFrame();
+        expect(logCall).not.toHaveAttribute("disabled");
+
+        // Called directly while the focus is outside the card: the call is saved, and the focus
+        // stays where it is.
+        queryOne(".o_crm_mobile_pipeline_add").focus();
+        await lead1Card.onLogCall();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/web_save"]);
+        expect(serverCalls()).toHaveLength(3);
+        expect(".o_crm_mobile_pipeline_add").toBeFocused();
+
+        // A panel toggled while the call runs keeps the focus where it is, even on the page.
+        hold = Promise.withResolvers();
+        queryOne(logCall).focus();
+        expect.verifySteps(["Log call focused"]);
+        await press("Enter");
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        lead1Card.toggleActivities();
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_lead_card_activities`).toHaveCount(1);
+        document.activeElement.blur();
+        hold.resolve();
+        hold = null;
+        await animationFrame();
+        expect(lead1Card.state.busy).toBe(false);
+        expect(document.activeElement).toBe(document.body);
+        expect.verifySteps([]);
+
+        // Called directly while the focus has fallen to the page: Log call takes it.
+        await lead1Card.onLogCall();
+        await animationFrame();
+        expect.verifySteps(["mail.activity/web_save", "Log call focused"]);
+        expect(logCall).toBeFocused();
+        // Online, every Log call is the server's own web_save, and nothing is queued.
+        expect(serverCalls()).toHaveLength(5);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: a Mark done started once a Log call has ended, before the patch that gives the focus back to Log call, owns the focus", async () => {
+        const [first] = await createActivities([
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "First" },
+            { res_id: 1, activity_type_id: 1, activity_category: "default", summary: "Second" },
+        ]);
+        mockActivityTypes(ACTIVITY_TYPES);
+        const save = Promise.withResolvers();
+        const done = Promise.withResolvers();
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await save.promise;
+        });
+        onRpc("mail.activity", "action_done", async ({ args }) => {
+            expect.step("mail.activity/action_done");
+            await done.promise;
+            MockServer.env["mail.activity"].action_feedback(args[0]);
+            return true;
+        });
+        const cards = captureInstances(CrmMobileLeadCard);
+        await mountPipelineWithReads();
+        const card = cardOf("Lead 1");
+        const lead1Card = mountedCardOf(cards, 1);
+        const logCall = `${card} .o_crm_mobile_card_log_call`;
+        const markDone = (id) =>
+            `${card} .o_crm_mobile_activity_row[data-activity-id='${id}'] .o_crm_mobile_activity_done`;
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(markDone(first)).toHaveCount(1);
+
+        // A Log call started with the focus on it ends: its focus is owed to the next patch.
+        queryOne(logCall).focus();
+        const logged = lead1Card.onLogCall();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        save.resolve();
+        await logged;
+        expect(lead1Card.state.busy).toBe(false);
+        expect(lead1Card.focusAfterLogCall).toEqual({ settled: true });
+
+        // Before that patch, a Mark done starts from the list: the patch, rendered while it
+        // runs, drops the Log call's focus rather than moving the focus to Stage.
+        queryOne(markDone(first)).focus();
+        lead1Card.onMarkDone(lead1Card.activityRows.find(({ id }) => id === first));
+        await expect.waitForSteps(["mail.activity/action_done"]);
+        await animationFrame();
+        expect(lead1Card.focusAfterLogCall).toBe(null);
+        expect(markDone(first)).toHaveAttribute("disabled");
+        expect(`${card} .o_crm_mobile_card_stage`).not.toBeFocused();
+        expect(logCall).not.toBeFocused();
+
+        // Once done, the row leaves and the Mark done hands the focus to another Mark done.
+        done.resolve();
+        await animationFrame();
+        expect(lead1Card.state.busy).toBe(false);
+        expect(markDone(first)).toHaveCount(0);
+        expect(document.activeElement).toHaveClass("o_crm_mobile_activity_done");
+        expect(queryOne(card).contains(document.activeElement)).toBe(true);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: a queued Log call, whose connection drops during the call or made offline, from the keyboard or a tap, gives the focus back to its Log call", async () => {
+        mockActivityTypes(ACTIVITY_TYPES);
+        const setOffline = mockOffline();
+        const hold = Promise.withResolvers();
+        // The connection drops during the online save: it answers a 502 once released.
+        onRpc("/web/dataset/call_kw/mail.activity/web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await hold.promise;
+            return new Response("", { status: 502 });
+        });
+        await mountPipeline();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const card = cardOf("Lead 1");
+        const logCall = `${card} .o_crm_mobile_card_log_call`;
+        const values = {
+            res_model: "crm.lead",
+            res_id: 1,
+            activity_type_id: 2,
+            summary: "Call",
+            date_deadline: serializeDate(today()),
+            user_id: serverState.userId,
+        };
+        const queuedCreates = () =>
+            queuedCalls("mail.activity", "web_save").map(({ args, kwargs }) => [args, kwargs]);
+        const create = [[[], values], { context: {}, specification: {} }];
+
+        // Enter on the focused Log call: the button is disabled while its save runs, which drops
+        // the focus to the page; the lost connection queues the call, and Log call has the focus
+        // again.
+        queryOne(logCall).focus();
+        queryOne(logCall).addEventListener("focus", () => expect.step("Log call focused"));
+        await press("Enter");
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        await animationFrame();
+        expect(logCall).toHaveAttribute("disabled");
+        // The browser's focus fixup of a disabled focused control, which it may run later.
+        queryOne(logCall).blur();
+        hold.resolve();
+        await animationFrame();
+        expect(getService(OfflinePlugin).isOffline()).toBe(true);
+        expect(queuedCreates()).toEqual([create]);
+        expect(logCall).not.toHaveAttribute("disabled");
+        expect(logCall).toBeFocused();
+        expect.verifySteps(["Log call focused"]);
+        await setOffline(true);
+        await advanceTime(1000);
+
+        // Enter offline: the call is queued at once, and Log call keeps the focus.
+        await press("Enter");
+        await animationFrame();
+        expect(queuedCreates()).toEqual([create, create]);
+        expect(logCall).toBeFocused();
+        await advanceTime(1000);
+
+        // A tap on Log call offline: queued as well, and the focus stays on it.
+        await contains(logCall).click();
+        await animationFrame();
+        expect(logCall).toBeFocused();
+        // The queued calls are the unchanged activity creates, one per Log call, and nothing was
+        // sent offline.
+        expect(queuedCreates()).toEqual([create, create, create]);
+        expect(queued()).toHaveLength(3);
+        expect.verifySteps([]);
+        await contains(`${card} .o_crm_mobile_card_activities`).click();
+        expect(
+            queryAllTexts(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_pending_badge`)
+        ).toEqual(["Pending sync", "Pending sync", "Pending sync"]);
+    });
+
+    test.tags("mobile");
     test("mobile: activity controls disabled when no activity type cached; meeting types not offered", async () => {
         // Only meeting and upload types exist for leads: none can be created.
         const types = mockActivityTypes([
@@ -12563,6 +12995,119 @@ describe("Mobile activities", () => {
         expect(`${card} .o_crm_mobile_activity_pending .o_crm_mobile_activity_type`).toHaveText(
             "Email"
         );
+    });
+
+    test.tags("mobile");
+    test("mobile: with no phonecall type, the disabled Log call gives its reason as its title and in a visible hint describing it, while Follow-up keeps its title; each card has its own hint, and a call in flight shows none", async () => {
+        mockActivityTypes([
+            { id: 1, display_name: "Email", category: "default" },
+            { id: 31, display_name: "Meeting", category: "meeting" },
+        ]);
+        const save = Promise.withResolvers();
+        onRpc("mail.activity", "web_save", async () => {
+            expect.step("mail.activity/web_save");
+            await save.promise;
+        });
+        const setOffline = mockOffline();
+        await mountPipelineWithReads();
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        const noCallType = { logCall: "No call activity type is available" };
+        const lead1Hint = expectActivityControlReasons("Lead 1", noCallType);
+        const lead2Hint = expectActivityControlReasons("Lead 2", noCallType);
+        // Several cards are on screen: each hint id is the card's own.
+        expect(lead1Hint).toMatch(/^o_crm_mobile_lead_card_actions_hint_\d+$/);
+        expect(lead2Hint).toMatch(/^o_crm_mobile_lead_card_actions_hint_\d+$/);
+        expect(lead2Hint).not.toBe(lead1Hint);
+
+        // A call of the card in flight disables every action for that call alone: the generic
+        // titles, no description and no hint, until it ends.
+        const card = cardOf("Lead 1");
+        await contains(`${card} .o_crm_mobile_card_follow_up`).click();
+        await contains(`${card} .o_crm_mobile_follow_up_save`).click();
+        await expect.waitForSteps(["mail.activity/web_save"]);
+        await animationFrame();
+        expect(`${card} .o_crm_mobile_card_log_call`).toHaveAttribute("disabled");
+        expect(`${card} .o_crm_mobile_card_follow_up`).toHaveAttribute("disabled");
+        expect(expectActivityControlReasons("Lead 1")).toBe(null);
+        expect(expectActivityControlReasons("Lead 2", noCallType)).toBe(lead2Hint);
+        save.resolve();
+        await animationFrame();
+        expect(expectActivityControlReasons("Lead 1", noCallType)).toBe(lead1Hint);
+
+        // Offline, the same reason holds, on the same hints.
+        await setOffline(true);
+        expect(expectActivityControlReasons("Lead 1", noCallType)).toBe(lead1Hint);
+        expect(expectActivityControlReasons("Lead 2", noCallType)).toBe(lead2Hint);
+        expect(queued()).toHaveLength(0);
+    });
+
+    test.tags("mobile");
+    test("mobile: with only meeting and upload types for leads, Log call and Follow-up both say that no activity type can be created", async () => {
+        mockActivityTypes([
+            { id: 28, display_name: "Upload Document", category: "upload_file" },
+            { id: 31, display_name: "Meeting", category: "meeting" },
+        ]);
+        await mountPipelineWithReads();
+        const reason = "No activity type can be created for leads";
+        for (const name of ["Lead 1", "Lead 2"]) {
+            expectActivityControlReasons(name, { logCall: reason, followUp: reason });
+        }
+    });
+
+    test.tags("mobile");
+    test("mobile: Log call and Follow-up say the activity types are loading online and not available on a cold offline mount without them, and the reconnection that reads them ends the hint", async () => {
+        const errors = cachedReadErrors([
+            // the pipeline mounted offline from the cache, with its leads' cached activities
+            LEAD_GROUPS,
+            ACTIVITIES,
+            ACTIVITIES,
+        ]);
+        expect.errors(errors.length);
+        const setOffline = mockOffline();
+        mockActivityTypes(ACTIVITY_TYPES);
+        const renderers = captureInstances(CrmMobilePipeline);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+        // The pipeline is visited online while its activity-type read is withheld: the types are
+        // still loading, and the framework cache holds the pipeline and its leads' activities,
+        // but no activity type.
+        const restoreTypeRead = patchWithCleanup(CrmMobilePipeline.prototype, {
+            _loadActivityTypes() {},
+        });
+        await getService("action").doAction(PIPELINE_ACTION_ID);
+        await activityReadsDone(renderers[0]);
+        restoreTypeRead();
+        const loading = "Loading activity types…";
+        for (const name of ["Lead 1", "Lead 2"]) {
+            expectActivityControlReasons(name, { logCall: loading, followUp: loading });
+        }
+
+        // Offline, the pipeline mounted anew from the cache has no type to offer.
+        await setOffline(true);
+        await visitedReady();
+        await getService("action").doAction(PIPELINE_ACTION_ID, { clearBreadcrumbs: true });
+        await animationFrame();
+        const renderer = renderers[1];
+        await activityReadsDone(renderer);
+        expect(renderer.mobileState.activityTypes).toBe(null);
+        const unavailable = "Activity types are not available offline";
+        const hints = ["Lead 1", "Lead 2"].map((name) =>
+            expectActivityControlReasons(name, { logCall: unavailable, followUp: unavailable })
+        );
+        expect(hints[0]).not.toBe(hints[1]);
+
+        // Reconnect: the types are read, both controls are enabled with their generic titles,
+        // and no hint or description is left.
+        await setOffline(false);
+        await animationFrame();
+        await activityReadsDone(renderer);
+        expect(renderer.mobileState.activityTypes.map(({ id }) => id)).toEqual([1, 2]);
+        for (const name of ["Lead 1", "Lead 2"]) {
+            expect(expectActivityControlReasons(name)).toBe(null);
+            expect(`${cardOf(name)} .o_crm_mobile_card_log_call`).not.toHaveAttribute("disabled");
+            expect(`${cardOf(name)} .o_crm_mobile_card_follow_up`).not.toHaveAttribute("disabled");
+        }
+        expect.verifyErrors(errors);
     });
 
     test.tags("mobile");
