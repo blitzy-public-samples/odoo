@@ -53,7 +53,7 @@ import {
     runAllTimers,
     test,
 } from "@odoo/hoot";
-import { pointerDown, press, rightClick } from "@odoo/hoot-dom";
+import { pointerDown, press, rightClick, waitUntil } from "@odoo/hoot-dom";
 import { defineCrmModels } from "@crm/../tests/crm_test_helpers";
 import {
     click as mailClick,
@@ -6126,6 +6126,196 @@ describe("SKIP and remaining DISABLE", () => {
         expect.verifySteps(["offline:mail.followers.edit/web_save"]);
         expect(queuedEntries()).toHaveLength(0);
         expect(".modal button[name='edit_followers']").toHaveCount(1);
+    });
+
+    /**
+     * The full composer form, reduced to what `mail.compose.message`'s wizard form gives its
+     * `mail_composer_form` view to read (target model, records, recipients, body) and its footer.
+     * The shared mock arch has no `js_class`, so it would not open as that view.
+     */
+    const FULL_COMPOSER_FORM_ARCH = /* xml */ `
+        <form js_class="mail_composer_form">
+            <field name="model" invisible="1"/>
+            <field name="res_ids" invisible="1"/>
+            <field name="subtype_is_log" invisible="1"/>
+            <field name="partner_ids" invisible="1"/>
+            <field name="partner_cc_ids" invisible="1"/>
+            <field name="body" widget="html_composer_message"/>
+            <footer>
+                <button name="action_send_mail" type="object" string="Send"
+                    invisible="context.get('default_message_id')"/>
+                <button name="action_update_message" type="object" string="Save"
+                    invisible="not context.get('default_message_id')"/>
+                <button special="cancel" string="Discard"/>
+            </footer>
+        </form>`;
+
+    /**
+     * The calls a full composer issues to sync the thread's recipients when dismissed, and every
+     * call that would send, save or edit its message.
+     */
+    const FULL_COMPOSER_CALLS = [
+        "res.partner/search_read",
+        "mail.compose.message/web_save",
+        "mail.compose.message/action_send_mail",
+        "mail.compose.message/action_update_message",
+        "/mail/message/post",
+        "/mail/message/update_content",
+    ];
+
+    /**
+     * Makes the chatter's full composer open as the `mail_composer_form` view, its records
+     * passed as the server holds them (`res_ids` is a text field holding a JSON list).
+     *
+     * @param {Object} pyEnv
+     */
+    function setUpFullComposer(pyEnv) {
+        pyEnv["mail.compose.message"]._views = { "form,false": FULL_COMPOSER_FORM_ARCH };
+        mockService("action", {
+            doAction(action) {
+                if (action?.res_model === "mail.compose.message") {
+                    action.context.default_res_ids = JSON.stringify(action.context.default_res_ids);
+                }
+                return super.doAction(...arguments);
+            },
+        });
+    }
+
+    /**
+     * Opens the thread composer of the chatter shown, types `text` in it and opens the full
+     * composer from it, once the full composer's editor shows the text.
+     *
+     * @param {Composer[]} composers captured composers
+     * @param {string} text
+     * @returns {Promise<Composer>} the thread composer
+     */
+    async function openFullComposer(composers, text) {
+        await mailClick(".o-mail-Chatter-sendMessage");
+        await mailContains(".o-mail-Composer-input");
+        await insertText(".o-mail-Composer-input", text, { replace: true });
+        const composer = composers.findLast(
+            (instance) => status(instance) === "mounted" && !instance.props.composer?.message
+        );
+        await composer.onClickFullComposer();
+        await mailContains(`.modal .odoo-editor-editable:contains('${text}')`);
+        return composer;
+    }
+
+    test("lead full composer: online its X still reads the recipients; opened online, it closes on disconnect, reading, sending and queuing nothing, and keeps the draft", async () => {
+        const { pyEnv } = await seedLeadThread();
+        setUpFullComposer(pyEnv);
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(FULL_COMPOSER_CALLS);
+        const components = captureChatterComponents();
+        await start();
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message:contains('Hello lead')");
+
+        // Online, closing it is unchanged: its X syncs the thread's recipients through the partner
+        // read, and its body goes back to the thread composer.
+        const composer = await openFullComposer(components.composers, "Typed online");
+        await mailClick(".modal-header button[aria-label='Close']");
+        await mailContains(".modal", { count: 0 });
+        expect.verifySteps(["res.partner/search_read"]);
+        const draft = composer.props.composer;
+        await waitUntil(() => String(draft.composerHtml).includes("Typed online"));
+
+        // Opened online, it closes when the connection drops, as its X does but without the
+        // partner read: nothing is sent, saved or queued, and its body is kept as the draft.
+        await openFullComposer(components.composers, "Kept offline");
+        await setOffline(true);
+        await animationFrame();
+        expect(".modal").toHaveCount(0);
+        await waitUntil(() => String(draft.composerHtml).includes("Kept offline"));
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+    });
+
+    test("lead message edited in the full composer: the disconnection asks to stop editing, once; kept open offline, its X reads nothing and closes it once confirmed", async () => {
+        const { pyEnv } = await seedLeadThread();
+        setUpFullComposer(pyEnv);
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(FULL_COMPOSER_CALLS);
+        const components = captureChatterComponents();
+        const messageActions = captureInstances(MessageAction);
+        await start();
+        await openFormView("crm.lead", 1, { arch: LEAD_CHATTER_FORM_ARCH });
+        await mailContains(".o-mail-Message:contains('Hello lead')");
+        await hover(".o-mail-Message");
+        const editAction = [...messageActionsByOwner(messageActions, "crm.lead").values()]
+            .flat()
+            .find((action) => action.id === "edit" && action.owner.constructor.name === "Message");
+        editAction.onSelected();
+        await mailContains(".o-mail-Message .o-mail-Composer-input");
+        const editComposer = components.composers.find(
+            (instance) => status(instance) === "mounted" && instance.props.composer?.message
+        );
+        await editComposer.onClickFullComposer();
+        await mailContains(".modal .odoo-editor-editable:contains('Hello lead')");
+
+        // The disconnection closes it as a dismiss does, so the edit asks to be stopped first, and
+        // only once: the dialog's body and footer renderers request one close, and a connection
+        // that comes back and drops again while the question is open asks nothing more.
+        const stopEditing = ".modal:contains('Leaving will stop editing this message.')";
+        await setOffline(true);
+        await animationFrame();
+        await mailContains(stopEditing);
+        await setOffline(false);
+        await setOffline(true);
+        await animationFrame();
+        await mailContains(stopEditing);
+        await mailClick(".modal-footer button:contains('Keep editing')");
+        await mailContains(stopEditing, { count: 0 });
+        expect(".modal .o_form_view").toHaveCount(1);
+
+        // Kept open offline, its X dismisses it without the partner read. Escape leaves a full
+        // composer open, online as offline: mail ignores it on composer dialogs.
+        await press("Escape");
+        await animationFrame();
+        expect(stopEditing).toHaveCount(0);
+        expect(".modal .o_form_view").toHaveCount(1);
+        await mailClick(".modal-header button[aria-label='Close']");
+        await mailContains(stopEditing);
+        await mailClick(".modal-footer button:contains('Stop editing')");
+        await mailContains(".modal", { count: 0 });
+        expect.verifySteps([]);
+        expect(queuedEntries()).toHaveLength(0);
+        expect(".o-mail-Message:contains('Hello lead')").toHaveCount(1);
+    });
+
+    test("full composer of another model offline: it stays open and its X still reads the recipients, as the framework does", async () => {
+        // Its X awaits the partner read, which loses the connection: the `ConnectionLostError` is
+        // the framework's own, silenced by its lost-connection handler in production.
+        expect.errors(1);
+        const pyEnv = await startServer();
+        const partnerId = pyEnv["res.partner"].create({ name: "Customer" });
+        setUpFullComposer(pyEnv);
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(FULL_COMPOSER_CALLS);
+        const components = captureChatterComponents();
+        await start();
+        await openFormView("res.partner", partnerId, {
+            arch: /* xml */ `
+                <form>
+                    <sheet><field name="name"/></sheet>
+                    <chatter/>
+                </form>`,
+        });
+        await openFullComposer(components.composers, "Partner draft");
+
+        await setOffline(true);
+        await animationFrame();
+        expect(".modal .o_form_view").toHaveCount(1);
+        await mailClick(".modal-header button[aria-label='Close']");
+        await expect.waitForErrors([
+            `Connection to "/web/dataset/call_kw/res.partner/search_read"`,
+        ]);
+        expect.verifySteps(["res.partner/search_read"]);
+        expect(".modal .o_form_view").toHaveCount(1);
+        expect(queuedEntries()).toHaveLength(0);
     });
 
     test("chatter file drop on an offline lead saves, uploads, reloads and queues nothing", async () => {

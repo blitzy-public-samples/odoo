@@ -2,12 +2,13 @@ import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
 import { registry } from "@web/core/registry";
 import { formView } from "@web/views/form/form_view";
 
-import { isOfflineModel, useCrmOffline } from "@crm/mobile/crm_offline_hooks";
+import { isOfflineModel, targetsCrmLead, useCrmOffline } from "@crm/mobile/crm_offline_hooks";
 import { HtmlField } from "@html_editor/fields/html_field";
 // Imported for its side effect, which must run before this module: it defines on
 // `Chatter.prototype` the web chatter methods that the CRM chatter patch below wraps, so the CRM
 // guards sit on top of them.
 import "@mail/chatter/web/chatter_patch";
+import { MailComposerFormRenderer } from "@mail/chatter/web/mail_composer_form";
 import { ScheduledMessage } from "@mail/chatter/web/scheduled_message";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
@@ -174,7 +175,9 @@ registry.category("views").add("crm_form", {
 // model, each patched method calls `super`. A lead message lists no action and runs none while
 // offline. In a lead chatter, its action components stay mounted but hidden across a connection
 // change rather than being removed and rebuilt (see `useShownMessageActions`). The mail dialog
-// forms the lead chatter opens are framework views, guarded in `@crm/mobile/crm_offline_hooks`.
+// forms the lead chatter opens are framework views, guarded in `@crm/mobile/crm_offline_hooks`;
+// the full composer's dialog also closes itself when the connection drops (see the
+// `MailComposerFormRenderer` patch).
 //
 // One path is not patched: removing an attachment from a posted message
 // (`Message.onClickAttachmentUnlink`). It relies on the framework's connection-loss handling
@@ -897,6 +900,78 @@ patch(MessageDeleteDialog.prototype, {
             return;
         }
         return super.onClickConfirm(...arguments);
+    },
+});
+
+/**
+ * The model a full composer form targets, by the rule of `targetsCrmLead`: `crm.lead` when its
+ * record targets a lead, and nothing otherwise, so the CRM guards stay inert for every other
+ * target.
+ *
+ * @param {MailComposerFormRenderer} renderer
+ * @returns {string | undefined}
+ */
+function mailComposerFormModel(renderer) {
+    return targetsCrmLead(renderer.props.record) ? CRM_LEAD : undefined;
+}
+
+/**
+ * The full composer dialogs (their raw `dialogData`) whose close, requested by the CRM guard, has
+ * not settled yet. A dialog's form has two renderers, its body and its footer moved into the
+ * dialog footer, each with the guard, and the close of a message edit waits for the user to
+ * confirm it: a dialog gets one close request at a time.
+ *
+ * @type {WeakSet<Object>}
+ */
+const closingMailComposerDialogs = new WeakSet();
+
+/**
+ * Closes a full composer's dialog as a dismiss does (its X or Back), unless a close the CRM guard
+ * requested for that dialog is still pending.
+ *
+ * @param {Object | undefined} dialogData the dialog's `env.dialogData`
+ */
+function dismissMailComposerDialog(dialogData) {
+    if (!dialogData?.close) {
+        return;
+    }
+    const rawDialogData = toRaw(dialogData);
+    if (closingMailComposerDialogs.has(rawDialogData)) {
+        return;
+    }
+    closingMailComposerDialogs.add(rawDialogData);
+    Promise.resolve(dialogData.close({ dismiss: true })).finally(() =>
+        closingMailComposerDialogs.delete(rawDialogData)
+    );
+}
+
+patch(MailComposerFormRenderer.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOffline = useCrmOffline();
+        // The dialog's dismiss callback (its X and Back; mail ignores Escape on composer dialogs)
+        // first reads the selected partners to sync the thread's suggested recipients, then the
+        // dialog closes. Offline that read can only fail, which would keep the dialog open: for a
+        // lead it is skipped.
+        const dialogData = this.env.dialogData;
+        const dismiss = dialogData?.dismiss;
+        if (dismiss) {
+            dialogData.dismiss = (...args) => {
+                if (isCrmLeadOffline(this, mailComposerFormModel(this))) {
+                    return Promise.resolve();
+                }
+                return dismiss(...args);
+            };
+        }
+        // Offline its footer buttons are disabled and its Send is inert (see
+        // `@crm/mobile/crm_offline_hooks`), so the dialog closes when the connection drops. It
+        // closes as a dismiss does: the composer keeps its draft as after an X, and a message
+        // edit still asks to stop editing.
+        useCloseOnCrmOffline(
+            this,
+            () => mailComposerFormModel(this),
+            () => dismissMailComposerDialog(this.env.dialogData)
+        );
     },
 });
 
