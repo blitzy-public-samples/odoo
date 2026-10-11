@@ -32,7 +32,17 @@
  */
 
 import { CrmSearchModel } from "@crm/views/crm_search_model";
-import { Component, computed, untrack, useEffect, usePlugin, useProps, xml } from "@odoo/owl";
+import {
+    Component,
+    computed,
+    onMounted,
+    onPatched,
+    untrack,
+    useEffect,
+    usePlugin,
+    useProps,
+    xml,
+} from "@odoo/owl";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { ORM } from "@web/core/orm_plugin";
@@ -41,7 +51,7 @@ import { user } from "@web/core/user";
 import { patch } from "@web/core/utils/patch";
 import { Record as RelationalRecord } from "@web/model/relational_model/record";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
-import { useEnv } from "@web/owl2/utils";
+import { useEnv, useSubEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { extractLayoutComponents, Layout } from "@web/search/layout";
 import { Field } from "@web/views/fields/field";
@@ -1320,7 +1330,31 @@ patch(ListController.prototype, {
 // Form stage widget
 // -----------------------------------------------------------------------------
 
+/**
+ * @param {Function} [component] the component class of a field
+ * @returns {boolean} whether it is `StatusBarField` or a subclass, such as the lead form's
+ *  `rotting_statusbar_duration`
+ */
+function isStatusBarComponent(component) {
+    return component === StatusBarField || component?.prototype instanceof StatusBarField;
+}
+
 patch(Field.prototype, {
+    /**
+     * A statusbar field of a `crm.lead` record gives its widget `env.isCrmStageLockedOffline()`,
+     * which returns `crmStageLockedOffline`: the widget reads it to dim the controls the CRM
+     * offline guard disables (see the `StatusBarField` patch). The env of every other field is
+     * unchanged.
+     */
+    setup() {
+        super.setup(...arguments);
+        if (
+            isStatusBarComponent(this.field.component) &&
+            this.props.record?.resModel === "crm.lead"
+        ) {
+            useSubEnv({ isCrmStageLockedOffline: () => this.crmStageLockedOffline });
+        }
+    },
     /**
      * A `crm.lead` stage widget stays unavailable offline: offline stage moves, the won stage
      * included, go through the kanban move or the mobile card's stage list. Offline, the
@@ -1333,9 +1367,8 @@ patch(Field.prototype, {
      */
     get fieldComponentProps() {
         const props = super.fieldComponentProps;
-        const { component } = this.field;
         if (
-            (component === StatusBarField || component?.prototype instanceof StatusBarField) &&
+            isStatusBarComponent(this.field.component) &&
             props.record?.resModel === "crm.lead" &&
             this.offlinePlugin.isOffline()
         ) {
@@ -1343,9 +1376,65 @@ patch(Field.prototype, {
         }
         return props;
     },
+    /**
+     * Whether this field is a `crm.lead` stage widget that only the CRM offline guard of
+     * `fieldComponentProps` disables: the client is offline, and the widget's own props leave it
+     * enabled (it is clickable, and its readonly expression does not hold, as it does for a lost
+     * or an archived lead). These are the widgets whose controls the framework marks offline when
+     * the connection drops while they are shown. The offline signal is read before the field's own
+     * props are computed, so nothing more is computed online.
+     *
+     * @returns {boolean}
+     */
+    get crmStageLockedOffline() {
+        return (
+            isStatusBarComponent(this.field.component) &&
+            this.props.record?.resModel === "crm.lead" &&
+            this.offlinePlugin.isOffline() &&
+            !super.fieldComponentProps.isDisabled
+        );
+    },
 });
 
 patch(StatusBarField.prototype, {
+    setup() {
+        super.setup(...arguments);
+        const syncDimming = () => this.syncCrmOfflineDimming();
+        onMounted(syncDimming);
+        onPatched(syncDimming);
+    },
+    /**
+     * Offline, the controls of a `crm.lead` stage widget that only the CRM offline guard disables
+     * (`env.isCrmStageLockedOffline()`, given by its field) carry the framework class
+     * `o_disabled_offline`, so they are dimmed like every other control disabled offline, whether
+     * the form was shown when the connection dropped or opened offline. The guard renders them
+     * `disabled` from the first render, which the framework's offline selector skips, so without
+     * this a widget mounted offline would never be marked. The class goes on the controls the
+     * framework marks when the connection drops while the widget is shown, and on no other: every
+     * stage button and dropdown toggle except the current stage's button, which its selection
+     * keeps disabled online too. A widget disabled by its own props (a lost or an archived lead, a
+     * statusbar that is not clickable) gets no class either. On reconnection the framework removes
+     * `disabled` together with the class from every marked element, and the widget renders
+     * `disabled` again only when its value changes, so a marked control that is disabled online
+     * too would be left enabled. The class is removed as soon as the predicate no longer holds.
+     * The DOM of every other model's statusbar is left as it is, and online the class is never
+     * added.
+     */
+    syncCrmOfflineDimming() {
+        const root = this.rootRef();
+        if (this.props.record?.resModel !== "crm.lead" || !root) {
+            return;
+        }
+        // Read untracked: the predicate evaluates the field's own props, on which this widget's
+        // rendering must not depend.
+        const locked = untrack(() => Boolean(this.env.isCrmStageLockedOffline?.()));
+        for (const button of root.querySelectorAll("button")) {
+            button.classList.toggle(
+                "o_disabled_offline",
+                locked && !button.classList.contains("o_arrow_button_current")
+            );
+        }
+    },
     /**
      * Every stage selection of a `crm.lead` statusbar is refused offline, before `record.update`:
      * its buttons, its dropdown items and command palette entries (including those opened before

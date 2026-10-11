@@ -1968,6 +1968,55 @@ function stageItem(statusbar, label) {
     return statusbar.getAllItems().find((item) => item.label === label);
 }
 
+/** The view reference of `LEAD_STAGE_WIDGET_FORM_ARCH` once `setUpLeadStageForms` adds it. */
+const LEAD_STAGE_VIEW_REF = "lead_stage";
+
+/**
+ * Sets up the production stage widget as `setUpLeadStageWidget` does, gives the lead mock, for the
+ * current test only, `LEAD_STAGE_WIDGET_FORM_ARCH` as a form view, and makes Lead 3 (in the
+ * Qualified stage) a lost lead. Lead 4 is archived, and Lead 1 and 2 are active and pending, in the
+ * New stage.
+ */
+function setUpLeadStageForms() {
+    setUpLeadStageWidget();
+    CrmLead._views = {
+        ...CrmLead._views,
+        [`form,${LEAD_STAGE_VIEW_REF}`]: LEAD_STAGE_WIDGET_FORM_ARCH,
+    };
+    CrmLead._records[2].won_status = "lost";
+}
+
+/**
+ * Opens the stage widget form of a lead as a new action, so the form shown before it gets a
+ * breadcrumb that shows it again. The action uses the framework's disk cache, as an action loaded
+ * from the server does, so a form read online can be shown again offline.
+ *
+ * @param {number} resId
+ */
+async function openLeadStageForm(resId) {
+    await getService("action").doAction({
+        type: "ir.actions.act_window",
+        res_model: "crm.lead",
+        res_id: resId,
+        views: [[LEAD_STAGE_VIEW_REF, "form"]],
+        cache: true,
+    });
+}
+
+/**
+ * @returns {Array<{ control: string, disabled: boolean, dimmed: boolean }>} each control of the
+ *  shown stage widget: its stage id or its label, whether it renders `disabled`, and whether it
+ *  carries the framework class `o_disabled_offline`
+ */
+function stageControlStates() {
+    return queryAll(".o_statusbar_status button").map((button) => ({
+        control:
+            button.dataset.value ?? button.getAttribute("aria-label") ?? button.innerText.trim(),
+        disabled: button.hasAttribute("disabled"),
+        dimmed: button.classList.contains("o_disabled_offline"),
+    }));
+}
+
 describe("DISABLE controls and handler enforcement", () => {
     test.tags("desktop");
     test("team switcher: online mount, disconnect, reconnect", async () => {
@@ -3078,6 +3127,233 @@ describe("DISABLE controls and handler enforcement", () => {
         await contains(toggle).click();
         await contains(option("Qualified")).click();
         expect(stageId()).toBe(2);
+    });
+
+    test.tags("desktop");
+    test("lead form stage widget opened offline: dimmed as when the connection drops, except the current stage and the widget of a lost or archived lead, enabled again online", async () => {
+        // Offline, every form shown again from the breadcrumbs is served from the framework's disk
+        // cache, whose background refresh of the record fails with a `ConnectionLostError`.
+        expect.errors(3);
+        setUpLeadStageForms();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["web_save", "onchange"]);
+        const statusbars = captureInstances(StatusBarField);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        const statusbar = () => statusbars.findLast((instance) => status(instance) === "mounted");
+        const stageId = () => statusbar().props.record.data.stage_id.id;
+        const current = ".o_statusbar_status button.o_arrow_button_current";
+        const qualified = ".o_statusbar_status button[data-value='2']";
+        const moreToggle = ".o_statusbar_status button.dropdown-toggle:visible";
+        const back = async () => {
+            await contains(".o_breadcrumb .o_back_button").click();
+            await animationFrame();
+        };
+
+        // Online, the archived Lead 4, the lost Lead 3, Lead 1 and Lead 2 are opened in turn: no
+        // control is dimmed, and the stage buttons other than the current one are enabled.
+        for (const resId of [4, 3, 1, 2]) {
+            await openLeadStageForm(resId);
+            expect(statusbar().props.record.resId).toBe(resId);
+            expect(".o_statusbar_status .o_disabled_offline").toHaveCount(0);
+        }
+        expect(statusbar()).toBeInstanceOf(RottingStatusBarDurationField);
+        expect(qualified).toBeEnabled();
+        expect(current).not.toBeEnabled();
+        const onlineOpacity = getComputedStyle(queryOne(qualified)).opacity;
+        const currentOnlineOpacity = getComputedStyle(queryOne(current)).opacity;
+
+        // The connection drops, and Lead 1's form is opened offline from the breadcrumbs: every
+        // control is disabled, and every one of them but the current stage's button carries the
+        // framework class, which renders it dimmed and not clickable.
+        await setOffline(true);
+        await visitedReady();
+        await back();
+        expect(".o_breadcrumb .o_last_breadcrumb_item").toHaveText("Lead 1");
+        expect(statusbar().props.record.resId).toBe(1);
+        expect(statusbar().props.isDisabled).toBe(true);
+        const openedOffline = stageControlStates();
+        // In DOM order: the "More..." toggle of the folded Won stage, the Qualified and New stage
+        // buttons, the toggle of the stages before them and the small-screen dropdown (both
+        // hidden on large screens).
+        expect(openedOffline).toEqual([
+            { control: "More...", disabled: true, dimmed: true },
+            { control: "2", disabled: true, dimmed: true },
+            { control: "1", disabled: true, dimmed: false },
+            { control: "More...", disabled: true, dimmed: true },
+            { control: "New", disabled: true, dimmed: true },
+        ]);
+        expect(current).toHaveAttribute("data-value", "1");
+        for (const control of [qualified, moreToggle]) {
+            expect(getComputedStyle(queryOne(control)).opacity).toBe("0.5");
+            expect(getComputedStyle(queryOne(control)).cursor).toBe("not-allowed");
+        }
+        expect(getComputedStyle(queryOne(current)).opacity).toBe(currentOnlineOpacity);
+        // A click on a stage, or a direct selection, changes nothing and calls nothing.
+        await contains(qualified).click();
+        await statusbar().selectItem(stageItem(statusbar(), "Qualified"));
+        await animationFrame();
+        expect(stageId()).toBe(1);
+        expect(statusbar().props.record.dirty).toBe(false);
+        expect(queuedEntries()).toHaveLength(0);
+        // A re-render keeps the same presentation.
+        window.dispatchEvent(new Event("resize"));
+        await animationFrame();
+        expect(stageControlStates()).toEqual(openedOffline);
+
+        // Back online, no control is dimmed: the stage buttons other than the current one and the
+        // toggles are enabled, and the current stage's button stays disabled.
+        await setOffline(false);
+        expect(statusbar().props.isDisabled).toBe(false);
+        expect(".o_statusbar_status .o_disabled_offline").toHaveCount(0);
+        expect(qualified).toBeEnabled();
+        expect(moreToggle).toBeEnabled();
+        expect(current).not.toBeEnabled();
+        expect(getComputedStyle(queryOne(qualified)).opacity).toBe(onlineOpacity);
+
+        // The connection drops while the form is shown: the controls are presented as when the
+        // form was opened offline.
+        await setOffline(true);
+        await animationFrame();
+        expect(stageControlStates()).toEqual(openedOffline);
+
+        // The forms of the lost Lead 3 and of the archived Lead 4, opened offline: their widget is
+        // disabled by its own readonly expression, so no control is dimmed, and each stays
+        // disabled once the connection is back.
+        for (const resId of [3, 4]) {
+            await back();
+            expect(".o_breadcrumb .o_last_breadcrumb_item").toHaveText(`Lead ${resId}`);
+            expect(statusbar().props.record.resId).toBe(resId);
+            const states = stageControlStates();
+            expect(states.length).toBeGreaterThan(0);
+            expect(states.every(({ disabled, dimmed }) => disabled && !dimmed)).toBe(true, {
+                message: `offline, lead ${resId}`,
+            });
+            await setOffline(false);
+            expect(stageControlStates()).toEqual(states);
+            await setOffline(true);
+            await animationFrame();
+            expect(stageControlStates()).toEqual(states);
+        }
+        expect.verifySteps([]);
+        await expect.waitForErrors(["crm.lead/web_read", "crm.lead/web_read", "crm.lead/web_read"]);
+
+        // Back online, Lead 1's form moves the stage again.
+        await setOffline(false);
+        await openLeadStageForm(1);
+        await contains(qualified).click();
+        expect(stageId()).toBe(2);
+        expect.verifySteps([]);
+    });
+
+    test.tags("mobile");
+    test("mobile: lead form stage dropdown opened offline: dimmed as when the connection drops, except for a lost or archived lead, enabled again online", async () => {
+        // Offline, every form shown again from the breadcrumbs is served from the framework's disk
+        // cache, whose background refresh of the record fails with a `ConnectionLostError`.
+        expect.errors(3);
+        setUpLeadStageForms();
+        const setOffline = mockOffline();
+        keepPingsFailing();
+        watchRpcs(["web_save", "onchange"]);
+        const statusbars = captureInstances(StatusBarField);
+        await mountWithCleanup(WebClient);
+        await runAllTimers(); // flush the start-up synchronisation of the offline plugin
+
+        const statusbar = () => statusbars.findLast((instance) => status(instance) === "mounted");
+        const stageId = () => statusbar().props.record.data.stage_id.id;
+        const current = ".o_statusbar_status button.o_arrow_button_current";
+        const toggle = ".o_statusbar_status button.dropdown-toggle:visible";
+        const option = (label) => `.o-dropdown--menu .dropdown-item:contains('${label}')`;
+        const back = async () => {
+            await contains(".o_breadcrumb .o_back_button").click();
+            await animationFrame();
+        };
+
+        // Online, the archived Lead 4, the lost Lead 3, Lead 1 and Lead 2 are opened in turn: no
+        // control is dimmed, and the small-screen dropdown is the widget's only visible control.
+        for (const resId of [4, 3, 1, 2]) {
+            await openLeadStageForm(resId);
+            expect(statusbar().props.record.resId).toBe(resId);
+            expect(".o_statusbar_status .o_disabled_offline").toHaveCount(0);
+        }
+        expect(statusbar()).toBeInstanceOf(RottingStatusBarDurationField);
+        expect(queryAll(toggle)).toHaveLength(1);
+        expect(toggle).toBeEnabled();
+        const onlineOpacity = getComputedStyle(queryOne(toggle)).opacity;
+
+        // The connection drops, and Lead 1's form is opened offline from the breadcrumbs: every
+        // control is disabled, and every one of them but the current stage's button carries the
+        // framework class, the visible dropdown included, which renders it dimmed.
+        await setOffline(true);
+        await visitedReady();
+        await back();
+        expect(".o_breadcrumb .o_last_breadcrumb_item").toHaveText("Lead 1");
+        expect(statusbar().props.record.resId).toBe(1);
+        expect(statusbar().props.isDisabled).toBe(true);
+        const openedOffline = stageControlStates();
+        expect(openedOffline.length).toBeGreaterThan(1);
+        for (const { control, disabled, dimmed } of openedOffline) {
+            expect(disabled).toBe(true, { message: control });
+            expect(dimmed).toBe(control !== "1", { message: control });
+        }
+        expect(current).toHaveAttribute("data-value", "1");
+        expect(queryAll(toggle)).toHaveLength(1);
+        expect(getComputedStyle(queryOne(toggle)).opacity).toBe("0.5");
+        expect(getComputedStyle(queryOne(toggle)).cursor).toBe("not-allowed");
+        // A tap on the dropdown opens nothing, and a direct selection changes nothing.
+        await contains(toggle).click();
+        expect(".o-dropdown--menu").toHaveCount(0);
+        await statusbar().selectItem(stageItem(statusbar(), "Qualified"));
+        await animationFrame();
+        expect(stageId()).toBe(1);
+        expect(statusbar().props.record.dirty).toBe(false);
+        expect(queuedEntries()).toHaveLength(0);
+
+        // Back online, no control is dimmed, the dropdown is enabled, and the current stage's
+        // button stays disabled.
+        await setOffline(false);
+        expect(statusbar().props.isDisabled).toBe(false);
+        expect(".o_statusbar_status .o_disabled_offline").toHaveCount(0);
+        expect(toggle).toBeEnabled();
+        expect(current).not.toBeEnabled();
+        expect(getComputedStyle(queryOne(toggle)).opacity).toBe(onlineOpacity);
+
+        // The connection drops while the form is shown: the controls are presented as when the
+        // form was opened offline.
+        await setOffline(true);
+        await animationFrame();
+        expect(stageControlStates()).toEqual(openedOffline);
+
+        // The forms of the lost Lead 3 and of the archived Lead 4, opened offline: their widget is
+        // disabled by its own readonly expression, so no control is dimmed, and each stays
+        // disabled once the connection is back.
+        for (const resId of [3, 4]) {
+            await back();
+            expect(".o_breadcrumb .o_last_breadcrumb_item").toHaveText(`Lead ${resId}`);
+            expect(statusbar().props.record.resId).toBe(resId);
+            const states = stageControlStates();
+            expect(states.length).toBeGreaterThan(0);
+            expect(states.every(({ disabled, dimmed }) => disabled && !dimmed)).toBe(true, {
+                message: `offline, lead ${resId}`,
+            });
+            await setOffline(false);
+            expect(stageControlStates()).toEqual(states);
+            await setOffline(true);
+            await animationFrame();
+            expect(stageControlStates()).toEqual(states);
+        }
+        expect.verifySteps([]);
+        await expect.waitForErrors(["crm.lead/web_read", "crm.lead/web_read", "crm.lead/web_read"]);
+
+        // Back online, Lead 1's dropdown moves the stage again.
+        await setOffline(false);
+        await openLeadStageForm(1);
+        await contains(toggle).click();
+        await contains(option("Qualified")).click();
+        expect(stageId()).toBe(2);
+        expect.verifySteps([]);
     });
 
     test.tags("desktop");
